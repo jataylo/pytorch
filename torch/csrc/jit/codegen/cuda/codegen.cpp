@@ -251,7 +251,7 @@ class CudaKernelGenerator : private OptOutConstDispatch {
     // Shared memory
     if (has_dynamic_smem || has_reductions || has_parallel_welford) {
       indent() << "alignas("
-#ifndef __HIP_PLATFORM_HCC__
+#ifndef USE_ROCM
                << dataTypeSize(kernel_summary.largest_smem_data_type)
 #else
                << 8 // for HIP, we want 8-aligned even for smaller datatypes
