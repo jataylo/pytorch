@@ -38,11 +38,7 @@ class NVFuserEnabler {
   std::mutex mutex_;
 
   static bool nvfuserCanBeEnabled() {
-#ifdef USE_ROCM
-    return false;
-#else
     return at::globalContext().hasCUDA() && NVFuserPassManager::isRegistered();
-#endif
   }
 
   static void assertFuserCanBeEnabled(bool is_enabled) {
