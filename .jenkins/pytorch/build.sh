@@ -65,8 +65,8 @@ fi
 pip_install -r requirements.txt || true
 
 # Enable LLVM dependency for TensorExpr testing
-export USE_LLVM=/opt/llvm
-export LLVM_DIR=/opt/llvm/lib/cmake/llvm
+export USE_LLVM=/opt/rocm/llvm
+export LLVM_DIR=/opt/rocm/llvm/lib/cmake/llvm
 
 # TODO: Don't install this here
 if ! which conda; then
@@ -245,7 +245,7 @@ else
       sudo rm -f /opt/cache/bin/c++
       sudo rm -f /opt/cache/bin/gcc
       sudo rm -f /opt/cache/bin/g++
-      pushd /opt/rocm/llvm/bin
+      pushd /opt/llvm/bin
       if [[ -d original ]]; then
         sudo mv original/clang .
         sudo mv original/clang++ .
