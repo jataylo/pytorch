@@ -28,6 +28,7 @@ from torch.testing._internal.common_utils import (
     skipIfTorchDynamo,
     suppress_warnings,
     TestCase,
+    TEST_WITH_ROCM,
 )
 from torch.testing._internal.inductor_utils import HAS_CPU, HAS_CUDA
 
@@ -120,6 +121,7 @@ if COLLECT_EXPECT:
     atexit.register(print_seen)
 
 inductor_skips = defaultdict(dict)
+inductor_skips_rocm = defaultdict(dict)
 
 inductor_skips["cpu"] = {
     "linalg.ldl_solve": {b8, f16, f32, f64, i32, i64},  # segfault
@@ -179,6 +181,28 @@ inductor_skips["cuda"] = {
     "fft.rfft": {f16, f32, f64, b8, i32, i64},
     "fft.rfft2": {f16, f32, f64},
     "fft.rfftn": {f16, f32, f64},
+}
+
+inductor_skips_rocm["cuda"] = {
+    "cummax": {f16, f32, f64},
+    "cummin": {f16, f32, f64},
+    "gather": {f16, f32, f64},
+    "index_add": {f16, f32, f64, i32, i64},
+    "index_select": {f16, f32, f64, i32, i64},
+    "nanquantile": {f16, f32, f64, i32, i64},
+    "embedding": {f16, f32, f64, i32, i64},
+    "nn.functional.embedding": {f16, f32, f64, i32, i64},
+    "nn.functional.interpolate.bilinear": {f16, f32, f64, i32, i64},
+    "nn.functional.interpolate.nearest": {f16, f32, f64, i32, i64},
+    "nn.functional.upsample_bilinear": {f16, f32, f64, i32, i64},
+    "nn.functional.upsample_nearest": {f16, f32, f64, i32, i64},
+    "quantile": {f16, f32, f64, i32, i64},
+    "scatter_add": {f16, f32, f64, i32, i64},
+    "scatter_reduce.amax": {f16, f32, f64, i32, i64},
+    "scatter_reduce.amin": {f16, f32, f64, i32, i64},
+    "scatter_reduce.mean": {f16, f32, f64, i32, i64},
+    "scatter_reduce.sum": {f16, f32, f64, i32, i64},
+    "take_along_dim": {f16, f32, f64, i32, i64},
 }
 
 inductor_expected_failures_single_sample = defaultdict(dict)
@@ -454,6 +478,9 @@ class TestInductorOpInfo(TestCase):
             #     print(f"SKIPPING OP {op_name} on {device_type}", flush=True, file=f)
             #     print(f"SKIPPING OP {op_name} on {device_type}", flush=True)
             self.skipTest(f"{op_name} in {dtype} not supported")
+        elif TEST_WITH_ROCM and dtype in inductor_skips_rocm[device_type].get(op_name, set()):
+            test_expect = TestExpect.SKIP
+            self.skipTest(f"{op_name} in {dtype} not supported on ROCM")
         elif dtype in inductor_expected_failures_single_sample[device_type].get(
             op_name, set()
         ) or dtype in inductor_gradient_expected_failures_single_sample[

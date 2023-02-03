@@ -20,4 +20,4 @@ except (
 ):
     pass
 
-HAS_CUDA = has_triton() and not TEST_WITH_ROCM
+HAS_CUDA = has_triton()
