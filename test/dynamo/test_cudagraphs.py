@@ -11,7 +11,7 @@ import torch._dynamo.config
 import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch._dynamo.testing import same
-from torch.testing._internal.common_utils import TEST_WITH_ROCM
+from torch.testing._internal.common_utils import TEST_WITH_ROCM, skipIfRocm
 
 
 def composed(*decs):
@@ -106,6 +106,7 @@ class TestAotCudagraphs(torch._dynamo.test_case.TestCase):
         fn(x, y)
 
     @patch("torch._functorch.config.use_functionalize", True)
+    @patch_all()
     def test_mutate_input(self):
         def model(x, y):
             y.add_(3)

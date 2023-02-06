@@ -40,12 +40,12 @@ from torch.testing._internal.common_utils import (
     IS_WINDOWS,
     IS_X86,
     TEST_WITH_ASAN,
-    TEST_WITH_ROCM,
     TEST_WITH_SLOW,
     TestCase as TorchTestCase,
 )
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_unflatten
+from torch.testing._internal.common_utils import skipIfRocm
 
 if IS_WINDOWS and IS_CI:
     sys.stderr.write(
@@ -2506,6 +2506,7 @@ class CommonTemplate:
             (torch.randn([4, 4, 4]),),
         )
 
+    @skipIfRocm
     def test_convolution1(self):
         m = torch.nn.Sequential(
             torch.nn.Conv2d(5, 6, [3, 3]),
@@ -2966,6 +2967,7 @@ class CommonTemplate:
             (torch.randn([10, 4]), torch.randint(10, [8]), torch.tensor([0, 2, 6])),
         )
 
+    @skipIfRocm
     def test_batch_norm_2d(self):
         m = torch.nn.Sequential(
             torch.nn.BatchNorm2d(10),
@@ -3654,6 +3656,7 @@ class CommonTemplate:
                 ),
             )
 
+    @skipIfRocm
     def test_cudnn_rnn(self):
         if self.device == "cpu":
             raise unittest.SkipTest("requires CUDA")
@@ -4058,7 +4061,7 @@ class CommonTemplate:
         inputs = (rand_strided((8,), (1,), device=self.device),)
         self.assertTrue(same(fn(*inputs), 2 * inputs[0]))
 
-    @config.patch({"triton.cudagraphs": True})
+    @config.patch({"triton.cudagraphs": True if not torch.version.hip else False})
     def test_strided_inputs(self):
         @torch._dynamo.optimize("inductor")
         def fn(x, y):
@@ -4070,7 +4073,7 @@ class CommonTemplate:
         )
         self.assertTrue(same(fn(*inputs), inputs[0] + inputs[1]))
 
-    @config.patch({"triton.cudagraphs": True})
+    @config.patch({"triton.cudagraphs": True if not torch.version.hip else False})
     @patch.object(functorch_config, "use_fake_tensor", True)
     def test_input_mutation1(self):
         def fn(a):
@@ -4611,6 +4614,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_scatter3(self):
         def fn(a, dim, index, b):
             return aten.scatter(a, dim, index, b, reduce="add")
@@ -4654,6 +4658,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_scatter_add2(self):
         def fn(a, dim, index, b):
             return aten.scatter_add(a, dim, index, b)
@@ -4668,6 +4673,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_scatter_add3(self):
         def fn(a, dim, index, b):
             return aten.scatter_add(a, dim, index, b)
@@ -4682,6 +4688,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_scatter_reduce1(self):
         def fn(a, dim, index, b):
             return aten.scatter_reduce(a, dim, index, b, "sum")
@@ -4696,6 +4703,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_scatter_reduce2(self):
         def fn(a, dim, index, b):
             return aten.scatter_reduce(a, dim, index, b, "sum", include_self=False)
@@ -4754,7 +4762,7 @@ class CommonTemplate:
 
         self.common(fn, [torch.randn(55)], assert_equal=False)
 
-    @config.patch({"triton.cudagraphs": True})
+    @config.patch({"triton.cudagraphs": True if not torch.version.hip else False})
     def test_dropout(self):
         random.seed(1234)
         torch.manual_seed(1234)
@@ -4784,7 +4792,7 @@ class CommonTemplate:
         def fn(a):
             return torch.nn.functional.dropout(a, 0.55, True)
 
-        for cg in (False, True):
+        for cg in [False, True] if not torch.version.hip else [False]:
             with patch.object(config.triton, "cudagraphs", cg):
                 torch._dynamo.reset()
 
@@ -5214,6 +5222,7 @@ class CommonTemplate:
             ],
         )
 
+    @skipIfRocm
     def test_argmax_argmin2(self):
         def fn(x):
             return (
@@ -5533,7 +5542,7 @@ class CommonTemplate:
         else:
             contexts = [
                 contextlib.nullcontext,
-                lambda: config.patch({"triton.cudagraphs": True}),
+                lambda: config.patch({"triton.cudagraphs": True if not torch.version.hip else False}),
             ]
 
         for context in contexts:
@@ -6907,6 +6916,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
     class CudaReproTests(TestCase):
         common = check_model_cuda
 
+        @skipIfRocm
         def test_index_put_issue(self):
             def forward(
                 self,
@@ -6943,6 +6953,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             compiled = compile_fx_inner(mod, inps)
             compiled(inps)
 
+        @skipIfRocm
         @requires_cuda()
         def test_input_channels_last(self):
             m = torch.nn.Sequential(
@@ -7014,7 +7025,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             compiled = compile_fx_inner(mod, ())
             assert compiled([])[0].device.type == "cuda"
 
-        @config.patch({"triton.cudagraphs": True})
+        @config.patch({"triton.cudagraphs": True if not torch.version.hip else False})
         def test_expanded_inputs_cudagraphs(self):
             @torch._dynamo.optimize("inductor")
             def fn(x, y):
@@ -7048,7 +7059,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(real_out, compiled_out)
             torch._dynamo.reset()
 
-        @config.patch({"triton.cudagraphs": True, "size_asserts": False})
+        @config.patch({"triton.cudagraphs": True if not torch.version.hip else False, "size_asserts": False})
         def test_expanded_inputs_cudagraphs_no_size_asserts(self):
             @torch._dynamo.optimize("inductor")
             def fn(x, y):
@@ -7091,7 +7102,8 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             res = opt_mod(*args)
             self.assertTrue(same(ref, res))
 
-        @config.patch({"triton.cudagraphs": True})
+        @skipIfRocm
+        @config.patch({"triton.cudagraphs": True if not torch.version.hip else False})
         def test_inplace_updates_cudagraphs(self):
             class Repro(torch.nn.Module):
                 def __init__(self):
@@ -7372,6 +7384,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(arguments_that_are_divisible_by_16_in_kernel1, (0, 1))
             torch._dynamo.reset()
 
+        @skipIfRocm
         def test_optimize_indexing_dtype(self):
             def fn(x: torch.Tensor) -> torch.Tensor:
                 return aten.upsample_bilinear2d.vec(x, None, True, [2.0, 2.0])
@@ -7401,6 +7414,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertFalse("out_ptr0" in code)
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
+        @skipIfRocm
         def test_cant_optimize_compute(self):
             def ones():
                 return torch.ones([4], device="cuda")
@@ -7427,6 +7441,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
                 self.assertTrue("to(tl.int64)" in code)
                 self.assertEqual(fn_opt(), fn())
 
+        @skipIfRocm
         def test_optimize_compute(self):
             def ones():
                 return torch.ones([4], device="cuda")
@@ -7627,5 +7642,5 @@ if HAS_CPU:
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 
-    if (HAS_CPU or HAS_CUDA) and not TEST_WITH_ROCM:
+    if (HAS_CPU or HAS_CUDA):
         run_tests(needs="filelock")
