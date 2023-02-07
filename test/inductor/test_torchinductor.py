@@ -3755,7 +3755,7 @@ class CommonTemplate:
         inputs = (rand_strided((8,), (1,), device=self.device),)
         self.assertTrue(same(fn(*inputs), 2 * inputs[0]))
 
-    @patch.object(config.triton, "cudagraphs", True)
+    @patch.object(config.triton, "cudagraphs", True if not torch.version.hip else False)
     def test_strided_inputs(self):
         @torch._dynamo.optimize("inductor")
         def fn(x, y):
@@ -5185,7 +5185,8 @@ class CommonTemplate:
         else:
             contexts = [
                 contextlib.nullcontext,
-                lambda: patch.object(config.triton, "cudagraphs", True),
+                lambda: patch.object(config.triton, "cudagraphs", True 
+                        if not torch.version.hip else False),
             ]
 
         for context in contexts:
