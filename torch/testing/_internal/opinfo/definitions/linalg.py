@@ -37,6 +37,7 @@ from torch.testing._internal.common_utils import (
     IS_MACOS,
     make_fullrank_matrices_with_distinct_singular_values,
     skipIfSlowGradcheckEnv,
+    skipIfNoLapack,
     slowTest,
 )
 from torch.testing._internal.opinfo.core import (
@@ -2039,7 +2040,7 @@ op_db: List[OpInfo] = [
         check_batched_forward_grad=False,
         sample_inputs_func=sample_inputs_linalg_pinv_hermitian,
         gradcheck_wrapper=gradcheck_wrapper_hermitian_input,
-        decorators=[skipCUDAIfNoMagma, skipCPUIfNoLapack],
+        decorators=[skipCUDAIfNoMagma, skipCPUIfNoLapack, skipIfNoLapack],
         skips=(
             DecorateInfo(
                 unittest.skip("Skipped!"),
@@ -2075,6 +2076,14 @@ op_db: List[OpInfo] = [
                 "test_fn_fwgrad_bwgrad",
                 device_type="cuda",
             ),
+            # This test fails without LAPACK compiled
+            DecorateInfo(
+                skipIfNoLapack,
+                "TestInductorOpInfoCUDA",
+                "test_comprehensive_linalg_pinv_hermitian",
+                device_type="cuda",
+                dtypes=[torch.float32, torch.float64]
+            )
         ),
     ),
     OpInfo(
