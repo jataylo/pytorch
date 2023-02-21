@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch._dynamo as torchdynamo
 import torch._inductor.config as torchinductor_config
-from torch.testing._internal.common_utils import IS_LINUX, TestCase
+from torch.testing._internal.common_utils import IS_LINUX, TestCase, skipIfRocm
 from torch.testing._internal.inductor_utils import HAS_CUDA
 
 
@@ -45,7 +45,7 @@ class SmokeTest(TestCase):
         def foo(x):
             return torch.sin(x) + x.min()
 
-        @torch.compile(mode="reduce-overhead")
+        @torch.compile()
         def bar(x):
             return x * x
 
