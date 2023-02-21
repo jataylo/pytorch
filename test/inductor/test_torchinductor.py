@@ -2091,6 +2091,8 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn(4), torch.randn(4)), check_lowp=False)
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3464
+    @skipIfRocm
     @requires_multigpu()
     def test_multi_gpu_recompile_on_index(self):
         torch.set_float32_matmul_precision("high")
@@ -2130,6 +2132,7 @@ class CommonTemplate:
             (torch.randn([4, 4, 4]),),
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
     @skipIfRocm
     def test_convolution1(self):
         m = torch.nn.Sequential(
@@ -2652,6 +2655,7 @@ class CommonTemplate:
             (torch.randn([10, 4]), torch.randint(10, [8]), torch.tensor([0, 2, 6])),
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3597
     @skipIfRocm
     def test_batch_norm_2d(self):
         m = torch.nn.Sequential(
@@ -3375,6 +3379,7 @@ class CommonTemplate:
                 ),
             )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3465
     @skipIfRocm
     def test_cudnn_rnn(self):
         if self.device == "cpu":
@@ -4359,6 +4364,7 @@ class CommonTemplate:
             ],
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3378
     @skipIfRocm
     def test_scatter3(self):
         def fn(a, dim, index, b):
@@ -4445,6 +4451,7 @@ class CommonTemplate:
             ],
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3378
     @skipIfRocm
     def test_scatter_add2(self):
         def fn(a, dim, index, b):
@@ -4460,6 +4467,7 @@ class CommonTemplate:
             ],
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3378
     @skipIfRocm
     def test_scatter_add3(self):
         def fn(a, dim, index, b):
@@ -4477,6 +4485,7 @@ class CommonTemplate:
                     ],
                 )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3378
     @skipIfRocm
     def test_scatter_reduce1(self):
         def fn(a, dim, index, b):
@@ -4492,6 +4501,7 @@ class CommonTemplate:
             ],
         )
 
+    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3378
     @skipIfRocm
     def test_scatter_reduce2(self):
         def fn(a, dim, index, b):
@@ -5047,6 +5057,7 @@ class CommonTemplate:
             ],
         )
 
+    # FIXME: Tensors are not alike https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
     @skipIfRocm
     def test_argmax_argmin2(self):
         def fn(x):
@@ -5968,6 +5979,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(arguments_that_are_divisible_by_16_in_kernel1, (0, 1))
             torch._dynamo.reset()
 
+        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
         @skipIfRocm
         def test_optimize_indexing_dtype(self):
             def fn(x: torch.Tensor) -> torch.Tensor:
@@ -5981,6 +5993,8 @@ if HAS_CUDA and not TEST_WITH_ASAN:
 
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
+        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
+        @skipIfRocm
         def test_not_materialize_pointwise_reduction(self):
             def fn(a, b):
                 return (a - b).sum(dim=-1).amax(dim=-1)
@@ -5998,6 +6012,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertFalse("out_ptr0" in code)
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
+        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
         @skipIfRocm
         def test_cant_optimize_compute(self):
             def ones():
@@ -6025,6 +6040,7 @@ if HAS_CUDA and not TEST_WITH_ASAN:
                 self.assertTrue("to(tl.int64)" in code)
                 self.assertEqual(fn_opt(), fn())
 
+        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
         @skipIfRocm
         def test_optimize_compute(self):
             def ones():
