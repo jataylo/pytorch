@@ -1459,6 +1459,7 @@ def unsafe_chunk_py_impl(tensor, chunks, dim=0) -> List[Tensor]:
     return torch.ops.aten.unsafe_split.Tensor(tensor, split_size, dim)
 
 
+@register_decomposition(aten.miopen_batch_norm.default)
 @register_decomposition(aten._native_batch_norm_legit.default)
 def _native_batch_norm_legit(
     input: Tensor,

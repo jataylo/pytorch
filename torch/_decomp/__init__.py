@@ -250,6 +250,7 @@ def core_aten_decompositions() -> Dict[OpOverload, Callable]:
             aten.masked_fill_,
             aten.max_pool2d_with_indices_backward,
             aten.mish,
+            aten.miopen_batch_norm,
             aten.mse_loss,
             aten.mse_loss_backward,
             aten.mv,
