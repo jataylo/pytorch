@@ -7353,8 +7353,6 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertEqual(arguments_that_are_divisible_by_16_in_kernel1, (0, 1))
             torch._dynamo.reset()
 
-        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
-        @skipIfRocm
         def test_optimize_indexing_dtype(self):
             def fn(x: torch.Tensor) -> torch.Tensor:
                 return aten.upsample_bilinear2d.vec(x, None, True, [2.0, 2.0])
@@ -7367,8 +7365,6 @@ if HAS_CUDA and not TEST_WITH_ASAN:
 
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
-        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
-        @skipIfRocm
         def test_not_materialize_pointwise_reduction(self):
             def fn(a, b):
                 return (a - b).sum(dim=-1).amax(dim=-1)
@@ -7386,8 +7382,6 @@ if HAS_CUDA and not TEST_WITH_ASAN:
             self.assertFalse("out_ptr0" in code)
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
-        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
-        @skipIfRocm
         def test_cant_optimize_compute(self):
             def ones():
                 return torch.ones([4], device="cuda")
@@ -7414,8 +7408,6 @@ if HAS_CUDA and not TEST_WITH_ASAN:
                 self.assertTrue("to(tl.int64)" in code)
                 self.assertEqual(fn_opt(), fn())
 
-        # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3463
-        @skipIfRocm
         def test_optimize_compute(self):
             def ones():
                 return torch.ones([4], device="cuda")
