@@ -48,6 +48,10 @@ test_skips = {
     "test_upsample_nearest2d_backward_dynamic_shapes": ("cpu", "cuda"),
 }
 
+# FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3849
+if TEST_WITH_ROCM:
+    test_skips["test_argmax_argmin1_dynamic_shapes"] = ("cpu", "cuda")
+
 
 def make_dynamic_cls(cls):
     return make_test_cls_with_patches(
