@@ -2551,8 +2551,7 @@ class CommonTemplate:
             (torch.randn([4, 4, 4]),),
         )
 
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
-    @skipIfRocm
+    @skipIfRocm("Skipped due to `tensors are not alike` (ROCm)")
     def test_convolution1(self):
         m = torch.nn.Sequential(
             torch.nn.Conv2d(5, 6, [3, 3]),
@@ -3013,8 +3012,7 @@ class CommonTemplate:
             (torch.randn([10, 4]), torch.randint(10, [8]), torch.tensor([0, 2, 6])),
         )
 
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3597
-    @skipIfRocm
+    @skipIfRocm("Skipped as MIOpen batch norm unregistered for inductor (ROCm)")
     def test_batch_norm_2d(self):
         m = torch.nn.Sequential(
             torch.nn.BatchNorm2d(10),
@@ -3703,8 +3701,7 @@ class CommonTemplate:
                 ),
             )
 
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3465
-    @skipIfRocm
+    @skipIfRocm("Skipped as explictly targets cudnn (ROCm)")
     def test_cudnn_rnn(self):
         if self.device == "cpu":
             raise unittest.SkipTest("requires CUDA")
@@ -5254,7 +5251,7 @@ class CommonTemplate:
         b = torch.rand(2, 2, 1, 4, 1).int()
         self.common(fn, (a, b))
 
-    @skipIfRocm
+    @skipIfRocm("Skipped due to `llvm assertion error` (ROCm)")
     def test_argmax_argmin1(self):
         def fn(x):
             return (aten.argmax(x), aten.argmin(x))
@@ -5266,9 +5263,7 @@ class CommonTemplate:
             ],
         )
 
-    # FIXME: Tensors are not alike https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3849
-    @skipIfRocm
+    @skipIfRocm("Skipped due to `tensors are not alike` (ROCm)")
     def test_argmax_argmin2(self):
         def fn(x):
             return (

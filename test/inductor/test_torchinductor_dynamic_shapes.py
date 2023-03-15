@@ -48,9 +48,9 @@ test_skips = {
 }
 
 if TEST_WITH_ROCM:
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3849
+    # LLVM assertion error
     test_skips["test_argmax_argmin1_dynamic_shapes"] = ("cpu", "cuda")
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
+    # Tensors are not alike
     test_skips["test_convolution1_dynamic_shapes"] = ("cpu", "cuda")
 
 

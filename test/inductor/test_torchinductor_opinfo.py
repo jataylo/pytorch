@@ -151,16 +151,16 @@ inductor_skips["cuda"] = {
 }
 
 inductor_skips_rocm["cuda"] = {
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3817
+    # Trapezoid atomics
     "cumulative_trapezoid": {f16, f32, f64, b8, i32, i64},
     "trapezoid": {f16, f32, f64, b8, i32, i64},
     "trapz": {f16, f32, f64, b8, i32, i64},
-    # FIXME: LAPACK support - can skip like this https://github.com/ROCmSoftwarePlatform/pytorch/pull/1177 - https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3598
+    # LAPACK support issues
     ("linalg.pinv", "hermitian"): {f16, f32, f64, b8, i32, i64},
     ("linalg.matrix_rank", "hermitian"): {f16, f32, f64, b8, i32, i64},
-    # FIXME: Tensors are not alike https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
+    # Tensors are not alike
     "logcumsumexp": {f32},
-    # FIXME: MIOpen batch norm failure
+    # MIOpen batch norm registration
     "nn.functional.batch_norm": {f32},
     "nn.functional.instance_norm": {f32},
 }
