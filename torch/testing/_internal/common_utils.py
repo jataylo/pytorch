@@ -1102,10 +1102,10 @@ torch_to_numpy_dtype_dict.update({
 })
 
 def skipIfRocm(fn):
-    @wraps(fn)
+    @wraps(fn, msg="test doesn't currently work on the ROCm stack")
     def wrapper(*args, **kwargs):
         if TEST_WITH_ROCM:
-            raise unittest.SkipTest("test doesn't currently work on the ROCm stack")
+            raise unittest.SkipTest(msg)
         else:
             fn(*args, **kwargs)
     return wrapper

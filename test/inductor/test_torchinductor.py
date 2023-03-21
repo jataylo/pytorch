@@ -2551,8 +2551,7 @@ class CommonTemplate:
             (torch.randn([4, 4, 4]),),
         )
 
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
-    @skipIfRocm
+    @skipIfRocm("Skipped on ROCm due to `Tensor-alikes are not close")
     def test_convolution1(self):
         m = torch.nn.Sequential(
             torch.nn.Conv2d(5, 6, [3, 3]),
@@ -3701,8 +3700,7 @@ class CommonTemplate:
                 ),
             )
 
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3465
-    @skipIfRocm
+    @skipIfRocm("Skipped on ROCm as explicitly targets cudnn rnn op")
     def test_cudnn_rnn(self):
         if self.device == "cpu":
             raise unittest.SkipTest("requires CUDA")
@@ -5252,7 +5250,7 @@ class CommonTemplate:
         b = torch.rand(2, 2, 1, 4, 1).int()
         self.common(fn, (a, b))
 
-    @skipIfRocm
+    @skipIfRocm("Skipped on ROCm due to LLVM assertion error")
     def test_argmax_argmin1(self):
         def fn(x):
             return (aten.argmax(x), aten.argmin(x))
@@ -5264,9 +5262,7 @@ class CommonTemplate:
             ],
         )
 
-    # FIXME: Tensors are not alike https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3462
-    # FIXME: https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/3849
-    @skipIfRocm
+    @skipIfRocm("Skipped on ROCm due to LLVM assertion error")
     def test_argmax_argmin2(self):
         def fn(x):
             return (
