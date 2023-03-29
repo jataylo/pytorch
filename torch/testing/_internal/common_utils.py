@@ -1063,7 +1063,7 @@ def skipIfRocm(msg="test doesn't currently work on the ROCm stack"):
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
             if TEST_WITH_ROCM:
-                raise unittest.SkipTest(msg)
+                raise unittest.SkipTest(f"skipIfRocm: {msg}")
             return fn(self, *args, **kwargs)
         return wrap_fn
     return dec_fn
