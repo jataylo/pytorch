@@ -1811,7 +1811,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
             archs = []
     else:
         archs = _archs.replace(' ', ';').split(';')
-    flags = ['--amdgpu-target=%s' % arch for arch in archs]
+    flags = ['--offload-arch=%s' % arch for arch in archs]
     flags += ['-fno-gpu-rdc']
     return flags
 
