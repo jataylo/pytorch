@@ -37,8 +37,8 @@ from torch.testing._internal.common_utils import (
     IS_MACOS,
     IS_WINDOWS,
     IS_X86,
-    TEST_WITH_ASAN,
     skipIfRocm,
+    TEST_WITH_ASAN,
     TestCase as TorchTestCase,
 )
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -5364,7 +5364,9 @@ class CommonTemplate:
         else:
             contexts = [
                 contextlib.nullcontext,
-                lambda: config.patch({"triton.cudagraphs": True if not torch.version.hip else False}),
+                lambda: config.patch(
+                    {"triton.cudagraphs": True if not torch.version.hip else False}
+                ),
             ]
 
         for context in contexts:
@@ -6199,5 +6201,5 @@ if HAS_CPU:
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
 
-    if (HAS_CPU or HAS_CUDA):
+    if HAS_CPU or HAS_CUDA:
         run_tests(needs="filelock")
