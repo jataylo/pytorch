@@ -3,7 +3,7 @@ import torch
 from torch._dynamo.test_case import run_tests, TestCase
 from torch._dynamo.utils import count_calls, counters
 from torch._inductor.fx_passes import joint_graph
-from torch.testing._internal.common_utils import IS_LINUX, skipIfRocm
+from torch.testing._internal.common_utils import IS_LINUX
 from torch.testing._internal.inductor_utils import HAS_CUDA
 
 
