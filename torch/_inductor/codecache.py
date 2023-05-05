@@ -519,7 +519,10 @@ def get_include_and_linking_paths(
         if macros:
             macros = f"-D{macros}"
         if cuda:
-            libs += ["c10_cuda", "cuda", "torch_cuda"]
+            if torch.version.hip is None:
+                libs += ["c10_cuda", "cuda", "torch_cuda"]
+            else:
+                libs += ["c10_hip", "torch_hip"]
     else:
         # Note - this is effectively a header only inclusion. Usage of some header files may result in
         # symbol not found, if those header files require a library.
@@ -584,15 +587,19 @@ class CudaKernelParamCache:
     @classmethod
     def set(cls, key, params, cubin):
         from filelock import FileLock
+        import os
+        import shutil
+        
+        #ROCm
+        hsaco_path = os.path.join(cubin_cache_dir(), f"{key}.hsaco")
 
-        cubin_path = os.path.join(cubin_cache_dir(), f"{key}.cubin")
-        params["cubin_path"] = cubin_path
+        params["hsaco_path"] = hsaco_path
+        #params["cubin_path"] = hsaco_path
         lock_dir = get_lock_dir()
         lock = FileLock(os.path.join(lock_dir, key + ".lock"), timeout=LOCK_TIMEOUT)
         with lock:
             cls.cache[key] = params
-            with open(cubin_path, "wb") as f:
-                f.write(cubin)
+            shutil.copy(cubin, hsaco_path)
 
     @classmethod
     def get(cls, key):
