@@ -41,7 +41,7 @@ class SmokeTest(TestCase):
         def foo(x):
             return torch.sin(x) + x.min()
 
-        @torch.compile()
+        @torch.compile(mode="reduce-overhead")
         def bar(x):
             return x * x
 
