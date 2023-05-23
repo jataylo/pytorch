@@ -59,7 +59,7 @@ c32 = torch.complex32
 c64 = torch.complex64
 c128 = torch.complex128
 
-_ops = partial(inductor_expected_failures_single_samples
+_ops = partial(
     ops, dtypes=OpDTypes.supported, allowed_dtypes=[f16, f32, f64, i32, i64, b8]
 )
 
