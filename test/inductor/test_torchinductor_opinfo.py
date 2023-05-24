@@ -357,7 +357,6 @@ inductor_expected_failures_single_sample["cuda"] = {
     "unique_consecutive": {b8, f16, f32, f64, i32, i64},
     # AssertionError: Tensor-likes are not close!
     "nn.functional.triplet_margin_loss": {f16},
-    "linalg.matrix_rank": {f32, f64},
     "pca_lowrank": {f32, f64},
     "svd_lowrank": {f32, f64},
     # AssertionError: Scalars are not close!
@@ -372,6 +371,7 @@ if not TEST_WITH_ROCM:
     inductor_expected_failures_single_sample["cuda"]["linalg.cond"] = {f32, f64}
     inductor_expected_failures_single_sample["cuda"]["linalg.svdvals"] = {f32, f64}
     inductor_expected_failures_single_sample["cuda"]["linalg.svd"] = {f32, f64}
+    inductor_expected_failures_single_sample["cuda"]["linalg.matrix_rank"] = {f32, f64}
     inductor_expected_failures_single_sample["cuda"]["svd"] = {f32, f64}
     inductor_expected_failures_single_sample["cuda"]["norm.nuc"] = {f32, f64}
 
