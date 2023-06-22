@@ -690,7 +690,7 @@ class CudaKernelParamCache:
 
     @classmethod
     def set(cls, key, params, cubin):
-        _, path = write(cubin, "cubin" if torch.version.hip is None else "hsaco", "", binary=True)
+        _, path = write(cubin, "cubin" if torch.version.hip is None else "hsaco", hash_type="cubin")
 
         if torch.version.hip is None:
             params["cubin_path"] = path

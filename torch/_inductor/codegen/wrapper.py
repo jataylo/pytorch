@@ -155,7 +155,7 @@ class EnterCudaDeviceContextManagerLine:
         if V.graph.cpp_wrapper:
             code.writeline("\n")
             if self.first_time:
-                code.writeline(f"at::cuda::CUDAGuard device_guard({self.device_idx});")
+                code.writeline(f"at::hip::HIPGuardMasqueradingAsCUDA device_guard({self.device_idx});")
             else:
                 code.writeline(f"device_guard.set_index({self.device_idx});")
         else:
@@ -1167,27 +1167,27 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
             """
             #include <ATen/native/BinaryOps.h>
             #include <c10/util/Exception.h>
-            #include <c10/cuda/CUDAGuard.h>
+            #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
             #define AT_CUDA_DRIVER_CHECK_OVERRIDE(EXPR)                         \\
             do {                                                                \\
-                CUresult __err = EXPR;                                          \\
-                if (__err != CUDA_SUCCESS) {                                    \\
+                hipError_t __err = EXPR;                                          \\
+                if (__err != hipSuccess) {                                    \\
                     AT_ERROR("CUDA driver error: ", static_cast<int>(__err));   \\
                 }                                                               \\
             } while (0)
 
-            static inline CUfunction loadKernel(const std::string &filePath,
+            static inline hipFunction_t loadKernel(const std::string &filePath,
                     const std::string &funcName) {
-                CUmodule mod;
-                CUfunction func;
-                AT_CUDA_DRIVER_CHECK_OVERRIDE(cuModuleLoad(&mod, filePath.c_str()));
-                AT_CUDA_DRIVER_CHECK_OVERRIDE(cuModuleGetFunction(&func, mod, funcName.c_str()));
+                hipModule_t mod;
+                hipFunction_t func;
+                AT_CUDA_DRIVER_CHECK_OVERRIDE(hipModuleLoad(&mod, filePath.c_str()));
+                AT_CUDA_DRIVER_CHECK_OVERRIDE(hipModuleGetFunction(&func, mod, funcName.c_str()));
                 return func;
             }
 
             static inline void launchKernel(
-                    CUfunction func,
+                    hipFunction_t func,
                     int gridX,
                     int gridY,
                     int gridZ,
@@ -1195,9 +1195,9 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
                     int sharedMemBytes,
                     void* args[],
                     int device_index) {
-                AT_CUDA_DRIVER_CHECK_OVERRIDE(cuLaunchKernel(
+                AT_CUDA_DRIVER_CHECK_OVERRIDE(hipModuleLaunchKernel(
                     func, gridX, gridY, gridZ, 32*numWraps, 1, 1, sharedMemBytes,
-                    at::cuda::getCurrentCUDAStream(device_index), args, nullptr));
+                    at::hip::getCurrentHIPStreamMasqueradingAsCUDA(device_index), args, nullptr));
             }
             """
         )
@@ -1211,14 +1211,14 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
     def generate(self):
         self.prefix.writeline("\n")
         for kernel in self.src_to_kernel.values():
-            self.prefix.writeline(f"static CUfunction {kernel} = nullptr;")
+            self.prefix.writeline(f"static hipFunction_t {kernel} = nullptr;")
         self.prefix.writeline("\n")
         return super().generate()
 
     def generate_load_kernel(self, name, params):
         mangled_name = params.get("mangled_name", None)
         assert mangled_name is not None, "missing mangled_name"
-        cubin_path = params.get("cubin_path" if torch.verion.hip is None else "hsaco_path", None)
+        cubin_path = params.get("cubin_path" if torch.version.hip is None else "hsaco_path", None)
         assert os.path.exists(
             cubin_path
         ), "cubin file should already exist at this moment"
@@ -1249,7 +1249,7 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
                 self.writeline(f"float {var_name} = {arg};")
             else:
                 self.writeline(
-                    f"CUdeviceptr {var_name} = reinterpret_cast<CUdeviceptr>({arg}.data_ptr());"
+                    f"hipDeviceptr_t {var_name} = reinterpret_cast<hipDeviceptr_t>({arg}.data_ptr());"
                 )
             new_args.append(f"&{var_name}")
 
