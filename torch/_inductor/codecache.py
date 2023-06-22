@@ -623,7 +623,10 @@ def get_include_and_linking_paths(
         if macros:
             macros = f"-D{macros}"
         if cuda:
-            libs += ["c10_cuda", "cuda", "torch_cuda"]
+            if torch.version.hip is None:
+                libs += ["c10_cuda", "cuda", "torch_cuda"]
+            else:
+                libs += ["c10_hip", "torch_hip"]
     else:
         # Note - this is effectively a header only inclusion. Usage of some header files may result in
         # symbol not found, if those header files require a library.
@@ -687,8 +690,13 @@ class CudaKernelParamCache:
 
     @classmethod
     def set(cls, key, params, cubin):
-        _, path = write(cubin, "cubin", hash_type="cubin")
-        params["cubin_path"] = path
+        _, path = write(cubin, "cubin" if torch.version.hip is None else "hsaco", "", binary=True)
+
+        if torch.version.hip is None:
+            params["cubin_path"] = path
+        else:
+            params["hsaco_path"] = path
+
         cls.cache[key] = params
 
     @classmethod
