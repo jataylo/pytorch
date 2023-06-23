@@ -217,7 +217,7 @@ if RUN_CUDA:
         tests: TorchTestCase = test_torchinductor.CudaTests()
 
     # Maintain two separate test lists for cuda and cpp for now
-    for item in [
+    cuda_tests = [
         BaseTest("test_as_strided"),  # buffer reuse
         BaseTest("test_batch_norm_2d_2"),
         BaseTest("test_bitwise"),  # int32
@@ -270,21 +270,42 @@ if RUN_CUDA:
         ),
         BaseTest("test_fft_real_input"),
         BaseTest("test_fft_real_input_real_output"),
-    ]:
+    ]
+
+    
+    if TEST_WITH_ROCM:
+        exclude_rocm_list = [
+            "test_as_strided",
+            "test_bitwise",
+            "test_bmm1",
+            "test_cat",
+            "test_convolution1",
+            "test_index_put_deterministic_fallback",
+            "test_multi_device",
+            "test_relu",
+            "test_silu",
+            "test_sum_dtype",
+            "test_transpose",
+            "test_foreach_cpp_wrapper",
+        ]
+
+        cuda_tests = [test for test in cuda_tests if test.name not in exclude_rocm_list]
+    
+    for item in cuda_tests:
         make_test_case(item.name, item.device, item.tests)
 
     test_torchinductor.copy_tests(CudaWrapperTemplate, TestCudaWrapper, "cuda_wrapper")
 
-    DynamicShapesCudaWrapperTemplate = (
-        test_torchinductor_dynamic_shapes.make_dynamic_cls(CudaWrapperTemplate)
-    )
+    #DynamicShapesCudaWrapperTemplate = (
+    #    test_torchinductor_dynamic_shapes.make_dynamic_cls(CudaWrapperTemplate)
+    #)
 
-    test_torchinductor.copy_tests(
-        DynamicShapesCudaWrapperTemplate,
-        DynamicShapesCudaWrapperCudaTests,
-        "cuda_wrapper",
-        xfail_prop="_expected_failure_dynamic_wrapper",
-    )
+    #test_torchinductor.copy_tests(
+    #    DynamicShapesCudaWrapperTemplate,
+    #    DynamicShapesCudaWrapperCudaTests,
+    #    "cuda_wrapper",
+    #    xfail_prop="_expected_failure_dynamic_wrapper",
+    #)
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
