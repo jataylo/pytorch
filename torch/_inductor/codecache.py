@@ -275,14 +275,17 @@ def code_hash(code, extra=""):
 def get_path(basename: str, extension: str):
     subdir = os.path.join(cache_dir(), basename[1:3])
     path = os.path.join(subdir, f"{basename}.{extension}")
+    print(basename)
+    print(subdir)
+    print(path)
     return basename, subdir, path
 
 
 def get_hash(content: Union[str, bytes], extra="", hash_type="code"):
-    assert hash_type in ["code", "cubin"], "Hash type not supported"
+    assert hash_type in ["code", "cubin", "hsaco"], "Hash type not supported"
     if hash_type == "code":
         return code_hash(content, extra)
-    if hash_type == "cubin":
+    if hash_type == "cubin" or "hsaco":
         return code_hash(repr(content))
 
 

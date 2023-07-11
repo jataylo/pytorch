@@ -41,7 +41,7 @@ except unittest.SkipTest:
 
 
 RUN_CPU = HAS_CPU and not torch.backends.mps.is_available() and not IS_MACOS
-RUN_CUDA = HAS_CUDA and not TEST_WITH_ASAN
+RUN_CUDA = HAS_CUDA and not TEST_WITH_ASAN and not TEST_WITH_ROCM
 
 
 class CppWrapperTemplate:
@@ -186,6 +186,15 @@ if RUN_CPU:
         BaseTest("test_relu"),  # multiple inputs
         BaseTest("test_repeat_interleave", "", test_cpu_repro.CPUReproTests()),
         BaseTest("test_scalar_input"),
+        BaseTest("test_scatter1"),
+        BaseTest("test_scatter2"),
+        BaseTest("test_scatter3"),
+        BaseTest("test_scatter4"),
+        BaseTest("test_scatter5"),
+        BaseTest("test_scatter6"),
+        BaseTest("test_scatter_reduce1"),
+        BaseTest("test_scatter_reduce2"),
+        BaseTest("test_scatter_reduce3"),
         BaseTest("test_silu"),  # single input, single output
         BaseTest("test_sort"),
         BaseTest("test_sum_dtype"),  # float64
@@ -225,7 +234,7 @@ if RUN_CUDA:
         tests: TorchTestCase = test_torchinductor.CudaTests()
 
     # Maintain two separate test lists for cuda and cpp for now
-    cuda_test = [
+    for item in [
         BaseTest("test_as_strided"),  # buffer reuse
         BaseTest("test_batch_norm_2d_2"),
         BaseTest("test_bitwise"),  # int32
@@ -279,27 +288,7 @@ if RUN_CUDA:
         ),
         BaseTest("test_fft_real_input"),
         BaseTest("test_fft_real_input_real_output"),
-    ]
-
-    if TEST_WITH_ROCM:
-        exclude_rocm_list = [
-            "test_as_strided",
-            "test_bitwise",
-            "test_bmm1",
-            "test_cat",
-            "test_convolution1",
-            "test_index_put_deterministic_fallback",
-            "test_multi_device",
-            "test_relu",
-            "test_silu",
-            "test_sum_dtype",
-            "test_transpose",
-            "test_foreach_cpp_wrapper",
-        ]
-
-        cuda_tests = [test for test in cuda_tests if test.name not in exclude_rocm_list]
-    
-    for item in cuda_tests
+    ]:
         make_test_case(item.name, item.device, item.tests)
 
     test_torchinductor.copy_tests(CudaWrapperTemplate, TestCudaWrapper, "cuda_wrapper")
