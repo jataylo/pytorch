@@ -279,10 +279,10 @@ def get_path(basename: str, extension: str):
 
 
 def get_hash(content: Union[str, bytes], extra="", hash_type="code"):
-    assert hash_type in ["code", "cubin"], "Hash type not supported"
+    assert hash_type in ["code", "cubin", "hsaco"], "Hash type not supported"
     if hash_type == "code":
         return code_hash(content, extra)
-    if hash_type == "cubin":
+    if hash_type == "cubin" or "hsaco":
         return code_hash(repr(content))
 
 

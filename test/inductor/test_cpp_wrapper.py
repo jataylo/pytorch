@@ -313,7 +313,7 @@ if RUN_CUDA:
 
         cuda_tests = [test for test in cuda_tests if test.name not in exclude_rocm_list]
     
-    for item in cuda_tests
+    for item in cuda_tests:
         make_test_case(item.name, item.device, item.tests)
 
     test_torchinductor.copy_tests(CudaWrapperTemplate, TestCudaWrapper, "cuda_wrapper")
