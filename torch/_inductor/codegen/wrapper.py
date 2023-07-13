@@ -47,7 +47,7 @@ def buffer_reuse_key(node: ir.Buffer):
         sympy_str(V.graph.sizevars.simplify(node.layout.storage_size())),
     )
 
-
+        
 def is_int(s: str):
     # Cpp code gen adds L at the end of ints
     # Lets remove it for checking whether we have an int or not
@@ -2582,7 +2582,9 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
         ), f"cuda kernel parameters for {name} should already exist at this moment"
         mangled_name = params.get("mangled_name", None)
         assert mangled_name is not None, "missing mangled_name"
-        cubin_path = params.get("cubin_path", None)
+        cubin_path = params.get(
+            "cubin_path" if torch.version.hip is None else "hsaco_path", None
+        )
         assert cubin_path is not None and os.path.exists(
             cubin_path
         ), f"cubin file should already exist at this moment: {cubin_path}"
