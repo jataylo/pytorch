@@ -165,6 +165,12 @@ joint_graph_constant_folding = True
 # Enable indirect_indexing asserts for decompositions and lowerings
 debug_index_asserts = False
 
+# Config to force convs to prefer channels last
+if torch.version.hip and not is_big_gpu():
+    conv_prefer_channels_last = False
+else:
+    conv_prefer_channels_last = True
+
 
 def is_fbcode():
     return not hasattr(torch.version, "git_version")

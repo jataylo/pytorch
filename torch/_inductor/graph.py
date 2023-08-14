@@ -13,6 +13,7 @@ import sympy
 
 import torch
 import torch._logging
+import torch._inductor.config as inductor_config
 import torch.fx
 from torch._decomp import get_decompositions
 from torch._dynamo.utils import dynamo_timed
@@ -24,7 +25,6 @@ from torch.fx.experimental.symbolic_shapes import (
     SymTypes,
 )
 from torch.utils._mode_utils import no_dispatch
-
 from . import config, ir, metrics
 from .codegen.wrapper import CppWrapperCodeGen, CudaWrapperCodeGen, WrapperCodeGen
 from .exc import (
@@ -355,7 +355,7 @@ class GraphLowering(torch.fx.Interpreter):
         """
         output_set = set()
         for n in reversed(self.module.graph.nodes):
-            if n.target == torch.ops.aten.convolution.default:
+            if n.target == torch.ops.aten.convolution.default and inductor_config.conv_prefer_channels_last:
                 output_set.add(n)
                 continue
 

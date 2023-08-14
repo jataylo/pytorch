@@ -3,6 +3,7 @@ import logging
 from typing import List
 
 import torch
+import torch._inductor.config as inductor_config
 from .. import config, ir
 from ..ir import TensorBox
 
@@ -257,7 +258,8 @@ def convert_1x1_conv_to_mm(x, weight, bias):
     weight = L[aten.permute](weight, [1, 0])
 
     if x.get_size()[0] != 1:
-        x = ir.ExternKernel.require_stride_order(x, channels_last_order(rank))
+        if inductor.config.conv_prefer_channels_last:
+            x = ir.ExternKernel.require_stride_order(x, channels_last_order(rank))
     else:
         x.realize()
         x.freeze_layout()
@@ -345,19 +347,21 @@ def convolution(
     # TODO: check if it's beneficial to convert Conv1d to Conv2d and then
     # apply channels last.
     if V.graph.layout_opt and ndim == 2:
-        V.graph.num_channels_last_conv += 1
-        x = ir.ExternKernel.require_channels_last(x)
-        # TODO maybe we can convert weights to channels last just once before
-        # running the model.
-        weight = ir.ExternKernel.require_channels_last(weight)
+        if inductor.config.conv_prefer_channels_last:
+            V.graph.num_channels_last_conv += 1
+            x = ir.ExternKernel.require_channels_last(x)
+            # TODO maybe we can convert weights to channels last just once before
+            # running the model.
+            weight = ir.ExternKernel.require_channels_last(weight)
         layout = conv_layout(x, weight, None, **kwargs)
     else:
         layout = conv_layout(x, weight, None, **kwargs)
-        req_stride_order = ir.get_stride_order(
-            V.graph.sizevars.size_hints(layout.stride)
-        )
-        x = ir.ExternKernel.require_stride_order(x, req_stride_order)
-        weight = ir.ExternKernel.require_stride_order(weight, req_stride_order)
+        if inductor.config.conv_prefer_channels_last:
+            req_stride_order = ir.get_stride_order(
+                V.graph.sizevars.size_hints(layout.stride)
+            )
+            x = ir.ExternKernel.require_stride_order(x, req_stride_order)
+            weight = ir.ExternKernel.require_stride_order(weight, req_stride_order)
 
     ordered_kwargs_for_cpp_kernel = [
         "stride",
