@@ -165,6 +165,13 @@ joint_graph_constant_folding = True
 # Enable indirect_indexing asserts for decompositions and lowerings
 debug_index_asserts = False
 
+# NHWC conv kernels enforced in inductor provide mechanism to disable this if necessary
+# TORCHINDUCTOR_LASTCHANNEL_CONV will override any default setting
+conv_prefer_channels_last = os.environ.get("TORCHINDUCTOR_LASTCHANNELS_CONV", "1") == "1"
+
+if torch.version.hip and not is_big_gpu():
+    conv_prefer_channels_last = False
+
 
 def is_fbcode():
     return not hasattr(torch.version, "git_version")
