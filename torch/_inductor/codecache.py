@@ -264,6 +264,7 @@ class PersistentCache(CacheBase):
             ):
                 # re-benchmark everything to try to get consistent numbers from the same machine
                 for choice in choices:
+                    print(choice)
                     timings[choice] = benchmark(choice)
                     local_cache.setdefault(name, {})
                     local_cache[name].setdefault(inputs, {})

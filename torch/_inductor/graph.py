@@ -367,7 +367,7 @@ class GraphLowering(torch.fx.Interpreter):
         """
         output_set = set()
         for n in reversed(self.module.graph.nodes):
-            if n.target == torch.ops.aten.convolution.default and inductor_config.conv_prefer_channels_last:
+            if n.target == torch.ops.aten.convolution.default and inductor_config.conv_force_channels_last:
                 output_set.add(n)
                 continue
 

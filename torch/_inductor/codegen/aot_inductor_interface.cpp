@@ -68,7 +68,7 @@ AOTInductorError AOTInductorModelContainerRun(
     output_tensors.push_back(outputs[i]);
   }
 
-  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+  auto stream = reinterpret_cast<hipStream_t>(stream_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { container->run(input_tensors, output_tensors, stream); })
 }

@@ -167,10 +167,10 @@ debug_index_asserts = False
 
 # NHWC conv kernels enforced in inductor provide mechanism to disable this if necessary
 # TORCHINDUCTOR_LASTCHANNEL_CONV will override any default setting
-conv_prefer_channels_last = os.environ.get("TORCHINDUCTOR_LASTCHANNELS_CONV", "1") == "1"
-
-if torch.version.hip and not is_big_gpu():
-    conv_prefer_channels_last = False
+if torch.version.hip:
+    conv_force_channels_last = os.environ.get("TORCHINDUCTOR_FORCE_LASTCHANNELS_CONV", "0") == "1"
+else:
+    conv_force_channels_last = os.environ.get("TORCHINDUCTOR_FORCE_LASTCHANNELS_CONV", "1") == "1"
 
 
 def is_fbcode():
