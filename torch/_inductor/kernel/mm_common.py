@@ -81,13 +81,13 @@ int8_mm_kernel_configs = [
 ]
 
 # Create filtered list of configs based on cond
-mm_platform_configs = [config["config"] for config in mm_kernel_configs if config["cond"]]
-int8_platform_configs = [config["config"] for config in int8_mm_kernel_configs if config["cond"]]
+mm_platform_configs = tuple(config["config"] for config in mm_kernel_configs if config["cond"])
+int8_platform_configs = tuple(config["config"] for config in int8_mm_kernel_configs if config["cond"])
 
 # On ROCm convert num_stages to 1 as pipelining provides no benefit
 if torch.version.hip:
-    mm_platform_configs = [(config[0], config[1], config[2], 1, config[4]) for config in platform_configs]
-    int8_platform_configs = [(config[0], config[1], config[2], 1, config[4]) for config in platform_configs]
+    mm_platform_configs = tuple((config[0], config[1], config[2], 1, config[4]) for config in mm_platform_configs]
+    int8_platform_configs = tuple((config[0], config[1], config[2], 1, config[4]) for config in mm_platform_configs]
 
 mm_configs = functools.partial(
     filtered_configs,
