@@ -60,11 +60,11 @@ kernel_configs = [
 ]
 
 # Create filtered list of configs based on conv
-platform_configs = [config["config"] for config in kernel_configs if config["cond"]]
+platform_configs = tuple(config["config"] for config in kernel_configs if config["cond"])
 
 # On ROCm convert num_stages to 1 as pipelining provides no benefit
 if torch.version.hip
-    platform_configs = [(config[0], config[1], config[2], 1, config[4]) for config in platform_configs]
+    platform_configs = tuple((config[0], config[1], config[2], 1, config[4]) for config in platform_configs)
 
 conv_configs = functools.partial(
     filtered_configs,
