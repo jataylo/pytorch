@@ -44,83 +44,60 @@ def filtered_configs(
             )
 
 
-if torch.version.hip is None:
-    mm_configs = functools.partial(
-        filtered_configs,
-        configs=(
-            # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-            (64, 64, 32, 2, 4),
-            (64, 128, 32, 3, 4),
-            (128, 64, 32, 3, 4),
-            (64, 128, 32, 4, 8),
-            (128, 64, 32, 4, 8),
-            (64, 32, 32, 5, 8),
-            (32, 64, 32, 5, 8),
-            (128, 128, 32, 2, 8),
-            (64, 64, 64, 3, 8),
-            (32, 32, 128, 2, 4),
-            (64, 64, 16, 2, 4),
-            (32, 32, 16, 1, 2),
-        ),
-    )
+# List of dictionaries to store kernel configs
+# Configs can be filtered for platforms by modifying cond
+# "True" means that the config is utilised on all platforms
+mm_kernel_configs = [
+    # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
+    {"config": (64, 64, 32, 2, 4), "cond": True},
+    {"config": (64, 128, 32, 3, 4), "cond": True}, 
+    {"config": (128, 64, 32, 3, 4), "cond": True},
+    {"config": (64, 128, 32, 4, 8), "cond": True},
+    {"config": (128, 64, 32, 4, 8), "cond": True},  
+    {"config": (64, 32, 32, 5, 8), "cond": True},  
+    {"config": (32, 64, 32, 5, 8), "cond": True},  
+    {"config": (128, 128, 32, 2, 8), "cond": True},  
+    {"config": (64, 64, 64, 3, 8), "cond": True},  
+    {"config": (32, 32, 128, 2, 4), "cond": torch.version.hip is None},  
+    {"config": (64, 64, 16, 2, 4), "cond": True},  
+    {"config": (32, 32, 16, 1, 2), "cond": True},  
+]
 
-    int8_mm_configs = functools.partial(
-        filtered_configs,
-        configs=(
-            # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-            (64, 64, 32, 2, 4),
-            (64, 128, 32, 3, 4),
-            (128, 64, 32, 3, 4),
-            (64, 128, 32, 4, 8),
-            (128, 64, 32, 4, 8),
-            (64, 32, 32, 5, 8),
-            (32, 64, 32, 5, 8),
-            (128, 128, 32, 2, 8),
-            (64, 64, 64, 3, 8),
-            # (32, 32, 128, 2, 4),
-            # (64, 64, 16, 2, 4),
-            # (32, 32, 16, 1, 2),
-            (128, 256, 128, 3, 8),
-            (256, 128, 128, 3, 8),
-        ),
-    )
-else:
-    # Separate ROCm configs as pipelining currently gives no benefit
-    # so we need to set "num_stages" to 1 and carefully pick the block configs
-    # to avoid running out of shared memory
-    mm_configs = functools.partial(
-        filtered_configs,
-        configs=(
-            # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-            (64, 64, 32, 1, 4),
-            (64, 128, 32, 1, 4),
-            (128, 64, 32, 1, 4),
-            (64, 128, 32, 1, 8),
-            (128, 64, 32, 1, 8),
-            (64, 32, 32, 1, 8),
-            (32, 64, 32, 1, 8),
-            (128, 128, 32, 1, 8),
-            (64, 64, 64, 1, 8),
-            (64, 64, 16, 1, 4),
-            (32, 32, 16, 1, 2),
-        ),
-    )
+int8_mm_kernel_configs = [
+    {"config": (64, 64, 32, 2, 4), "cond": True},
+    {"config": (64, 128, 32, 3, 4), "cond": True},
+    {"config": (128, 64, 32, 3, 4), "cond": True},
+    {"config": (64, 128, 32, 4, 8), "cond": True},
+    {"config": (128, 64, 32, 4, 8), "cond": True},
+    {"config": (64, 32, 32, 5, 8), "cond": True},
+    {"config": (32, 64, 32, 5, 8), "cond": True},
+    {"config": (128, 128, 32, 2, 8), "cond": True},
+    {"config": (64, 64, 64, 3, 8), "cond": True},
+    # {"config": (32, 32, 128, 2, 4), "cond": True},
+    # {"config": (64, 64, 16, 2, 4), "cond": True},
+    # {"config": (32, 32, 16, 1, 2), "cond": True},
+    {"config": (128, 256, 128, 3, 8), "cond": torch.version.hip is None}, 
+    {"config": (256, 128, 128, 3, 8), "cond": torch.version.hip is None},
+]
 
-    int8_mm_configs = functools.partial(
-        filtered_configs,
-        configs=(
-            # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-            (64, 64, 32, 2, 4),
-            (64, 128, 32, 1, 4),
-            (128, 64, 32, 1, 4),
-            (64, 128, 32, 1, 8),
-            (128, 64, 32, 1, 8),
-            (64, 32, 32, 1, 8),
-            (32, 64, 32, 1, 8),
-            (128, 128, 32, 1, 8),
-            (64, 64, 64, 1, 8),
-        ),
-    )
+# Create filtered list of configs based on cond
+mm_platform_configs = [config["config"] for config in mm_kernel_configs if config["cond"]]
+int8_platform_configs = [config["config"] for config in int8_mm_kernel_configs if config["cond"]]
+
+# On ROCm convert num_stages to 1 as pipelining provides no benefit
+if torch.version.hip:
+    mm_platform_configs = [(config[0], config[1], config[2], 1, config[4]) for config in platform_configs]
+    int8_platform_configs = [(config[0], config[1], config[2], 1, config[4]) for config in platform_configs]
+
+mm_configs = functools.partial(
+    filtered_configs,
+    configs=mm_platform_configs,
+)
+
+int8_mm_configs = functools.partial(
+    filtered_configs,
+    configs=int8_platform_configs,
+)
 
 
 def mm_grid(m, n, meta):
