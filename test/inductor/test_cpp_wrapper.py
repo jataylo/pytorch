@@ -94,8 +94,8 @@ test_failures_cuda_wrapper = {
 if TEST_WITH_ROCM:
     # Current skips for ROCm
     rocm_exclude_list = [
-        "test_addmm"
-        "test_batch_norm_2d_2_cuda"
+        "test_addmm",
+        "test_batch_norm_2d_2_cuda",
         "test_bmm1_cuda",
         "test_cat_cuda",
         "test_convolution1_cuda",

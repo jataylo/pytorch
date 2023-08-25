@@ -2241,7 +2241,7 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict(
         (
             "CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES",
             ("hipFuncAttributeMaxDynamicSharedMemorySize", CONV_TYPE, API_RUNTIME),
-        ),   
+        ),
         (
             "CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES",
             ("hipFuncAttributeConstSizeBytes", CONV_TYPE, API_DRIVER, HIP_UNSUPPORTED),
