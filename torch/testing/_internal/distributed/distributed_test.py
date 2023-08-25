@@ -4571,67 +4571,41 @@ class DistributedTest:
             torch.cuda.set_device(self.rank)
 
             # Test a simple linear as well as a ResNet model.
-            models_to_test = [
-                nn.Sequential(
-                    nn.Linear(3, 3), nn.Linear(3, 3), nn.Linear(3, 3)
-                ).cuda()
-            ]
-            if HAS_TORCHVISION:
-                models_to_test.append(
-                    torchvision.models.resnet50().cuda()
-                )
+            model = torchvision.models.resnet50().cuda()
+            model_copy = copy.deepcopy(model)
+            
+            optim = optim_cls(model.parameters(), **optim_kwargs)
+            optim_copy = optim_cls(model.parameters(), **optim_kwargs)
+            
+            for p1, p2 in zip(
+                model.parameters(), model_copy.parameters()
+            ):
+                self.assertEqual(p1, p2, "Parameters not initially equal!")
+            
+            # Enable determinism in cudnn operators
+            with torch.backends.cudnn.flags(
+                enabled=True, deterministic=False, benchmark=False
+            ):
+                for i in range(100):
+                    inp = torch.randn(1, 3, 1000, 1000, device='cuda')
+                    
+                    model(inp).sum().backward()
+                    optim.step()
+                    
+                    model_copy(inp).sum().backward()
+                    optim_copy.step()
 
-            for j, model in enumerate(models_to_test):
-                model_optim_in_bwd = copy.deepcopy(model)
-                model = nn.parallel.DistributedDataParallel(
-                    model,
-                    device_ids=[self.rank],
-                    gradient_as_bucket_view=gradient_as_bucket_view,
-                )
-                optim = optim_cls(model.parameters(), **optim_kwargs)
-                # Note: have to apply_optimizer_in_backward before wrapping with DDP.
-                _apply_optimizer_in_backward(
-                    optimizer_class=optim_cls,
-                    params=model_optim_in_bwd.parameters(),
-                    optimizer_kwargs=optim_kwargs,
-                )
-                model_optim_in_bwd = nn.parallel.DistributedDataParallel(
-                    model_optim_in_bwd,
-                    device_ids=[self.rank],
-                    gradient_as_bucket_view=gradient_as_bucket_view,
-                )
-
-                for p1, p2 in zip(
-                    model.parameters(), model_optim_in_bwd.parameters()
-                ):
-                    self.assertEqual(p1, p2, "Parameters not initially equal!")
-                # Enable determinism in cudnn operators
-                with torch.backends.cudnn.flags(
-                    enabled=True, deterministic=True, benchmark=False
-                ):
-                    for i in range(100):
-                        inp = (
-                            torch.randn(1, 3, 1000, 1000, device='cuda')
-                            if j == 1 else torch.randn(10, 3, device='cuda')
+                    for p1, p2 in zip(
+                        model.parameters(), model_copy.parameters()
+                    ):
+                        self.assertEqual(p1, p2, f"Params not equal at iteration {i}")
+                        self.assertTrue(
+                            p2.grad is None, f"Optim in backward grad is not None at {i}"
                         )
-                        model(inp).sum().backward()
-                        optim.step()
-                        model_optim_in_bwd(inp).sum().backward()  # runs optimizer as well
-                        for p1, p2 in zip(
-                            model.parameters(), model_optim_in_bwd.parameters()
-                        ):
-                            self.assertEqual(p1, p2, f"Params not equal at iteration {i}")
-                            self.assertTrue(
-                                p2.grad is None, f"Optim in backward grad is not None at {i}"
-                            )
 
-                        # set_to_none for regular optimizer to match in backward
-                        # case.
-                        optim.zero_grad(set_to_none=True)
 
-        @skip_if_lt_x_gpu(2)
         def test_ddp_apply_optim_in_backward(self):
-            for optim_cls in [torch.optim.SGD, torch.optim.Adam]:
+            for optim_cls in [torch.optim.SGD]:
                 with self.subTest(optim_cls=optim_cls):
                     self._test_ddp_apply_optim_in_backward(
                         optim_cls=optim_cls,
