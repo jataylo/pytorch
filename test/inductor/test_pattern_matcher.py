@@ -75,18 +75,20 @@ class TestPaternMatcher(TestCase):
                 torch.randn(8, 8, device="cuda"),
                 torch.randint(-128, 127, (8, 8), dtype=torch.int8, device="cuda"),
             ),
-            (
-                torch.randn(8, 2, device="cuda", dtype=torch.bfloat16),
-                torch.randint(-128, 127, (2, 8), dtype=torch.int8, device="cuda"),
-            ),
+            # https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/5880 - Failed to emit LLVM IR with bf16
+            #(
+            #    torch.randn(8, 2, device="cuda", dtype=torch.bfloat16),
+            #    torch.randint(-128, 127, (2, 8), dtype=torch.int8, device="cuda"),
+            #),
             (
                 torch.randn(8, 5, device="cuda", dtype=torch.float16),
                 torch.randint(0, 255, (5, 2), dtype=torch.uint8, device="cuda"),
             ),
-            (
-                torch.randn(8, 8, device="cuda", dtype=torch.float32),
-                torch.randn(8, 8, device="cuda", dtype=torch.bfloat16),
-            ),
+            # https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/5880 - Failed to emit LLVM IR with bf16
+            #(
+            #    torch.randn(8, 8, device="cuda", dtype=torch.float32),
+            #    torch.randn(8, 8, device="cuda", dtype=torch.bfloat16),
+            #),
         ]
 
         for args in args_list:
@@ -103,10 +105,11 @@ class TestPaternMatcher(TestCase):
                 torch.randn(8, 8, device="cuda", dtype=torch.float16),
                 torch.randint(-128, 127, (2, 8), dtype=torch.int8, device="cuda").t(),
             ),
-            (
-                torch.randn(8, 8, device="cuda", dtype=torch.bfloat16),
-                torch.randint(0, 255, (2, 8), dtype=torch.uint8, device="cuda").t(),
-            ),
+            # https://github.com/ROCmSoftwarePlatform/frameworks-internal/issues/5880 - Failed to emit LLVM IR with bf16
+            #(
+            #    torch.randn(8, 8, device="cuda", dtype=torch.bfloat16),
+            #    torch.randint(0, 255, (2, 8), dtype=torch.uint8, device="cuda").t(),
+            #),
         ]
 
         for args in args_list:
