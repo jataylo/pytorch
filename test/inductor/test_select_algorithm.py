@@ -114,6 +114,7 @@ class TestSelectAlgorithm(TestCase):
         )
         self.check_counter(counters["inductor"]["select_algorithm_autotune"], 1)
 
+    @skipIfRocm
     @patches
     def test__int_mm(self):
         @torch.compile
