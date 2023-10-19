@@ -1209,6 +1209,7 @@ def cpp_compile_command(
     aot_mode: bool = False,
     compile_only: bool = False,
     use_absolute_path: bool = False,
+    offload: bool = False,
 ) -> str:
     ipaths, lpaths, libs, macros = get_include_and_linking_paths(
         include_pytorch, vec_isa, cuda, aot_mode
@@ -1230,6 +1231,11 @@ def cpp_compile_command(
         out_name = output
         linker_paths = ""  # let the compiler pick
     inp_name_str = " ".join(inp_name)
+
+    if offload:
+        from torch.inductor.utils import offload_target, offload_arch
+        offload_compilation = f"-fopenmp-targets={offload_target} -Xopenmp-target={offload_target} -march={offload_arch}"
+
     return re.sub(
         r"[ \n]+",
         " ",
@@ -1243,6 +1249,7 @@ def cpp_compile_command(
             {use_fb_internal_macros()}
             {use_standard_sys_dir_headers()}
             {get_compile_only(compile_only)}
+            {offload_compilation}
             -o {out_name}
         """,
     ).strip()

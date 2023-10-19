@@ -1300,3 +1300,8 @@ aot_inductor_launcher = """
             output_handles.data(), output_handles.size());
     }
 """
+
+# Hardcoding purely for testing openmp offload backend
+if torch.version.hip:
+    offload_target = "amdgcn-amd-amdhsa"
+    offload_arch = "gfx1100"
