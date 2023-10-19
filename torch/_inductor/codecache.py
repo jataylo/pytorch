@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+OFFLOAD_TEST=True
+
 import base64
 import copyreg
 import dataclasses
@@ -1238,6 +1240,8 @@ def cpp_compile_command(
     if offload:
         from torch.inductor.utils import offload_target, offload_arch
         offload_compilation = f"-fopenmp-targets={offload_target} -Xopenmp-target={offload_target} -march={offload_arch}"
+    else:
+        offload_compilation = ""
 
     return re.sub(
         r"[ \n]+",
