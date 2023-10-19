@@ -694,7 +694,10 @@ def _run_from_cache(compiled_graph: CompiledFxGraph, inputs: List[Any]) -> Any:
     return compiled_graph.compiled_artifact(inputs)
 
 
-def cpp_compiler() -> str:
+def cpp_compiler(offload_test=False) -> str:
+    # TESTING
+    if offload_test:
+        return "/opt/rocm/llvm/bin/clang++"
     if config.is_fbcode():
         return build_paths.gcc()
     if isinstance(config.cpp.cxx, (list, tuple)):
@@ -839,7 +842,7 @@ cdll.LoadLibrary("__lib_path__")
             output_path = input_path[:-3] + "so"
             build_cmd = shlex.split(
                 cpp_compile_command(
-                    input_path, output_path, warning_all=False, vec_isa=self
+                    input_path, output_path, warning_all=False, vec_isa=self, offload=OFFLOAD_TEST
                 )
             )
             try:
@@ -1240,7 +1243,7 @@ def cpp_compile_command(
         r"[ \n]+",
         " ",
         f"""
-            {cpp_compiler()} {inp_name_str} {get_shared(shared)}
+            {cpp_compiler(offload_test={offload})} {inp_name_str} {get_shared(shared)}
             {get_warning_all_flag(warning_all)} {cpp_flags()}
             {get_glibcxx_abi_build_flags()}
             {ipaths} {lpaths} {libs} {macros} {linker_paths}
@@ -1556,7 +1559,7 @@ class CppCodeCache:
     @classmethod
     def load(cls, source_code: str) -> CDLL:
         picked_vec_isa = pick_vec_isa()
-        cpp_command = repr(cpp_compile_command("i", "o", vec_isa=picked_vec_isa))
+        cpp_command = repr(cpp_compile_command("i", "o", vec_isa=picked_vec_isa, offload=OFFLOAD_TEST))
         key, input_path = write(source_code, "cpp", extra=cpp_command)
         if key not in cls.cache:
             from filelock import FileLock
@@ -1568,7 +1571,7 @@ class CppCodeCache:
                 if not os.path.exists(output_path):
                     cmd = shlex.split(
                         cpp_compile_command(
-                            input=input_path, output=output_path, vec_isa=picked_vec_isa
+                            input=input_path, output=output_path, vec_isa=picked_vec_isa, offload=OFFLOAD_TEST
                         )
                     )
                     compile_file(input_path, output_path, cmd)
