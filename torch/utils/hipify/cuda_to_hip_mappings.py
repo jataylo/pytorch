@@ -2782,7 +2782,7 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict(
         ),
         (
             "cuGetErrorString",
-            ("hipGetErrorString", CONV_ERROR, API_DRIVER, HIP_UNSUPPORTED),
+            ("hipDrvGetErrorString", CONV_ERROR, API_DRIVER, HIP_UNSUPPORTED),
         ),
         ("cuInit", ("hipInit", CONV_INIT, API_DRIVER)),
         ("cuDriverGetVersion", ("hipDriverGetVersion", CONV_VERSION, API_DRIVER)),
