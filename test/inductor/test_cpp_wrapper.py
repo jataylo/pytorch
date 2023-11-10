@@ -103,6 +103,7 @@ if TEST_WITH_ROCM:
         "test_custom_op_cuda",
         "test_foreach_cpp_wrapper",
         "test_linear_relu_cuda",
+        "test_mm_plus_mm2",
         "test_index_put_deterministic_fallback_cuda",
         "test_index_tensor_cuda",
         "test_multi_device_cuda",
