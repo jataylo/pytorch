@@ -4480,6 +4480,10 @@ class DistributedTest:
             BACKEND == "nccl" or BACKEND == "ucc",
             "Issues with async error handling, see https://github.com/pytorch/pytorch/issues/73259"
         )
+        @sandcastle_skip_if(
+            BACKEND == "gloo" and HAS_TORCHVISION,
+            "Failing with gloo backend + torchvision due to ongoing issue https://github.com/pytorch/pytorch/issues/111834",
+        )
         @skip_if_lt_x_gpu(2)
         @parametrize("grad_as_bucket_view", [True, False])
         @parametrize("static_graph", [True, False])
@@ -4507,6 +4511,10 @@ class DistributedTest:
             BACKEND == "nccl" or BACKEND == "ucc",
             "Issues with async error handling, see https://github.com/pytorch/pytorch/issues/73259"
         )
+        @sandcastle_skip_if(
+            BACKEND == "gloo" and HAS_TORCHVISION,
+            "Failing with gloo backend + torchvision due to ongoing issue https://github.com/pytorch/pytorch/issues/111834",
+        )
         @skip_if_lt_x_gpu(2)
         @parametrize("optimize_subset", [True, False])
         def test_ddp_hook_with_optimizer_parity_adam(self, optimize_subset):
@@ -4526,6 +4534,10 @@ class DistributedTest:
         @sandcastle_skip_if(
             BACKEND == "nccl" or BACKEND == "ucc",
             "Issues with async error handling, see https://github.com/pytorch/pytorch/issues/73259"
+        )
+        @sandcastle_skip_if(
+            BACKEND == "gloo" and HAS_TORCHVISION,
+            "Failing with gloo backend + torchvision due to ongoing issue https://github.com/pytorch/pytorch/issues/111834",
         )
         @skip_if_lt_x_gpu(2)
         @parametrize("optimize_subset", [True, False])
