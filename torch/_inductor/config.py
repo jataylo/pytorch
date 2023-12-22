@@ -213,7 +213,13 @@ coordinate_descent_search_radius = int(
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_RADIUS", "1")
 )
 
-layout_optimization = os.environ.get("TORCHINDUCTOR_LAYOUT_OPTIMIZATION", "1") == "1"
+# Disabled by default on ROCm, opt-in feature if workload uses NHWC convolutions
+layout_optimization = (
+    os.environ.get(
+        "TORCHINDUCTOR_LAYOUT_OPTIMIZATION", "1" if not torch.version.hip else "0"
+    )
+    == "1"
+)
 
 
 force_layout_optimization = os.environ.get("TORCHINDUCTOR_FORCE_LAYOUT_OPT", "0") == "1"
