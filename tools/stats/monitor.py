@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import psutil  # type: ignore[import]
 import pynvml  # type: ignore[import]
+import amdsmi
 
 # ROCm does not currently have the rocm_smi module installed to a pythonic location.
 # Must import from ROCm installation path.
@@ -69,6 +70,14 @@ def get_per_process_cpu_info() -> List[Dict[str, Any]]:
 
 def get_per_process_gpu_info(handle: Any) -> List[Dict[str, Any]]:
     processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+    per_process_info = []
+    for p in processes:
+        info = {"pid": p.pid, "gpu_memory": p.usedGpuMemory}
+        per_process_info.append(info)
+    return per_process_info
+
+def get_per_process_gpu_info_amdsmi(handle: Any) -> List[Dict[str, Any]]:
+    processes = amdsmi.amdsmi_get_gpu_process_list(handle)
     per_process_info = []
     for p in processes:
         info = {"pid": p.pid, "gpu_memory": p.usedGpuMemory}
@@ -172,6 +181,7 @@ if __name__ == "__main__":
                 stats["total_gpu_utilization"] = gpu_utilization.gpu
                 stats["total_gpu_mem_utilization"] = gpu_utilization.memory
             if rsmi_handles:
+                # rsmi handles or amdsmi ... hmm?
                 stats["per_process_gpu_info"] = rocm_get_per_process_gpu_info()
                 # There are 1 to 4 GPUs in use; these values may sum > 1.0.
                 gpu_utilization = 0.0
