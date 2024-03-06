@@ -18,6 +18,8 @@
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
 #include <c10/cuda/driver_api.h>
 #include <nvml.h>
+#else
+#include <rocm_smi/rocm_smi.h>
 #endif
 
 #include <cuda_runtime.h>
@@ -146,7 +148,26 @@ static NvlMesh getNvlMesh(const std::vector<std::string>& rankToBusId) {
   }
   return nvlMesh;
 #else
-  return {};
+  NvlMesh nvlMesh = {};
+  const auto worldSize = rankToBusId.size();
+  // For each device, loop over devices connected to it 
+  for (size_t idx = 0; idx < worldSize; ++idx) {
+    for (size_t link = 0; link < kMaxDevices; ++link) {
+        if(idx == link) continue;
+
+        bool conn = false;
+        auto ret = rsmi_is_P2P_accessible(idx, link, &conn);
+        if (ret != RSMI_STATUS_SUCCESS){
+            LOG(ERROR) << "IntraNodeComm: getNvlMesh: rsmi_is_P2P_accessible returned error ret=" << ret;
+            return {};
+        }
+
+        if (conn){
+            nvlMesh[idx][link] += 1;
+        }
+    }
+  }
+  return nvlMesh;
 #endif
 }
 
@@ -288,7 +309,6 @@ bool IntraNodeComm::rendezvous() {
   if (isInitialized_) {
     return true;
   }
-#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
   if (!isIntraNodeCommSupported() || !isEnabled() || worldSize_ < 2 ||
       worldSize_ > kMaxDevices) {
     return false;
@@ -305,12 +325,28 @@ bool IntraNodeComm::rendezvous() {
 
   DevInfo devInfo{};
   gethostname(devInfo.hostname, sizeof(devInfo.hostname));
+
+#if defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  auto ret = rsmi_init(0);
+  if (ret != RSMI_STATUS_SUCCESS) {
+    LOG(ERROR) << "IntraNodeComm:: rendezvous failed in rsmi_init, ret=" << ret;
+    return nullptr;
+  }
+#endif
+
   cudaDeviceProp prop{};
   AT_CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceIdx));
+
+#if defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  auto pci_format = "%08X:%02X:%02X.0";
+#else
+  auto pci_format = NVML_DEVICE_PCI_BUS_ID_FMT;
+#endif
+
   snprintf(
       devInfo.busId,
       sizeof(devInfo.busId),
-      NVML_DEVICE_PCI_BUS_ID_FMT,
+      pci_format,
       prop.pciDomainID,
       prop.pciBusID,
       prop.pciDeviceID);
@@ -424,8 +460,6 @@ bool IntraNodeComm::rendezvous() {
   buffersDev_ = buffersDev;
   topoInfo_ = topoInfo;
   return true;
-#endif
-  return false;
 }
 
 } // namespace c10d::intra_node_comm
