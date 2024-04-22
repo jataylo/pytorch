@@ -1,22 +1,26 @@
 set -ex
 
-# Check if ROCM_VERSION argument is provided
-if [[ -z "$1" ]]; then
-    echo "ROCM_VERSION argument not provided setting to default."
-    ROCM_VERSION="6.0"
-else
-    ROCM_VERSION="$1"
+# Set ROCM_HOME isn't available, use ROCM_PATH if set or /opt/rocm
+ROCM_HOME="${ROCM_HOME:-${ROCM_PATH:-/opt/rocm}}"
+
+# Find rocm_version.h header file for ROCm version extract
+rocm_version_h="${ROCM_HOME}/include/rocm-core/rocm_version.h"
+if [ ! -f "$rocm_version_h" ]; then
+    rocm_version_h="${ROCM_HOME}/include/rocm_version.h"
 fi
 
-# Set ROCM_HOME if not set
-if [[ -z "${ROCM_HOME}" ]]; then
-    export ROCM_HOME=/opt/rocm
+# Error out if rocm_version.h not found
+if [ ! -f "$rocm_version_h" ]; then
+    echo "Error: rocm_version.h not found in expected locations." >&2
+    exit 1
 fi
 
-# Extract major and minor version numbers
-MAJOR_VERSION=$(echo "${ROCM_VERSION}" | cut -d '.' -f 1)
-MINOR_VERSION=$(echo "${ROCM_VERSION}" | cut -d '.' -f 2)
-ROCM_INT=$(($MAJOR_VERSION * 10000 + $MINOR_VERSION * 100)) # Add patch later
+# Extract major, minor and patch ROCm version numbers
+MAJOR_VERSION=$(grep 'ROCM_VERSION_MAJOR' "$rocm_version_h" | awk '{print $3}')
+MINOR_VERSION=$(grep 'ROCM_VERSION_MINOR' "$rocm_version_h" | awk '{print $3}')
+PATCH_VERSION=$(grep 'ROCM_VERSION_PATCH' "$rocm_version_h" | awk '{print $3}')
+ROCM_INT=$(($MAJOR_VERSION * 10000 + $MINOR_VERSION * 100 + $PATCH_VERSION))
+echo "ROCm version: $ROCM_INT"
 
 # Check TRITON_ROCM_DIR is set
 if [[ -z "${TRITON_ROCM_DIR}" ]]; then
