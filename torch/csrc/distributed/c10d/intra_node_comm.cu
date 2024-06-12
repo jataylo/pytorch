@@ -120,6 +120,7 @@ DEVICE_INLINE void releaseSignal(uint32_t* addr) {
   CUDA_KERNEL_ASSERT(false);
 #else
   atomicAdd_system(addr, 1);
+  __threadfence_system();
 #endif
 }
 

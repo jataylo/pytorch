@@ -330,7 +330,7 @@ bool IntraNodeComm::rendezvous() {
   auto ret = rsmi_init(0);
   if (ret != RSMI_STATUS_SUCCESS) {
     LOG(ERROR) << "IntraNodeComm:: rendezvous failed in rsmi_init, ret=" << ret;
-    return nullptr;
+    return false;
   }
 #endif
 
