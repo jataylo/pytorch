@@ -3337,6 +3337,24 @@ exit(2)
         rc = check_output([sys.executable, '-c', test_script]).decode("ascii").strip()
         self.assertEqual(rc, "0")
 
+    @unittest.skipIf(not TEST_MULTIGPU, "requires multiple devices")
+    @unittest.skipIf(TEST_WITH_ROCM, "too lazy to debug this on ROCm")
+    def test_device_count_not_cached_pre_init(self):
+        test_script = """\
+import torch
+import os
+r1 = torch.cuda.device_count()
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+r2 = torch.cuda.device_count()
+torch.empty(10, device='cuda')
+print(f"{r1}, {r2}")
+"""
+
+        r = subprocess.check_output([sys.executable, "-c", test_script]).decode("ascii").strip()
+
+        x = torch.cuda.device_count()
+        self.assertEqual(f"{x}, 1", r)
+
 
 class TestCudaMallocAsync(TestCase):
     @unittest.skipIf(TEST_CUDAMALLOCASYNC, "setContextRecorder not supported by CUDAMallocAsync")
