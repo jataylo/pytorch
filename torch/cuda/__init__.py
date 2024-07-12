@@ -642,13 +642,47 @@ def _device_count_nvml() -> int:
         return -1
     return len(visible_devices)
 
+
+_cached_device_count: Optional[int] = None
+
+
 @lru_cache(maxsize=1)
 def device_count() -> int:
     r"""Returns the number of GPUs available."""
+    global _cached_device_count
     if not _is_compiled():
         return 0
+    if _cached_device_count is not None:
+        return _cached_device_count
     nvml_count = _device_count_nvml()
-    return torch._C._cuda_getDeviceCount() if nvml_count < 0 else nvml_count
+    r = torch._C._cuda_getDeviceCount() if nvml_count < 0 else nvml_count
+    
+    # NB: Do not cache the device count prior to CUDA initialization, because
+    # the number of devices can change due to changes to CUDA_VISIBLE_DEVICES
+    # setting prior to CUDA initialization.
+    if _initialized:
+        _cached_device_count = r
+    return r
+
+
+def _get_nvml_device_index(device: Optional[Union[int, Device]]) -> int:
+    r"""Return the NVML index of the device, taking CUDA_VISIBLE_DEVICES into account."""
+    idx = _get_device_index(device, optional=True)
+    visible_devices = _parse_visible_devices()
+    if type(visible_devices[0]) is str:
+        uuids = _raw_device_uuid_nvml()
+        if uuids is None:
+            raise RuntimeError("Can't get device UUIDs")
+        visible_devices = _transform_uuid_to_ordinals(
+            cast(List[str], visible_devices), uuids
+        )
+    visible_devices = cast(List[int], visible_devices)
+    if idx < 0 or idx >= len(visible_devices):
+        raise RuntimeError(
+            f"device {idx} is not visible (CUDA_VISIBLE_DEVICES={visible_devices})"
+        )
+    return visible_devices[idx]
+
 
 def get_arch_list() -> List[str]:
     r"""Returns list CUDA architectures this library was compiled for."""
