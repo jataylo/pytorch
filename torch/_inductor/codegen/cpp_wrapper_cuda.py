@@ -71,7 +71,7 @@ class CppWrapperCuda(CppWrapperCpu):
 
     def write_get_raw_stream(self, index, graph=None):
         name = f"stream{index}"
-        self.writeline(maybe_hipify_code_wrapper(f"cudaStream_t {name};"))
+        self.writeline(maybe_hipify_code_wrapper(f"hipStream_t {name};"))
         self.writeline(
             f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream({index}, (void**)&{name}));"
         )
@@ -91,7 +91,7 @@ class CppWrapperCuda(CppWrapperCpu):
                 sorted([entry[0] for entry in self.user_defined_kernel_cache.values()]),
             ):
                 self.prefix.writeline(
-                    maybe_hipify_code_wrapper(f"static CUfunction {kernel} = nullptr;")
+                    maybe_hipify_code_wrapper(f"static hipFunction_t {kernel} = nullptr;")
                 )
             self.prefix.writeline("\n")
         return super().generate(is_inference)
@@ -143,7 +143,7 @@ class CppWrapperCuda(CppWrapperCpu):
             else:
                 if config.abi_compatible:
                     self.writeline(
-                        maybe_hipify_code_wrapper(f"CUdeviceptr {var_name};")
+                        maybe_hipify_code_wrapper(f"hipDeviceptr_t {var_name};")
                     )
                     self.writeline(
                         f"AOTI_TORCH_ERROR_CODE_CHECK(aoti_torch_get_data_ptr({arg}, reinterpret_cast<void**>(&{var_name})));"
@@ -151,7 +151,7 @@ class CppWrapperCuda(CppWrapperCpu):
                 else:
                     self.writeline(
                         maybe_hipify_code_wrapper(
-                            f"CUdeviceptr {var_name} = reinterpret_cast<CUdeviceptr>({arg}.data_ptr());"
+                            f"hipDeviceptr_t {var_name} = reinterpret_cast<hipDeviceptr_t>({arg}.data_ptr());"
                         )
                     )
             new_args.append(f"&{var_name}")

@@ -1,6 +1,8 @@
 import copy
 import itertools
 import logging
+import torch
+
 from typing import Callable, Optional
 
 from .hints import TRITON_MAX_BLOCK
@@ -80,7 +82,7 @@ class CoordescTuner:
     def get_warpsmax(self):
         # Currently, CUDA has a maximum of 1024 threads, so 32 is the max
         # number of warps.
-        return 1024 // 32
+        return 1024 // 64
 
     def cache_benchmark_result(self, config, timing):
         self.cached_benchmark_results[triton_config_to_hashable(config)] = timing
@@ -113,6 +115,10 @@ class CoordescTuner:
             "BLOCK_K",
             "num_warps",
         ]
+        if torch.version.hip:
+            out.append("num_stages")
+            out.append("waves_per_eu")
+
         if self.is_mm:
             out.append("num_stages")
 
@@ -129,6 +135,10 @@ class CoordescTuner:
             return val > self.get_rmax()
         if name == "num_warps":
             return val > self.get_warpsmax()
+        if name == "num_stages":
+            return val > 1
+        if name == "waves_per_eu":
+            return val > 8
 
         return False
 

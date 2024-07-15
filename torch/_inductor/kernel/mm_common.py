@@ -67,6 +67,7 @@ def filtered_configs(
         # each warp computes 16x16 tile = 256
         num_warps = min(num_warps, block_m * block_n // 256)
         if torch.version.hip:
+            waves_per_eu = int(8 / num_warps)
             for matrix_instr_nonkdim in [0, 16]:
                 if matrix_instr_nonkdim != 0 and (
                     block_m % matrix_instr_nonkdim != 0
@@ -80,6 +81,7 @@ def filtered_configs(
                     block_k,
                     num_stages,
                     num_warps,
+                    waves_per_eu,
                     matrix_instr_nonkdim,
                 ) not in used:
                     used.add(
@@ -89,6 +91,7 @@ def filtered_configs(
                             block_k,
                             num_stages,
                             num_warps,
+                            waves_per_eu,
                             matrix_instr_nonkdim,
                         )
                     )
@@ -98,6 +101,7 @@ def filtered_configs(
                         BLOCK_K=block_k,
                         num_stages=num_stages,
                         num_warps=num_warps,
+                        waves_per_eu=waves_per_eu,
                         matrix_instr_nonkdim=matrix_instr_nonkdim,
                     )
         else:

@@ -697,9 +697,9 @@ class Reduction(Loops):
         num_sm = device_interface.Worker.get_device_properties(
             device
         ).multi_processor_count
-        min_elements_per_thread = 32
-        max_elements_per_thread = 512
-        threads_per_sm = 2048
+        min_elements_per_thread = 64 # Warp
+        max_elements_per_thread = 1024 # Warp * 8
+        threads_per_sm = 2048 # should be in interfac?
         min_elements_per_device = min_elements_per_thread * num_sm * threads_per_sm
         max_elements_per_device = max_elements_per_thread * num_sm * threads_per_sm
 
@@ -707,7 +707,7 @@ class Reduction(Loops):
             # do heuristics that's close to eager mode for split inner reduction
             # we leak reduction autotune configs here, and will need to refactor to avoid this later
             num_warps = 8
-            num_threads = 32 * num_warps
+            num_threads = 64 * num_warps # warp size
             if numel_hint >= 2 * num_sm:  # don't split if there are enough outputs
                 return 1
             if reduction_numel_hint <= 8192:
@@ -743,7 +743,7 @@ class Reduction(Loops):
             # TODO the best heuristic currently has XBLOCK (corresponding to numel_hint) 128
             # extend to even smaller number of outputs
             num_warps = 8
-            num_threads = num_warps * 32
+            num_threads = num_warps * 64 # warp size
             rvals_per_thread = 4  # comes from heuristics, refactor to not leak here
             xvals_per_block = 128
             xblocks = (numel_hint + xvals_per_block - 1) // xvals_per_block
@@ -812,7 +812,7 @@ class Reduction(Loops):
             return ReductionHint.INNER, split
         if (
             reduction_numel_hint <= min_elements_per_thread
-            or numel_hint >= num_sm * 2 * 32
+            or numel_hint >= num_sm * 2 * 64 # warp size
         ):
             return ReductionHint.DEFAULT, 1
 

@@ -55,11 +55,17 @@ if triton is not None:
         from triton.compiler.compiler import ASTSource
     except ImportError:
         ASTSource = None
+    try:
+        from triton.backends.compiler import GPUTarget
+    except ImportError:
+        GPUTarget = None
+
 else:
     Config = object
     KernelInterface = object
     OutOfResources = object
     ASTSource = None
+    GPUTarget = None
 
 try:
     autograd_profiler = torch.autograd.profiler
@@ -104,7 +110,7 @@ def autotune_hints_to_configs(
                     triton_config(
                         size_hints,
                         *xyz,
-                        num_elements_per_warp=32,
+                        num_elements_per_warp=64,
                     )
                 )
 
@@ -347,10 +353,17 @@ class CachingAutotuner(KernelInterface):
             else:
                 rocm_warp_size = 64
 
-            target = (
-                (compile_meta["device_type"], compile_meta["cc"])
-                if not torch.version.hip
-                else [compile_meta["device_type"], compile_meta["cc"], rocm_warp_size]
+            if GPUTarget:
+                target = GPUTarget(
+                    compile_meta["device_type"],
+                    compile_meta["cc"],
+                    rocm_warp_size if torch.version.hip else 32,
+                )
+            else:
+                target = (
+                    (compile_meta["device_type"], compile_meta["cc"])
+                    if not torch.version.hip
+                    else [compile_meta["device_type"], compile_meta["cc"], rocm_warp_size]
             )
 
             options = {
@@ -1163,7 +1176,7 @@ def triton_config(
     y=None,
     z=None,
     num_stages=1,
-    num_elements_per_warp=256,
+    num_elements_per_warp=512,
     min_elem_per_thread=0,
 ) -> Config:
     """
@@ -1186,7 +1199,8 @@ def triton_config(
     # for a 2d size_hints [a, b], a should be mapped to YBLOCK rather than XBLOCK
     size_hints = list(reversed(size_hints))
 
-    maxGridSize = [2147483647, 65535, 65535]
+    maxGridSize = [2147483647*2, 65535, 65535]
+
 
     target = conditional_product(x, y, z)
     if conditional_product(*size_hints) < target:
@@ -1248,6 +1262,8 @@ def triton_config(
         cfg["YBLOCK"] = y
     if z:
         cfg["ZBLOCK"] = z
+
+    cfg["waves_per_eu"] = int(8 / num_warps)
     check_config(cfg, xnumel=xnumel, ynumel=ynumel, znumel=znumel)
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
 
@@ -1298,6 +1314,7 @@ def triton_config_reduction(size_hints, x, r, num_stages=1, num_warps=None) -> C
             break
 
     cfg = {"XBLOCK": x, "RBLOCK": r}
+    cfg["waves_per_eu"] = int(8 / num_warps)
     check_config(cfg, xnumel=size_hints[0])
     assert r <= TRITON_MAX_BLOCK["R"], f"increase TRITON_MAX_BLOCK['r'] to {r}"
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)
@@ -1329,6 +1346,7 @@ def triton_config_tiled_reduction(size_hints, x, y, r, num_stages=1):
 
     cfg = {"XBLOCK": x, "YBLOCK": y, "RBLOCK": r}
     num_warps = next_power_of_2(min(max(conditional_product(x, y, r) // 256, 1), 8))
+    cfg["waves_per_eu"] = int(8 / num_warps)
     check_config(cfg, xnumel=size_hints[0], ynumel=size_hints[1])
     assert r <= TRITON_MAX_BLOCK["R"], f"increase TRITON_MAX_BLOCK['r'] to {r}"
     return Config(cfg, num_warps=num_warps, num_stages=num_stages)

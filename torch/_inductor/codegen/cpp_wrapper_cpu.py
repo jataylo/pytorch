@@ -667,7 +667,7 @@ class CppWrapperCpu(WrapperCodeGen):
             )
         for kernel in sorted(declare_kernel):
             self.prefix.writeline(
-                maybe_hipify_code_wrapper(f"    CUfunction {kernel}{{nullptr}};")
+                maybe_hipify_code_wrapper(f"    hipFunction_t {kernel}{{nullptr}};")
             )
         self.prefix.writeline("};")
         self.prefix.writeline("}  // namespace")
