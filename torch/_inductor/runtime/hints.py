@@ -69,7 +69,7 @@ else:
     )
 
 
-_NUM_THREADS_PER_WARP = 32
+_NUM_THREADS_PER_WARP = 64
 
 
 class HeuristicType(Enum):
