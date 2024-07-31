@@ -126,9 +126,12 @@ class DeviceProperties(typing.NamedTuple):
                 major=props.major,
                 regs_per_multiprocessor=props.regs_per_multiprocessor,
                 max_threads_per_multi_processor=props.max_threads_per_multi_processor,
-                multi_processor_count=props.multi_processor_count,
+                multi_processor_count=props.multi_processor_count
+                if hasattr(props, "multi_processor_count")
+                else None,
                 warp_size=props.warp_size,
             )
+
         return cls(
             type=device_type,
             index=device.index,
