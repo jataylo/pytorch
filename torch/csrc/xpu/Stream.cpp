@@ -49,7 +49,7 @@ static PyObject* THXPStream_pynew(
             stream_id,
             static_cast<c10::DeviceIndex>(device_index),
             static_cast<c10::DeviceType>(device_type))
-      : at::xpu::getStreamFromPool(priority, current_device);
+      : at::xpu::getStreamFromPoolMasqueradingAsCUDA(priority, current_device);
 
   THXPStream* self = (THXPStream*)ptr.get();
   self->stream_id = static_cast<int64_t>(stream.id());

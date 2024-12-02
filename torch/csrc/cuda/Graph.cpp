@@ -5,8 +5,8 @@
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/pybind.h>
 
-#include <ATen/cuda/CUDAGraph.h>
-#include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <ATen/hip/HIPGraph.h>
+#include <c10/hip/HIPGraphsC10Utils.h>
 
 // Cargo culted partially from csrc/distributed/c10d/init.cpp
 // and partially from csrc/cuda/Stream.cpp.
@@ -30,18 +30,18 @@ void THCPGraph_init(PyObject* module) {
       .def(
           "capture_begin",
           [](::at::cuda::CUDAGraph& self,
-             std::optional<c10::cuda::MempoolId_t> pool_opt,
+             std::optional<c10::hip::MempoolId_t> pool_opt,
              const std::string& capture_error_mode) {
-            cudaStreamCaptureMode capture_mode{};
-            c10::cuda::MempoolId_t pool = pool_opt.has_value()
+            hipStreamCaptureMode capture_mode{};
+            c10::hip::MempoolId_t pool = pool_opt.has_value()
                 ? pool_opt.value()
-                : c10::cuda::MempoolId_t{0, 0};
+                : c10::hip::MempoolId_t{0, 0};
             if (capture_error_mode == "global") {
-              capture_mode = cudaStreamCaptureModeGlobal;
+              capture_mode = hipStreamCaptureModeGlobal;
             } else if (capture_error_mode == "thread_local") {
-              capture_mode = cudaStreamCaptureModeThreadLocal;
+              capture_mode = hipStreamCaptureModeThreadLocal;
             } else if (capture_error_mode == "relaxed") {
-              capture_mode = cudaStreamCaptureModeRelaxed;
+              capture_mode = hipStreamCaptureModeRelaxed;
             } else {
               TORCH_CHECK(
                   false,

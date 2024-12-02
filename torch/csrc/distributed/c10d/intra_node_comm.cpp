@@ -3,7 +3,7 @@
 #include <torch/csrc/distributed/c10d/DMAConnectivity.hpp>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 
-// #include <cuda_runtime.h>
+// #include <hip/hip_runtime.h>
 
 namespace c10d::intra_node_comm {
 
@@ -136,7 +136,7 @@ bool IntraNodeComm::rendezvous() {
   }
 
   // NOLINTNEXTLINE(bugprone-signed-char-misuse)
-  deviceIdx_ = at::cuda::current_device();
+  deviceIdx_ = at::hip::current_device();
 
   // Exchange hostname and device bus ID
   struct DevInfo {

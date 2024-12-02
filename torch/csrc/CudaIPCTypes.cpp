@@ -1,5 +1,5 @@
 #include <ATen/MapAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/csrc/CudaIPCTypes.h>
 #include <atomic>
 #include <map>
@@ -168,23 +168,23 @@ CudaIPCSentData::CudaIPCSentData(
     // because the main thread may have queued extra work on the stream, which
     // this event will consequently wait for (uselessly).
     cuda_ipc_global_entities.sync_events_used_++;
-    C10_CUDA_CHECK(cudaEventCreateWithFlags(
+    C10_HIP_CHECK(hipEventCreateWithFlags(
         &event_,
-        cudaEventDisableTiming | cudaEventInterprocess |
-            cudaEventBlockingSync));
-    C10_CUDA_CHECK(cudaEventRecord(
-        event_, c10::cuda::getCurrentCUDAStream(device.index())));
+        hipEventDisableTiming | hipEventInterprocess |
+            hipEventBlockingSync));
+    C10_HIP_CHECK(hipEventRecord(
+        event_, c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device.index())));
     event_sync_required_ = true;
   } else {
-    auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device.index());
     at::cuda::stream_synchronize(stream);
     event_ = nullptr;
     event_sync_required_ = false;
   }
 #else
-  // cuIpcGetEventHandle with HIP is not supported, so we have to sync
+  // hipIpcGetEventHandle with HIP is not supported, so we have to sync
   // stream instead of passing event
-  auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device.index());
   at::cuda::stream_synchronize(stream);
   event_sync_required_ = false;
 #endif
@@ -195,8 +195,8 @@ CudaIPCSentData::~CudaIPCSentData() {
 #if !defined(USE_ROCM)
   try {
     if (event_sync_required_) {
-      at::cuda::CUDAGuard device_guard(device_.index());
-      C10_CUDA_CHECK(cudaEventDestroy(event_));
+      at::hip::HIPGuardMasqueradingAsCUDA device_guard(device_.index());
+      C10_HIP_CHECK(hipEventDestroy(event_));
       if (!CudaIPCGlobalEntities::alive) {
         return;
       }

@@ -36,6 +36,7 @@ def filtered_configs(
     n: int,
     k: int,
     configs: Sequence[Tuple[int, int, int, int, int]],
+    extra_args: Sequence[Optional[Dict[str, Any]]], 
     has_int8_tensor=False,
     scale=1,
     exclude=lambda m, n, k: False,
@@ -76,7 +77,8 @@ def filtered_configs(
         min_block_size_k,
     )
     used = set()
-    for block_m, block_n, block_k, num_stages, num_warps in configs:
+
+    for (block_m, block_n, block_k, num_stages, num_warps) in zip(configs, extra_args):
         # shrink configs for small sizes
         block_m = max(min(int(block_m * scale), m), min_block_size)
         block_n = max(min(int(block_n * scale), n), min_block_size)
@@ -87,40 +89,61 @@ def filtered_configs(
 
         # each warp computes 16x16 tile = 256
         num_warps = min(num_warps, block_m * block_n // 256)
+        
+        
+        if extra_config is not None:
+            group_m = extra_config.get("GROUP_M", 8)
+            if torch.version.hip:
+                waves_per_eu = extra_config("waves_per_eu", 0)
+        else:
+            group_m = 8  # Default for NV 
+        
         if torch.version.hip:
-            for matrix_instr_nonkdim in [0, 16]:
-                if matrix_instr_nonkdim != 0 and (
-                    block_m % matrix_instr_nonkdim != 0
-                    or block_n % matrix_instr_nonkdim != 0
-                ):
-                    #  block_m and block_n must be a multiple of matrix_instr_nonkdim
-                    continue
-                if (
-                    block_m,
-                    block_n,
-                    block_k,
-                    num_stages,
-                    num_warps,
-                    matrix_instr_nonkdim,
-                ) not in used:
-                    used.add(
-                        (
-                            block_m,
-                            block_n,
-                            block_k,
-                            num_stages,
-                            num_warps,
-                            matrix_instr_nonkdim,
-                        )
+            matrix_instr_nonkdim=16
+            kpack = 2 
+            if matrix_instr_nonkdim != 0 and (
+                block_m % matrix_instr_nonkdim != 0
+                or block_n % matrix_instr_nonkdim != 0
+            ):
+                #  block_m and block_n must be a multiple of matrix_instr_nonkdim
+                matrix_instr_non_kdim = 0
+                kpack = 1
+                continue
+            if (
+                block_m,
+                block_n,
+                block_k,
+                num_stages,
+                num_warps,
+                group_m
+                matrix_instr_nonkdim,
+                kpack,
+                waves_per_eu,
+            ) not in used:
+                used.add(
+                    (
+                        block_m,
+                        block_n,
+                        block_k,
+                        num_stages,
+                        num_warps,
+                        group_m,
+                        matrix_instr_nonkdim,
+                        kpack,
+                        waves_per_eu
                     )
-                    yield triton_config(
-                        BLOCK_M=block_m,
-                        BLOCK_N=block_n,
-                        BLOCK_K=block_k,
-                        num_stages=num_stages,
-                        num_warps=num_warps,
-                        matrix_instr_nonkdim=matrix_instr_nonkdim,
-                    )
+                )
+                yield triton_config(
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    num_stages=num_stages,
+                    num_warps=num_warps,
+                    GROUP_M=group_m
+                    matrix_instr_nonkdim=matrix_instr_nonkdim,
+                    kpack=kpack,
+                    waves_per_eu=waves_per_eu
+                )
         else:
             if (block_m, block_n, block_k, num_stages, num_warps, 0) not in used:
                 used.add((block_m, block_n, block_k, num_stages, num_warps, 0))
@@ -136,38 +159,98 @@ def filtered_configs(
 # List of dictionaries to store the kernel configs. Configs that evaluate to true
 # will be utilised on the target platform. The configs are as follows:
 # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
-mm_kernel_configs = (
-    [
-        {"config": (32, 32, 16, 1, 2), "cond": True},
-        {"config": (32, 32, 128, 2, 4), "cond": True},
-        {"config": (32, 64, 32, 5, 8), "cond": True},
-        {"config": (64, 32, 32, 5, 8), "cond": True},
-        {"config": (64, 32, 128, 5, 4), "cond": True},
-        {"config": (64, 64, 16, 2, 4), "cond": True},
-        {"config": (64, 64, 32, 2, 4), "cond": True},
-        {"config": (64, 64, 64, 3, 8), "cond": True},
-        {"config": (64, 64, 128, 5, 4), "cond": True},
-        {"config": (64, 128, 32, 3, 4), "cond": True},
-        {"config": (64, 128, 32, 4, 8), "cond": True},
-        {"config": (64, 128, 64, 3, 4), "cond": True},
-        {"config": (64, 128, 128, 4, 4), "cond": True},
-        {"config": (128, 64, 32, 3, 4), "cond": True},
-        {"config": (128, 64, 32, 4, 8), "cond": True},
-        {"config": (128, 128, 32, 2, 8), "cond": True},
-        {"config": (128, 128, 32, 3, 4), "cond": True},
-        {"config": (128, 128, 64, 3, 4), "cond": True},
-        {"config": (128, 128, 64, 5, 8), "cond": True},
-    ]
-    if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE"
-    else [
-        {"config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps), "cond": True}
-        for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
-            [16, 32, 64, 128, 256], repeat=3
+if torch.version.hip is None:
+    mm_kernel_configs = (
+        [
+            {"config": (32, 32, 16, 1, 2), "cond": True},
+            {"config": (32, 32, 128, 2, 4), "cond": True},
+            {"config": (32, 64, 32, 5, 8), "cond": True},
+            {"config": (64, 32, 32, 5, 8), "cond": True},
+            {"config": (64, 32, 128, 5, 4), "cond": True},
+            {"config": (64, 64, 16, 2, 4), "cond": True},
+            {"config": (64, 64, 32, 2, 4), "cond": True},
+            {"config": (64, 64, 64, 3, 8), "cond": True},
+            {"config": (64, 64, 128, 5, 4), "cond": True},
+            {"config": (64, 128, 32, 3, 4), "cond": True},
+            {"config": (64, 128, 32, 4, 8), "cond": True},
+            {"config": (64, 128, 64, 3, 4), "cond": True},
+            {"config": (64, 128, 128, 4, 4), "cond": True},
+            {"config": (128, 64, 32, 3, 4), "cond": True},
+            {"config": (128, 64, 32, 4, 8), "cond": True},
+            {"config": (128, 128, 32, 2, 8), "cond": True},
+            {"config": (128, 128, 32, 3, 4), "cond": True},
+            {"config": (128, 128, 64, 3, 4), "cond": True},
+            {"config": (128, 128, 64, 5, 8), "cond": True},
+        ]
+        if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE"
+        else [
+            {"config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)}
+            for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
+                [16, 32, 64, 128, 256], repeat=3
+            )
+            for num_stages in [1, 2, 3, 4, 5]
+            for num_warps in [2, 4, 8]
+        ]
+    )
+
+else:
+    rocm_num_stages = get_backend_num_stages()
+    if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE":
+        mm_kernel_configs = (
+            [
+                {"config": (128, 128, 32, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 128, 32, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 2, "cond": True},
+                {"config": (128, 128, 32, 8, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 128, 32, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 2, "cond": True},
+                {"config": (128, 128, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 128, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 2, "cond": True},
+                {"config": (128, 128, 64, 8, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 128, 64, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 2, "cond": True},
+                {"config": (128, 128, 64, 8, rocm_num_stages), "GROUP_M": 4, "wpeu": 0, "cond": True},
+                {"config": (128, 128, 64, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (128, 128, 64, 8, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (128, 256, 32, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 2, "cond": True},
+                {"config": (128, 64, 16, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 64, 32, 8, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 64, 32, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (128, 64, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (128, 64, 64, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 0, "cond": True},
+                {"config": (128, 64, 64, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (128, 64, 64, 8, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (16, 16, 256, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 2, "cond": True},
+                {"config": (16, 16, 256, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (256, 128, 32, 8, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (256, 128, 32, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 2, "cond": True},
+                {"config": (32, 16, 256, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 0, "cond": True},
+                {"config": (32, 32, 128, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (32, 64, 128, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (32, 64, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (32, 64, 64, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (64, 128, 32, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (64, 128, 32, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 2, "cond": True},
+                {"config": (64, 128, 32, 8, rocm_num_stages), "GROUP_M": 4, "wpeu": 0, "cond": True},
+                {"config": (64, 128, 32, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (64, 128, 32, 8, rocm_num_stages), "GROUP_M": 8, "wpeu": 0, "cond": True},
+                {"config": (64, 128, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 2, "cond": True},
+                {"config": (64, 16, 128, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 2, "cond": True},
+                {"config": (64, 16, 128, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (64, 16, 64, 4, rocm_num_stages), "GROUP_M": 8, "wpeu": 2, "cond": True},
+                {"config": (64, 64, 64, 4, rocm_num_stages), "GROUP_M": 16, "wpeu": 0, "cond": True},
+                {"config": (64, 64, 64, 4, rocm_num_stages), "GROUP_M": 4, "wpeu": 0, "cond": True},
+            ]
         )
-        for num_stages in [1, 2, 3, 4, 5]
-        for num_warps in [2, 4, 8]
-    ]
-)
+        if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE"
+        else [
+            {"config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)}
+            for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
+                [16, 32, 64, 128, 256], repeat=3
+            )
+            for num_stages in [2]
+            for num_warps in [4, 8]
+            for waves_per_eu in [0, 2]
+            for GROUP_M in [4, 8, 16]
+        ]
+
 
 # these are only used in tuned_mm when AutoHeuristic is enabled
 # the idea is that when AutoHeuristic collects data to learn a heuristic, more configs are autotuned
@@ -316,65 +399,51 @@ scaled_mm_kernel_configs = [
     {"config": (32, 256, 64, 6, 4), "cond": True},
 ]
 
-
 # Create filtered list of configs based on cond evaluation
-mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in mm_kernel_configs
-    if config["cond"]
-)
-extra_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in extra_mm_kernel_configs
-    if config["cond"]
-)
-int8_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in int8_mm_kernel_configs
-    if config["cond"]
-)
-mixed_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in mixed_mm_kernel_configs
-    if config["cond"]
-)
-scaled_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in scaled_mm_kernel_configs
-    if config["cond"]
-)
+# and parse other params as extra_args
+mm_platform_configs, mm_args = extract_configs(mm_kernel_configs)
+extra_mm_platform_configs, extra_mm_args = extract_configs(mm_kernel_configs)
+int8_mm_platform_configs, int8_mm_args = extract_configs(mm_kernel_configs)
+mixed_mm_platform_configs, mixed_mm_args = extract_configs(mm_kernel_configs)
+scaled_mm_platform_configs, scaled_mm_args = extract_configs(mm_kernel_configs)
 
 # On ROCm convert num_stages to improve performance
+# This can be removed when ROCm specific implementations introduced
 if torch.version.hip:
-    mm_platform_configs = build_rocm_gemm_configs(mm_platform_configs)
-    extra_mm_platform_configs = build_rocm_gemm_configs(extra_mm_platform_configs)
-    int8_platform_configs = build_rocm_gemm_configs(int8_platform_configs)
-    mixed_mm_platform_configs = build_rocm_gemm_configs(mixed_mm_platform_configs)
-    scaled_mm_platform_configs = build_rocm_gemm_configs(scaled_mm_platform_configs)
+    extra_mm_configs = build_rocm_gemm_configs(extra_mm_platform_configs)
+    int8_configs = build_rocm_gemm_configs(int8_platform_configs)
+    mixed_mm_configs = build_rocm_gemm_configs(mixed_mm_platform_configs)
+    scaled_mm_configs = build_rocm_gemm_configs(scaled_mm_platform_configs)
 
 mm_configs = functools.partial(
     filtered_configs,
     configs=mm_platform_configs,
+    extra_args=mm_args,
 )
 
 extra_mm_configs = functools.partial(
     filtered_configs,
     configs=extra_mm_platform_configs,
+    extra_args=extra_mm_args,
 )
 
 int8_mm_configs = functools.partial(
     filtered_configs,
     configs=int8_platform_configs,
+    extra_args=int8_mm_args,
+
 )
 
 mixed_mm_configs = functools.partial(
     filtered_configs,
     configs=mixed_mm_platform_configs,
+    extra_args=mixed_mm_args,
 )
 
 scaled_mm_configs = functools.partial(
     filtered_configs,
     configs=scaled_mm_platform_configs,
+    extra_args=scaled_mm_args,
 )
 
 
@@ -405,7 +474,6 @@ def mm_options(config, sym_m, sym_n, sym_k, layout, b_prologue_cast_type=None):
         or ((sym_m % 16) == 0 and (sym_n % 16) == 0 and (sym_k % 8) == 0)
     )
     return dict(
-        GROUP_M=8,
         EVEN_K=even_k_symbolic,
         ALLOW_TF32=allow_tf32,
         ACC_TYPE=acc_type(layout.dtype),
@@ -468,6 +536,29 @@ def addmm_epilogue(dtype, alpha, beta):
 
     return epilogue
 
+def _extract_configs(
+    configs: List[Dict[str, Any]]
+) -> Tuple[List[Tuple[int, int, int, int, int]], List[Optional[Dict[str, Any]]]]:
+    """
+    Extracts platform configs and additional arguments if present, filtering by "cond".
+
+    Args:
+        configs (List[Dict[str, Any]]): List of configuration dictionaries. Each dictionary must have a "config" key
+                                         and an optional "cond" key.
+
+    Returns:
+        Tuple[List[Tuple[int, int, int, int, int]], List[Optional[Dict[str, Any]]]]:
+            A tuple containing two lists:
+              - base_configs: List of base configurations as tuples.
+              - extra_args: List of extra arguments (or None if no extra args exist).
+    """
+    base_configs = []
+    extra_args = []
+    for config in configs:
+        if config.get("cond", False):
+            base_configs.append(cast(Tuple[int, int, int, int, int], config["config"]))
+            extra_args.append({k: v for k, v in config.items() if k not in {"config", "cond"}} or None)
+    return base_configs, extra_args
 
 def _is_static_problem(layout: Layout) -> Tuple[bool, bool]:
     """
@@ -498,3 +589,4 @@ def _is_static_problem(layout: Layout) -> Tuple[bool, bool]:
         numel *= dim
     nonzero = numel > 0
     return static_shape, nonzero
+

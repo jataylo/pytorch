@@ -18,14 +18,14 @@ AOTIModelContainerRunnerCuda::~AOTIModelContainerRunnerCuda() = default;
 
 std::vector<at::Tensor> AOTIModelContainerRunnerCuda::run(
     const std::vector<at::Tensor>& inputs) {
-  at::cuda::CUDAStream cuda_stream = c10::cuda::getCurrentCUDAStream();
+  at::hip::HIPStreamMasqueradingAsCUDA cuda_stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA();
   return AOTIModelContainerRunner::run(
       inputs, reinterpret_cast<AOTInductorStreamHandle>(cuda_stream.stream()));
 }
 
 std::vector<at::Tensor> AOTIModelContainerRunnerCuda::run_with_cuda_stream(
     const std::vector<at::Tensor>& inputs,
-    at::cuda::CUDAStream cuda_stream) {
+    at::hip::HIPStreamMasqueradingAsCUDA cuda_stream) {
   return AOTIModelContainerRunner::run(
       inputs, reinterpret_cast<AOTInductorStreamHandle>(cuda_stream.stream()));
 }

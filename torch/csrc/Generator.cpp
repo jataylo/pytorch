@@ -17,8 +17,8 @@
 
 #include <utility>
 
-#ifdef USE_CUDA
-#include <ATen/cuda/CUDAGeneratorImpl.h>
+#ifdef USE_ROCM
+#include <ATen/hip/HIPGeneratorImpl.h>
 #endif
 
 #ifdef USE_MPS
@@ -63,7 +63,7 @@ static PyObject* THPGenerator_pynew(
   if (device.type() == at::kCPU) {
     self->cdata = make_generator<CPUGeneratorImpl>();
   }
-#ifdef USE_CUDA
+#ifdef USE_ROCM
   else if (device.type() == at::kCUDA) {
     self->cdata = make_generator<CUDAGeneratorImpl>(device.index());
   }

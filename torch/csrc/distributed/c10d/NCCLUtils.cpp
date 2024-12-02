@@ -57,7 +57,7 @@ std::shared_ptr<NCCLComm> NCCLComm::split(
   LOG(INFO) << "Rank " << source->rank_ << ": split from parent comm "
             << source->repr() << " with color_id " << color_id << " and rank "
             << rank;
-  at::cuda::OptionalCUDAGuard gpuGuard(source->deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(source->deviceIndex_);
   auto comm = std::make_shared<NCCLComm>();
   // This call will block until the source communicator is initialized
   auto sourceComm = source->getNcclComm();
@@ -148,7 +148,7 @@ size_t hashTensors(const std::vector<at::Tensor>& tensors) {
         std::vector<char> dst(data_size);
         // This is needed so that we trigger a device synchronization so we can
         // get the collective finished if launched on GPU and hash its output.
-        cudaMemcpy(dst.data(), src, data_size, cudaMemcpyDeviceToHost);
+        hipMemcpy(dst.data(), src, data_size, hipMemcpyDeviceToHost);
         for (size_t i = 0; i < data_size; ++i) {
           // Update the hash for each byte in the tensor
           hash = c10::hash_combine(hash, c10::get_hash(dst[i], data_size));

@@ -1,8 +1,8 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/ATenCUDAGeneral.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/ATenHIPGeneral.h>
+#include <ATen/hip/HIPContext.h>
 #include <torch/csrc/Export.h>
 #include <optional>
 
@@ -28,7 +28,7 @@ TORCH_CUDA_CU_API std::vector<at::Tensor>& scatter_out(
     const at::Tensor& tensor,
     std::vector<at::Tensor>& out_tensors,
     int64_t dim = 0,
-    const std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>&
+    const std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>&
         streams = std::nullopt);
 
 TORCH_CUDA_CU_API std::vector<at::Tensor> scatter(
@@ -36,7 +36,7 @@ TORCH_CUDA_CU_API std::vector<at::Tensor> scatter(
     at::IntArrayRef devices,
     const std::optional<std::vector<int64_t>>& chunk_sizes = std::nullopt,
     int64_t dim = 0,
-    const std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>&
+    const std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>&
         streams = std::nullopt);
 
 TORCH_CUDA_CU_API at::Tensor& gather_out(

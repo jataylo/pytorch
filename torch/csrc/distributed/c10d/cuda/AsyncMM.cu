@@ -1,12 +1,12 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/nvrtc_stub/ATenNVRTC.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#if !defined(USE_ROCM) && !defined(_WIN32) && defined(CUDA_VERSION) && \
-    CUDA_VERSION >= 12000
+#if !defined(USE_ROCM) && !defined(_WIN32) && defined(TORCH_HIP_VERSION) && \
+    TORCH_HIP_VERSION >= 12000
 #define BUILD_ASYNC_MM_KERNEL
 #endif
 
@@ -14,7 +14,7 @@
 
 // We are going to override the cuTensorMapEncodeTiled driver api with our lazy
 // loader
-static CUresult CUDAAPI nvrtc_cuTensorMapEncodeTiled(
+static hipError_t CUDAAPI nvrtc_cuTensorMapEncodeTiled(
     CUtensorMap* tensorMap,
     CUtensorMapDataType tensorDataType,
     cuuint32_t tensorRank,
@@ -80,7 +80,7 @@ at::Tensor async_input_mm_impl(
     at::Tensor a_chunk_signals,
     int64_t a_chunk_pivot,
     at::Tensor out) {
-  c10::cuda::CUDAGuard guard(a.device());
+  c10::hip::HIPGuardMasqueradingAsCUDA guard(a.device());
 
   using ElementA = cutlass::bfloat16_t;
   using LayoutA = cutlass::layout::RowMajor;
@@ -219,9 +219,9 @@ at::Tensor async_input_mm_impl(
   TORCH_CHECK(
       gemm.initialize(arguments, workspace.get()) == cutlass::Status::kSuccess);
   TORCH_CHECK(
-      gemm(at::cuda::getCurrentCUDAStream()) == cutlass::Status::kSuccess);
+      gemm(at::hip::getCurrentHIPStreamMasqueradingAsCUDA()) == cutlass::Status::kSuccess);
 
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
   return out;
 }
 

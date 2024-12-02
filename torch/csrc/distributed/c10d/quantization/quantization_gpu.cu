@@ -1,4 +1,5 @@
-#include <c10/cuda/CUDAGuard.h>
+#include "hip/hip_runtime.h"
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/csrc/distributed/c10d/Utils.hpp>
 #include <torch/csrc/distributed/c10d/quantization/quantization_gpu.h>
 #include <torch/csrc/distributed/c10d/quantization/quantization_utils.h>
@@ -57,7 +58,7 @@ at::Tensor _float_to_bfloat16_cuda(const at::Tensor& input) {
   // Currently it supports 2D inputs
   TENSOR_NDIM_EQUALS(input, 2);
 
-  at::cuda::OptionalCUDAGuard device_guard;
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard;
   device_guard.set_index(input.get_device());
 
   const auto nrows = input.size(0);
@@ -77,18 +78,18 @@ at::Tensor _float_to_bfloat16_cuda(const at::Tensor& input) {
   }
 
   constexpr size_t threads_per_block = 256;
-  const auto blockDim_x = std::min(output_columns, threads_per_block);
+  const auto blockDim_x = ::min(output_columns, threads_per_block);
   dim3 blockDim(blockDim_x, threads_per_block / blockDim_x);
   const auto gridDim_x = (output_columns + blockDim.x - 1) / blockDim.x;
   const auto gridDim_y =
       std::min<size_t>((nrows + blockDim.y - 1) / blockDim.y, 65535u);
   dim3 gridDim(gridDim_x, gridDim_y);
 
-  _float_to_bfloat16_cuda_kernel<<<
-      gridDim,
-      blockDim,
+ hipLaunchKernelGGL(( _float_to_bfloat16_cuda_kernel), 
+      dim3(gridDim),
+      dim3(blockDim),
       0,
-      at::cuda::getCurrentCUDAStream()>>>(
+      at::hip::getCurrentHIPStreamMasqueradingAsCUDA(), 
       input.const_data_ptr<float>(),
       nrows,
       ncols,
@@ -98,7 +99,7 @@ at::Tensor _float_to_bfloat16_cuda(const at::Tensor& input) {
       reinterpret_cast<uint16_t*>(output.mutable_data_ptr<at::Half>())
 #endif
       );
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
 
   return output;
 }
@@ -108,7 +109,7 @@ at::Tensor _bfloat16_to_float_cuda(const at::Tensor& input) {
   // Currently it supports 2D inputs
   TENSOR_NDIM_EQUALS(input, 2);
 
-  at::cuda::OptionalCUDAGuard device_guard;
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard;
   device_guard.set_index(input.get_device());
 
   const auto nrows = input.size(0);
@@ -125,18 +126,18 @@ at::Tensor _bfloat16_to_float_cuda(const at::Tensor& input) {
 
   constexpr size_t threads_per_block = 256;
 
-  const auto blockDim_x = std::min(output_columns, threads_per_block);
+  const auto blockDim_x = ::min(output_columns, threads_per_block);
   dim3 blockDim(blockDim_x, threads_per_block / blockDim_x);
   const auto gridDim_x = (output_columns + blockDim.x - 1) / blockDim.x;
   const auto gridDim_y =
       std::min<size_t>((nrows + blockDim.y - 1) / blockDim.y, 65535u);
   dim3 gridDim(gridDim_x, gridDim_y);
 
-  _bfloat16_to_float_cuda_kernel<<<
-      gridDim,
-      blockDim,
+ hipLaunchKernelGGL(( _bfloat16_to_float_cuda_kernel), 
+      dim3(gridDim),
+      dim3(blockDim),
       0,
-      at::cuda::getCurrentCUDAStream()>>>(
+      at::hip::getCurrentHIPStreamMasqueradingAsCUDA(), 
 #if HAS_NCCL_BF16_DATATYPE
       reinterpret_cast<const uint16_t*>(input.const_data_ptr<at::BFloat16>()),
 #else
@@ -145,7 +146,7 @@ at::Tensor _bfloat16_to_float_cuda(const at::Tensor& input) {
       nrows,
       ncols,
       output.mutable_data_ptr<float>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
 
   return output;
 }

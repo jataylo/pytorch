@@ -234,7 +234,7 @@ std::shared_ptr<SugaredValue> CUDAPythonModuleValue::attr(
       "synchronize"};
 
   if (cuda_ops.find(field) != cuda_ops.end()) {
-    // Both current_device and set_device API's are a part of c10::cuda
+    // Both current_device and set_device API's are a part of c10::hip
     // namespace. Hence, to resolve the conflict for jit, we append _ to both
     // these APIs.
     if (field == "current_device" || field == "set_device") {

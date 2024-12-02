@@ -18,18 +18,18 @@ void _device_synchronize(int64_t device_index) {
   // This is a helper API which synchronizes the device identified
   // by the device index. The device index of the device is passed as an
   // argument to this API.
-  auto current_device_index = c10::cuda::current_device();
+  auto current_device_index = c10::hip::current_device();
   // If the current_device and the device to synchronize are not
   // the same, set the device to the device_index of the device
   // to synchronize.
   if (current_device_index != device_index) {
-    c10::cuda::set_device(device_index);
+    c10::hip::set_device(device_index);
   }
-  c10::cuda::device_synchronize();
+  c10::hip::device_synchronize();
 
   // Reset the device to current_device before synchronizing.
   if (current_device_index != device_index) {
-    c10::cuda::set_device(current_device_index);
+    c10::hip::set_device(current_device_index);
   }
 }
 
@@ -40,9 +40,9 @@ RegisterOperators const reg({
           auto device = pop(stack).toOptional<c10::Device>();
           c10::DeviceIndex device_index = device.has_value()
               ? device->index()
-              : c10::cuda::current_device();
-          auto s = c10::cuda::getCurrentCUDAStream(device_index);
-          auto st = make_custom_class<torch::jit::CUDAStream>(s);
+              : c10::hip::current_device();
+          auto s = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device_index);
+          auto st = make_custom_class<torch::jit::HIPStreamMasqueradingAsCUDA>(s);
           push(stack, IValue(st));
         },
         aliasAnalysisFromSchema()),
@@ -51,9 +51,9 @@ RegisterOperators const reg({
         [](Stack& stack) {
           auto idx = pop(stack).toOptional<c10::DeviceIndex>();
           c10::DeviceIndex device_index =
-              idx.has_value() ? idx.value() : c10::cuda::current_device();
-          auto s = c10::cuda::getCurrentCUDAStream(device_index);
-          auto st = make_custom_class<torch::jit::CUDAStream>(s);
+              idx.has_value() ? idx.value() : c10::hip::current_device();
+          auto s = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device_index);
+          auto st = make_custom_class<torch::jit::HIPStreamMasqueradingAsCUDA>(s);
           push(stack, IValue(st));
         },
         aliasAnalysisFromSchema()),
@@ -63,9 +63,9 @@ RegisterOperators const reg({
           auto device = pop(stack).toOptional<c10::Device>();
           c10::DeviceIndex device_index = device.has_value()
               ? device->index()
-              : c10::cuda::current_device();
-          auto s = c10::cuda::getDefaultCUDAStream(device_index);
-          auto st = make_custom_class<torch::jit::CUDAStream>(s);
+              : c10::hip::current_device();
+          auto s = c10::hip::getDefaultHIPStreamMasqueradingAsCUDA(device_index);
+          auto st = make_custom_class<torch::jit::HIPStreamMasqueradingAsCUDA>(s);
           push(stack, IValue(st));
         },
         aliasAnalysisFromSchema()),
@@ -74,16 +74,16 @@ RegisterOperators const reg({
         [](Stack& stack) {
           auto idx = pop(stack).toOptional<c10::DeviceIndex>();
           c10::DeviceIndex device_index =
-              idx.has_value() ? idx.value() : c10::cuda::current_device();
-          auto s = c10::cuda::getDefaultCUDAStream(device_index);
-          auto st = make_custom_class<torch::jit::CUDAStream>(s);
+              idx.has_value() ? idx.value() : c10::hip::current_device();
+          auto s = c10::hip::getDefaultHIPStreamMasqueradingAsCUDA(device_index);
+          auto st = make_custom_class<torch::jit::HIPStreamMasqueradingAsCUDA>(s);
           push(stack, IValue(st));
         },
         aliasAnalysisFromSchema()),
     Operator(
         "cuda::_current_device() -> int",
         [](Stack& stack) {
-          auto v = c10::cuda::current_device();
+          auto v = c10::hip::current_device();
           push(stack, static_cast<int>(v));
         },
         aliasAnalysisFromSchema()),
@@ -96,11 +96,11 @@ RegisterOperators const reg({
             push(stack, -1);
             return;
           }
-          auto prev_idx = c10::cuda::current_device();
-          c10::cuda::set_device(static_cast<c10::DeviceIndex>(idx));
+          auto prev_idx = c10::hip::current_device();
+          c10::hip::set_device(static_cast<c10::DeviceIndex>(idx));
           push(stack, static_cast<int>(prev_idx));
         },
-        // cuda::set_device has side effects.
+        // hip::set_device has side effects.
         c10::AliasAnalysisKind::CONSERVATIVE),
     Operator(
         "cuda::_maybe_exchange_device(int64_t index) -> int",
@@ -111,7 +111,7 @@ RegisterOperators const reg({
             push(stack, -1);
             return;
           }
-          int prev_idx = c10::cuda::MaybeExchangeDevice(static_cast<int>(idx));
+          int prev_idx = c10::hip::MaybeExchangeDevice(static_cast<int>(idx));
           push(stack, prev_idx);
         },
         c10::AliasAnalysisKind::CONSERVATIVE),
@@ -120,7 +120,7 @@ RegisterOperators const reg({
         [](Stack& stack) {
           int64_t idx = -1;
           pop(stack, idx);
-          c10::cuda::set_device(static_cast<c10::DeviceIndex>(idx));
+          c10::hip::set_device(static_cast<c10::DeviceIndex>(idx));
         },
         aliasAnalysisFromSchema()),
     Operator(
@@ -139,30 +139,30 @@ RegisterOperators const reg({
         "cuda::set_stream(__torch__.torch.classes.cuda.Stream stream) -> ()",
         [](Stack& stack) {
           auto v = pop(stack);
-          auto s = v.toCustomClass<torch::jit::CUDAStream>();
+          auto s = v.toCustomClass<torch::jit::HIPStreamMasqueradingAsCUDA>();
           auto stream_device_idx = s->device_index();
-          auto cur_device_idx = c10::cuda::current_device();
+          auto cur_device_idx = c10::hip::current_device();
           // If the stream is not on the current device, change the
           // device to the device of the stream.
           if (cur_device_idx != stream_device_idx) {
-            c10::cuda::set_device(stream_device_idx);
+            c10::hip::set_device(stream_device_idx);
           }
           // To set the current CUDA stream using
-          // c10::cuda::setCurrentCUDAStream, the jit::CUDAStream object needs
-          // to be converted to c10::cuda::CUDAStream. Since the latter cannot
+          // c10::hip::setCurrentHIPStreamMasqueradingAsCUDA, the jit::HIPStreamMasqueradingAsCUDA object needs
+          // to be converted to c10::hip::HIPStreamMasqueradingAsCUDA. Since the latter cannot
           // be returned from a class registered via TorchBind, this can only be
-          // achieved by packing the c10::cuda::CUDAStream instance contained
-          // inside the jit::CUDAStream object to a struct representation, and
+          // achieved by packing the c10::hip::HIPStreamMasqueradingAsCUDA instance contained
+          // inside the jit::HIPStreamMasqueradingAsCUDA object to a struct representation, and
           // unpacking it inside this operator. The unpacked stream is then used
           // to set the current CUDA stream.
-          auto unpacked = c10::cuda::CUDAStream::unpack3(
+          auto unpacked = c10::hip::HIPStreamMasqueradingAsCUDA::unpack3(
               s->id(), stream_device_idx, c10::DeviceType::CUDA);
-          c10::cuda::setCurrentCUDAStream(unpacked);
+          c10::hip::setCurrentHIPStreamMasqueradingAsCUDA(unpacked);
         },
         aliasAnalysisFromSchema()),
     Operator(
         "cuda::synchronize() -> ()",
-        [](Stack& stack) { c10::cuda::device_synchronize(); },
+        [](Stack& stack) { c10::hip::device_synchronize(); },
         aliasAnalysisFromSchema()),
     Operator(
         "cuda::synchronize.device(Device? device) -> ()",
@@ -170,7 +170,7 @@ RegisterOperators const reg({
           auto device = pop(stack).toOptional<c10::Device>();
           c10::DeviceIndex device_index = device.has_value()
               ? device->index()
-              : c10::cuda::current_device();
+              : c10::hip::current_device();
           _device_synchronize(device_index);
         },
         aliasAnalysisFromSchema()),
@@ -179,7 +179,7 @@ RegisterOperators const reg({
         [](Stack& stack) {
           auto idx = pop(stack).toOptional<c10::DeviceIndex>();
           c10::DeviceIndex device_index =
-              idx.has_value() ? idx.value() : c10::cuda::current_device();
+              idx.has_value() ? idx.value() : c10::hip::current_device();
           _device_synchronize(device_index);
         },
         aliasAnalysisFromSchema()),

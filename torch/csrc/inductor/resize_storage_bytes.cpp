@@ -3,8 +3,8 @@
 #include <ATen/FunctionalTensorWrapper.h>
 #include <ATen/native/Resize.h>
 
-#ifdef USE_CUDA
-#include <ATen/native/cuda/Resize.h>
+#ifdef USE_ROCM
+#include <ATen/native/hip/Resize.h>
 #endif
 
 namespace torch::inductor {
@@ -15,7 +15,7 @@ static void resize_storage_bytes_(const Tensor& variable, SymInt new_size) {
   // similar to THPStorage_resize_ in StorageMethods.cpp, but is traceable
   if (variable.storage().device_type() == at::kCUDA) {
     // rocm build has undefined reference to resize_bytes_cuda
-#if defined(USE_CUDA) && !defined(USE_ROCM)
+#if defined(USE_ROCM) && !defined(USE_ROCM)
     at::native::resize_bytes_cuda(
         variable.storage().unsafeGetStorageImpl(), new_size.expect_int());
 #else

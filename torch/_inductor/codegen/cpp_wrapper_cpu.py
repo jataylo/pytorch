@@ -527,7 +527,7 @@ class CppWrapperCpu(PythonWrapperCodegen):
             )
         for kernel in sorted(declare_kernel):
             self.prefix.writeline(
-                maybe_hipify_code_wrapper(f"    CUfunction {kernel}{{nullptr}};")
+                maybe_hipify_code_wrapper(f"    hipFunction_t {kernel}{{nullptr}};")
             )
         for name, kernel in self.initialized_kernels.items():
             assert hasattr(

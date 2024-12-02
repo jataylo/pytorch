@@ -7,8 +7,8 @@
 #include <torch/csrc/jit/passes/graph_rewrite_helper.h>
 #include <torch/csrc/jit/passes/remove_mutation.h>
 #include <torch/csrc/jit/passes/subgraph_rewrite.h>
-#ifdef USE_CUDA
-#include <ATen/cuda/CUDAConfig.h>
+#ifdef USE_ROCM
+#include <ATen/hip/HIPConfig.h>
 #endif
 
 namespace torch::jit {

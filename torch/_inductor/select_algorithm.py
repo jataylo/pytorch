@@ -341,8 +341,15 @@ class TritonTemplateKernel(TritonKernel):
         for arg_num in triton_meta["configs"][0].equal_to_1:  # type: ignore[index]
             triton_meta["constants"][signature[arg_num].name] = 1  # type: ignore[index]
         matrix_instr_nonkdim = self.meta.get("matrix_instr_nonkdim", 0)
+        waves_per_eu = self.meta.get("waves_per_eu", 0)
+        kpack = self.meta.get("kpack", 1)
+
         if matrix_instr_nonkdim != 0:
             triton_meta["matrix_instr_nonkdim"] = matrix_instr_nonkdim
+        if waves_per_eu != 0:
+            triton_meta["waves_per_eu"] = waves_per_eu
+        if kpack != 0:
+            triton_meta["kpack"] = kpack
 
         self.triton_meta = triton_meta
 
@@ -896,6 +903,8 @@ class TritonTemplate(KernelTemplate):
             num_stages=num_stages,
             num_warps=num_warps,
             matrix_instr_nonkdim=kwargs.get("matrix_instr_nonkdim", 0),
+            waves_per_eu=kwargs.get("waves_per_eu", 0),
+            kpack=kwargs.get("kpack", 1),
             input_tensor_meta=TensorMeta.from_irnodes(full_input_nodes),  # type: ignore[arg-type]
             output_tensor_meta=TensorMeta.from_irnodes(layout),
             workspace_arg=workspace_arg,
@@ -918,6 +927,7 @@ class TritonTemplate(KernelTemplate):
                 ),
                 "num_stages": num_stages,
                 "num_warps": num_warps,
+                "GROUP_M": kwargs.get("GROUP_M", -1)
                 "allow_tf32": str(kwargs.get("ALLOW_TF32", None)),
                 "acc_type": str(kwargs.get("ACC_TYPE", None)),
             },
@@ -1010,6 +1020,9 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
                 "grid": str(self.bmreq.grid),
                 "num_stages": self.bmreq.num_stages,
                 "num_warps": self.bmreq.num_warps,
+                "matrix_instr_nonkdim": self.bmreq.matrix_instr_nonkdim,
+                "waves_per_eu": self.bmreq.waves_per_eu,
+                "kpack": self.bmreq.kpack,
             }
         )
         self.mutated_inputs = mutated_inputs

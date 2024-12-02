@@ -42,18 +42,18 @@ extern uint8_t _binary_constants_bin_end[];
 
 namespace {
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
 
 using CUDAPtr = std::unique_ptr<void, std::function<void(void*)>>;
 
 CUDAPtr RAII_cudaMalloc(size_t num_bytes) {
   void* data_ptr;
-  AOTI_RUNTIME_DEVICE_CHECK(cudaMalloc((void**)&data_ptr, num_bytes));
-  auto deleter = [](void* ptr) { AOTI_RUNTIME_DEVICE_CHECK(cudaFree(ptr)); };
+  AOTI_RUNTIME_DEVICE_CHECK(hipMalloc((void**)&data_ptr, num_bytes));
+  auto deleter = [](void* ptr) { AOTI_RUNTIME_DEVICE_CHECK(hipFree(ptr)); };
   return CUDAPtr(data_ptr, deleter);
 }
 
-#endif // USE_CUDA
+#endif // USE_ROCM
 
 } // anonymous namespace
 
@@ -114,27 +114,27 @@ class AOTInductorModelBase {
         cubin_dir_(std::move(cubin_dir)) {
     parse_device_str(device_str, device_type_, device_idx_);
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (device_idx_ == -1) {
-      AOTI_RUNTIME_DEVICE_CHECK(cudaGetDevice(&device_idx_));
+      AOTI_RUNTIME_DEVICE_CHECK(hipGetDevice(&device_idx_));
     } else {
       // If device_idx_ is passed in, we need to set the current device to it
-      AOTI_RUNTIME_DEVICE_CHECK(cudaSetDevice(device_idx_));
+      AOTI_RUNTIME_DEVICE_CHECK(hipSetDevice(device_idx_));
     }
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   // NOLINTNEXTLINE(modernize-use-equals-default)
   ~AOTInductorModelBase() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (run_finished_) {
-      auto code = cudaEventDestroy(*run_finished_);
-      if (code != cudaSuccess) {
+      auto code = hipEventDestroy(*run_finished_);
+      if (code != hipSuccess) {
         std::cerr << "Failed to destroy CUDA event in AOTInductor model: "
-                  << cudaGetErrorString(code) << std::endl;
+                  << hipGetErrorString(code) << std::endl;
       }
     }
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   AOTInductorModelBase(AOTInductorModelBase&&) = delete;
@@ -152,47 +152,47 @@ class AOTInductorModelBase {
                           // borrowed
       DeviceStreamType stream,
       AOTIProxyExecutorHandle proxy_executor) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
-      cudaEvent_t run_finished;
-      AOTI_RUNTIME_DEVICE_CHECK(cudaEventCreate(&run_finished));
+      hipEvent_t run_finished;
+      AOTI_RUNTIME_DEVICE_CHECK(hipEventCreate(&run_finished));
       run_finished_.emplace(run_finished);
     }
 
     auto* model = static_cast<Model*>(this);
     model->run_impl(input_handles, output_handles, stream, proxy_executor);
-    AOTI_RUNTIME_DEVICE_CHECK(cudaEventRecord(*run_finished_, stream));
-#else // !USE_CUDA
+    AOTI_RUNTIME_DEVICE_CHECK(hipEventRecord(*run_finished_, stream));
+#else // !USE_ROCM
     run_finished_ = false;
     auto* model = static_cast<Model*>(this);
     model->run_impl(input_handles, output_handles, stream, proxy_executor);
     run_finished_ = true;
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   std::unordered_map<std::string, AtenTensorHandle> run_const_fold(
       DeviceStreamType stream,
       AOTIProxyExecutorHandle proxy_executor,
       bool initialization = false) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
-      cudaEvent_t run_finished;
-      AOTI_RUNTIME_DEVICE_CHECK(cudaEventCreate(&run_finished));
+      hipEvent_t run_finished;
+      AOTI_RUNTIME_DEVICE_CHECK(hipEventCreate(&run_finished));
       run_finished_.emplace(run_finished);
     }
-#else // USE_CUDA
+#else // USE_ROCM
     run_finished_ = false;
-#endif // USE_CUDA
+#endif // USE_ROCM
 
     auto* model = static_cast<Model*>(this);
     auto folded_constants =
         model->const_run_impl(stream, proxy_executor, initialization);
 
-#ifdef USE_CUDA
-    AOTI_RUNTIME_DEVICE_CHECK(cudaEventRecord(*run_finished_, stream));
-#else // USE_CUDA
+#ifdef USE_ROCM
+    AOTI_RUNTIME_DEVICE_CHECK(hipEventRecord(*run_finished_, stream));
+#else // USE_ROCM
     run_finished_ = true;
-#endif // USE_CUDA
+#endif // USE_ROCM
 
     return folded_constants;
   }
@@ -205,7 +205,7 @@ class AOTInductorModelBase {
     if (device_type_ != aoti_torch_device_type_cpu()) {
       size_t blob_size = 0;
       compute_cuda_constant_blob(blob_size, constants_internal_offset);
-#ifdef USE_CUDA
+#ifdef USE_ROCM
       constant_blob_ = RAII_cudaMalloc(blob_size);
 #endif
     }
@@ -213,12 +213,12 @@ class AOTInductorModelBase {
     size_t bytes_read = 0;
     for (size_t i = 0; i < num_constants; i++) {
       bool from_folded = this->constant_from_folded(i);
-#ifndef USE_CUDA
+#ifndef USE_ROCM
       if (from_folded) {
         // We do not reallocate and copy for CPU.
         continue;
       }
-#endif // USE_CUDA
+#endif // USE_ROCM
       std::string name = this->constant_name(i);
       size_t data_size = this->constant_data_size(i);
       uint8_t* internal_ptr = (data_size != 0)
@@ -279,7 +279,7 @@ class AOTInductorModelBase {
     }
   }
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
   CUDAPtr&& release_constant_blob() {
     return std::move(constant_blob_);
   }
@@ -298,17 +298,17 @@ class AOTInductorModelBase {
       size_t bytes_read,
       size_t data_size,
       bool skip_copy) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     auto* constants_ptr = static_cast<uint8_t*>(constant_blob_.get());
     uint8_t* internal_ptr = constants_ptr + constant_offset;
     // Copy data to GPU memory
     // TODO: Handle shared storage case.
     if (!skip_copy) {
-      AOTI_RUNTIME_DEVICE_CHECK(cudaMemcpy(
+      AOTI_RUNTIME_DEVICE_CHECK(hipMemcpy(
           internal_ptr,
           _get_constants_start() + bytes_read,
           data_size,
-          cudaMemcpyHostToDevice));
+          hipMemcpyHostToDevice));
     }
     return internal_ptr;
 
@@ -316,13 +316,13 @@ class AOTInductorModelBase {
     // get pointer to constant which is packed in model during compile time.
     AOTI_RUNTIME_CHECK(!skip_copy, "pure cpu mode doesn't support skip copy");
     return _get_constants_start() + bytes_read;
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   void compute_cuda_constant_blob(
       size_t& blob_size,
       std::vector<size_t>& constants_internal_offset) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     size_t num_constants = this->num_constants();
     // Compute required blob size with 64-alignment if on GPU.
     blob_size = 0;
@@ -335,7 +335,7 @@ class AOTInductorModelBase {
       constants_internal_offset[i] = blob_size;
       blob_size += data_size;
     }
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   size_t num_inputs() const {
@@ -457,35 +457,35 @@ class AOTInductorModelBase {
 
   /// Returns true if the model is complete.
   bool is_finished() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
       throw std::runtime_error{"Model CUDA event was not initialized"};
     }
 
-    auto event_status = cudaEventQuery(*run_finished_);
-    if (event_status == cudaSuccess) {
+    auto event_status = hipEventQuery(*run_finished_);
+    if (event_status == hipSuccess) {
       return true;
-    } else if (event_status == cudaErrorNotReady) {
+    } else if (event_status == hipErrorNotReady) {
       return false;
     }
 
     throw std::runtime_error(
         std::string("The model did not finish successfully. Error: ") +
-        cudaGetErrorString(cudaGetLastError()));
-#else // !USE_CUDA
+        hipGetErrorString(hipGetLastError()));
+#else // !USE_ROCM
     return run_finished_;
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   /// Synchronizes completion event.
   void wait_for_completion() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
       throw std::runtime_error{"Model event was not initialized"};
     }
 
-    AOTI_RUNTIME_DEVICE_CHECK(cudaEventSynchronize(*run_finished_));
-#endif // USE_CUDA
+    AOTI_RUNTIME_DEVICE_CHECK(hipEventSynchronize(*run_finished_));
+#endif // USE_ROCM
   }
 
  protected:
@@ -557,10 +557,10 @@ class AOTInductorModelBase {
   std::shared_ptr<ConstantMap> constants_map_;
   std::shared_ptr<std::vector<ConstantHandle>> constants_;
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
   // Holds the blob storage for constants' at::Tensor for CUDA.
   CUDAPtr constant_blob_;
-#endif // USE_CUDA
+#endif // USE_ROCM
 #ifdef USE_MMAP_SELF
   uint8_t* self_mmap = NULL;
 #endif
@@ -570,9 +570,9 @@ class AOTInductorModelBase {
 
   // Record if the model finishes an inference run so that its owning
   // AOTModelContainer can re-use this instance.
-#ifdef USE_CUDA
-  std::optional<cudaEvent_t> run_finished_;
-#else // !USE_CUDA
+#ifdef USE_ROCM
+  std::optional<hipEvent_t> run_finished_;
+#else // !USE_ROCM
   bool run_finished_{};
 #endif
 

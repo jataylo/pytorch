@@ -10,9 +10,9 @@
 #include <mutex>
 
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAEvent.h>
+#include <ATen/hip/HIPEvent.h>
 #include <c10/util/Exception.h>
-#include <nccl.h>
+#include <rccl/rccl.h>
 #include <torch/csrc/distributed/c10d/TraceUtils.h>
 #include <optional>
 
@@ -219,7 +219,7 @@ class NCCLComm {
     // barrier here.
     LockType lock(mutex_);
     if (ncclComm_ && initialized_ && !aborted_) {
-      at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+      at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex_);
 #ifdef ENABLE_NCCL_ERROR_CHECKING
       // Use ncclCommAbort instead of ncclCommDestroy here since
       // ncclCommDestroy could block forever waiting for work to complete on
@@ -236,7 +236,7 @@ class NCCLComm {
       int rank,
       ncclUniqueId commId,
       at::DeviceIndex deviceIndex) {
-    at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex);
+    at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex);
     auto comm = std::make_shared<NCCLComm>();
     C10D_NCCL_CHECK(
         ncclCommInitRank(&(comm->ncclComm_), numRanks, commId, rank),
@@ -257,7 +257,7 @@ class NCCLComm {
       ncclUniqueId commId,
       at::DeviceIndex deviceIndex,
       ncclConfig_t& config) {
-    at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex);
+    at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex);
     auto comm = std::make_shared<NCCLComm>();
     comm->nonBlocking_ = config.blocking == 0;
     LOG(INFO) << "Rank " << rank << ": creating NCCL communicator with mode: "
@@ -330,7 +330,7 @@ class NCCLComm {
 
   void abort(std::optional<std::string> commFailureReason = std::nullopt) {
     LockType lock(mutex_);
-    at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+    at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex_);
 #ifdef ENABLE_NCCL_ERROR_CHECKING
     if (aborted_ && !initialized_) {
       // Should not abort twice.

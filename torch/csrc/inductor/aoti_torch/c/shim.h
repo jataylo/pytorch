@@ -587,7 +587,7 @@ AOTI_TORCH_EXPORT void aoti_torch_save_tensor_handle(
     const char* launch_prefix,
     const char* kernel_name);
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
 
 struct CUDAGuardOpaque;
 using CUDAGuardHandle = CUDAGuardOpaque*;
@@ -618,7 +618,7 @@ aoti_torch_delete_cuda_stream_guard(CUDAStreamGuardHandle guard);
 AOTI_TORCH_EXPORT AOTITorchError
 aoti_torch_get_current_cuda_stream(int32_t device_index, void** ret_stream);
 
-#endif // USE_CUDA
+#endif // USE_ROCM
 
 // See `ProxyExecutor Design Note` in ir.py for more details
 AOTI_TORCH_EXPORT AOTITorchError aoti_torch_proxy_executor_call_function(

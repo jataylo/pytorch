@@ -1,7 +1,7 @@
 #if !defined(C10_MOBILE) && !defined(ANDROID)
 #pragma once
 
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/csrc/inductor/aoti_runner/model_container_runner.h>
 
 namespace torch::inductor {
@@ -24,7 +24,7 @@ class TORCH_API AOTIModelContainerRunnerCuda : public AOTIModelContainerRunner {
 
   std::vector<at::Tensor> run_with_cuda_stream(
       const std::vector<at::Tensor>& inputs,
-      at::cuda::CUDAStream cuda_stream);
+      at::hip::HIPStreamMasqueradingAsCUDA cuda_stream);
 };
 
 } // namespace torch::inductor

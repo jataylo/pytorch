@@ -53,7 +53,7 @@ class AOTInductorModelContainer {
     }
 
     model->load_constants();
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     constant_blob_ = model->release_constant_blob();
     constants_internal_offset_.resize(model->num_constants());
     model->compute_cuda_constant_blob(blob_size_, constants_internal_offset_);
@@ -276,7 +276,7 @@ class AOTInductorModelContainer {
         continue;
       }
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
       AtenTensorHandle tensor;
       if (_should_skip_update(idx) && use_inactive) {
         tensor = original_constants_map->find(constant_name)->second.get();
@@ -294,11 +294,11 @@ class AOTInductorModelContainer {
       aoti_torch_get_data_ptr(tensor, &user_constant_ptr);
       aoti_torch_get_storage_size(tensor, &constant_size);
 
-      AOTI_RUNTIME_DEVICE_CHECK(cudaMemcpy(
+      AOTI_RUNTIME_DEVICE_CHECK(hipMemcpy(
           internal_constants_ptr,
           user_constant_ptr,
           constant_size,
-          cudaMemcpyDefault));
+          hipMemcpyDefault));
 
       // Generate Tensor from container handled blob.
       // We extract stride and offset from provided Tensor since we do not
@@ -320,9 +320,9 @@ class AOTInductorModelContainer {
           aoti_torch_device_type_cuda(),
           device_idx,
           &tensor_handle));
-#else // USE_CUDA
+#else // USE_ROCM
       AtenTensorHandle tensor_handle = it->second;
-#endif // USE_CUDA
+#endif // USE_ROCM
 
       // Now place the tensor to constants_map. Note at this point the ownership
       // of the tensor_handle will be taken over.
@@ -397,16 +397,16 @@ class AOTInductorModelContainer {
   const char* in_spec_;
   const char* out_spec_;
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
   // Holds the blob storage for constants' at::Tensor for CUDA.
   CUDAPtr constant_blob_;
   CUDAPtr constant_blob_secondary_;
 
-  // Let's place this within USE_CUDA at the moment before we fully support
+  // Let's place this within USE_ROCM at the moment before we fully support
   // update for CPU cases.
   size_t blob_size_;
   std::vector<size_t> constants_internal_offset_;
-#endif // USE_CUDA
+#endif // USE_ROCM
 
   // Determine which constants is being used for the model.
   // If true,
@@ -461,7 +461,7 @@ class AOTInductorModelContainer {
   // make sure no one is executing the model.
   std::shared_mutex model_exec_mutex_;
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
   void* get_constant_blob_ptr(bool get_inactive) {
     if ((get_inactive && use_secondary_) ||
         (!get_inactive && !use_secondary_)) {
@@ -473,7 +473,7 @@ class AOTInductorModelContainer {
       return constant_blob_secondary_.get();
     }
   }
-#endif // USE_CUDA
+#endif // USE_ROCM
 
   std::shared_ptr<ConstantMap> get_constants_map(bool get_inactive) {
     if ((get_inactive && use_secondary_) ||

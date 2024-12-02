@@ -10,7 +10,7 @@
 #include <torch/csrc/PyInterpreter.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/inductor/aoti_runner/model_container_runner_cpu.h>
-#ifdef USE_CUDA
+#ifdef USE_ROCM
 #include <torch/csrc/inductor/aoti_runner/model_container_runner_cuda.h>
 #endif
 #include <torch/csrc/jit/frontend/function_schema_parser.h>
@@ -424,7 +424,7 @@ std::shared_ptr<AOTIModelContainerRunner> AOTIPythonKernelHolder::
       c10::DeviceTypeName(device_.type()),
       " now.");
   if (device_.type() == c10::DeviceType::CUDA) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     return std::make_shared<AOTIModelContainerRunnerCuda>(so_path);
 #else
     return nullptr;

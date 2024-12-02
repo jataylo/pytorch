@@ -79,7 +79,7 @@ using namespace ::c10::aten;
 }
 namespace cuda {
 #if !defined(USE_ROCM)
-using namespace ::c10::cuda;
+using namespace ::c10::hip;
 #endif
 } // namespace cuda
 

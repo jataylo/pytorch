@@ -3,9 +3,9 @@
 
 #if defined(USE_TENSORPIPE) && !defined(USE_ROCM)
 
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wdeprecated")
 #include <tensorpipe/tensorpipe.h>
@@ -23,7 +23,7 @@ std::unique_ptr<ChannelRegistration> makeCudaIpcChannel() {
       ChannelRegistration{std::move(context), kCudaIpcChannelPriority});
 }
 
-// The cuda_ipc channels use cudaMemcpy to transmit CUDA tensor across processes
+// The cuda_ipc channels use hipMemcpy to transmit CUDA tensor across processes
 C10_REGISTER_CREATOR(TensorPipeChannelRegistry, cuda_ipc, makeCudaIpcChannel);
 
 #endif
@@ -77,10 +77,10 @@ class TensorpipeCudaConverter : public TensorpipeDeviceTypeConverter {
       const std::vector<c10::Stream>& streams,
       tensorpipe::Message& message) const override {
     auto stream =
-        at::cuda::CUDAStream(getStreamForDevice(streams, storage.device()));
+        at::hip::HIPStreamMasqueradingAsCUDA(getStreamForDevice(streams, storage.device()));
     // record tensor data ptrs on TensorPipe streams, so that the tensors
     // won't be destructed before TensorPipe finishing sending them.
-    c10::cuda::CUDACachingAllocator::recordStream(storage.data_ptr(), stream);
+    c10::hip::HIPCachingAllocatorMasqueradingAsCUDA::recordStreamMasqueradingAsCUDA(storage.data_ptr(), stream);
 
     tensorpipe::CudaBuffer buffer;
     buffer.ptr = static_cast<char*>(storage.mutable_data());
@@ -101,12 +101,12 @@ class TensorpipeCudaConverter : public TensorpipeDeviceTypeConverter {
       const std::vector<c10::Stream>& streams,
       tensorpipe::Allocation& allocation) const override {
     c10::Device device(c10::kCUDA, deviceIndex);
-    at::cuda::CUDAStream stream(getStreamForDevice(streams, device));
-    // CUDACachingAllocator will call recordStream accordingly on the current
+    at::hip::HIPStreamMasqueradingAsCUDA stream(getStreamForDevice(streams, device));
+    // HIPCachingAllocator will call recordStream accordingly on the current
     // stream.
-    at::cuda::CUDAStreamGuard guard(stream);
+    at::hip::HIPStreamGuardMasqueradingAsCUDA guard(stream);
     at::DataPtr dataPtr =
-        c10::cuda::CUDACachingAllocator::get()->allocate(length);
+        c10::hip::HIPCachingAllocatorMasqueradingAsCUDA::get()->allocate(length);
 
     tensorpipe::CudaBuffer buffer;
     buffer.ptr = dataPtr.get();
