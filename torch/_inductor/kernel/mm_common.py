@@ -1,8 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
-import itertools
 import logging
-from typing import Any, cast, Dict, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import sympy
 
@@ -15,12 +14,7 @@ from .. import config as inductor_config
 from ..codegen.wrapper import PythonWrapperCodegen
 from ..ir import Layout
 from ..runtime.runtime_utils import next_power_of_2
-from ..utils import (
-    ceildiv as cdiv,
-    get_backend_num_stages,
-    get_num_sms,
-    TMA_DESCRIPTOR_SIZE,
-)
+from ..utils import ceildiv as cdiv, get_num_sms, TMA_DESCRIPTOR_SIZE
 
 
 log = logging.getLogger(__name__)
@@ -141,7 +135,14 @@ def filtered_configs(
                 )
 
 
-mm_heuristics = V.choices.get_device_mm_heuristic("cuda")
+print(inductor_config.max_autotune_custom_heuristic)
+
+if inductor_config.max_autotune_custom_heuristic is None:
+    mm_heuristics = V.choices.get_device_mm_heuristic("cuda")
+else:
+    mm_heuristics = inductor_config.max_autotune_custom_heuristic
+
+print(mm_heuristics.get_mm_configs())
 
 if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE":
     mm_kernel_configs = mm_heuristics.get_mm_configs()
@@ -161,86 +162,39 @@ mixed_mm_kernel_configs = (
     else mm_kernel_configs
 )
 
-
-
-# Create filtered list of configs based on cond evaluation
-mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in mm_kernel_configs
-    if config["cond"]
-)
-extra_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in extra_mm_kernel_configs
-    if config["cond"]
-)
-int8_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in int8_mm_kernel_configs
-    if config["cond"]
-)
-mixed_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in mixed_mm_kernel_configs
-    if config["cond"]
-)
-persistent_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in persistent_mm_kernel_configs
-    if config["cond"]
-)
-scaled_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in scaled_mm_kernel_configs
-    if config["cond"]
-)
-scaled_persistent_mm_platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in scaled_persistent_mm_kernel_configs
-    if config["cond"]
-)
-
-# On ROCm convert num_stages to improve performance
-if torch.version.hip and torch.cuda.is_available():
-    mm_platform_configs = build_rocm_gemm_configs(mm_platform_configs)
-    extra_mm_platform_configs = build_rocm_gemm_configs(extra_mm_platform_configs)
-    int8_platform_configs = build_rocm_gemm_configs(int8_platform_configs)
-    mixed_mm_platform_configs = build_rocm_gemm_configs(mixed_mm_platform_configs)
-    scaled_mm_platform_configs = build_rocm_gemm_configs(scaled_mm_platform_configs)
-
 mm_configs = functools.partial(
     filtered_configs,
-    configs=mm_platform_configs,
+    configs=mm_kernel_configs,
 )
 
 extra_mm_configs = functools.partial(
     filtered_configs,
-    configs=extra_mm_platform_configs,
+    configs=extra_mm_kernel_configs,
 )
 
 int8_mm_configs = functools.partial(
     filtered_configs,
-    configs=int8_platform_configs,
+    configs=int8_mm_kernel_configs,
 )
 
 mixed_mm_configs = functools.partial(
     filtered_configs,
-    configs=mixed_mm_platform_configs,
+    configs=mixed_mm_kernel_configs,
 )
 
 persistent_mm_configs = functools.partial(
     filtered_configs,
-    configs=persistent_mm_platform_configs,
+    configs=persistent_mm_kernel_configs,
 )
 
 scaled_mm_configs = functools.partial(
     filtered_configs,
-    configs=scaled_mm_platform_configs,
+    configs=scaled_mm_kernel_configs,
 )
 
 scaled_persistent_mm_configs = functools.partial(
     filtered_configs,
-    configs=scaled_persistent_mm_platform_configs,
+    configs=scaled_persistent_mm_kernel_configs,
 )
 
 

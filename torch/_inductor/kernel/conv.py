@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import cast, List, Optional, Sequence, Tuple, TYPE_CHECKING, TypedDict
+from typing import List, Optional, Sequence, TYPE_CHECKING, TypedDict
 
 import torch
 from torch._inductor.codegen.rocm.ck_conv_template import CKGroupedConvFwdTemplate
@@ -30,7 +30,7 @@ from ..utils import (
     use_triton_template,
 )
 from ..virtualized import V
-from .mm_common import build_rocm_gemm_configs, filtered_configs
+from .mm_common import filtered_configs
 
 
 if TYPE_CHECKING:
@@ -58,29 +58,8 @@ def conv3d_grid(n, c, d, h, w, meta):
     )
 
 
-# List of dictionaries to store the kernel configs. Configs that evaluate to true
-# will be utilised on the target platform
-kernel_configs = [
-    # "BLOCK_M", "BLOCK_N", "BLOCK_K", "num_stages", "num_warps"
-    {"config": (64, 256, 16, 2, 4), "cond": True},
-    {"config": (256, 64, 16, 2, 4), "cond": True},
-    {"config": (1024, 16, 16, 1, 8), "cond": True},
-    {"config": (128, 128, 32, 2, 8), "cond": True},
-    {"config": (64, 64, 32, 2, 4), "cond": True},
-    {"config": (64, 256, 32, 2, 8), "cond": True},
-    {"config": (256, 64, 32, 2, 8), "cond": True},
-]
-
-# Create filtered list of configs based on conv
-platform_configs = tuple(
-    cast(Tuple[int, int, int, int, int], config["config"])
-    for config in kernel_configs
-    if config["cond"]
-)
-
-# On ROCm convert num_stages to 1 as pipelining provides no benefit
-if torch.version.hip and torch.cuda.is_available():
-    platform_configs = build_rocm_gemm_configs(platform_configs)
+conv_heuristics = V.choices.get_device_mm_heuristic("cuda")
+kernel_configs = conv_heuristics.get_conv_configs()
 
 
 def _is_large_block_for_cpu(m, n, k):
@@ -96,11 +75,11 @@ def conv_configs(m, n, k, *, device_type, **kwargs):
             m,
             n,
             k,
-            configs=platform_configs,
+            configs=kernel_configs,
             scale=0.5,
             exclude=_is_large_block_for_cpu,
         )
-    return filtered_configs(m, n, k, configs=platform_configs)
+    return filtered_configs(m, n, k, configs=kernel_configs)
 
 
 LOOP_BODY_2D = """
