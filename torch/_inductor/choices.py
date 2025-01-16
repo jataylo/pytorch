@@ -27,6 +27,544 @@ class Sortable(typing.Protocol):
         ...
 
 
+class BaseMMConfigHeuristic():
+    """
+    Base class for mm_configs, device specific matmul config inherit from here
+    """
+    def get_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (32, 32, 16, 1, 2), "cond": True},
+            {"config": (32, 32, 128, 2, 4), "cond": True},
+            {"config": (32, 64, 32, 5, 8), "cond": True},
+            {"config": (64, 32, 32, 5, 8), "cond": True},
+            {"config": (64, 32, 128, 5, 4), "cond": True},
+            {"config": (64, 64, 16, 2, 4), "cond": True},
+            {"config": (64, 64, 32, 2, 4), "cond": True},
+            {"config": (64, 64, 64, 3, 8), "cond": True},
+            {"config": (64, 64, 128, 5, 4), "cond": True},
+            {"config": (64, 128, 32, 3, 4), "cond": True},
+            {"config": (64, 128, 32, 4, 8), "cond": True},
+            {"config": (64, 128, 64, 3, 4), "cond": True},
+            {"config": (64, 128, 128, 4, 4), "cond": True},
+            {"config": (128, 64, 32, 3, 4), "cond": True},
+            {"config": (128, 64, 32, 4, 8), "cond": True},
+            {"config": (128, 128, 32, 2, 8), "cond": True},
+            {"config": (128, 128, 32, 3, 4), "cond": True},
+            {"config": (128, 128, 64, 3, 4), "cond": True},
+            {"config": (128, 128, 64, 5, 8), "cond": True},
+        ]
+
+    def get_exhaustive_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps), "cond": True}
+            for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
+                [16, 32, 64, 128, 256], repeat=3
+            )
+            for num_stages in [1, 2, 3, 4, 5]
+            for num_warps in [2, 4, 8]
+        ]        
+
+    def get_extra_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (16, 32, 16, 3, 2), "cond": True},
+            {"config": (16, 32, 32, 4, 2), "cond": True},
+            {"config": (16, 32, 32, 5, 2), "cond": True},
+            {"config": (64, 64, 128, 3, 4), "cond": True},
+            {"config": (128, 64, 32, 2, 2), "cond": True},
+            {"config": (128, 64, 64, 3, 8), "cond": True},
+            {"config": (128, 64, 128, 4, 8), "cond": True},
+            {"config": (128, 128, 32, 4, 4), "cond": True},
+            {"config": (128, 128, 64, 3, 8), "cond": True},
+            {"config": (128, 128, 64, 5, 4), "cond": True},
+        ]
+
+    def get_int8_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (64, 64, 32, 2, 4), "cond": True},
+            {"config": (64, 128, 32, 3, 4), "cond": True},
+            {"config": (128, 64, 32, 3, 4), "cond": True},
+            {"config": (64, 128, 32, 4, 8), "cond": True},
+            {"config": (128, 64, 32, 4, 8), "cond": True},
+            {"config": (64, 32, 32, 5, 8), "cond": True},
+            {"config": (32, 64, 32, 5, 8), "cond": True},
+            {"config": (128, 128, 32, 2, 8), "cond": True},
+            {"config": (64, 64, 64, 3, 8), "cond": True},
+            # {"config": (32, 32, 128, 2, 4), "cond": True},
+            # {"config": (64, 64, 16, 2, 4), "cond": True},
+            # {"config": (32, 32, 16, 1, 2), "cond": True},
+            {"config": (128, 256, 128, 3, 8), "cond": True},
+            {"config": (256, 128, 128, 3, 8), "cond": True},
+        ]
+
+    def get_mixed_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (16, 128, 256, 3, 4), "cond": True},
+            {"config": (16, 128, 256, 5, 8), "cond": True},
+        ]
+
+    def get_persistent_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {"config": (128, 256, 64, 3, 8), "cond": True},
+            {"config": (128, 128, 64, 3, 8), "cond": True},
+            {"config": (128, 128, 128, 3, 8), "cond": True},
+            {"config": (128, 128, 128, 3, 4), "cond": True},
+            {"config": (128, 128, 64, 4, 8), "cond": True},
+        ]
+
+    def get_scaled_mm_configs(self) -> List[Dict[str, Any]]:
+        return [ 
+            {"config": (128, 256, 32, 3, 8), "cond": True},
+            {"config": (256, 128, 32, 3, 8), "cond": True},
+            {"config": (256, 64, 32, 4, 4), "cond": True},
+            {"config": (64, 256, 32, 4, 4), "cond": True},
+            {"config": (128, 128, 32, 4, 4), "cond": True},
+            {"config": (128, 64, 32, 4, 4), "cond": True},
+            {"config": (64, 128, 32, 4, 4), "cond": True},
+            {"config": (128, 32, 32, 4, 4), "cond": True},
+            {"config": (64, 32, 32, 5, 2), "cond": True},
+            {"config": (256, 128, 128, 3, 8), "cond": True},
+            {"config": (256, 64, 128, 4, 4), "cond": True},
+            {"config": (64, 256, 128, 4, 4), "cond": True},
+            {"config": (128, 128, 128, 4, 4), "cond": True},
+            {"config": (128, 64, 64, 4, 4), "cond": True},
+            {"config": (64, 128, 64, 4, 4), "cond": True},
+            {"config": (128, 32, 64, 4, 4), "cond": True},
+            {"config": (64, 32, 64, 5, 2), "cond": True},
+            {"config": (16, 32, 32, 2, 2), "cond": True},
+            {"config": (16, 64, 32, 2, 2), "cond": True},
+            {"config": (16, 128, 32, 2, 4), "cond": True},
+            {"config": (16, 256, 32, 2, 4), "cond": True},
+            {"config": (16, 32, 64, 2, 2), "cond": True},
+            {"config": (16, 64, 64, 2, 2), "cond": True},
+            {"config": (16, 128, 64, 2, 4), "cond": True},
+            {"config": (16, 256, 64, 2, 4), "cond": True},
+            {"config": (32, 32, 32, 2, 2), "cond": True},
+            {"config": (32, 64, 32, 2, 2), "cond": True},
+            {"config": (32, 128, 32, 2, 4), "cond": True},
+            {"config": (32, 256, 32, 2, 4), "cond": True},
+            {"config": (32, 32, 64, 2, 2), "cond": True},
+            {"config": (32, 64, 64, 2, 2), "cond": True},
+            {"config": (32, 128, 64, 2, 4), "cond": True},
+            {"config": (32, 256, 64, 2, 4), "cond": True},
+            {"config": (16, 32, 32, 3, 2), "cond": True},
+            {"config": (16, 64, 32, 3, 2), "cond": True},
+            {"config": (16, 128, 32, 3, 4), "cond": True},
+            {"config": (16, 256, 32, 3, 4), "cond": True},
+            {"config": (16, 32, 64, 3, 2), "cond": True},
+            {"config": (16, 64, 64, 3, 2), "cond": True},
+            {"config": (16, 128, 64, 3, 4), "cond": True},
+            {"config": (16, 256, 64, 3, 4), "cond": True},
+            {"config": (32, 32, 32, 3, 2), "cond": True},
+            {"config": (32, 64, 32, 3, 2), "cond": True},
+            {"config": (32, 128, 32, 3, 4), "cond": True},
+            {"config": (32, 256, 32, 3, 4), "cond": True},
+            {"config": (32, 32, 64, 3, 2), "cond": True},
+            {"config": (32, 64, 64, 3, 2), "cond": True},
+            {"config": (32, 128, 64, 3, 4), "cond": True},
+            {"config": (32, 256, 64, 3, 4), "cond": True},
+            {"config": (16, 32, 32, 4, 2), "cond": True},
+            {"config": (16, 64, 32, 4, 2), "cond": True},
+            {"config": (16, 128, 32, 4, 4), "cond": True},
+            {"config": (16, 256, 32, 4, 4), "cond": True},
+            {"config": (16, 32, 64, 4, 2), "cond": True},
+            {"config": (16, 64, 64, 4, 2), "cond": True},
+            {"config": (16, 128, 64, 4, 4), "cond": True},
+            {"config": (16, 256, 64, 4, 4), "cond": True},
+            {"config": (32, 32, 32, 4, 2), "cond": True},
+            {"config": (32, 64, 32, 4, 2), "cond": True},
+            {"config": (32, 128, 32, 4, 4), "cond": True},
+            {"config": (32, 256, 32, 4, 4), "cond": True},
+            {"config": (32, 32, 64, 4, 2), "cond": True},
+            {"config": (32, 64, 64, 4, 2), "cond": True},
+            {"config": (32, 128, 64, 4, 4), "cond": True},
+            {"config": (32, 256, 64, 4, 4), "cond": True},
+            {"config": (16, 32, 32, 5, 2), "cond": True},
+            {"config": (16, 64, 32, 5, 2), "cond": True},
+            {"config": (16, 128, 32, 5, 4), "cond": True},
+            {"config": (16, 256, 32, 5, 4), "cond": True},
+            {"config": (16, 32, 64, 5, 2), "cond": True},
+            {"config": (16, 64, 64, 5, 2), "cond": True},
+            {"config": (16, 128, 64, 5, 4), "cond": True},
+            {"config": (16, 256, 64, 5, 4), "cond": True},
+            {"config": (32, 32, 32, 5, 2), "cond": True},
+            {"config": (32, 64, 32, 5, 2), "cond": True},
+            {"config": (32, 128, 32, 5, 4), "cond": True},
+            {"config": (32, 256, 32, 5, 4), "cond": True},
+            {"config": (32, 32, 64, 5, 2), "cond": True},
+            {"config": (32, 64, 64, 5, 2), "cond": True},
+            {"config": (32, 128, 64, 5, 4), "cond": True},
+            {"config": (32, 256, 64, 5, 4), "cond": True},
+            {"config": (16, 32, 32, 6, 2), "cond": True},
+            {"config": (16, 64, 32, 6, 2), "cond": True},
+            {"config": (16, 128, 32, 6, 4), "cond": True},
+            {"config": (16, 256, 32, 6, 4), "cond": True},
+            {"config": (16, 32, 64, 6, 2), "cond": True},
+            {"config": (16, 64, 64, 6, 2), "cond": True},
+            {"config": (16, 128, 64, 6, 4), "cond": True},
+            {"config": (16, 256, 64, 6, 4), "cond": True},
+            {"config": (32, 32, 32, 6, 2), "cond": True},
+            {"config": (32, 64, 32, 6, 2), "cond": True},
+            {"config": (32, 128, 32, 6, 4), "cond": True},
+            {"config": (32, 256, 32, 6, 4), "cond": True},
+            {"config": (32, 32, 64, 6, 2), "cond": True},
+            {"config": (32, 64, 64, 6, 2), "cond": True},
+            {"config": (32, 128, 64, 6, 4), "cond": True},
+            {"config": (32, 256, 64, 6, 4), "cond": True},
+        ]
+
+
+class CUDAMMConfigHeuristics(BaseMMConfigHeuristic):
+    pass
+
+class ROCmMMConfigHeuristic(BaseMMConfigHeuristic):
+    """
+    Abstract interface for device specific matmul config heuristics
+    """
+    from utils import get_backend_num_stages
+
+    rocm_num_stages = get_backend_num_stages()
+
+    def _build_rocm_gemm_configs(configs):
+        rocm_num_stages = self.rocm_num_stages()
+        return tuple((c[0], c[1], c[2], self.rocm_num_stages, c[4]) for c in configs)
+
+    def get_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "config": (128, 128, 32, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 32, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 32, rocm_num_stages, 8),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 64, rocm_num_stages, 8),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 256, 32, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 16, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 32, rocm_num_stages, 8),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 32, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 64, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 64, rocm_num_stages, 8),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (16, 16, 256, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (256, 128, 32, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (256, 128, 32, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (32, 16, 256, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (32, 32, 128, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (32, 64, 128, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (32, 64, 64, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 32, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 32, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 16, 128, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (64, 16, 64, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (64, 64, 64, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 64, 128, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 128, rocm_num_stages, 8),
+                "GROUP_M": 16,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 128, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 64, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "mfma_size": 0,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (64, 64, 32, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (256, 256, 64, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (256, 128, 64, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 256, 64, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 128, rocm_num_stages, 8),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (32, 16, 128, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 32, 32, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (32, 256, 64, rocm_num_stages, 8),
+                "GROUP_M": 8,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (64, 128, 64, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (16, 64, 128, rocm_num_stages, 8),
+                "GROUP_M": 8,
+                "cond": True,
+            },
+            {
+                "config": (128, 32, 16, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "kpack": 1,
+                "wpeu": 2,
+                "cond": True,
+            },
+            {
+                "config": (128, 64, 128, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (128, 32, 16, rocm_num_stages, 4),
+                "GROUP_M": 16,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (64, 256, 64, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "kpack": 1,
+                "mfma_size": 0,
+                "cond": True,
+            },
+            {
+                "config": (64, 256, 16, rocm_num_stages, 4),
+                "GROUP_M": 4,
+                "kpack": 1,
+                "cond": True,
+            },
+            {
+                "config": (64, 32, 32, rocm_num_stages, 4),
+                "GROUP_M": 8,
+                "kpack": 2,
+                "mfma_size": 0,
+                "cond": True,
+            },
+            {
+                "config": (128, 128, 128, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "cond": True,
+            },
+            {
+                "config": (64, 256, 32, rocm_num_stages, 8),
+                "GROUP_M": 4,
+                "cond": True,
+            },
+        ]
+
+    def get_exhaustive_mm_configs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps),
+                "GROUP_M": GROUP_M,
+                "wpeu": waves_per_eu,
+                "mfma_size": matrix_instr_nonkdim,
+                "kpack": kpack,
+                "cond": True,
+            }
+            for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
+                [16, 32, 64, 128, 256], repeat=3
+            )
+            for num_stages in [2]
+            for num_warps in [4, 8]
+            for waves_per_eu in [0, 2]
+            for GROUP_M in [4, 8, 16]
+            for matrix_instr_nonkdim in [0, 16]
+            for kpack in [1, 2]
+        ]        
+
+    def get_extra_configs(self) -> List[Dict[str, Any]]:
+        return _build_rocm_configs(super().get_extra_mm_configs())
+
+    def get_int8_mm_configs(self) -> List[Dict[str, Any]]:
+        return _build_rocm_configs(super().get_int8_mm_configs())
+
+    def get_mixed_mm_configs(self) -> List[Dict[str, Any]]:
+        return _build_rocm_configs(super().get_mixed_mm_configs())
+
+    def get_persistent_mm_configs(self) -> List[Dict[str, Any]]:
+        return _build_rocm_configs(super().get_persistent_mm_configs())
+
+    def get_scaled_mm_configs(self) -> List[Dict[str, Any]]:
+        return _build_rocm_configs(super().get_scaled_mm_configs())
+
+
 class InductorChoices:
     """
     This class contains a collection of default heuristics that effect performance of our generated
@@ -39,6 +577,19 @@ class InductorChoices:
 
             torch._inductor.virtualized.V.set_choices_handler(MyHeuristics())
     """
+    def __init__(self):
+        self._mm_heuristics = ROCmMMConfigHeuristic() if torch.version.hip else CUDAMMConfigHeuristic()
+
+    def get_device_mm_heuristic(self, device_type)
+        if device_type == "cuda":
+            if torch.version.hip is None:
+                return CUDAMMConfigHeuristic() 
+            else
+                return ROCmMMConfigHeuristic()
+        elif device_type == "hip":
+            return ROCmMMConfigHueristic()
+        else
+            return BaseMMConfigHeuristic()
 
     def triton_kernel_kwargs(
         self,
