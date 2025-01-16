@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import torch
-import typing
-from typing import Any, cast, Dict, List, Type, TYPE_CHECKING
 import itertools
+from typing import Any, cast, Dict, List
 
-class BaseConfigHeuristic():
+
+class BaseConfigHeuristic:
     """
-    Base class for mm_configs, device specific matmul config inherit from here
+    Base class for mm_configs, device specific triton kernels config inherit from here
     """
+
     # List of dictionaries to store the kernel configs. Configs that evaluate to true
     # will be utilised on the target platform. The configs are as follows:
     # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
@@ -321,16 +321,20 @@ class BaseConfigHeuristic():
     def get_conv_configs(self) -> List[Dict[str, Any]]:
         return self._filter_configs(self.conv_configs)
 
+
 class CPUConfigHeuristic(BaseConfigHeuristic):
     pass
 
+
 class CUDAConfigHeuristic(BaseConfigHeuristic):
     pass
+
 
 class ROCmConfigHeuristic(BaseConfigHeuristic):
     """
     Abstract interface for device specific matmul config heuristics
     """
+
     from .utils import get_backend_num_stages
 
     default_num_stages = get_backend_num_stages()
@@ -339,7 +343,9 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return tuple((c[0], c[1], c[2], num_stages, c[4]) for c in configs)
 
     def get_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_exhaustive_mm_configs(self) -> List[Dict[str, Any]]:
         return [
@@ -359,22 +365,34 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         ]
 
     def get_extra_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_extra_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_extra_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_int8_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_int8_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_int8_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_mixed_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_mixed_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_mixed_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_persistent_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_persistent_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_scaled_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_scaled_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_scaled_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_scaled_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_scaled_mm_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_scaled_mm_configs(), num_stages=self.default_num_stages
+        )
 
     def get_mm_plus_mm_configs(self) -> List[Dict[str, Any]]:
         configs = super().get_mm_plus_mm_configs()
@@ -383,10 +401,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         return configs
 
     def get_conv_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(super().get_conv_configs(), num_stages=self.default_num_stages)
+        return self._build_rocm_gemm_configs(
+            super().get_conv_configs(), num_stages=self.default_num_stages
+        )
 
 
 class XPUConfigHeuristic(BaseConfigHeuristic):
     pass
-
-

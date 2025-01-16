@@ -48,24 +48,24 @@ class InductorChoices:
     """
 
     def __init__(self):
-        self._mm_heuristics = (
-            ROCmConfigHeuristic() if torch.version.hip else CUDAConfigHeuristic()
-        )
+        self.config_heuristics = self._get_device_config_heuristic()
 
-    def get_device_mm_heuristic(self, device_type):
+    def _get_device_config_heuristic(self, device_type="cuda"):
+        from torch._inductor.utils import get_gpu_type
+
+        device_type = get_gpu_type()
+
         if device_type == "cuda":
             if torch.version.hip is None:
                 return CUDAConfigHeuristic()
             else:
                 return ROCmConfigHeuristic()
-        elif device_type == "cpu":
-            return CPUConfigHeuristic()
-        elif device_type == "hip":
-            return ROCmConfigHeuristic()
         elif device_type == "xpu":
             return XPUConfigHeuristic()
-        else:
+        elif torch.cuda.is_available():
             return BaseConfigHeuristic()
+        else:
+            return CPUConfigHeuristic()
 
     def triton_kernel_kwargs(
         self,

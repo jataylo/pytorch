@@ -135,14 +135,10 @@ def filtered_configs(
                 )
 
 
-print(inductor_config.max_autotune_custom_heuristic)
-
 if inductor_config.max_autotune_custom_heuristic is None:
-    mm_heuristics = V.choices.get_device_mm_heuristic("cuda")
+    mm_heuristics = V.choices.config_heuristics
 else:
     mm_heuristics = inductor_config.max_autotune_custom_heuristic
-
-print(mm_heuristics.get_mm_configs())
 
 if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE":
     mm_kernel_configs = mm_heuristics.get_mm_configs()

@@ -58,7 +58,11 @@ def conv3d_grid(n, c, d, h, w, meta):
     )
 
 
-conv_heuristics = V.choices.get_device_mm_heuristic("cuda")
+if torch._inductor.config.max_autotune_custom_heuristic is None:
+    conv_heuristics = V.choices.config_heuristics
+else:
+    conv_heuristics = torch._inductor.config.max_autotune_custom_heuristic
+
 kernel_configs = conv_heuristics.get_conv_configs()
 
 
