@@ -47,26 +47,74 @@ class InductorChoices:
             torch._inductor.virtualized.V.set_choices_handler(MyHeuristics())
     """
 
-    def __init__(self):
-        self.config_heuristics = self._get_device_config_heuristic()
-
-    def _get_device_config_heuristic(self, device_type="cuda"):
+    def get_config_heuristics(self, device_type="cuda"):
         from torch._inductor.utils import get_gpu_type
-
+        from torch._inductor import config
         device_type = get_gpu_type()
 
-        if device_type == "cuda":
-            if torch.version.hip is None:
-                return CUDAConfigHeuristic()
+        if config.max_autotune_custom_heuristic is None:
+            if device_type == "cuda":
+                if torch.version.hip is None:
+                    return CUDAConfigHeuristic()
+                else:
+                    return CUDAConfigHeuristic()
+            elif device_type == "xpu":
+                return XPUConfigHeuristic()
+            elif torch.cuda.is_available():
+                return BaseConfigHeuristic()
             else:
-                return ROCmConfigHeuristic()
-        elif device_type == "xpu":
-            return XPUConfigHeuristic()
-        elif torch.cuda.is_available():
-            return BaseConfigHeuristic()
+                return CPUConfigHeuristic()
         else:
-            return CPUConfigHeuristic()
+            return torch._inductor.max_autotune_custom_heuristic
 
+    # GEMM configs
+    def get_base_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        if config.max_autotune_gemm_search_space != "EXHAUSTIVE":
+            return mm_heuristics.get_mm_configs()
+        else:
+            return mm_heuristics.get_exhaustive_mm_configs()
+    
+    def get_extra_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heuristics.get_extra_mm_configs()
+
+    def get_int8_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heuristics.get_int8_mm_configs()
+
+    def get_mixed_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        mixed_mm_kernel_configs = mm_heuristics.get_mixed_mm_configs()
+        mm_kernel_configs = get_base_mm_configs()
+        configs = (
+            mm_kernel_configs + mixed_mm_kernel_configs
+            if config.max_autotune_gemm_search_space != "EXHAUSTIVE"
+            else mm_kernel_configs
+        )
+        return configs
+
+    def get_persistent_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heuristics.get_persistent_mm_configs()
+
+    def get_scaled_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heuristics.get_scaled_mm_configs()
+
+    def get_scaled_persistent_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heuristics.get_scaled_persistent_mm_configs()
+
+    def get_mm_plus_mm_configs(self):
+        mm_heuristics = self.get_config_heuristics()
+        return mm_heursitics.get_mm_plus_mm_configs()
+    
+    # Conv configs
+    def get_conv_configs(self):
+        conv_heuristics = self.get_config_heuristics()
+        return conv_heuristics.get_conv_configs()
+    
     def triton_kernel_kwargs(
         self,
         kernel_cls: Type[TritonKernel],

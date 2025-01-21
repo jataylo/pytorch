@@ -58,13 +58,6 @@ def conv3d_grid(n, c, d, h, w, meta):
     )
 
 
-if torch._inductor.config.max_autotune_custom_heuristic is None:
-    conv_heuristics = V.choices.config_heuristics
-else:
-    conv_heuristics = torch._inductor.config.max_autotune_custom_heuristic
-
-kernel_configs = conv_heuristics.get_conv_configs()
-
 
 def _is_large_block_for_cpu(m, n, k):
     # Thresholds are experimentally determined to reduce Triton CPU compile times

@@ -116,15 +116,9 @@ mm_plus_mm_template = TritonTemplate(
 def mm_configs():
     import triton
 
-    if torch._inductor.config.max_autotune_custom_heuristic is None:
-        mm_heuristics = V.choices.config_heuristics
-    else:
-        mm_heuristics = torch._inductor.config.max_autotune_custom_heuristic
-
-    mm_configs = mm_heuristics.get_mm_plus_mm_configs()
     return [
         triton.Config(c["config"], num_stages=c["num_stages"], num_warps=c["num_warps"])
-        for c in mm_configs
+        for c in V.choices.get_mm_plus_mm_configs()
         if c["cond"]
     ]
 

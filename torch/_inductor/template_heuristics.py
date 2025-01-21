@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from typing import Any, cast, Dict, List
-
+from functools import partial
 
 class BaseConfigHeuristic:
     """
@@ -291,35 +291,125 @@ class BaseConfigHeuristic:
             if config["cond"]
         )
 
+    def _preprocess_mm_configs(
+        self,
+        m: int,
+        n: int,
+        k: int,
+        configs: Sequence[tuple[int, int, int, int, int]],
+        has_int8_tensor=False,
+        scale=1,
+        exclude=lambda m, n, k: False,
+    ):
+        from .runtime.runtime_utils import next_power_of_2
+        from torch.utils._ordered_set import OrderedSet
+        from torch._inductor.virtualized import V
+        """
+        Heuristic to preprocess configs e.g. shrink when they are bigger than the input size
+
+        :param scale: scale factor applied to the config values
+        :param exclude: whether a given config should be excluded
+        """
+        from torch._inductor import config
+
+        max_mm_configs = config.test_configs.max_mm_configs
+
+        min_block_size = 16
+        # block_k=16 seems to be causing issues
+        # see: https://github.com/triton-lang/triton/issues/2156#issuecomment-1695897424
+        min_block_size_k = 32 if has_int8_tensor else 16
+        m = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    m, fallback=config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size,
+        )
+        n = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    n, fallback=config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size,
+        )
+        k = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    k, fallback=config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size_k,
+        )
+        used = OrderedSet[tuple[int, int, int, int, int, int]]()
+        for block_m, block_n, block_k, num_stages, num_warps in configs:
+            # shrink configs for small sizes
+            block_m = max(min(int(block_m * scale), m), min_block_size)
+            block_n = max(min(int(block_n * scale), n), min_block_size)
+            block_k = max(min(int(block_k * scale), k), min_block_size_k)
+
+            if exclude(block_m, block_n, block_k):
+                continue
+
+            # each warp computes 16x16 tile = 256
+            num_warps = min(num_warps, block_m * block_n // 256)
+            
+            if (block_m, block_n, block_k, num_stages, num_warps, 0) not in used and (
+                max_mm_configs is None or len(used) < max_mm_configs
+            ):
+                used.add((block_m, block_n, block_k, num_stages, num_warps, 0))
+                yield self.triton_config(
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    BLOCK_K=block_k,
+                    num_stages=num_stages,
+                    num_warps=num_warps,
+                )
+ 
+    def triton_config(self, num_stages, num_warps, **kwargs):
+        from triton import Config  # type: ignore[attr-defined]
+        return Config(kwargs, num_stages=num_stages, num_warps=num_warps)
+ 
     def get_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.mm_configs)
+        filtered_configs = self._filter_configs(self.mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_exhaustive_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.exhaustive_configs)
+        filtered_configs = self._filter_configs(self.exhaustive_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_extra_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.extra_mm_configs)
+        filtered_configs = self._filter_configs(self.extra_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_int8_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.int8_mm_configs)
+        filtered_configs = self._filter_configs(self.int8_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_mixed_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.mixed_mm_configs)
+        filtered_configs = self._filter_configs(self.mixed_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.persistent_mm_configs)
+        filtered_configs = self._filter_configs(self.persistent_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_scaled_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.scaled_mm_configs)
+        filtered_configs = self._filter_configs(self.scaled_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_scaled_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.scaled_persistent_mm_configs)
+        filtered_configs = self._filter_configs(self.scaled_persistent_mm_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_mm_plus_mm_configs(self) -> List[Dict[str, Any]]:
-        return self.mm_plus_mm_configs
+        filtered_configs = self.mm_plus_mm_configs
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_conv_configs(self) -> List[Dict[str, Any]]:
-        return self._filter_configs(self.conv_configs)
+        filtered_configs = self._filter_configs(self.conv_configs)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
 
 class CPUConfigHeuristic(BaseConfigHeuristic):
@@ -339,71 +429,145 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
 
     default_num_stages = get_backend_num_stages()
 
-    def _build_rocm_gemm_configs(self, configs, num_stages):
-        return tuple((c[0], c[1], c[2], num_stages, c[4]) for c in configs)
+    def _filter_configs(self, configs, num_stages):
+        return tuple(
+            cast(tuple[int, int, int, int, int], config["config"])
+            for config in configs
+            if config["cond"]
+        )
+
+        
+    def _preprocess_mm_configs(
+        m: int,
+        n: int,
+        k: int,
+        configs: Sequence[tuple[int, int, int, int, int]],
+        has_int8_tensor=False,
+        scale=1,
+        exclude=lambda m, n, k: False,
+    ):
+        """
+        Heuristic to preprocess configs e.g. shrink when they are bigger than the input size
+
+        :param scale: scale factor applied to the config values
+        :param exclude: whether a given config should be excluded
+        """
+        from torch._inductor import config
+
+        max_mm_configs = config.test_configs.max_mm_configs
+
+        min_block_size = 16
+        # block_k=16 seems to be causing issues
+        # see: https://github.com/triton-lang/triton/issues/2156#issuecomment-1695897424
+        min_block_size_k = 32 if has_int8_tensor else 16
+        m = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    m, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size,
+        )
+        n = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    n, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size,
+        )
+        k = max(
+            next_power_of_2(
+                V.graph.sizevars.size_hint(
+                    k, fallback=torch._inductor.config.unbacked_symint_fallback  # type: ignore[arg-type]
+                )
+            ),
+            min_block_size_k,
+        )
+        used = OrderedSet[tuple[int, int, int, int, int, int]]()
+        for block_m, block_n, block_k, num_stages, num_warps in configs:
+            # shrink configs for small sizes
+            block_m = max(min(int(block_m * scale), m), min_block_size)
+            block_n = max(min(int(block_n * scale), n), min_block_size)
+            block_k = max(min(int(block_k * scale), k), min_block_size_k)
+
+            if exclude(block_m, block_n, block_k):
+                continue
+
+            # each warp computes 16x16 tile = 256
+            num_warps = min(num_warps, block_m * block_n // 256)
+            
+            for matrix_instr_nonkdim in [0, 16]:
+                if matrix_instr_nonkdim != 0 and (
+                    block_m % matrix_instr_nonkdim != 0
+                    or block_n % matrix_instr_nonkdim != 0
+                ):
+                    #  block_m and block_n must be a multiple of matrix_instr_nonkdim
+                    continue
+                if (
+                    block_m,
+                    block_n,
+                    block_k,
+                    num_stages,
+                    num_warps,
+                    matrix_instr_nonkdim,
+                ) not in used and (
+                    max_mm_configs is None or len(used) < max_mm_configs
+                ):
+                    used.add(
+                        (
+                            block_m,
+                            block_n,
+                            block_k,
+                            num_stages,
+                            num_warps,
+                            matrix_instr_nonkdim,
+                        )
+                    )
+                    yield triton_config(
+                        BLOCK_M=block_m,
+                        BLOCK_N=block_n,
+                        BLOCK_K=block_k,
+                        num_stages=num_stages,
+                        num_warps=num_warps,
+                        matrix_instr_nonkdim=matrix_instr_nonkdim,
+                    )
 
     def get_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_exhaustive_mm_configs(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "config": (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps),
-                "mfma_size": matrix_instr_nonkdim,
-                "kpack": kpack,
-                "cond": True,
-            }
-            for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
-                [16, 32, 64, 128, 256], repeat=3
-            )
-            for num_stages in [2]
-            for num_warps in [4, 8]
-            for matrix_instr_nonkdim in [0, 16]
-            for kpack in [1, 2]
-        ]
+        filtered_configs = self._filter_configs(self.exhaustive_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_extra_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_extra_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.extra_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_int8_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_int8_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.int8_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_mixed_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_mixed_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.mixed_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_persistent_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.persistent_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_scaled_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_scaled_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.scaled_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_scaled_persistent_mm_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_scaled_mm_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self._filter_configs(self.scaled_persistent_mm_configs, num_stages=self.default_num_stages)
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
     def get_mm_plus_mm_configs(self) -> List[Dict[str, Any]]:
-        configs = super().get_mm_plus_mm_configs()
-        for c in configs:
-            c["num_stages"] = 1
-        return configs
-
-    def get_conv_configs(self) -> List[Dict[str, Any]]:
-        return self._build_rocm_gemm_configs(
-            super().get_conv_configs(), num_stages=self.default_num_stages
-        )
+        filtered_configs = self.mm_plus_mm_configs
+        return partial(self._preprocess_mm_configs, configs=filtered_configs)
 
 
 class XPUConfigHeuristic(BaseConfigHeuristic):

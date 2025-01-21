@@ -23,7 +23,6 @@ from .mm_common import (
     _is_static_problem,
     addmm_epilogue,
     mm_args,
-    mm_configs,
     mm_options,
 )
 
@@ -44,6 +43,7 @@ def _is_large_block_for_cpu(m, n, k):
 
 
 def bmm_configs(m, n, k, *, device_type):
+    mm_configs = V.choices.get_mm_configs()
     if device_type == "cpu":
         return mm_configs(m, n, k, scale=0.5, exclude=_is_large_block_for_cpu)
     return mm_configs(m, n, k)

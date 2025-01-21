@@ -135,65 +135,6 @@ def filtered_configs(
                 )
 
 
-if inductor_config.max_autotune_custom_heuristic is None:
-    mm_heuristics = V.choices.config_heuristics
-else:
-    mm_heuristics = inductor_config.max_autotune_custom_heuristic
-
-if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE":
-    mm_kernel_configs = mm_heuristics.get_mm_configs()
-else:
-    mm_kernel_configs = mm_heuristics.get_exhaustive_mm_configs()
-
-extra_mm_kernel_configs = mm_heuristics.get_extra_mm_configs()
-int8_mm_kernel_configs = mm_heuristics.get_int8_mm_configs()
-mixed_mm_kernel_configs_small_m = mm_heuristics.get_mixed_mm_configs()
-persistent_mm_kernel_configs = mm_heuristics.get_persistent_mm_configs()
-scaled_mm_kernel_configs = mm_heuristics.get_scaled_mm_configs()
-scaled_persistent_mm_kernel_configs = mm_heuristics.get_scaled_persistent_mm_configs()
-
-mixed_mm_kernel_configs = (
-    mm_kernel_configs + mixed_mm_kernel_configs_small_m
-    if inductor_config.max_autotune_gemm_search_space != "EXHAUSTIVE"
-    else mm_kernel_configs
-)
-
-mm_configs = functools.partial(
-    filtered_configs,
-    configs=mm_kernel_configs,
-)
-
-extra_mm_configs = functools.partial(
-    filtered_configs,
-    configs=extra_mm_kernel_configs,
-)
-
-int8_mm_configs = functools.partial(
-    filtered_configs,
-    configs=int8_mm_kernel_configs,
-)
-
-mixed_mm_configs = functools.partial(
-    filtered_configs,
-    configs=mixed_mm_kernel_configs,
-)
-
-persistent_mm_configs = functools.partial(
-    filtered_configs,
-    configs=persistent_mm_kernel_configs,
-)
-
-scaled_mm_configs = functools.partial(
-    filtered_configs,
-    configs=scaled_mm_kernel_configs,
-)
-
-scaled_persistent_mm_configs = functools.partial(
-    filtered_configs,
-    configs=scaled_persistent_mm_kernel_configs,
-)
-
-
 def mm_grid(m, n, meta):
     """
     The CUDA grid size for matmul triton templates.
