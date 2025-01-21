@@ -14,9 +14,7 @@ from .runtime.hints import DeviceProperties, ReductionHint
 from .scheduler import BaseSchedulerNode, Scheduler, WhyNoFuse
 from .template_heuristics import (
     BaseConfigHeuristic,
-    CPUConfigHeuristic,
     CUDAConfigHeuristic,
-    ROCmConfigHeuristic,
     XPUConfigHeuristic,
 )
 from .virtualized import V
@@ -48,8 +46,9 @@ class InductorChoices:
     """
 
     def get_config_heuristics(self, device_type="cuda"):
-        from torch._inductor.utils import get_gpu_type
         from torch._inductor import config
+        from torch._inductor.utils import get_gpu_type
+
         device_type = get_gpu_type()
 
         if config.max_autotune_custom_heuristic is None:
@@ -62,8 +61,6 @@ class InductorChoices:
                 return XPUConfigHeuristic()
             elif torch.cuda.is_available():
                 return BaseConfigHeuristic()
-            else:
-                return CPUConfigHeuristic()
         else:
             return torch._inductor.max_autotune_custom_heuristic
 
@@ -74,7 +71,7 @@ class InductorChoices:
             return mm_heuristics.get_mm_configs()
         else:
             return mm_heuristics.get_exhaustive_mm_configs()
-    
+
     def get_extra_mm_configs(self):
         mm_heuristics = self.get_config_heuristics()
         return mm_heuristics.get_extra_mm_configs()
@@ -108,13 +105,13 @@ class InductorChoices:
 
     def get_mm_plus_mm_configs(self):
         mm_heuristics = self.get_config_heuristics()
-        return mm_heursitics.get_mm_plus_mm_configs()
-    
+        return mm_heuristics.get_mm_plus_mm_configs()
+
     # Conv configs
     def get_conv_configs(self):
         conv_heuristics = self.get_config_heuristics()
         return conv_heuristics.get_conv_configs()
-    
+
     def triton_kernel_kwargs(
         self,
         kernel_cls: Type[TritonKernel],

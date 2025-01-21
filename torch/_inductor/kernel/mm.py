@@ -44,6 +44,7 @@ from .mm_common import (
     _is_static_problem,
     addmm_epilogue,
     mm_args,
+    mm_config_kwargs,
     mm_grid,
     mm_options,
     persistent_mm_grid,
@@ -263,15 +264,6 @@ def _is_large_block_for_cpu(m, n, k):
     return m * n > 2**13
 
 
-def mm_config_kwargs(device):
-    if device == "cpu":
-        return {
-            "scale": 0.5,
-            "exclude": _is_large_block_for_cpu,
-        }
-    return {}
-
-
 def bias_addmm(inp, mat1, mat2, *, out=None, alpha=1, beta=1):
     """
     Giving torch.addmm a 1D tensor calls a different (faster) cublasLt
@@ -413,7 +405,6 @@ def tuned_mm(mat1, mat2, *, layout=None):
 
 @register_lowering(aten._int_mm, type_promotion_kind=None)
 def tuned_int_mm(mat1, mat2, *, layout=None):
-
     m, n, k, layout, mat1, mat2 = mm_args(
         mat1, mat2, layout=layout, out_dtype=torch.int32
     )

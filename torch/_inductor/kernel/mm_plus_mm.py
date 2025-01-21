@@ -1,5 +1,4 @@
 # mypy: allow-untyped-defs
-import functools
 
 import torch
 
@@ -112,17 +111,6 @@ mm_plus_mm_template = TritonTemplate(
 )
 
 
-@functools.lru_cache(None)
-def mm_configs():
-    import triton
-
-    return [
-        triton.Config(c["config"], num_stages=c["num_stages"], num_warps=c["num_warps"])
-        for c in V.choices.get_mm_plus_mm_configs()
-        if c["cond"]
-    ]
-
-
 def tuned_mm_plus_mm(mat1, mat2, mat3, mat4, *, layout=None):
     """
     Computes mm(mat1, mat2) + mm(mat3, mat4)
@@ -153,6 +141,9 @@ def tuned_mm_plus_mm(mat1, mat2, mat3, mat4, *, layout=None):
         if use_aten_gemm_kernels()
         else []
     )
+
+    mm_configs = V.choices.get_mm_plus_mm_configs()
+
     if use_triton_template(layout1):
         for config in mm_configs():
             # see https://github.com/openai/triton/issues/1298
