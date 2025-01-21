@@ -253,7 +253,7 @@ class BaseConfigHeuristic:
         max_mm_configs: int,
     ) -> Generator[Dict[str, Any], None, None]:
         """
-        Finalizes configs, ensuring they meet constraints and yielding them.
+        Finalizes configs after scaling, applying additional constraints.
         """
         used = OrderedSet[tuple[int, int, int, int, int, int]]()
 
@@ -442,9 +442,6 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         configs: List[Tuple[int, int, int, int, int]],
         max_mm_configs: int,
     ) -> Generator[Dict[str, Any], None, None]:
-        """
-        Finalizes configs, ensuring they meet constraints and yielding them.
-        """
         used = OrderedSet[tuple[int, int, int, int, int, int]]()
         for block_m, block_n, block_k, num_stages, num_warps in configs:
             # each warp computes 16x16 tile = 256
