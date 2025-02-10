@@ -40,6 +40,20 @@ Config = namedtuple(
     "Config", ["block_m", "block_n", "block_k", "num_stages", "num_warps"]
 )
 
+ROCmConfig = namedtuple(
+    "ROCmConfig",
+    [
+        "block_m",
+        "block_n",
+        "block_k",
+        "num_stages",
+        "num_warps",
+        "group_m",
+        "matrix_instr_nonkdim",
+        "waves_per_eu",
+        "kpack"
+    ],
+)
 
 class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
     """
@@ -276,6 +290,7 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
         max_mm_configs = config.test_configs.max_mm_configs
 
         for block_m, block_n, block_k, num_stages, num_warps in configs:
+
             # Each warp computes a 16x16 tile = 256 elements
             num_warps = min(num_warps, block_m * block_n // 256)
 
@@ -446,19 +461,313 @@ class CUDAConfigHeuristic(BaseConfigHeuristic):
 
 
 class ROCmConfigHeuristic(BaseConfigHeuristic):
+
     def __init__(self) -> None:
         super().__init__()
 
         self.default_num_stages = get_backend_num_stages()
+        self.default_kpack = 2
+        self.default_mfma_instr_size = 16
+
+        self.mm_configs = [
+            ROCmConfig(
+                128, 128, 64, self.default_num_stages, 4,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 128, 64, self.default_num_stages, 8,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                256, 256, 64, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                256, 128, 64, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 256, 64, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 128, 128, self.default_num_stages, 8,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 128, 32, self.default_num_stages, 4,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 64, 64, self.default_num_stages, 4,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 64, 128, self.default_num_stages, 8,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 64, 64, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 64, 128, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 128, 64, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                256, 128, 32, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 128, 128, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                256, 128, 32, self.default_num_stages, 8,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 256, 32, self.default_num_stages, 4,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                16, 16, 256, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 128, 32, self.default_num_stages, 8,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                16, 16, 256, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 128, 32, self.default_num_stages, 8,
+                group_m=16,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 128, 32, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 128, 32, self.default_num_stages, 8,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 64, 256, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                32, 16, 256, self.default_num_stages, 4,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                32, 64, 64, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 64, 32, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                256, 64, 64, self.default_num_stages, 8,
+                group_m=4,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 16, 128, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 32, 128, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                32, 32, 128, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 64, 16, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                32, 32, 16, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=0,
+                waves_per_eu=2,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 64, 16, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 32, 64, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 32, 64, self.default_num_stages, 8,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 32, 32, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 32, 64, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                64, 32, 32, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=self.default_mfma_instr_size,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+            ROCmConfig(
+                128, 32, 32, self.default_num_stages, 4,
+                group_m=8,
+                matrix_instr_nonkdim=0,
+                waves_per_eu=0,
+                kpack=self.default_kpack,
+            ),
+        ]
+
 
         # Exhaustive search for mm configs
         self.exhaustive_configs = [
-            Config(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
+            ROCmConfig(
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                num_stages,
+                num_warps,
+                group_m,
+                matrix_instr_nonkdim,
+                waves_per_eu,
+                kpack
+            )
             for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
                 [16, 32, 64, 128, 256], repeat=3
             )
             for num_stages in [1, self.default_num_stages]
             for num_warps in [4, 8]
+            for group_m in [4, 8, 16]
+            for matrix_instr_nonkdim in [0, 16]
+            for waves_per_eu in [0, 2]
+            for kpack in [1, 2]
         ]
 
     def _filter_configs(
@@ -476,37 +785,60 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         used = OrderedSet[Tuple[Config, int]]()
 
         max_mm_configs = config.test_configs.max_mm_configs
-        for block_m, block_n, block_k, num_stages, num_warps in configs:
-            # each warp computes 16x16 tile = 256
-            num_warps = min(num_warps, block_m * block_n // 256)
+        for conf in configs:
 
-            for matrix_instr_nonkdim in [0, 16]:
-                if matrix_instr_nonkdim != 0 and (
-                    block_m % matrix_instr_nonkdim != 0
-                    or block_n % matrix_instr_nonkdim != 0
-                ):
-                    #  block_m and block_n must be a multiple of matrix_instr_nonkdim
-                    continue
+            block_m, block_n, block_k, num_stages, num_warps, *kwargs = conf
+            
+            conf_dict = conf._asdict()
+            group_m                = conf_dict.get("group_m", 8)
+            matrix_instr_nonkdim   = conf_dict.get("matrix_instr_nonkdim", self.default_mfma_instr_size)
+            waves_per_eu           = conf_dict.get("waves_per_eu", 0)
+            kpack                  = conf_dict.get("kpack", self.default_kpack)
+            
+            if group_m != 8:
+                group_m_list = [group_m, 8]
+            else:
+                group_m_list = [group_m]
+
+            num_warps = min(num_warps, block_m * block_n // 256)
+            if waves_per_eu != 0:
+                waves_per_eu = int(8 // num_warps)
+
+            if matrix_instr_nonkdim != 0 and (
+                block_m % matrix_instr_nonkdim != 0
+                or block_n % matrix_instr_nonkdim != 0
+            ):
+                #  block_m and block_n must be a multiple of matrix_instr_nonkdim
+                matrix_instr_nonkdim = 0
+                kpack = 1
+
+            for group_m in group_m_list:
                 if (
                     block_m,
                     block_n,
                     block_k,
                     num_stages,
                     num_warps,
+                    group_m,
                     matrix_instr_nonkdim,
+                    waves_per_eu,
+                    kpack
                 ) not in used and (
                     max_mm_configs is None or len(used) < max_mm_configs
                 ):
                     used.add(
                         (
-                            Config(
+                            ROCmConfig(
                                 block_m,
                                 block_n,
                                 block_k,
                                 num_stages,
                                 num_warps,
-                            ),
-                            matrix_instr_nonkdim,
+                                group_m,
+                                matrix_instr_nonkdim,
+                                waves_per_eu,
+                                kpack,
+                            )
                         )
                     )
 
@@ -516,7 +848,10 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
                         BLOCK_K=block_k,
                         num_stages=num_stages,
                         num_warps=num_warps,
+                        GROUP_M=group_m,
                         matrix_instr_nonkdim=matrix_instr_nonkdim,
+                        waves_per_eu=waves_per_eu,
+                        kpack=kpack
                     )
 
     def get_mm_configs(self) -> partial[Generator[TritonConfig, None, None]]:
