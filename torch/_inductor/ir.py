@@ -1137,7 +1137,7 @@ class Reduction(Loops):
 
         props = DeviceProperties.create(device)
         num_sm = props.multi_processor_count
-        min_elements_per_thread = 32
+        min_elements_per_thread = 64
         if should_split:
             inner_reduction_splits: Callable[[int, int], int] = functools.partial(
                 V.choices.reduction_split_factor, device, inner_reduction=True
@@ -1188,7 +1188,7 @@ class Reduction(Loops):
             return ReductionHint.INNER, split
         if (
             reduction_numel_hint <= min_elements_per_thread
-            or numel_hint >= num_sm * 2 * 32
+            or numel_hint >= num_sm * 2 * 64
         ):
             return ReductionHint.DEFAULT, 1
 

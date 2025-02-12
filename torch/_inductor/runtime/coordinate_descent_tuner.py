@@ -6,7 +6,9 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from .hints import TRITON_MAX_BLOCK
 from .runtime_utils import red_text, triton_config_to_hashable
+from ..virtualized import V
 
+from torch._dynamo.device_interface import get_interface_for_device
 
 if TYPE_CHECKING:
     from .triton_compat import triton
@@ -20,6 +22,8 @@ def get_field(config, name):
         return config.num_warps
     elif name == "num_stages":
         return config.num_stages
+    elif name == "waves_per_eu":
+        return config.kwargs.get(name, int(8 // config.num_warps))
     else:
         return config.kwargs.get(name, None)
 
@@ -60,8 +64,12 @@ class CoordescTuner:
 
     def get_warpsmax(self):
         # Currently, CUDA has a maximum of 1024 threads, so 32 is the max
-        # number of warps.
-        return 1024 // 32
+        # number of warps. ROCm warp size may change depending on architecture
+        # so we will query device properties.
+        #device_interface = get_interface_for_device(V.graph.device_type)
+        #device_props = device_interface.get_device_properties(V.graph.device_type)
+        #warp_size = getattr(device_props, "warp_size", 32)
+        return 1024 // 64
 
     def cache_benchmark_result(self, config, timing):
         self.cached_benchmark_results[triton_config_to_hashable(config)] = timing
@@ -97,6 +105,8 @@ class CoordescTuner:
         ]
         if self.is_mm:
             out.append("num_stages")
+        if self.inductor_meta["is_hip"] == True:
+            out.append("waves_per_eu")
 
         return out
 
@@ -107,6 +117,8 @@ class CoordescTuner:
             return val > self.get_config_max(prefix)
         if name == "num_warps":
             return val > self.get_warpsmax()
+        if name == "waves_per_eu":
+            return val > 8
 
         return False
 
@@ -116,6 +128,8 @@ class CoordescTuner:
         returned as it's own neighbour.
         """
         assert radius >= 1
+
+        print(name)
 
         def update(cur_val, inc=True):
             if name == "num_stages":

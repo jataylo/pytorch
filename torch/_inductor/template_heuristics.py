@@ -796,7 +796,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             kpack                  = conf_dict.get("kpack", self.default_kpack)
             
             if group_m != 8:
-                group_m_list = [group_m, 8]
+                group_m_list = [group_m]
             else:
                 group_m_list = [group_m]
 
