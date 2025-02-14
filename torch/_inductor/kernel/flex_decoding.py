@@ -318,21 +318,6 @@ def get_split_k(B: int, H: int, Mk: int) -> int:
     return split_k
 
 
-def _get_decoding_default_config(key) -> tuple[int, int, int]:
-    dtype = key.get_dtype()
-    head_dim = key.get_size()[-1]
-    sm_version = torch.cuda.get_device_capability()
-    default_config = (64, 2, 1)
-    if sm_version >= (9, 0):
-        if head_dim > 128 and dtype == torch.float32:
-            return default_config
-        if torch.version.hip is None:
-            return (64, 2, 3)
-        else:
-            return (64, 2, 1)
-    return default_config
-
-
 def create_flex_decoding_kernel(*args, **kwargs):
     from .flex_attention import set_head_dim_values
 
@@ -427,20 +412,9 @@ def create_flex_decoding_kernel(*args, **kwargs):
     mask_mod_other_buffers = maybe_realize(mask_mod_other_buffers)
 
     choices: list[Any] = []
-    configs: list[tuple[int, int, int]] = []
-    configs.append(_get_decoding_default_config(key))
-    # Note: max_autotune is not supported yet. Causes error in lowering the dynamic shape in reduction ops.
-    if config.max_autotune:
-        configs += [
-            (64, 2, 2),
-            (32, 2, 3),
-            (128, 2, 3),
-        ]
-
-        # Use num_stages=1 on ROCm to avoid shmem limitation
-        if torch.version.hip:
-            configs = [(c[0], c[1], 1) for c in configs]
-
+    dtype = key.get_dtype()
+    head_dim = key.get_size()[-1]
+    configs = V.choices.get_flex_decode_configs(key, dtype, head_dim)
     # TODO: fix autotuning.
 
     kernel_options.setdefault("SM_SCALE", scale)

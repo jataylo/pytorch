@@ -127,6 +127,18 @@ class InductorChoices:
         conv_heuristics = self.get_config_heuristics(device_type)
         return conv_heuristics.get_conv_configs()
 
+    def get_flex_attention_configs(
+        self, query, mode, dtype, head_dim, device_type: Optional[str] = "cuda"
+    ):
+        flex_heuristics = self.get_config_heuristics(device_type)
+        return flex_heuristics.get_flex_attention_configs(query, mode, dtype, head_dim)
+
+    def get_flex_decode_configs(
+        self, key, dtype, head_dim, device_type: Optional[str] = "cuda"
+    ):
+        flex_heuristics = self.get_config_heuristics(device_type)
+        return flex_heuristics.get_flex_decode_configs(key,  dtype, head_dim)
+
     def triton_kernel_kwargs(
         self,
         kernel_cls: type[TritonKernel],

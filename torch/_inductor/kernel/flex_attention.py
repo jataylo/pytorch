@@ -758,101 +758,6 @@ class Mode(Enum):
     bwd = auto()
 
 
-def _get_rocm_config(query, mode: Mode) -> tuple[int, int, int, int]:
-    dtype = query.get_dtype()
-    head_dim = V.graph.sizevars.evaluate_static_shape(query.get_size()[-1])
-    fwd_config = None
-
-    if mode == Mode.fwd:
-        if head_dim <= 256:
-            if dtype == torch.float32:
-                fwd_config = (64, 64, 4, 1)
-            else:
-                fwd_config = (128, 64, 8, 1)
-            fwd_config = _rocm_default_config.get((dtype, head_dim), fwd_config)
-        else:  # modest hardware or extremely large head_dim
-            if dtype == torch.float32:
-                fwd_config = (32, 16, 4, 1)
-            else:
-                fwd_config = (64, 32, 4, 1)
-        return fwd_config
-    else:  # bwd
-        assert mode == Mode.bwd
-        if dtype == torch.float32:
-            return (16, 16, 4, 1)
-        elif head_dim <= 256:
-            if head_dim == 64:
-                return (64, 64, 4, 1)
-            elif head_dim == 128:
-                return (64, 128, 8, 1)
-            else:
-                return (64, 64, 4, 1)
-        else:  # modest hardware or extremely large head_dim
-            return (16, 16, 4, 1)
-
-
-def _get_nv_config(query, mode: Mode) -> tuple[int, int, int, int]:
-    dtype = query.get_dtype()
-    head_dim = V.graph.sizevars.evaluate_static_shape(query.get_size()[-1])
-    fwd_config = None
-
-    capability = torch.cuda.get_device_capability()
-
-    if mode == Mode.fwd:
-        if head_dim <= 256:
-            if dtype == torch.float32:
-                fwd_config = (64, 64, 4, 3)
-            else:
-                fwd_config = (128, 64, 4, 3)
-            if capability >= (9, 0):
-                fwd_config = _h100_default_config.get((dtype, head_dim), fwd_config)
-            elif capability >= (8, 0):
-                fwd_config = _a100_default_config.get((dtype, head_dim), fwd_config)
-        else:  # modest hardware or extremely large head_dim
-            if dtype == torch.float32:
-                fwd_config = (32, 16, 4, 3)
-            else:
-                fwd_config = (64, 32, 4, 3)
-        return fwd_config
-
-    else:  # bwd
-        assert mode == Mode.bwd
-        if dtype == torch.float32:
-            return (16, 16, 4, 1)
-        elif head_dim <= 256 and capability >= (9, 0):  # H100
-            if head_dim == 64:
-                return (64, 64, 4, 3)
-            elif head_dim == 128:
-                return (64, 128, 8, 3)
-            else:
-                return (64, 64, 4, 2)
-        elif capability >= (8, 0):
-            if head_dim >= 64:
-                return (32, 128, 4, 3)
-            elif head_dim == 128:
-                # SM86/89 have smaller shared memory sizes
-                num_stages = 3 if capability[-1] == 0 else 2
-                return (64, 64, 4, num_stages)
-            else:
-                return (64, 64, 4, 2)
-        else:  # modest hardware or extremely large head_dim
-            return (16, 16, 4, 1)
-
-
-def _get_default_config_fwd(query) -> tuple[int, int, int, int]:
-    if torch.version.hip is None:
-        return _get_nv_config(query, mode=Mode.fwd)
-    else:
-        return _get_rocm_config(query, mode=Mode.fwd)
-
-
-def _get_default_config_bwd(query) -> tuple[int, int, int, int]:
-    if torch.version.hip is None:
-        return _get_nv_config(query, mode=Mode.bwd)
-    else:
-        return _get_rocm_config(query, mode=Mode.bwd)
-
-
 def create_num_blocks_fake_generator(sparse_indices):
     # The idea here is that we need to create a real tensor with real data
     # that's representative for benchmarking.
@@ -1413,19 +1318,10 @@ def flex_attention(
 
     choices: list[Any] = []
     configs: list[tuple[int, int, int, int]] = []
-    configs.append(_get_default_config_fwd(query))
-    if config.max_autotune:
-        configs += [
-            (128, 64, 4, 3),
-            (128, 128, 4, 3),
-            (128, 128, 8, 2),
-            (64, 128, 4, 3),
-            (64, 64, 4, 3),
-        ]
 
-        # On ROCm convert num_stages to 1 to avoid shmem issues
-        if torch.version.hip:
-            configs = [(c[0], c[1], c[2], 1) for c in configs]
+    dtype = query.get_dtype()
+    head_dim = V.graph.sizevars.evaluate_static_shape(query.get_size()[-1])
+    configs = V.choices.get_flex_attention_configs(query, Mode.fwd, dtype, head_dim)
 
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
     SPARSE_KV_BLOCK_SIZE = V.graph.sizevars.evaluate_static_shape(SPARSE_KV_BLOCK_SIZE)
@@ -2504,19 +2400,11 @@ def flex_attention_backward(*args, **kwargs):
 
     choices: list[Any] = []
     configs: list[tuple[int, int, int, int]] = []
-    configs.append(_get_default_config_bwd(query))
-    if config.max_autotune:
-        num_stages_list = [1, 3, 4, 5] if torch.version.hip is None else [1]
-        configs.extend(
-            [
-                (BLOCK1, BLOCK2, w, s)
-                for BLOCK1 in [32, 64]
-                for BLOCK2 in [32, 64, 128]
-                for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4])
-                for s in num_stages_list
-                if BLOCK2 % BLOCK1 == 0
-            ]
-        )
+
+    dtype = query.get_dtype()
+    head_dim = V.graph.sizevars.evaluate_static_shape(query.get_size()[-1])
+    configs = V.choices.get_flex_attention_configs(query, Mode.bwd, dtype, head_dim)
+
     original_kernel_options = kernel_options.copy()
     for BLOCK1, BLOCK2, num_warps, num_stages in configs:
         if (

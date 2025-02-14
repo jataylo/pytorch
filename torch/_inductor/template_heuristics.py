@@ -1,4 +1,5 @@
 from __future__ import annotations
+import torch
 
 import itertools
 from collections import namedtuple
@@ -12,6 +13,7 @@ from . import config
 from .utils import get_backend_num_stages
 from .virtualized import V
 
+from .kernel.flex_attention import Mode
 
 if TYPE_CHECKING:
     from triton import Config as TritonConfig
@@ -38,6 +40,10 @@ class BaseConfigSingleton(type):
 
 Config = namedtuple(
     "Config", ["block_m", "block_n", "block_k", "num_stages", "num_warps"]
+)
+
+FlexConfig = namedtuple(
+    "Config", ["block_m", "block_n", "num_stages", "num_warps"]
 )
 
 ROCmConfig = namedtuple(
@@ -278,6 +284,7 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
             Config(256, 64, 32, 2, 8),
         ]
 
+
     def _finalize_mm_configs(
         self,
         configs: List[Config],
@@ -363,6 +370,7 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
 
         return scaled_configs
 
+
     def preprocess_mm_configs(
         self,
         m: int,
@@ -424,6 +432,67 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
     def get_conv_configs(self) -> partial[Generator[TritonConfig, None, None]]:
         return partial(self.preprocess_mm_configs, configs=self.conv_configs)
 
+    def get_flex_attention_configs(self, query, mode, dtype, head_dim) -> tuple[Config]:
+        configs: list[tuple[int, int, int, int]] = []
+        fwd_config = None
+        bwd_config = None
+        if mode == Mode.fwd:
+            if head_dim <= 256:
+                if dtype == torch.float32:
+                    fwd_config = (64, 64, 4, 3)
+                else:
+                    fwd_config = (128, 64, 4, 3)
+            else:  # modest hardware or extremely large head_dim
+                if dtype == torch.float32:
+                    fwd_config = (32, 16, 4, 3)
+                else:
+                    fwd_config = (64, 32, 4, 3)
+
+            configs.append(fwd_config)
+
+            if config.max_autotune:
+                configs += [
+                    (128, 64, 4, 3),
+                    (128, 128, 4, 3),
+                    (128, 128, 8, 2),
+                    (64, 128, 4, 3),
+                    (64, 64, 4, 3),
+                ]
+        else:  # bwd
+            assert mode == Mode.bwd
+            if dtype == torch.float32:
+                bwd_config = (16, 16, 4, 1)
+            else:  # modest hardware or extremely large head_dim
+                bwd_config = (16, 16, 4, 1)
+
+            configs.append(bwd_config)
+
+            if config.max_autotune:
+                num_stages_list = [1, 3, 4, 5]
+                configs.extend(
+                    [
+                        (BLOCK1, BLOCK2, w, s)
+                        for BLOCK1 in [32, 64]
+                        for BLOCK2 in [32, 64, 128]
+                        for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4])
+                        for s in num_stages_list
+                        if BLOCK2 % BLOCK1 == 0
+                    ]
+                )
+
+        return configs
+
+    def get_flex_decode_configs(key, dtype, head_dim) -> tuple[int, int, int]:
+        configs: list[tuple[int, int, int]] = []
+        sm_version = torch.cuda.get_device_capability()
+        default_config = (64, 2, 1)
+        if sm_version >= (9, 0):
+            if head_dim > 128 and dtype == torch.float32:
+                return default_config
+            else:
+                return (64, 2, 3)
+        return default_config
+
     def generate_mixed_mm_config(self, m: int, n: int, k: int) -> TritonConfig:
         if m <= 16 and n >= 4096 and k >= 4096:
             return self.triton_config(
@@ -456,7 +525,103 @@ class CPUConfigHeuristic(BaseConfigHeuristic):
 
 
 class CUDAConfigHeuristic(BaseConfigHeuristic):
-    pass
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.h100_attn_configs = {
+            (torch.float32, 64): FlexConfig(block_m=128, block_n=32, num_warps=4, num_stages=3),
+            (torch.float32, 128): FlexConfig(block_m=32, block_n=64, num_warps=4, num_stages=3),
+            (torch.float32, 256): FlexConfig(block_m=32, block_n=32, num_warps=4, num_stages=3),
+            (torch.bfloat16, 64): FlexConfig(block_m=128, block_n=128, num_warps=4, num_stages=3),
+            (torch.bfloat16, 128): FlexConfig(block_m=128, block_n=64, num_warps=8, num_stages=3),
+            (torch.bfloat16, 256): FlexConfig(block_m=64, block_n=32, num_warps=4, num_stages=3),
+            (torch.float16, 64):  FlexConfig(block_m=128, block_n=128, num_warps=4, num_stages=3),
+            (torch.float16, 128): FlexConfig(block_m=128, block_n=128, num_warps=8, num_stages=3),
+            (torch.float16, 256): FlexConfig(block_m=64, block_n=3, num_warps=4, num_stages=3),
+        }
+
+        self.a100_attn_configs = {
+            (torch.float32, 64): FlexConfig(block_m=128, block_n=32, num_warps=4, num_stages=3),
+            (torch.float32, 128): FlexConfig(block_m=128, block_n=32, num_warps=4, num_stages=3),
+            (torch.float32, 256): FlexConfig(block_m=64, block_n=16, num_warps=4, num_stages=3),
+            (torch.bfloat16, 64): FlexConfig(block_m=128, block_n=64, num_warps=4, num_stages=3),
+            (torch.bfloat16, 128): FlexConfig(block_m=128, block_n=64, num_warps=8, num_stages=3),
+            (torch.bfloat16, 256): FlexConfig(block_m=32, block_n=64, num_warps=4, num_stages=3),
+            (torch.float16, 64):  FlexConfig(block_m=128, block_n=64, num_warps=4, num_stages=3),
+            (torch.float16, 128): FlexConfig(block_m=128, block_n=64, num_warps=8, num_stages=3),
+            (torch.float16, 256): FlexConfig(block_m=32, block_n=64, num_warps=4, num_stages=3),
+        }
+
+    def get_flex_attention_configs(self, query, mode, dtype, head_dim) -> tuple[Config]:
+
+        configs: list[tuple[int, int, int, int]] = []
+        fwd_config = None
+        bwd_config = None
+
+        if mode == Mode.fwd:
+            if head_dim <= 256:
+                if dtype == torch.float32:
+                    fwd_config = (64, 64, 4, 3)
+                else:
+                    fwd_config = (128, 64, 4, 3)
+                if capability >= (9, 0):
+                    fwd_config = self.h100_default_config.get((dtype, head_dim), fwd_config)
+                elif capability >= (8, 0):
+                    fwd_config = self.a100_default_config.get((dtype, head_dim), fwd_config)
+            else:  # modest hardware or extremely large head_dim
+                if dtype == torch.float32:
+                    fwd_config = (32, 16, 4, 3)
+                else:
+                    fwd_config = (64, 32, 4, 3)
+
+            configs.append(fwd_config)
+
+            if config.max_autotune:
+                configs += [
+                    (128, 64, 4, 3),
+                    (128, 128, 4, 3),
+                    (128, 128, 8, 2),
+                    (64, 128, 4, 3),
+                    (64, 64, 4, 3),
+                ]
+
+        else:  # bwd
+            assert mode == Mode.bwd
+            if dtype == torch.float32:
+                bwd_ (16, 16, 4, 1)
+            elif head_dim <= 256 and capability >= (9, 0):  # H100
+                if head_dim == 64:
+                    bwd_config = (64, 64, 4, 3)
+                elif head_dim == 128:
+                    bwd_config = (64, 128, 8, 3)
+                else:
+                    bwd_config = (64, 64, 4, 2)
+            elif capability >= (8, 0):
+                if head_dim >= 64:
+                    bwd_config = (32, 128, 4, 3)
+                elif head_dim == 128:
+                    # SM86/89 have smaller shared memory sizes
+                    num_stages = 3 if capability[-1] == 0 else 2
+                    bwd_config = (64, 64, 4, num_stages)
+                else:
+                    bwd_config = (64, 64, 4, 2)
+            else:  # modest hardware or extremely large head_dim
+                bwd_config = (16, 16, 4, 1)
+
+            configs.append(bwd_config)
+
+            if config.max_autotune:
+                num_stages_list = [1, 3, 4, 5]
+                configs.extend(
+                    [
+                        (BLOCK1, BLOCK2, w, s)
+                        for BLOCK1 in [32, 64]
+                        for BLOCK2 in [32, 64, 128]
+                        for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4])
+                        for s in num_stages_list
+                        if BLOCK2 % BLOCK1 == 0
+                    ]
+                )
 
 
 class ROCmConfigHeuristic(BaseConfigHeuristic):
@@ -767,6 +932,18 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             for kpack in [1, 2]
         ]
 
+        self.attn_configs = {
+            (torch.float32, 64): FlexConfig(block_m=128, block_n=32, num_warps=4, num_stages=2),
+            (torch.float32, 128): FlexConfig(block_m=128, block_n=32, num_warps=4, num_stages=2),
+            (torch.float32, 256): FlexConfig(block_m=64, block_n=16, num_warps=4, num_stages=2),
+            (torch.bfloat16, 64): FlexConfig(block_m=128, block_n=64, num_warps=4, num_stages=2),
+            (torch.bfloat16, 128): FlexConfig(block_m=128, block_n=64, num_warps=8, num_stages=2),
+            (torch.bfloat16, 256): FlexConfig(block_m=32, block_n=64, num_warps=4, num_stages=2),
+            (torch.float16, 64):  FlexConfig(block_m=128, block_n=64, num_warps=4, num_stages=2),
+            (torch.float16, 128): FlexConfig(block_m=128, block_n=64, num_warps=8, num_stages=2),
+            (torch.float16, 256): FlexConfig(block_m=32, block_n=64, num_warps=4, num_stages=2),
+        }
+
     def _filter_configs(
         self, configs: List[Config], new_num_stages: int
     ) -> List[Config]:
@@ -907,6 +1084,78 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
             self.conv_configs, self.default_num_stages
         )
         return partial(self.preprocess_mm_configs, configs=filtered_configs)
+
+    def get_flex_attention_configs(self, query, mode, dtype, head_dim) -> tuple[Config]:
+        configs: list[tuple[int, int, int, int]] = []
+        fwd_config = None
+        bwd_config = None
+
+        if mode == Mode.fwd:
+            if head_dim <= 256:
+                if dtype == torch.float32:
+                    fwd_config = (64, 64, 4, 1)
+                else:
+                    fwd_config = (128, 64, 8, 1)
+                fwd_config = self.attn_configs.get((dtype, head_dim), fwd_config)
+            else:  # modest hardware or extremely large head_dim
+                if dtype == torch.float32:
+                    fwd_config = (32, 16, 4, 1)
+                else:
+                    fwd_config = (64, 32, 4, 1)
+
+            configs.append(fwd_config)
+
+            if config.max_autotune:
+                configs += [
+                    (128, 64, 4, 3),
+                    (128, 128, 4, 3),
+                    (128, 128, 8, 2),
+                    (64, 128, 4, 3),
+                    (64, 64, 4, 3),
+                ]
+
+        else:  # bwd
+            assert mode == Mode.bwd
+            if dtype == torch.float32:
+                bwd_config = (16, 16, 4, 1)
+            elif head_dim <= 256:
+                if head_dim == 64:
+                    bwd_config = (64, 64, 4, 1)
+                elif head_dim == 128:
+                    bwd_config = (64, 128, 8, 1)
+                else:
+                    bwd_config = (64, 64, 4, 1)
+            else:  # modest hardware or extremely large head_dim
+                bwd_config = (16, 16, 4, 1)
+
+            configs.append(bwd_config)
+
+        if config.max_autotune:
+            num_stages_list = [1, self.default_num_stages]
+            configs.extend(
+                [
+                    (BLOCK1, BLOCK2, w, s)
+                    for BLOCK1 in [32, 64]
+                    for BLOCK2 in [32, 64, 128]
+                    for w in ([4, 8])
+                    for s in num_stages_list
+                    if BLOCK2 % BLOCK1 == 0
+                ]
+            )
+
+        return configs
+
+    def get_flex_decode_configs(key, dtype, head_dim) -> tuple[int, int, int]:
+        configs: list[tuple[int, int, int]] = []
+        default_config = (64, 2, 1)
+        configs.append(default_config)
+        if config.max_autotune:
+            configs += [
+                (64, 2, 1),
+                (32, 2, 1),
+                (128, 2, 1),
+            ]
+        return configs
 
     def generate_mixed_mm_config(self, m: int, n: int, k: int) -> TritonConfig:
         if m <= 16 and n >= 4096 and k >= 4096:
