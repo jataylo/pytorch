@@ -1239,10 +1239,16 @@ class TritonTemplate(KernelTemplate):
             bmreq,
             log_info={
                 "tile_shape": str(
-                    (
-                        kwargs.get("BLOCK_M", -1),
-                        kwargs.get("BLOCK_K", -1),
-                        kwargs.get("BLOCK_N", -1),
+                    tuple(
+                        val for val in (
+                            kwargs.get("BLOCK_M", -1),
+                            kwargs.get("BLOCK_K", -1),
+                            kwargs.get("BLOCK_N", -1),
+                            kwargs.get("BLOCK_M1", -1),
+                            kwargs.get("BLOCK_M2", -1),
+                            kwargs.get("BLOCK_N1", -1),
+                            kwargs.get("BLOCK_N2", -1),
+                        ) if val >= 0
                     )
                 ),
                 "num_stages": num_stages,
@@ -1298,6 +1304,7 @@ class ExternKernelChoice:
             parts.append(inspect.getsource(fn))
         except Exception:
             pass
+
         return code_hash("-".join(parts))
 
     def bind(
@@ -1363,12 +1370,64 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         return f"template_kernels.{self.name}"
 
     def hash_key(self):
-        return "-".join(
-            [
-                self.name.rsplit("_", 1)[0],
-                self.bmreq.module_cache_key,
+        # Check if the environment variable is set
+        if os.getenv('TORCHINDUCTOR_HUMAN_READABLE_AUTOTUNE_CACHE') == '1':
+            tile_info = eval(self.info_dict()["tile_shape"])
+
+            # Construct the basic string components
+            base_key = [
+                f"name-{self.name.rsplit('_', 1)[0]}",  # Op name (e.g., 'triton_mm')
             ]
-        )
+
+            # Add the tile sizes dynamically (block1, block2, block3, etc.)
+            for i, size in enumerate(tile_info):
+                if size >= 0:
+                    base_key.append(f"block{i+1}-{size}")
+
+            # Add other parameters in a structured format
+            base_key.extend([
+                f"num_stages-{self.bmreq.num_stages}",
+                f"num_warps-{self.bmreq.num_warps}",
+            ])
+
+            # Special case for when we have additional parameters (only if the else part is active)
+            if torch.version.hip is not None:  # Assuming else means non-HIP setup
+                base_key.extend([
+                    f"matrix_instr_nonkdim-{self.bmreq.matrix_instr_nonkdim}",
+                    f"waves_per_eu-{self.bmreq.waves_per_eu}",
+                    f"kpack-{self.bmreq.kpack}",
+                ])
+
+            # Add the module_cache_key at the end for the human-readable case
+            base_key.append(f"module_cache_key-{self.bmreq.module_cache_key}")
+            
+            # Create the final key by joining all components with a hyphen
+            final_key = ":".join(base_key)
+            
+            # Print the generated hash key for debugging
+            print(final_key)
+
+            return final_key
+        
+        else:
+        
+            base_key = [
+                self.name.rsplit("_", 1)[0],  # Op name (e.g., 'triton_mm')
+            ]
+
+            base_key.extend([
+                f"num_stages: {self.bmreq.num_stages}",
+                f"num_warps: {self.bmreq.num_warps}",
+                f"module_cache_key: {self.bmreq.module_cache_key}"
+            ])
+
+            # Create the final key
+            final_key = "-".join(base_key)
+            
+            # Print the generated hash key for debugging
+            print(final_key)
+            
+            return final_key
 
     def output_node(self):
         return ir.TensorBox.create(

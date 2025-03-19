@@ -138,6 +138,9 @@ def maybe_realize(args: list[Optional[IRNode]]):
 
 
 def get_float32_precision():
+    import os 
+    if os.getenv("TORCHINDUCTOR_FLEX_FORCE_TF32") == "1":
+        return "'tf32'"
     if (
         torch.get_float32_matmul_precision() == "highest"
         or torch.version.hip
@@ -1469,6 +1472,19 @@ def flex_attention(
         if torch.version.hip:
             configs = [(c[0], c[1], c[2], 1) for c in configs]
 
+    # Experimental exhaust flag
+    import os
+    import itertools
+    if os.getenv("TORCHINDUCTOR_EXHAUSTIVE_FLEX_ATTENTION_EXPERIMENTAL") == "1":
+        BLOCK_M_VALS = [16, 32, 64, 128, 256, 512]
+        BLOCK_N_VALS = [16, 32, 64, 128, 256, 512]
+        NUM_WARPS_VALS = [4, 8]
+        NUM_STAGES_VALS = [1, 2]
+        NUM_MFMA_VALS = [0, 16]
+        NUM_WPEU_VALS = [0, 1, 2, 4, 8]
+
+        configs = list(itertools.product(BLOCK_M_VALS, BLOCK_N_VALS, NUM_WARPS_VALS, NUM_STAGES_VALS))
+
     # Mark SPARSE_KV_BLOCK_SIZE & SPARSE_Q_BLOCK_SIZE as static shapes and add guards.
     SPARSE_KV_BLOCK_SIZE = V.graph.sizevars.evaluate_static_shape(SPARSE_KV_BLOCK_SIZE)
     SPARSE_Q_BLOCK_SIZE = V.graph.sizevars.evaluate_static_shape(SPARSE_Q_BLOCK_SIZE)
@@ -1508,29 +1524,56 @@ def flex_attention(
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
 
-        error = flex_attention_template.maybe_append_choice(
-            choices=choices,
-            input_nodes=[
-                query,
-                key,
-                value,
-                logsumexp,
-                kv_num_blocks,
-                kv_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-            ],
-            layout=layout,
-            subgraphs=[
-                subgraph_buffer,
-                mask_graph_buffer,
-            ],
-            mutated_inputs=[
-                logsumexp,
-            ],
-            call_sizes=query.get_size(),
-            **cur_kernel_options,
-        )
+        if os.getenv("TORCHINDUCTOR_EXHAUSTIVE_FLEX_ATTENTION_EXPERIMENTAL") == "1":
+            for mfma in NUM_MFMA_VALS:
+                for wpeu in NUM_WPEU_VALS:
+                     error = flex_attention_template.maybe_append_choice(
+                        choices=choices,
+                        input_nodes=[
+                            query,
+                            key,
+                            value,
+                            logsumexp,
+                            kv_num_blocks,
+                            kv_indices,
+                            full_kv_num_blocks,
+                            full_kv_indices,
+                        ],
+                        layout=layout,
+                        subgraphs=[
+                            subgraph_buffer,
+                            mask_graph_buffer,
+                        ],
+                        mutated_inputs=[
+                            logsumexp,
+                        ],
+                        call_sizes=query.get_size(),
+                        **cur_kernel_options,
+                    )
+        else:
+            error = flex_attention_template.maybe_append_choice(
+                choices=choices,
+                input_nodes=[
+                    query,
+                    key,
+                    value,
+                    logsumexp,
+                    kv_num_blocks,
+                    kv_indices,
+                    full_kv_num_blocks,
+                    full_kv_indices,
+                ],
+                layout=layout,
+                subgraphs=[
+                    subgraph_buffer,
+                    mask_graph_buffer,
+                ],
+                mutated_inputs=[
+                    logsumexp,
+                ],
+                call_sizes=query.get_size(),
+                **cur_kernel_options,
+            )
         if error is not None and len(configs) == 1:
             raise error
     inputs_for_autotuning = (
@@ -2552,17 +2595,35 @@ def flex_attention_backward(*args, **kwargs):
     configs: list[tuple[int, int, int, int]] = []
     configs.append(_get_default_config_bwd(query))
     if config.max_autotune:
-        num_stages_list = [1, 3, 4, 5] if torch.version.hip is None else [1]
-        configs.extend(
-            [
-                (BLOCK1, BLOCK2, w, s)
-                for BLOCK1 in [32, 64]
-                for BLOCK2 in [32, 64, 128]
-                for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4])
-                for s in num_stages_list
-                if BLOCK2 % BLOCK1 == 0
-            ]
-        )
+        import os
+        if os.getenv("TORCHINDUCTOR_EXHAUSTIVE_FLEX_ATTENTION_EXPERIMENTAL") == "1":
+            num_stages_list = [1, 3, 4, 5] if torch.version.hip is None else [1, 2]
+            configs.extend(
+                [
+                    (BLOCK1, BLOCK2, w, s)
+                    for BLOCK1 in [16, 32, 64, 128, 256, 512]
+                    for BLOCK2 in [16, 32, 64, 128, 256, 512]
+                    for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4, 8])
+                    for s in num_stages_list
+                    if BLOCK2 % BLOCK1 == 0
+                ]
+            )
+
+            NUM_MFMA_VALS = [0, 16]
+            NUM_WPEU_VALS = [0, 1, 2, 4, 8]
+
+        else:
+            num_stages_list = [1, 3, 4, 5] if torch.version.hip is None else [1]
+            configs.extend(
+                [
+                    (BLOCK1, BLOCK2, w, s)
+                    for BLOCK1 in [32, 64]
+                    for BLOCK2 in [32, 64, 128]
+                    for w in ([4, 8] if BLOCK1 >= 128 or BLOCK2 >= 128 else [4])
+                    for s in num_stages_list
+                    if BLOCK2 % BLOCK1 == 0
+                ]
+            )
     original_kernel_options = kernel_options.copy()
     for BLOCK1, BLOCK2, num_warps, num_stages in configs:
         if (
@@ -2594,41 +2655,82 @@ def flex_attention_backward(*args, **kwargs):
         cur_kernel_options.setdefault("SPARSE_Q_BLOCK_SIZE", SPARSE_Q_BLOCK_SIZE)
         cur_kernel_options.setdefault("SPARSE_KV_BLOCK_SIZE", SPARSE_KV_BLOCK_SIZE)
 
-        flex_attention_backward_template.maybe_append_choice(
-            choices=choices,
-            input_nodes=[
-                query,
-                key,
-                value,
-                logsumexp,
-                delta,
-                grad_out,
-                grad_query,
-                broadcasted_grad_value,
-                kv_num_blocks,
-                kv_indices,
-                q_num_blocks,
-                q_indices,
-                full_kv_num_blocks,
-                full_kv_indices,
-                full_q_num_blocks,
-                full_q_indices,
-            ],
-            layout=layout_broadcasted_k,  # We use store_output only for grad_key
-            subgraphs=[
-                fw_subgraph_buffer,
-                joint_outputs.grad_input,
-                mask_graph_buffer,
-                joint_outputs.captured_grads_compute,
-            ],
-            mutated_inputs=[
-                grad_query,
-                broadcasted_grad_value,
-                *joint_outputs.mutated_grads,
-            ],
-            call_sizes=query.get_size() + key.get_size()[1:3],
-            **cur_kernel_options,
-        )
+        if os.getenv("TORCHINDUCTOR_EXHAUSTIVE_FLEX_ATTENTION_EXPERIMENTAL") == "1":
+            for wpeu in NUM_WPEU_VALS:
+                for mfma in NUM_MFMA_VALS:
+                    cur_kernel_options["waves_per_eu"] = wpeu
+                    cur_kernel_options["matrix_instr_non_kdim"] = mfma
+                    flex_attention_backward_template.maybe_append_choice(
+                        choices=choices,
+                        input_nodes=[
+                            query,
+                            key,
+                            value,
+                            logsumexp,
+                            delta,
+                            grad_out,
+                            grad_query,
+                            broadcasted_grad_value,
+                            kv_num_blocks,
+                            kv_indices,
+                            q_num_blocks,
+                            q_indices,
+                            full_kv_num_blocks,
+                            full_kv_indices,
+                            full_q_num_blocks,
+                            full_q_indices,
+                        ],
+                        layout=layout_broadcasted_k,  # We use store_output only for grad_key
+                        subgraphs=[
+                            fw_subgraph_buffer,
+                            joint_outputs.grad_input,
+                            mask_graph_buffer,
+                            joint_outputs.captured_grads_compute,
+                        ],
+                        mutated_inputs=[
+                            grad_query,
+                            broadcasted_grad_value,
+                            *joint_outputs.mutated_grads,
+                        ],
+                        call_sizes=query.get_size() + key.get_size()[1:3],
+                        **cur_kernel_options,
+                    )
+        else:
+            flex_attention_backward_template.maybe_append_choice(
+                choices=choices,
+                input_nodes=[
+                    query,
+                    key,
+                    value,
+                    logsumexp,
+                    delta,
+                    grad_out,
+                    grad_query,
+                    broadcasted_grad_value,
+                    kv_num_blocks,
+                    kv_indices,
+                    q_num_blocks,
+                    q_indices,
+                    full_kv_num_blocks,
+                    full_kv_indices,
+                    full_q_num_blocks,
+                    full_q_indices,
+                ],
+                layout=layout_broadcasted_k,  # We use store_output only for grad_key
+                subgraphs=[
+                    fw_subgraph_buffer,
+                    joint_outputs.grad_input,
+                    mask_graph_buffer,
+                    joint_outputs.captured_grads_compute,
+                ],
+                mutated_inputs=[
+                    grad_query,
+                    broadcasted_grad_value,
+                    *joint_outputs.mutated_grads,
+                ],
+                call_sizes=query.get_size() + key.get_size()[1:3],
+                **cur_kernel_options,
+            )
     inputs_for_autotuning = (
         [
             query,
