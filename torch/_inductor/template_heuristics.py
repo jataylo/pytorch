@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import itertools
-from collections import namedtuple
+from dataclasses import dataclass
 from functools import partial
 from threading import Lock
 from typing import Any, Callable, TYPE_CHECKING
@@ -38,10 +38,22 @@ class BaseConfigSingleton(type):
             return cls._instances[cls]
 
 
-Config = namedtuple(
-    "Config", ["block_m", "block_n", "block_k", "num_stages", "num_warps"]
-)
+# TODO: Once the set of configs grows large move into own file
+@dataclass(frozen=True, slots=True)
+class BaseConfig:
+    block_m: int
+    block_n: int
+    block_k: int
+    num_stages: int
+    num_warps: int
 
+
+@dataclass(frozen=True, slots=True)
+class GemmConfig(BaseConfig):
+    GROUP_M: int = 8
+
+
+ConvConfig = BaseConfig  # Until conv's have own special tuneable params
 
 class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
     """
@@ -53,35 +65,36 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
         # will be utilised on the target platform. The configs are as follows:
         # (BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
         self.mm_configs = [
-            Config(32, 32, 16, 1, 2),
-            Config(32, 32, 128, 2, 4),
-            Config(32, 64, 32, 5, 8),
-            Config(64, 32, 32, 5, 8),
-            Config(64, 32, 128, 5, 4),
-            Config(64, 64, 16, 2, 4),
-            Config(64, 64, 32, 2, 4),
-            Config(64, 64, 64, 3, 8),
-            Config(64, 64, 128, 5, 4),
-            Config(64, 128, 32, 3, 4),
-            Config(64, 128, 32, 4, 8),
-            Config(64, 128, 64, 3, 4),
-            Config(64, 128, 128, 4, 4),
-            Config(128, 64, 32, 3, 4),
-            Config(128, 64, 32, 4, 8),
-            Config(128, 128, 32, 2, 8),
-            Config(128, 128, 32, 3, 4),
-            Config(128, 128, 64, 3, 4),
-            Config(128, 128, 64, 5, 8),
+            GemmConfig(32, 32, 16, 1, 2),
+            GemmConfig(32, 32, 128, 2, 4),
+            GemmConfig(32, 64, 32, 5, 8),
+            GemmConfig(64, 32, 32, 5, 8),
+            GemmConfig(64, 32, 128, 5, 4),
+            GemmConfig(64, 64, 16, 2, 4),
+            GemmConfig(64, 64, 32, 2, 4),
+            GemmConfig(64, 64, 64, 3, 8),
+            GemmConfig(64, 64, 128, 5, 4),
+            GemmConfig(64, 128, 32, 3, 4),
+            GemmConfig(64, 128, 32, 4, 8),
+            GemmConfig(64, 128, 64, 3, 4),
+            GemmConfig(64, 128, 128, 4, 4),
+            GemmConfig(128, 64, 32, 3, 4),
+            GemmConfig(128, 64, 32, 4, 8),
+            GemmConfig(128, 128, 32, 2, 8),
+            GemmConfig(128, 128, 32, 3, 4),
+            GemmConfig(128, 128, 64, 3, 4),
+            GemmConfig(128, 128, 64, 5, 8),
         ]
 
         # Exhaustive search for mm configs
         self.exhaustive_configs = [
-            Config(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps)
+            GemmConfig(BLOCK_M, BLOCK_N, BLOCK_K, num_stages, num_warps, GROUP_M)
             for BLOCK_M, BLOCK_N, BLOCK_K in itertools.product(
                 [16, 32, 64, 128, 256], repeat=3
             )
             for num_stages in [1, 2, 3, 4, 5]
             for num_warps in [2, 4, 8]
+            for GROUP_M in [8]
         ]
 
         # these are only used in tuned_mm when AutoHeuristic is enabled
@@ -90,180 +103,180 @@ class BaseConfigHeuristic(metaclass=BaseConfigSingleton):
         # which saves compilation time (since less configs are autotuned) and potentially increase performance
         # because the learned heuristic might predict a config that is not part mm_configs
         self.extra_mm_configs = [
-            Config(16, 32, 16, 3, 2),
-            Config(16, 32, 32, 4, 2),
-            Config(16, 32, 32, 5, 2),
-            Config(64, 64, 128, 3, 4),
-            Config(128, 64, 32, 2, 2),
-            Config(128, 64, 64, 3, 8),
-            Config(128, 64, 128, 4, 8),
-            Config(128, 128, 32, 4, 4),
-            Config(128, 128, 64, 3, 8),
-            Config(128, 128, 64, 5, 4),
+            GemmConfig(16, 32, 16, 3, 2),
+            GemmConfig(16, 32, 32, 4, 2),
+            GemmConfig(16, 32, 32, 5, 2),
+            GemmConfig(64, 64, 128, 3, 4),
+            GemmConfig(128, 64, 32, 2, 2),
+            GemmConfig(128, 64, 64, 3, 8),
+            GemmConfig(128, 64, 128, 4, 8),
+            GemmConfig(128, 128, 32, 4, 4),
+            GemmConfig(128, 128, 64, 3, 8),
+            GemmConfig(128, 128, 64, 5, 4),
         ]
 
         self.int8_mm_configs = [
-            Config(64, 64, 32, 2, 4),
-            Config(64, 128, 32, 3, 4),
-            Config(128, 64, 32, 3, 4),
-            Config(64, 128, 32, 4, 8),
-            Config(128, 64, 32, 4, 8),
-            Config(64, 32, 32, 5, 8),
-            Config(32, 64, 32, 5, 8),
-            Config(128, 128, 32, 2, 8),
-            Config(64, 64, 64, 3, 8),
-            Config(128, 256, 128, 3, 8),
-            Config(256, 128, 128, 3, 8),
+            GemmConfig(64, 64, 32, 2, 4),
+            GemmConfig(64, 128, 32, 3, 4),
+            GemmConfig(128, 64, 32, 3, 4),
+            GemmConfig(64, 128, 32, 4, 8),
+            GemmConfig(128, 64, 32, 4, 8),
+            GemmConfig(64, 32, 32, 5, 8),
+            GemmConfig(32, 64, 32, 5, 8),
+            GemmConfig(128, 128, 32, 2, 8),
+            GemmConfig(64, 64, 64, 3, 8),
+            GemmConfig(128, 256, 128, 3, 8),
+            GemmConfig(256, 128, 128, 3, 8),
         ]
 
         self.mixed_mm_configs = [
-            Config(16, 128, 256, 3, 4),
-            Config(16, 128, 256, 5, 8),
+            GemmConfig(16, 128, 256, 3, 4),
+            GemmConfig(16, 128, 256, 5, 8),
         ]
 
         self.persistent_mm_configs = [
-            Config(128, 256, 64, 3, 8),
-            Config(128, 128, 64, 3, 8),
-            Config(128, 128, 128, 3, 8),
-            Config(128, 128, 128, 3, 4),
-            Config(128, 128, 64, 4, 8),
+            GemmConfig(128, 256, 64, 3, 8),
+            GemmConfig(128, 128, 64, 3, 8),
+            GemmConfig(128, 128, 128, 3, 8),
+            GemmConfig(128, 128, 128, 3, 4),
+            GemmConfig(128, 128, 64, 4, 8),
         ]
 
         self.scaled_mm_configs = [
-            Config(128, 256, 32, 3, 8),
-            Config(256, 128, 32, 3, 8),
-            Config(256, 64, 32, 4, 4),
-            Config(64, 256, 32, 4, 4),
-            Config(128, 128, 32, 4, 4),
-            Config(128, 64, 32, 4, 4),
-            Config(64, 128, 32, 4, 4),
-            Config(128, 32, 32, 4, 4),
-            Config(64, 32, 32, 5, 2),
-            Config(256, 128, 128, 3, 8),
-            Config(256, 64, 128, 4, 4),
-            Config(64, 256, 128, 4, 4),
-            Config(128, 128, 128, 4, 4),
-            Config(128, 64, 64, 4, 4),
-            Config(64, 128, 64, 4, 4),
-            Config(128, 32, 64, 4, 4),
-            Config(64, 32, 64, 5, 2),
-            Config(16, 32, 32, 2, 2),
-            Config(16, 64, 32, 2, 2),
-            Config(16, 128, 32, 2, 4),
-            Config(16, 256, 32, 2, 4),
-            Config(16, 32, 64, 2, 2),
-            Config(16, 64, 64, 2, 2),
-            Config(16, 128, 64, 2, 4),
-            Config(16, 256, 64, 2, 4),
-            Config(32, 32, 32, 2, 2),
-            Config(32, 64, 32, 2, 2),
-            Config(32, 128, 32, 2, 4),
-            Config(32, 256, 32, 2, 4),
-            Config(32, 32, 64, 2, 2),
-            Config(32, 64, 64, 2, 2),
-            Config(32, 128, 64, 2, 4),
-            Config(32, 256, 64, 2, 4),
-            Config(16, 32, 32, 3, 2),
-            Config(16, 64, 32, 3, 2),
-            Config(16, 128, 32, 3, 4),
-            Config(16, 256, 32, 3, 4),
-            Config(16, 32, 64, 3, 2),
-            Config(16, 64, 64, 3, 2),
-            Config(16, 128, 64, 3, 4),
-            Config(16, 256, 64, 3, 4),
-            Config(32, 32, 32, 3, 2),
-            Config(32, 64, 32, 3, 2),
-            Config(32, 128, 32, 3, 4),
-            Config(32, 256, 32, 3, 4),
-            Config(32, 32, 64, 3, 2),
-            Config(32, 64, 64, 3, 2),
-            Config(32, 128, 64, 3, 4),
-            Config(32, 256, 64, 3, 4),
-            Config(16, 32, 32, 4, 2),
-            Config(16, 64, 32, 4, 2),
-            Config(16, 128, 32, 4, 4),
-            Config(16, 256, 32, 4, 4),
-            Config(16, 32, 64, 4, 2),
-            Config(16, 64, 64, 4, 2),
-            Config(16, 128, 64, 4, 4),
-            Config(16, 256, 64, 4, 4),
-            Config(32, 32, 32, 4, 2),
-            Config(32, 64, 32, 4, 2),
-            Config(32, 128, 32, 4, 4),
-            Config(32, 256, 32, 4, 4),
-            Config(32, 32, 64, 4, 2),
-            Config(32, 64, 64, 4, 2),
-            Config(32, 128, 64, 4, 4),
-            Config(32, 256, 64, 4, 4),
-            Config(16, 32, 32, 5, 2),
-            Config(16, 64, 32, 5, 2),
-            Config(16, 128, 32, 5, 4),
-            Config(16, 256, 32, 5, 4),
-            Config(16, 32, 64, 5, 2),
-            Config(16, 64, 64, 5, 2),
-            Config(16, 128, 64, 5, 4),
-            Config(16, 256, 64, 5, 4),
-            Config(32, 32, 32, 5, 2),
-            Config(32, 64, 32, 5, 2),
-            Config(32, 128, 32, 5, 4),
-            Config(32, 256, 32, 5, 4),
-            Config(32, 32, 64, 5, 2),
-            Config(32, 64, 64, 5, 2),
-            Config(32, 128, 64, 5, 4),
-            Config(32, 256, 64, 5, 4),
-            Config(16, 32, 32, 6, 2),
-            Config(16, 64, 32, 6, 2),
-            Config(16, 128, 32, 6, 4),
-            Config(16, 256, 32, 6, 4),
-            Config(16, 32, 64, 6, 2),
-            Config(16, 64, 64, 6, 2),
-            Config(16, 128, 64, 6, 4),
-            Config(16, 256, 64, 6, 4),
-            Config(32, 32, 32, 6, 2),
-            Config(32, 64, 32, 6, 2),
-            Config(32, 128, 32, 6, 4),
-            Config(32, 256, 32, 6, 4),
-            Config(32, 32, 64, 6, 2),
-            Config(32, 64, 64, 6, 2),
-            Config(32, 128, 64, 6, 4),
-            Config(32, 256, 64, 6, 4),
+            GemmConfig(128, 256, 32, 3, 8),
+            GemmConfig(256, 128, 32, 3, 8),
+            GemmConfig(256, 64, 32, 4, 4),
+            GemmConfig(64, 256, 32, 4, 4),
+            GemmConfig(128, 128, 32, 4, 4),
+            GemmConfig(128, 64, 32, 4, 4),
+            GemmConfig(64, 128, 32, 4, 4),
+            GemmConfig(128, 32, 32, 4, 4),
+            GemmConfig(64, 32, 32, 5, 2),
+            GemmConfig(256, 128, 128, 3, 8),
+            GemmConfig(256, 64, 128, 4, 4),
+            GemmConfig(64, 256, 128, 4, 4),
+            GemmConfig(128, 128, 128, 4, 4),
+            GemmConfig(128, 64, 64, 4, 4),
+            GemmConfig(64, 128, 64, 4, 4),
+            GemmConfig(128, 32, 64, 4, 4),
+            GemmConfig(64, 32, 64, 5, 2),
+            GemmConfig(16, 32, 32, 2, 2),
+            GemmConfig(16, 64, 32, 2, 2),
+            GemmConfig(16, 128, 32, 2, 4),
+            GemmConfig(16, 256, 32, 2, 4),
+            GemmConfig(16, 32, 64, 2, 2),
+            GemmConfig(16, 64, 64, 2, 2),
+            GemmConfig(16, 128, 64, 2, 4),
+            GemmConfig(16, 256, 64, 2, 4),
+            GemmConfig(32, 32, 32, 2, 2),
+            GemmConfig(32, 64, 32, 2, 2),
+            GemmConfig(32, 128, 32, 2, 4),
+            GemmConfig(32, 256, 32, 2, 4),
+            GemmConfig(32, 32, 64, 2, 2),
+            GemmConfig(32, 64, 64, 2, 2),
+            GemmConfig(32, 128, 64, 2, 4),
+            GemmConfig(32, 256, 64, 2, 4),
+            GemmConfig(16, 32, 32, 3, 2),
+            GemmConfig(16, 64, 32, 3, 2),
+            GemmConfig(16, 128, 32, 3, 4),
+            GemmConfig(16, 256, 32, 3, 4),
+            GemmConfig(16, 32, 64, 3, 2),
+            GemmConfig(16, 64, 64, 3, 2),
+            GemmConfig(16, 128, 64, 3, 4),
+            GemmConfig(16, 256, 64, 3, 4),
+            GemmConfig(32, 32, 32, 3, 2),
+            GemmConfig(32, 64, 32, 3, 2),
+            GemmConfig(32, 128, 32, 3, 4),
+            GemmConfig(32, 256, 32, 3, 4),
+            GemmConfig(32, 32, 64, 3, 2),
+            GemmConfig(32, 64, 64, 3, 2),
+            GemmConfig(32, 128, 64, 3, 4),
+            GemmConfig(32, 256, 64, 3, 4),
+            GemmConfig(16, 32, 32, 4, 2),
+            GemmConfig(16, 64, 32, 4, 2),
+            GemmConfig(16, 128, 32, 4, 4),
+            GemmConfig(16, 256, 32, 4, 4),
+            GemmConfig(16, 32, 64, 4, 2),
+            GemmConfig(16, 64, 64, 4, 2),
+            GemmConfig(16, 128, 64, 4, 4),
+            GemmConfig(16, 256, 64, 4, 4),
+            GemmConfig(32, 32, 32, 4, 2),
+            GemmConfig(32, 64, 32, 4, 2),
+            GemmConfig(32, 128, 32, 4, 4),
+            GemmConfig(32, 256, 32, 4, 4),
+            GemmConfig(32, 32, 64, 4, 2),
+            GemmConfig(32, 64, 64, 4, 2),
+            GemmConfig(32, 128, 64, 4, 4),
+            GemmConfig(32, 256, 64, 4, 4),
+            GemmConfig(16, 32, 32, 5, 2),
+            GemmConfig(16, 64, 32, 5, 2),
+            GemmConfig(16, 128, 32, 5, 4),
+            GemmConfig(16, 256, 32, 5, 4),
+            GemmConfig(16, 32, 64, 5, 2),
+            GemmConfig(16, 64, 64, 5, 2),
+            GemmConfig(16, 128, 64, 5, 4),
+            GemmConfig(16, 256, 64, 5, 4),
+            GemmConfig(32, 32, 32, 5, 2),
+            GemmConfig(32, 64, 32, 5, 2),
+            GemmConfig(32, 128, 32, 5, 4),
+            GemmConfig(32, 256, 32, 5, 4),
+            GemmConfig(32, 32, 64, 5, 2),
+            GemmConfig(32, 64, 64, 5, 2),
+            GemmConfig(32, 128, 64, 5, 4),
+            GemmConfig(32, 256, 64, 5, 4),
+            GemmConfig(16, 32, 32, 6, 2),
+            GemmConfig(16, 64, 32, 6, 2),
+            GemmConfig(16, 128, 32, 6, 4),
+            GemmConfig(16, 256, 32, 6, 4),
+            GemmConfig(16, 32, 64, 6, 2),
+            GemmConfig(16, 64, 64, 6, 2),
+            GemmConfig(16, 128, 64, 6, 4),
+            GemmConfig(16, 256, 64, 6, 4),
+            GemmConfig(32, 32, 32, 6, 2),
+            GemmConfig(32, 64, 32, 6, 2),
+            GemmConfig(32, 128, 32, 6, 4),
+            GemmConfig(32, 256, 32, 6, 4),
+            GemmConfig(32, 32, 64, 6, 2),
+            GemmConfig(32, 64, 64, 6, 2),
+            GemmConfig(32, 128, 64, 6, 4),
+            GemmConfig(32, 256, 64, 6, 4),
         ]
 
         self.scaled_persistent_mm_configs = [
-            Config(128, 128, 64, 3, 8),
-            Config(128, 128, 128, 3, 8),
-            Config(128, 128, 128, 4, 8),
-            Config(128, 128, 128, 4, 4),
-            Config(128, 128, 128, 3, 4),
-            Config(128, 128, 128, 5, 4),
-            Config(128, 128, 128, 5, 8),
-            Config(128, 128, 128, 6, 8),
-            Config(128, 128, 64, 4, 8),
+            GemmConfig(128, 128, 64, 3, 8),
+            GemmConfig(128, 128, 128, 3, 8),
+            GemmConfig(128, 128, 128, 4, 8),
+            GemmConfig(128, 128, 128, 4, 4),
+            GemmConfig(128, 128, 128, 3, 4),
+            GemmConfig(128, 128, 128, 5, 4),
+            GemmConfig(128, 128, 128, 5, 8),
+            GemmConfig(128, 128, 128, 6, 8),
+            GemmConfig(128, 128, 64, 4, 8),
         ]
 
         # TODO: Unify with other gemm patterns, mm_plus_mm currently follows
         # slightly different pattern than rest
         self.mm_plus_mm_configs = [
-            Config(64, 64, 32, 2, 4),
-            Config(64, 64, 32, 3, 8),
-            Config(64, 64, 32, 4, 16),
-            Config(64, 32, 32, 4, 8),
-            Config(32, 64, 32, 4, 8),
-            Config(128, 128, 32, 1, 8),
-            Config(64, 64, 64, 1, 8),
-            Config(32, 32, 128, 1, 8),
-            Config(64, 64, 16, 2, 4),
-            Config(32, 32, 16, 1, 2),
+            GemmConfig(64, 64, 32, 2, 4),
+            GemmConfig(64, 64, 32, 3, 8),
+            GemmConfig(64, 64, 32, 4, 16),
+            GemmConfig(64, 32, 32, 4, 8),
+            GemmConfig(32, 64, 32, 4, 8),
+            GemmConfig(128, 128, 32, 1, 8),
+            GemmConfig(64, 64, 64, 1, 8),
+            GemmConfig(32, 32, 128, 1, 8),
+            GemmConfig(64, 64, 16, 2, 4),
+            GemmConfig(32, 32, 16, 1, 2),
         ]
 
         self.conv_configs = [
-            Config(64, 256, 16, 2, 4),
-            Config(256, 64, 16, 2, 4),
-            Config(1024, 16, 16, 1, 8),
-            Config(128, 128, 32, 2, 8),
-            Config(64, 64, 32, 2, 4),
-            Config(64, 256, 32, 2, 8),
-            Config(256, 64, 32, 2, 8),
+            ConvConfig(64, 256, 16, 2, 4),
+            ConvConfig(256, 64, 16, 2, 4),
+            ConvConfig(1024, 16, 16, 1, 8),
+            ConvConfig(128, 128, 32, 2, 8),
+            ConvConfig(64, 64, 32, 2, 4),
+            ConvConfig(64, 256, 32, 2, 8),
+            ConvConfig(256, 64, 32, 2, 8),
         ]
 
     def _finalize_mm_configs(
@@ -453,7 +466,7 @@ class ROCmConfigHeuristic(BaseConfigHeuristic):
         configs: list[Config],
     ) -> Generator[TritonConfig, None, None]:
         used = OrderedSet[tuple[Config, int, int]]()
-
+        import pdb; pdb.set_trace()
         max_mm_configs = config.test_configs.max_mm_configs
         for block_m, block_n, block_k, num_stages, num_warps in configs:
             # each warp computes 16x16 tile = 256
