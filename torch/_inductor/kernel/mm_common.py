@@ -86,6 +86,7 @@ def mm_options(config, sym_m, sym_n, sym_k, layout):
         group_m = config.kwargs.get("GROUP_M", 8)
         options_dict["GROUP_M"] = group_m
 
+    return options_dict
 
 def persistent_mm_options(mat1, mat2):
     return dict(
