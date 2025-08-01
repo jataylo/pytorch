@@ -1937,18 +1937,6 @@ def cached_autotune(
         reset_to_zero_arg_names.extend(triton_meta.pop("reset_to_zero"))
 
     def decorator(fn):
-        # Remove XBLOCK from config if it's not a function argument.
-        # This way, coordinate descent tuning will not try to tune it.
-        #
-        # Context: When TritonKernel.no_x_dim is True, we hardcode XBLOCK to 1.
-        import inspect
-
-        if "XBLOCK" not in inspect.signature(fn.fn).parameters:
-            for tconfig in configs:
-                if "XBLOCK" in tconfig.kwargs:
-                    assert tconfig.kwargs["XBLOCK"] == 1
-                    tconfig.kwargs.pop("XBLOCK")
-
         if inductor_meta.get("profile_bandwidth"):
             return DebugAutotuner(
                 fn,
@@ -2359,7 +2347,6 @@ def pointwise(
     Construct @triton.heuristics() based on size_hints.
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
-    assert not inductor_meta.get("no_x_dim")
 
     numel = functools.reduce(operator.mul, size_hints.values())
     bs = max(256, min(numel // 128, 1024))
@@ -2617,8 +2604,6 @@ def reduction(
     """args to @triton.heuristics()"""
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
-        size_hints["x"] = 1
 
     assert triton_meta is not None
 
@@ -2643,8 +2628,6 @@ def cooperative_reduction(
 ):
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
-        size_hints["x"] = 1
 
     # Cooperative reductions currently only support a single reduction dimension.
     assert len(size_hints) == 2, (
@@ -2752,8 +2735,6 @@ def persistent_reduction(
 ):
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
-        size_hints["x"] = 1
 
     configs = _persistent_reduction_configs(size_hints, reduction_hint, inductor_meta)
 
@@ -2785,8 +2766,6 @@ def split_scan(
     """Heuristic for TritonSplitScanKernel"""
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
-    if inductor_meta.get("no_x_dim"):
-        size_hints["x"] = 1
 
     assert triton_meta is not None
     if len(size_hints) != 2:
@@ -3101,7 +3080,6 @@ class ComboKernelGrid(GridExpr):
         combo_meta = self.inductor_meta["combo_grid_meta"]
         if combo_meta["default_config"]:
             meta = {**combo_meta["default_config"], **meta}
-        no_x_dims = []
         xnumels = []
         ynumels = []
         znumels = []
@@ -3109,14 +3087,13 @@ class ComboKernelGrid(GridExpr):
             assert (
                 combo_meta[f"xnumel_{num}"] is None or combo_meta[f"xnumel_{num}"] > 0
             )
-            no_x_dims.append(combo_meta[f"no_x_dim_{num}"])
             xnumels.append(combo_meta[f"xnumel_{num}"] or f"xnumel_{num}")
             if f"ynumel_{num}" in combo_meta:
                 ynumels.append(combo_meta[f"ynumel_{num}"] or f"ynumel_{num}")
             if f"znumel_{num}" in combo_meta:
                 znumels.append(combo_meta[f"znumel_{num}"] or f"znumel_{num}")
 
-        self.x_grid = self.combo_x_grid(xnumels, no_x_dims, meta)
+        self.x_grid = self.combo_x_grid(xnumels, meta)
         if combo_meta["min_blocks"]:
             self.x_grid = self.maximum([self.x_grid, combo_meta["min_blocks"]])
         if ynumels:
@@ -3127,7 +3104,6 @@ class ComboKernelGrid(GridExpr):
     def combo_x_grid(
         self,
         xnumels: list[Union[int, str]],
-        no_x_dims: list[bool],
         meta: dict[str, int],
     ) -> Union[str, int]:
         raise NotImplementedError
@@ -3137,29 +3113,20 @@ class SequentialComboKernelGrid(ComboKernelGrid):
     def combo_x_grid(
         self,
         xnumels: list[Union[int, str]],
-        no_x_dims: list[bool],
         meta: dict[str, int],
     ) -> Union[str, int]:
-        assert len(xnumels) == len(no_x_dims)
-        return self.summation(
-            [
-                self.ceildiv(x, 1 if no_x_dim else meta.get("XBLOCK"))
-                for x, no_x_dim in zip(xnumels, no_x_dims)
-            ]
-        )
+        return self.summation([self.ceildiv(x, meta.get("XBLOCK")) for x in xnumels])
 
 
 class RoundRobinComboKernelGrid(ComboKernelGrid):
     def combo_x_grid(
         self,
         xnumels: list[Union[int, str]],
-        no_x_dims: list[bool],
         meta: dict[str, int],
     ) -> str:
-        assert len(xnumels) == len(no_x_dims)
         num_kernels = self.inductor_meta["combo_grid_meta"]["num_kernels"]
-        exprs = [x for x, no_x_dim in zip(xnumels, no_x_dims) if no_x_dim]
-        xnumels_x_dim = [x for x, no_x_dim in zip(xnumels, no_x_dims) if not no_x_dim]
+        exprs = [x for x in xnumels]
+        xnumels_x_dim = [x for x in xnumels]
         if xnumels_x_dim:
             exprs.append(self.ceildiv(self.maximum(xnumels_x_dim), meta.get("XBLOCK")))
         return f"({self.maximum(exprs)}) * {num_kernels}"

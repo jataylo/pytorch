@@ -47,7 +47,6 @@ class TritonSplitScanKernel(TritonKernel):
             tiling,
             **kwargs,
         )
-        self.no_x_dim = True
 
     def should_use_persistent_reduction(self) -> bool:
         return False

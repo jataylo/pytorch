@@ -352,7 +352,7 @@ def _parse_kernel_args_num_gb(
 ) -> Optional[float]:
     """
     inductor meta looks like:
-        inductor_meta={... 'mutated_arg_names': [], 'no_x_dim': False, 'kernel_num_gb': 2.0},
+        inductor_meta={... 'mutated_arg_names': [], 'kernel_num_gb': 2.0},
     """
     m = re.search(r".kernel_num_gb.:\s*([0-9.]+)", kernel_fn_code)
     if m:

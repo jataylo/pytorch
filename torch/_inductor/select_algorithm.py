@@ -833,7 +833,6 @@ class TritonTemplateKernel(TritonKernel):
             inside_reduction=False,
             is_reduction=False,
             numels=groups,
-            no_x_dim=False,
         )
         load_code = None
 
