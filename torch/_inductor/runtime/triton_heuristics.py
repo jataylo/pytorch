@@ -1,6 +1,8 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import signal
+
 import builtins
 import copy
 import dataclasses
@@ -35,6 +37,7 @@ from torch._prims_common import compute_required_storage_length
 from torch.utils._ordered_set import OrderedSet
 
 from ..triton_bundler import TritonBundler
+from ..config import experimental_max_autotune
 from ..utils import prefix_is_reduction, triton_version_uses_attrs_dict
 from . import triton_helpers
 from .autotune_cache import AutotuneCache
@@ -456,7 +459,9 @@ class CachingAutotuner(KernelInterface):
         exc = None
         for c in self.configs:
             try:
-                compile_results.append(self._precompile_config(c))
+                compile_result = self._precompile_config(c)
+                if compile_result is not None:  # This could be unsafe as less configs returned, may mismatch
+                    compile_results.append(compile_result)
             except (OutOfResources, PTXASError) as e:
                 exc = e
         if len(compile_results) == 0:
@@ -746,14 +751,26 @@ class CachingAutotuner(KernelInterface):
 
         try:
             binary = triton.compile(*compile_args, **compile_kwargs)
-        except Exception:
-            log.exception(
-                "Triton compilation failed: %s\n%s\nmetadata: %s",
-                self.inductor_meta.get("kernel_name", "triton_"),
-                self.fn.src,
-                compile_meta,
-            )
-            raise
+        except Exception as e:
+            if experimental_max_autotune:
+                log.warning(
+                    "Triton compilation failed for config %s during exhaustive tuning (skipping): %s\n"
+                    "Config: %s\nError: %s",
+                    cfg,
+                    self.inductor_meta.get("kernel_name", "triton_"),
+                    compile_meta,
+                    str(e)
+                )
+                return None  # Return None to indicate compilation failure
+            else:
+                log.exception(
+                    "Triton compilation failed: %s\n%s\nmetadata: %s",
+                    self.inductor_meta.get("kernel_name", "triton_"),
+                    self.fn.src,
+                    compile_meta,
+                )
+                raise
+
         TritonBundler.put(
             triton_hash_to_path_key(binary.hash), self.triton_meta.get("device", 0)
         )
@@ -794,64 +811,83 @@ class CachingAutotuner(KernelInterface):
 
     def bench(self, launcher, *args, with_profiler=False, **kwargs):
         """Measure the performance of a given launcher"""
-        # we don't skip configs with spilled registers when auto-tuning custom
-        # (user-written) Triton kernels, as (i) we don't have any knowledge or
-        # control over the kernel code; (ii) there is empirical evidence that
-        # for some (complicated) custom Triton kernels, a register-spilling
-        # config may yield the best latency.
-        if not self.custom_kernel and launcher.n_spills > self.inductor_meta.get(
-            "spill_threshold", 32
-        ):
-            log.debug(
-                "Skip config %s because of register spilling: %d",
-                launcher.config,
-                launcher.n_spills,
-            )
-            return float("inf")
+        
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Autotune config bench timed out")
 
-        device_interface = self.get_device_interface()
-        stream = device_interface.get_raw_stream(device_interface.current_device())
+        if experimental_max_autotune:
+            handler = signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(30)  # 30 second timeout
 
-        cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
-
-        def kernel_call():
-            cloned_args, cloned_kwargs = self.maybe_clone_args(
-                cpu_copies, *args, **kwargs
-            )
-            # reset to zero before evaluating any config
-            self.reset_to_zero_args(*args, **kwargs)
-            args_with_constexprs = self._get_args_with_constexprs(cloned_args, launcher)
-            if autograd_profiler._is_profiler_enabled:
-                profiler_kwargs = self.get_profiler_kwargs(stream, launcher)
-                with torch._C._profiler._RecordFunctionFast(
-                    self.inductor_meta.get("kernel_name", "triton kernel"),
-                    args_with_constexprs,
-                    profiler_kwargs,
+        try:
+            if not experimental_max_autotune:
+                # we don't skip configs with spilled registers when auto-tuning custom
+                # (user-written) Triton kernels, as (i) we don't have any knowledge or
+                # control over the kernel code; (ii) there is empirical evidence that
+                # for some (complicated) custom Triton kernels, a register-spilling
+                # config may yield the best latency.
+                if not self.custom_kernel and launcher.n_spills > self.inductor_meta.get(
+                    "spill_threshold", 32
                 ):
+                    log.debug(
+                        "Skip config %s because of register spilling: %d",
+                        launcher.config,
+                        launcher.n_spills,
+                    )
+                    return float("inf")
+
+            device_interface = self.get_device_interface()
+            stream = device_interface.get_raw_stream(device_interface.current_device())
+
+            cpu_copies = self.copy_args_to_cpu_if_needed(*args, **kwargs)
+
+            def kernel_call():
+                cloned_args, cloned_kwargs = self.maybe_clone_args(
+                    cpu_copies, *args, **kwargs
+                )
+                # reset to zero before evaluating any config
+                self.reset_to_zero_args(*args, **kwargs)
+                args_with_constexprs = self._get_args_with_constexprs(cloned_args, launcher)
+                if autograd_profiler._is_profiler_enabled:
+                    profiler_kwargs = self.get_profiler_kwargs(stream, launcher)
+                    with torch._C._profiler._RecordFunctionFast(
+                        self.inductor_meta.get("kernel_name", "triton kernel"),
+                        args_with_constexprs,
+                        profiler_kwargs,
+                    ):
+                        launcher(
+                            *args_with_constexprs,
+                            **cloned_kwargs,
+                            stream=stream,
+                        )
+
+                else:
                     launcher(
                         *args_with_constexprs,
                         **cloned_kwargs,
                         stream=stream,
                     )
+                self.restore_args_from_cpu(cpu_copies)
+
+            # only use profiler when not already in a profiler instance
+            if with_profiler and not autograd_profiler._is_profiler_enabled:
+                from torch._inductor.utils import do_bench_using_profiling
+
+                return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+
+            if self.device_props.type == "cpu":
+                return benchmarker.benchmark_cpu(kernel_call)
 
             else:
-                launcher(
-                    *args_with_constexprs,
-                    **cloned_kwargs,
-                    stream=stream,
-                )
-            self.restore_args_from_cpu(cpu_copies)
+                return benchmarker.benchmark_gpu(kernel_call, rep=40)
+        
+        except (Exception, TimeoutError) as e:
+            if experimental_max_autotune:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, handler)
 
-        # only use profiler when not already in a profiler instance
-        if with_profiler and not autograd_profiler._is_profiler_enabled:
-            from torch._inductor.utils import do_bench_using_profiling
-
-            return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
-
-        if self.device_props.type == "cpu":
-            return benchmarker.benchmark_cpu(kernel_call)
-
-        return benchmarker.benchmark_gpu(kernel_call, rep=40)
+            log.debug(f"Benchmark failed for config {launcher.config}: {e}")
+            return float("inf")
 
     def copy_args_to_cpu_if_needed(self, *args, **kwargs):
         """
@@ -2366,6 +2402,60 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
         return new_configs
     return configs
 
+def _pointwise_exhaustive_configs(
+    size_hints, triton_meta, filename, inductor_meta
+):
+    """Generate exhaustive configs for pointwise kernels"""
+    
+    # Define search space
+    block_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    warp_counts = [1, 2, 4, 8]
+    stage_counts = [1, 2, 3]
+    waves_per_eu = [None, 1, 2, 4] if torch.version.hip else [None]
+    
+    configs = []
+    
+    # Filter block sizes to reasonable values based on size hints
+    max_x = min(max(block_sizes), size_hints.get("x"))
+    max_y = min(max(block_sizes), size_hints.get("y")) if "y" in size_hints else None
+    max_z = min(max(block_sizes), size_hints.get("z")) if "z" in size_hints else None
+    
+    valid_x_blocks = [b for b in block_sizes if b <= max_x]
+    valid_y_blocks = [b for b in block_sizes if b <= max_y] if max_y else [None]
+    valid_z_blocks = [b for b in block_sizes if b <= max_z] if max_z else [None]
+    
+    # Generate all combinations - let invalid configs fail during benchmarking
+    for x_block in valid_x_blocks:
+        for y_block in valid_y_blocks:
+            for z_block in valid_z_blocks:
+                for num_warps in warp_counts:
+                    for num_stages in stage_counts:
+                        for wpeu in waves_per_eu:
+                            # Construct config directly without scaling
+                            cfg_dict = {"XBLOCK": x_block}
+                            
+                            if len(size_hints) >= 2 and y_block is not None:
+                                cfg_dict["YBLOCK"] = y_block
+                            if len(size_hints) >= 3 and z_block is not None:
+                                cfg_dict["ZBLOCK"] = z_block
+                        
+                            if waves_per_eu is not None:
+                                cfg_dict["waves_per_eu"] = wpeu
+
+                            # Create config directly without triton_config scaling
+                            cfg = Config(cfg_dict, num_warps=num_warps, num_stages=num_stages)
+                            configs.append(cfg)
+    
+    log.debug(f"Generated {len(configs)} exhaustive configs for pointwise kernel")
+    
+    return cached_autotune(
+        size_hints,
+        configs,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.POINTWISE,
+        filename=filename,
+    )
 
 def pointwise(
     size_hints,
@@ -2380,6 +2470,12 @@ def pointwise(
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
     assert not inductor_meta.get("no_x_dim")
+
+    if experimental_max_autotune:
+        log.debug("Using experimental exhaustive pointwise tuning")
+        return _pointwise_eexperimental_max_autotunexhaustive_configs(
+            size_hints, triton_meta, filename, inductor_meta
+        )
 
     numel = functools.reduce(operator.mul, size_hints.values())
     bs = max(256, min(numel // 128, 1024))
