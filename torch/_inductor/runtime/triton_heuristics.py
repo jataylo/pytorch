@@ -2473,7 +2473,7 @@ def pointwise(
 
     if experimental_max_autotune:
         log.debug("Using experimental exhaustive pointwise tuning")
-        return _pointwise_eexperimental_max_autotunexhaustive_configs(
+        return _pointwise_exhaustive_configs(
             size_hints, triton_meta, filename, inductor_meta
         )
 
