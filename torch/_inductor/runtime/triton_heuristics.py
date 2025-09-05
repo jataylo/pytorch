@@ -2079,8 +2079,8 @@ def _persistent_reduction_configs(
             for tconfig in tiny_configs:
                 if tconfig not in configs:
                     configs.append(tconfig)
-            else:
-                configs = tiny_configs
+        else:
+            configs = tiny_configs
 
     for c in configs:
         # we don't need Rn_BLOCK for persistent reduction
