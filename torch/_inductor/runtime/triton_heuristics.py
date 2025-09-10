@@ -2402,6 +2402,172 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
         return new_configs
     return configs
 
+
+def _persistent_reduction_exhaustive_configs(
+    size_hints, triton_meta, filename, inductor_meta
+):
+    """Generate exhaustive configs for persistent reduction kernels"""
+    
+    # Define search space
+    x_block_sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+    y_block_sizes = [16, 32, 64, 128] if "y" in size_hints else [None]
+    warp_counts = [1, 2, 4, 8]
+    stage_counts = [1, 2, 3]
+    waves_per_eu = [None, 1, 2] if torch.version.hip else [None]
+    
+    configs = []
+    
+    # Filter block sizes based on size hints
+    max_x = min(max(x_block_sizes), size_hints.get("x", 1024))
+    valid_x_blocks = [b for b in x_block_sizes if b <= max_x]
+    
+    if "y" in size_hints:
+        # 2D persistent reduction case
+        max_y = min(max(y_block_sizes), size_hints.get("y", 1024))
+        valid_y_blocks = [b for b in y_block_sizes if b <= max_y and b is not None]
+        
+        for x_block in valid_x_blocks:
+            for y_block in valid_y_blocks:
+                for num_warps in warp_counts:
+                    for num_stages in stage_counts:
+                        for wpeu in waves_per_eu:
+                            cfg_dict = {
+                                "XBLOCK": x_block,
+                                "YBLOCK": y_block
+                            }
+                            
+                            if wpeu is not None:
+                                cfg_dict["waves_per_eu"] = wpeu
+                            
+                            cfg = Config(cfg_dict, num_warps=num_warps, num_stages=num_stages)
+                            configs.append(cfg)
+    else:
+        # 1D persistent reduction case
+        for x_block in valid_x_blocks:
+            for num_warps in warp_counts:
+                for num_stages in stage_counts:
+                    for wpeu in waves_per_eu:
+                        cfg_dict = {"XBLOCK": x_block}
+                        
+                        if wpeu is not None:
+                            cfg_dict["waves_per_eu"] = wpeu
+                        
+                        cfg = Config(cfg_dict, num_warps=num_warps, num_stages=num_stages)
+                        configs.append(cfg)
+    
+    log.debug(f"Generated {len(configs)} exhaustive configs for persistent reduction kernel")
+    
+    return cached_autotune(
+        size_hints,
+        configs,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.PERSISTENT_REDUCTION,
+        filename=filename,
+    )
+
+
+def _reduction_exhaustive_configs(
+    size_hints, triton_meta, filename, inductor_meta
+):
+    """ Generate exhaustive configs for reduction kernels """
+    x_block_sizes = [32, 64]
+    y_block_sizes = [32, 64]
+    r_block_sizes = [1, 2, 4, 8, 16, 32, 64]
+    warp_counts = [1, 2, 4, 8]
+    stage_counts = [1, 2, 3]
+    waves_per_eu = [None, 1, 2, 4] if torch.version.hip else [None]
+
+    configs = []
+
+    max_x = min(max(x_block_sizes), size_hints.get("x", 1024))
+    valid_x_blocks = [b for b in x_block_sizes if b <= max_x]
+
+    # Handle reduction dimensions - find all r0_, r1_, etc. prefixes
+    reduction_dims = {}
+    for prefix in size_hints:
+        if prefix_is_reduction(prefix):
+            max_r = min(max(r_block_sizes), size_hints.get(prefix, 2048))
+            valid_r_blocks = [b for b in r_block_sizes if b <= max_r]
+            reduction_dims[prefix] = valid_r_blocks
+
+    # If no reduction dimensions found, assume single r0_ dimension
+    if not reduction_dims:
+        total_r_numel = get_total_reduction_numel(size_hints)
+        if total_r_numel > 1:
+            max_r = min(max(r_block_sizes), total_r_numel)
+            valid_r_blocks = [b for b in r_block_sizes if b <= max_r]
+            reduction_dims["r0_"] = valid_r_blocks
+
+    # Generate all combinations of reduction block sizes
+    def generate_r_combinations(dims_dict):
+        if not dims_dict:
+            return [{}]
+        keys = list(dims_dict.keys())
+        values = list(dims_dict.values())
+        import itertools
+        return [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+
+    r_combinations = generate_r_combinations(reduction_dims)
+ 
+    # Generate configs based on whether Y dimension exists
+    if "y" in size_hints:
+        # 2D reduction configs (X + Y + R blocks)
+        max_y = min(max(y_block_sizes), size_hints.get("y", 1024))
+        valid_y_blocks = [b for b in y_block_sizes if b <= max_y]
+        
+        for x_block in valid_x_blocks:
+            for y_block in valid_y_blocks:
+                for r_combo in r_combinations:
+                    for num_warps in warp_counts:
+                        for num_stages in stage_counts:
+                            for wpeu in waves_per_eu:
+                                cfg_dict = {
+                                    "XBLOCK": x_block,
+                                    "YBLOCK": y_block
+                                }
+                                
+                                # Add reduction blocks
+                                for prefix, r_block in r_combo.items():
+                                    cfg_dict[f"{prefix.upper()}BLOCK"] = r_block
+                                
+                                # Add HIP-specific parameters
+                                if wpeu is not None:
+                                    cfg_dict["waves_per_eu"] = waves_per_eu
+                                
+                                cfg = Config(cfg_dict, num_warps=num_warps, num_stages=num_stages)
+                                configs.append(cfg)
+    else:
+        # 1D reduction configs (X + R blocks only)
+        for x_block in valid_x_blocks:
+            for r_combo in r_combinations:
+                for num_warps in warp_counts:
+                    for num_stages in stage_counts:
+                        for wpeu in waves_per_eu:
+                            cfg_dict = {"XBLOCK": x_block}
+                            
+                            # Add reduction blocks
+                            for prefix, r_block in r_combo.items():
+                                cfg_dict[f"{prefix.upper()}BLOCK"] = r_block
+                            
+                            # Add HIP-specific parameters
+                            if wpeu is not None:
+                                cfg_dict["waves_per_eu"] = wpeu
+                            
+                            cfg = Config(cfg_dict, num_warps=num_warps, num_stages=num_stages)
+                            configs.append(cfg)
+    
+    log.debug(f"Generated {len(configs)} exhaustive configs for reduction kernel")
+
+    return cached_autotune(
+        size_hints,
+        configs,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        heuristic_type=HeuristicType.REDUCTION,
+        filename=filename,
+    )
+
 def _pointwise_exhaustive_configs(
     size_hints, triton_meta, filename, inductor_meta
 ):
@@ -2758,6 +2924,13 @@ def reduction(
     """args to @triton.heuristics()"""
     inductor_meta = {} if inductor_meta is None else inductor_meta
     inductor_meta["reduction_hint"] = reduction_hint
+
+    if experimental_max_autotune:
+        log.debug("Using experimental exhaustive pointwise tuning")
+        return _reduction_exhaustive_configs(
+            size_hints, triton_meta, filename, inductor_meta
+        )
+
     if inductor_meta.get("no_x_dim"):
         size_hints["x"] = 1
 
@@ -2914,6 +3087,12 @@ def persistent_reduction(
     inductor_meta["reduction_hint"] = reduction_hint
     if inductor_meta.get("no_x_dim"):
         size_hints["x"] = 1
+
+    if experimental_max_autotune:
+        log.debug("Using experimental exhaustive pointwise tuning")
+        return _persistent_reduction_exhaustive_configs(
+            size_hints, triton_meta, filename, inductor_meta
+        )
 
     configs = _persistent_reduction_configs(size_hints, reduction_hint, inductor_meta)
 
