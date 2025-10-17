@@ -2564,8 +2564,23 @@ def pointwise(
     )
 
     configs = None
+    use_looped_pointwise = True
+    has_r0_block = any(
+        arg == "R0_BLOCK" 
+        for arg in triton_meta.get("signature", {}).keys()
+    )
+
     if len(size_hints) == 1:
-        if not inductor_meta.get("autotune_pointwise", True) and not (
+
+        if has_r0_block:
+            configs = [
+                Config({"XBLOCK": 512, "R0_BLOCK": 256}, num_warps=4, num_stages=1),
+                Config({"XBLOCK": 1024, "R0_BLOCK": 512}, num_warps=4, num_stages=1),
+                Config({"XBLOCK": 2048, "R0_BLOCK": 1024}, num_warps=8, num_stages=1),
+                Config({"XBLOCK": 4096, "R0_BLOCK": 2048}, num_warps=8, num_stages=1),
+            ]
+
+        elif not inductor_meta.get("autotune_pointwise", True) and not (
             inductor_meta.get("max_autotune")
             or inductor_meta.get("max_autotune_pointwise")
         ):
@@ -2579,7 +2594,24 @@ def pointwise(
                 *hinted_configs,
             ]
     if len(size_hints) == 2:
-        if (
+        if has_r0_block:
+            # Find which dimension is larger
+            dim_sizes = [(name, size) for name, size in size_hints.items()]
+            larger_dim, larger_size = max(dim_sizes, key=lambda x: x[1])
+            smaller_dim, smaller_size = min(dim_sizes, key=lambda x: x[1])
+            
+            # Split the larger dimension with R0_BLOCK
+            larger_block = larger_dim.upper() + "BLOCK"
+            smaller_block = smaller_dim.upper() + "BLOCK"
+
+            configs = [
+                Config({larger_block: 512, "R0_BLOCK": 256, smaller_block: 32}, num_warps=4, num_stages=1),
+                Config({larger_block: 1024, "R0_BLOCK": 512, smaller_block: 32}, num_warps=4, num_stages=1),
+                Config({larger_block: 512, "R0_BLOCK": 256, smaller_block: 64}, num_warps=4, num_stages=1),
+                Config({larger_block: 1024, "R0_BLOCK": 512, smaller_block: 64}, num_warps=8, num_stages=1),
+            ]
+
+        elif (
             not inductor_meta.get("autotune_pointwise", True)
             or tile_hint == TileHint.SQUARE
         ) and not (

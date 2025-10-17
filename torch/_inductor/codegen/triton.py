@@ -4474,6 +4474,268 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue.clear()
         self.prologue_cache.clear()
 
+    def _should_use_pointwise_inner_loop(self):
+        """Check if we should use inner loop optimization for this pointwise kernel."""
+
+        # Safety check: never apply to reduction kernels
+        if self.inside_reduction:
+            return False
+
+        # Only apply to non-template kernels
+        if self.fixed_config or self.cooperative_reduction or self.persistent_reduction:
+            return False
+
+        # Check for operations incompatible with inner loop
+        code_str = ""
+        if hasattr(self, 'indexing_code') and self.indexing_code:
+            code_str += str(self.indexing_code)
+        if hasattr(self, 'loads') and self.loads:
+            code_str += str(self.loads)
+        if hasattr(self, 'compute') and self.compute:
+            code_str += str(self.compute)
+        if hasattr(self, 'stores') and self.stores:
+            code_str += str(self.stores)
+
+        # Skip if using block pointers - they have complex shape calculations
+        if "tl.make_block_ptr" in code_str:
+            return False
+
+        # Skip if using tensor descriptors (TMA)
+        if "tl.make_tensor_descriptor" in code_str:
+            return False
+
+        # Separate trees by type
+        valid_prefixes = {'x', 'y', 'z'}
+        valid_trees = []
+        reduction_trees = []
+
+        for tree in self.range_trees:
+            if tree.prefix in valid_prefixes:
+                valid_trees.append(tree)
+            elif tree.prefix.startswith('r') and (len(tree.prefix) == 1 or tree.prefix[1:].replace('_', '').isdigit()):
+                reduction_trees.append(tree)
+
+        # Check if all reduction trees are trivial (numel=1)
+        for tree in reduction_trees:
+            try:
+                size_hint = V.graph.sizevars.size_hint(tree.numel, fallback=999999)
+                if size_hint > 1:
+                    return False
+            except:
+                return False
+
+        # Need at least one valid dimension
+        if len(valid_trees) == 0 or len(valid_trees) > 2:
+            return False
+
+        # Check dimension sizes
+        dimension_sizes = []
+        for tree in valid_trees:
+            try:
+                size_hint = V.graph.sizevars.size_hint(
+                    tree.numel,
+                    fallback=config.unbacked_symint_fallback
+                )
+                dimension_sizes.append((tree.prefix, size_hint))
+            except:
+                return False
+
+        #if dimension_sizes:
+        #    largest_size = max(size for _, size in dimension_sizes)
+        #    # Need sufficient work to hide memory latency
+        #    if largest_size < 512:
+        #        return False
+        #else:
+        #    return False
+
+        return True
+
+    def _get_split_dimension_info(self):
+        """Get information about which dimension to split for inner loop."""
+        # Only consider x, y, z dimensions (skip reduction dimensions)
+        valid_prefixes = {'x', 'y', 'z'}
+        non_reduction_trees = [
+            t for t in self.range_trees
+            if t.prefix in valid_prefixes
+        ]
+
+        if not non_reduction_trees:
+            return None, []
+
+        # Find dimension with largest numel
+        split_tree = max(
+            non_reduction_trees,
+            key=lambda tree: V.graph.sizevars.size_hint(
+                tree.numel, fallback=config.unbacked_symint_fallback
+            )
+        )
+
+        return split_tree, non_reduction_trees
+
+    def _get_largest_dimension_for_inner_loop(self):
+        """Determine which dimension to split based on largest numel."""
+        if len(self.range_trees) == 1:
+            return self.range_trees[0]
+
+        # Find dimension with largest numel
+        largest_tree = max(
+            self.range_trees,
+            key=lambda tree: V.graph.sizevars.size_hint(
+                tree.numel, fallback=config.unbacked_symint_fallback
+            )
+        )
+        return largest_tree
+
+    def _codegen_pointwise_with_inner_loop(self):
+        """Generate pointwise kernel body with inner R0_BLOCK loop."""
+
+        # Save the current generated code
+        saved_indexing = self.indexing_code.getvalue()
+        saved_loads = self.loads.getvalue()
+        saved_compute = self.compute.getvalue()
+        saved_stores = self.stores.getvalue()
+
+        # Clear buffers for our custom generation
+        self.indexing_code.clear()
+        self.body.clear()
+        self.loads.clear()
+        self.compute.clear()
+        self.stores.clear()
+
+        # Determine which dimension to split
+        non_reduction_trees = [t for t in self.range_trees if t.prefix in {'x', 'y', 'z'}]
+        if not non_reduction_trees:
+            # Restore and fallback
+            self.indexing_code.writelines(saved_indexing.split('\n'))
+            self.loads.writelines(saved_loads.split('\n'))
+            self.compute.writelines(saved_compute.split('\n'))
+            self.stores.writelines(saved_stores.split('\n'))
+            return
+
+        split_tree = max(
+            non_reduction_trees,
+            key=lambda tree: V.graph.sizevars.size_hint(
+                tree.numel, fallback=config.unbacked_symint_fallback
+            )
+        )
+        split_prefix = split_tree.prefix
+
+        # Add static assertion
+        self.body.writeline(f"tl.static_assert({split_prefix.upper()}BLOCK % R0_BLOCK == 0)")
+
+        # Map prefix to program_id
+        prefix_to_pid = {
+            'x': "tl.program_id(0)",
+            'y': "(tl.program_id(1) + tl.program_id(2) * tl.num_programs(1))",
+            'z': "tl.program_id(2)"
+        }
+
+        # Build prefix list for broadcast calculations
+        all_prefixes = [t.prefix for t in non_reduction_trees]
+
+        # Generate offset+index+mask for NON-SPLIT dimensions
+        for tree in non_reduction_trees:
+            if tree.prefix != split_prefix:
+                prefix = tree.prefix
+                pid = prefix_to_pid[prefix]
+
+                idx = all_prefixes.index(prefix)
+                if len(all_prefixes) == 1:
+                    broadcast = ""
+                elif len(all_prefixes) == 2:
+                    broadcast = "[:, None]" if idx == 0 else "[None, :]"
+                else:
+                    parts = ["None"] * len(all_prefixes)
+                    parts[idx] = ":"
+                    broadcast = f"[{', '.join(parts)}]"
+
+                self.body.writeline(f"{prefix}offset = {pid} * {prefix.upper()}BLOCK")
+                self.body.writeline(
+                    f"{prefix}index = {prefix}offset + tl.arange(0, {prefix.upper()}BLOCK){broadcast}"
+                )
+                self.body.writeline(f"{prefix}mask = {prefix}index < {prefix}numel")
+
+        # For split dimension, generate offset only
+        pid = prefix_to_pid[split_prefix]
+        self.body.writeline(f"{split_prefix}offset = {pid} * {split_prefix.upper()}BLOCK")
+        self.body.writeline(f"tile_start = {split_prefix}offset")
+
+        # Save original name
+        original_name = split_tree.name
+
+        # Generate pipelined inner loop
+        self.body.writeline(f"for r in tl.range(0, {split_prefix.upper()}BLOCK, R0_BLOCK, num_stages=2):")
+
+        with self.body.indent():
+            self.body.writeline("lanes = tl.arange(0, R0_BLOCK)")
+
+            # Calculate broadcast for split dimension
+            split_idx = all_prefixes.index(split_prefix)
+            if len(all_prefixes) == 1:
+                broadcast = ""
+            elif len(all_prefixes) == 2:
+                broadcast = "[:, None]" if split_idx == 0 else "[None, :]"
+            else:
+                parts = ["None"] * len(all_prefixes)
+                parts[split_idx] = ":"
+                broadcast = f"[{', '.join(parts)}]"
+
+            self.body.writeline(
+                f"{split_prefix}index = (tile_start + r + lanes){broadcast}"
+            )
+            self.body.writeline(f"{split_prefix}mask = {split_prefix}index < {split_prefix}numel")
+
+            # Override the range tree name temporarily
+            split_tree.name = f"{split_prefix}index"
+
+            # Generate derived indices
+            for node_name, entry in self.range_tree_nodes.items():
+                if hasattr(entry, 'expr') and entry.name != f"{split_prefix}index":
+                    line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
+                    self.body.writeline(line)
+
+            # Fix shapes in the saved code
+            block_name = f"{split_prefix.upper()}BLOCK"
+
+            # Replace in all buffers
+            import re
+
+            def fix_shapes(code):
+                if not code:
+                    return code
+
+                # Replace [XBLOCK] with [R0_BLOCK]
+                code = code.replace(f"[{block_name}]", "[R0_BLOCK]")
+
+                # Replace tl.full([XBLOCK], ...) with tl.full([R0_BLOCK], ...)
+                code = re.sub(
+                    rf'tl\.full\(\[{block_name}\]',
+                    'tl.full([R0_BLOCK]',
+                    code
+                )
+
+                # Replace broadcast_to(expr, [XBLOCK]) with broadcast_to(expr, [R0_BLOCK])
+                code = re.sub(
+                    rf'broadcast_to\((.*?),\s*\[{block_name}\]\)',
+                    r'broadcast_to(\1, [R0_BLOCK])',
+                    code
+                )
+
+                return code
+
+            # Apply fixes and write the code
+            if saved_indexing:
+                self.body.splice(fix_shapes(saved_indexing))
+            if saved_loads:
+                self.body.splice(fix_shapes(saved_loads))
+            if saved_compute:
+                self.body.splice(fix_shapes(saved_compute))
+            if saved_stores:
+                self.body.splice(fix_shapes(saved_stores))
+
+        # Restore original name
+        split_tree.name = original_name
+
     def codegen_body(self):
         """
         Concat output code from index_code, loads, compute, stores,
@@ -4492,6 +4754,14 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             or self.post_loop_combine
             or self.post_loop_store
         ):
+            return
+
+        if self._should_use_pointwise_inner_loop():
+            self._codegen_pointwise_with_inner_loop()
+            self.indexing_code.clear()
+            self.loads.clear()
+            self.compute.clear()
+            self.stores.clear()
             return
 
         loop_trees = [tree for tree in self.range_trees if tree.is_loop]
@@ -4909,6 +5179,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 continue
 
             add_constexpr_arg(f"{tree.prefix.upper()}BLOCK")
+
+        # In codegen_kernel(), replace the R0_BLOCK section with:
+        if self._should_use_pointwise_inner_loop():
+            add_constexpr_arg("R0_BLOCK")
 
         if self.cooperative_reduction:
             add_constexpr_arg("RSPLIT")
