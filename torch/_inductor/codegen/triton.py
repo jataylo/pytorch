@@ -275,7 +275,6 @@ class TritonSymbols:
 
     @classmethod
     def get_block_size(cls, tree: IterationRanges) -> sympy.Symbol:
-        # Looping a PW dim → its lanes are R0_BLOCK.
         try:
             if (
                 getattr(V.kernel, "pointwise_lanes_enabled", False)
@@ -4585,66 +4584,58 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.cse.invalidate(self.outside_loop_vars)
                 tree.cache_clear()
         else:
-
-            # ---- pointwise path (opt-in lanes-reindexed) ----
-            import os
-            self.pointwise_lanes_enabled = bool(
-                getattr(torch._inductor.config.triton, "pointwise_lanes_reindexed", False)
-                or os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
-            )
+            # ---- Pointwise path ----            
+            self.pointwise_lanes_enabled = os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
             self.pointwise_loop_tree = None
             if self.pointwise_lanes_enabled:
-                import pdb; pdb.set_trace()
                 nonred = [t for t in self.range_trees if not t.is_reduction]
                 if nonred:
-                    self.pointwise_loop_tree = max(nonred, key=lambda t: self.block_priority(t))
+                    # pick largest block; tie-break x>y>z via max_block(prefix)
+                    self.pointwise_loop_tree = max(nonred, key=lambda t: (self.max_block(t.prefix), {"x":2,"y":1,"z":0}.get(t.prefix, -1)))
 
-            # If not using lanes-reindexed, use original path
-            if self._pointwise_loop_tree is None:
+            if self.pointwise_loop_tree is None:
+                # Fallback: straight-line PW
                 self.body.splice(self.indexing_code)
                 self.body.splice(self.loads)
                 self.body.splice(self.compute)
                 self.body.splice(self.stores)
             else:
-                loop_tree = self.pointwise_loop_tree
-                P = loop_tree.prefix
-                PBLOCK = f"{P.upper()}BLOCK"
-                Pbase = f"{P}base"
-                Pr = f"{P}r"
-                Poffset = f"{P}offset"
-                Pnumel = f"{P}numel"
+                L = self.pointwise_loop_tree
+                LBLOCK = f"{L.prefix.upper()}BLOCK"
+                Lbase  = f"{L.prefix}base"
+                Lr     = f"{L.prefix}r"
+                Lnum   = f"{L.prefix}numel"
 
-                # Emit headers for all NON-loop trees once (reused each iteration)
+                # Emit headers for all NON-loop trees once (reused inside the loop)
                 for t in self.range_trees:
-                    if t is loop_tree:
+                    if t is L:
                         continue
                     self.iteration_ranges_codegen_header(t, self.body)
 
-                # Local constexpr (no signature change)
+                # Local constexpr lanes width (no signature change)
                 rblock = int(os.environ.get("INDUCTOR_POINTWISE_RBLOCK", "64"))
                 self.body.writeline(f"R0_BLOCK: tl.constexpr = {rblock}")
-                self.body.writeline(f"tl.static_assert({PBLOCK} % R0_BLOCK == 0)")
-                size = self.indexing_size_str(loop_tree.tensor_dim)
-                self.body.writeline(f"{Pbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
+                self.body.writeline(f"tl.static_assert({LBLOCK} % R0_BLOCK == 0)")
+                size = self.indexing_size_str(L.tensor_dim)
+                self.body.writeline(f"{Lbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
 
-                pid_expr = self.iteration_ranges_get_pid(loop_tree)  # e.g., tl.program_id(0)
-                self.body.writeline(f"for {Pr} in tl.range(0, {PBLOCK}, R0_BLOCK, num_stages=2):")
+                # Use the correct program_id() for this dim
+                pid_expr = self.iteration_ranges_get_pid(L)  # e.g., tl.program_id(0)
+                self.body.writeline(f"for {Lr} in tl.range(0, {LBLOCK}, R0_BLOCK, num_stages=2):")
                 with self.body.indent():
-                    # Per-iter offset and current lanes index for the looped PW dim
-                    self.body.writeline(f"{Poffset} = {pid_expr} * {PBLOCK} + {Pr}")
-                    self.body.writeline(f"{loop_tree.name} = {Poffset} + {Pbase}")
-                    # Tail mask must stay dynamic
-                    self.body.writeline(f"{P}mask = {loop_tree.name} < {Pnumel}")
-
-                    # Now emit the normal body under this loop; any aliases (e.g., x0 = xindex)
-                    # are recomputed from the just-updated {loop_tree.name}.
+                    # Compute index directly from PID and chunk; no reliance on pre-loop offset.
+                    self.body.writeline(f"{L.name} = {pid_expr} * {LBLOCK} + {Lr} + {Lbase}")
+                    self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
+                    # Re-emit normal body so aliases (x0/x1/…) are derived from the new {L.name}
                     self.body.splice(self.indexing_code)
                     self.body.splice(self.loads)
                     self.body.splice(self.compute)
                     self.body.splice(self.stores)
 
+        # Always emit any post-body combine (matches prior behavior for PW)
         self.body.splice(self.post_loop_combine)
-        
+       
+
         if self.cooperative_reduction and (
             self.post_loop_combine or self.post_loop_store
         ):
@@ -5518,6 +5509,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self, entry: IterationRangesRoot, code: IndentedBuffer
     ) -> None:
         x = entry.prefix
+        
+        # If this is the chosen PW looped tree, its header is emitted inside the loop (not here).
+        if (
+            getattr(self, "pointwise_lanes_enabled", False)
+            and getattr(self, "pointwise_loop_tree", None) is entry
+            and not self.inside_reduction
+            and not entry.is_loop
+        ):
+            return
+
         if entry.is_loop:
             code.writeline(f"{entry.name} = {x}offset + {x}base")
         elif entry.grid_dim is None:

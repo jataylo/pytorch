@@ -573,7 +573,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                 continue
 
             if not tree.is_reduction or self.inside_reduction:
-                # Lanes-reindexed PW pipeline: chosen PW tree runs with R0_BLOCK lanes.
+                # Lanes-reindexed PW: chosen PW tree runs with R0_BLOCK lanes.
                 if (
                     getattr(self, "pointwise_lanes_enabled", False)
                     and getattr(self, "pointwise_loop_tree", None) is tree
@@ -582,7 +582,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                     sizes[tree.tensor_dim] = "R0_BLOCK"
                 else:
                     sizes[tree.tensor_dim] = f"{tree.prefix.upper()}BLOCK"
-        return sizes
+            return sizes
 
     def dense_size_str(self) -> str:
         sizes = self.dense_size_list()
