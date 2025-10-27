@@ -275,6 +275,16 @@ class TritonSymbols:
 
     @classmethod
     def get_block_size(cls, tree: IterationRanges) -> sympy.Symbol:
+        # Looping a PW dim → its lanes are R0_BLOCK.
+        try:
+            if (
+                getattr(V.kernel, "pointwise_lanes_enabled", False)
+                and getattr(V.kernel, "pointwise_loop_tree", None) is tree
+                and not V.kernel.inside_reduction
+            ):
+                return sympy.Symbol("R0_BLOCK")
+        except Exception:
+            pass
         return cls.block_sizes[tree.symt]
 
     @classmethod
@@ -2248,6 +2258,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         self.optimize_mask: bool = optimize_mask
         self.fixed_config = fixed_config
+        self._loop_dim = None
         super().__init__(tiling, **kwargs)
         self.cse = TritonCSE(self.newvar_prefix, self.suffix)
         # Cache of values that can be reused for the prologue.
@@ -2272,6 +2283,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
 
+        self._pointwise_loop_tree = None
+
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)
 
@@ -2286,6 +2299,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.has_load_with_contiguous_rdim = False
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
+
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -4490,6 +4504,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue.clear()
         self.prologue_cache.clear()
 
+    def block_priority(self, tree):
+        # Robust: prefer configured numeric capability for this axis.
+        return self.max_block(tree.prefix)
+
     def codegen_body(self):
         """
         Concat output code from index_code, loads, compute, stores,
@@ -4526,6 +4544,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     )
                 with self.body.indent(offset=level + 1):
                     self.iteration_ranges_codegen_header(tree, self.body)
+
 
             # The innermost loop performs the reduction.
             with self.body.indent(offset=len(loop_trees)):
@@ -4566,11 +4585,66 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.cse.invalidate(self.outside_loop_vars)
                 tree.cache_clear()
         else:
-            self.body.splice(self.indexing_code)
-            self.body.splice(self.loads)
-            self.body.splice(self.compute)
-            self.body.splice(self.stores)
+
+            # ---- pointwise path (opt-in lanes-reindexed) ----
+            import os
+            self.pointwise_lanes_enabled = bool(
+                getattr(torch._inductor.config.triton, "pointwise_lanes_reindexed", False)
+                or os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
+            )
+            self.pointwise_loop_tree = None
+            if self.pointwise_lanes_enabled:
+                import pdb; pdb.set_trace()
+                nonred = [t for t in self.range_trees if not t.is_reduction]
+                if nonred:
+                    self.pointwise_loop_tree = max(nonred, key=lambda t: self.block_priority(t))
+
+            # If not using lanes-reindexed, use original path
+            if self._pointwise_loop_tree is None:
+                self.body.splice(self.indexing_code)
+                self.body.splice(self.loads)
+                self.body.splice(self.compute)
+                self.body.splice(self.stores)
+            else:
+                loop_tree = self.pointwise_loop_tree
+                P = loop_tree.prefix
+                PBLOCK = f"{P.upper()}BLOCK"
+                Pbase = f"{P}base"
+                Pr = f"{P}r"
+                Poffset = f"{P}offset"
+                Pnumel = f"{P}numel"
+
+                # Emit headers for all NON-loop trees once (reused each iteration)
+                for t in self.range_trees:
+                    if t is loop_tree:
+                        continue
+                    self.iteration_ranges_codegen_header(t, self.body)
+
+                # Local constexpr (no signature change)
+                rblock = int(os.environ.get("INDUCTOR_POINTWISE_RBLOCK", "64"))
+                self.body.writeline(f"R0_BLOCK: tl.constexpr = {rblock}")
+                self.body.writeline(f"tl.static_assert({PBLOCK} % R0_BLOCK == 0)")
+                size = self.indexing_size_str(loop_tree.tensor_dim)
+                self.body.writeline(f"{Pbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
+
+                pid_expr = self.iteration_ranges_get_pid(loop_tree)  # e.g., tl.program_id(0)
+                self.body.writeline(f"for {Pr} in tl.range(0, {PBLOCK}, R0_BLOCK, num_stages=2):")
+                with self.body.indent():
+                    # Per-iter offset and current lanes index for the looped PW dim
+                    self.body.writeline(f"{Poffset} = {pid_expr} * {PBLOCK} + {Pr}")
+                    self.body.writeline(f"{loop_tree.name} = {Poffset} + {Pbase}")
+                    # Tail mask must stay dynamic
+                    self.body.writeline(f"{P}mask = {loop_tree.name} < {Pnumel}")
+
+                    # Now emit the normal body under this loop; any aliases (e.g., x0 = xindex)
+                    # are recomputed from the just-updated {loop_tree.name}.
+                    self.body.splice(self.indexing_code)
+                    self.body.splice(self.loads)
+                    self.body.splice(self.compute)
+                    self.body.splice(self.stores)
+
         self.body.splice(self.post_loop_combine)
+        
         if self.cooperative_reduction and (
             self.post_loop_combine or self.post_loop_store
         ):
