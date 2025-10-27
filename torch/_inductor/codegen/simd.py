@@ -572,10 +572,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if tree.tensor_dim is None:
                 continue
 
-            # pyrefly: ignore  # missing-argument
             if not tree.is_reduction or self.inside_reduction:
-                # If lanes-reindexed PW pipeline is active on this tree,
-                # its runtime vector lanes are [R0_BLOCK], not [*BLOCK].
                 if (
                     getattr(self, "pointwise_lanes_enabled", False)
                     and getattr(self, "pointwise_loop_tree", None) is tree

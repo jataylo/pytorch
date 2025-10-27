@@ -4606,28 +4606,30 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 Lbase  = f"{L.prefix}base"
                 Lr     = f"{L.prefix}r"
                 Lnum   = f"{L.prefix}numel"
-
-                # Emit headers for NON-loop, NON-reduction trees once (reused in the loop)
+                Loff   = f"{L.prefix}offset"
+ 
+                # Emit headers for all NON-loop trees once (reused inside the loop)
                 for t in self.range_trees:
-                    if t is L or t.is_reduction:
+                    if t is L:
                         continue
                     self.iteration_ranges_codegen_header(t, self.body)
-
-                # Local constexpr lanes width (no signature change)
+ 
+                # Local constexpr for lanes width
                 rblock = int(os.environ.get("INDUCTOR_POINTWISE_RBLOCK", "64"))
                 self.body.writeline(f"R0_BLOCK: tl.constexpr = {rblock}")
                 self.body.writeline(f"tl.static_assert({LBLOCK} % R0_BLOCK == 0)")
                 size = self.indexing_size_str(L.tensor_dim)
                 self.body.writeline(f"{Lbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
-
-                # Use the correct program_id() for this dim
-                pid_expr = self.iteration_ranges_get_pid(L)  # e.g., tl.program_id(0)
                 self.body.writeline(f"for {Lr} in tl.range(0, {LBLOCK}, R0_BLOCK, num_stages=2):")
                 with self.body.indent():
-                    # Per-iter index = pid*BLOCK + chunk + base   (no pre-loop offset reuse)
-                    self.body.writeline(f"{L.name} = {pid_expr} * {LBLOCK} + {Lr} + {Lbase}")
+                    # per-iter offset and current lanes for the looped PW dim
+                    pid_expr = self.iteration_ranges_get_pid(L)
+                    self.body.writeline(f"{Loff} = {pid_expr} * {LBLOCK} + {Lr}")
+                    self.body.writeline(f"{L.name} = {Loff} + {Lbase}")
                     self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
-                    # Re-emit normal body so aliases (x0/x1/…) are derived from the new {L.name}
+ 
+                    # Normal body now runs with the updated {L.name}; any aliases like
+                    # "x0 = xindex" are emitted via indexing_code *inside* this loop.
                     self.body.splice(self.indexing_code)
                     self.body.splice(self.loads)
                     self.body.splice(self.compute)
@@ -5321,10 +5323,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
         line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
-        if entry.root.is_loop:
+        # Emit inside the PW lanes loop if this entry depends on the looped PW root.
+        emit_inside_pw_loop = (
+            getattr(self, "pointwise_lanes_enabled", False)
+            and getattr(self, "pointwise_loop_tree", None) is entry.root
+            and not self.inside_reduction
+        )
+        if entry.root.is_loop or emit_inside_pw_loop:
             self.indexing_code.writeline(line)
         else:
-            # lift non-reduction stores outside loop
             self.body.writeline(line)
 
     def iteration_ranges_ranges_code(self, entry: IterationRangesRoot) -> str:
@@ -5511,15 +5518,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         x = entry.prefix
         
-        # 1) If we are in the PW lanes-reindexed mode and *this* is the chosen
-        #    looped tree, skip emitting its header here; it's built inside the loop.
-        if (
-            getattr(self, "pointwise_lanes_enabled", False)
-            and getattr(self, "pointwise_loop_tree", None) is entry
-            and not self.inside_reduction
-        ):
+        # Skip header for the chosen PW loop tree: it will be built inside the loop.
+        if getattr(self, "pointwise_lanes_enabled", False) and getattr(self, "pointwise_loop_tree", None) is entry and not self.inside_reduction:
             return
-        # 2) Never emit reduction headers in the PW body (no reduction loop active).
+        # Never emit reduction headers during PW path.
         if entry.is_loop and not self.inside_reduction:
             return
 
