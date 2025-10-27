@@ -275,6 +275,7 @@ class TritonSymbols:
 
     @classmethod
     def get_block_size(cls, tree: IterationRanges) -> sympy.Symbol:
+        # If lanes-reindexed PW pipeline is active on this tree, its lanes are R0_BLOCK.
         try:
             if (
                 getattr(V.kernel, "pointwise_lanes_enabled", False)
@@ -4606,9 +4607,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 Lr     = f"{L.prefix}r"
                 Lnum   = f"{L.prefix}numel"
 
-                # Emit headers for all NON-loop trees once (reused inside the loop)
+                # Emit headers for NON-loop, NON-reduction trees once (reused in the loop)
                 for t in self.range_trees:
-                    if t is L:
+                    if t is L or t.is_reduction:
                         continue
                     self.iteration_ranges_codegen_header(t, self.body)
 
@@ -4623,7 +4624,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 pid_expr = self.iteration_ranges_get_pid(L)  # e.g., tl.program_id(0)
                 self.body.writeline(f"for {Lr} in tl.range(0, {LBLOCK}, R0_BLOCK, num_stages=2):")
                 with self.body.indent():
-                    # Compute index directly from PID and chunk; no reliance on pre-loop offset.
+                    # Per-iter index = pid*BLOCK + chunk + base   (no pre-loop offset reuse)
                     self.body.writeline(f"{L.name} = {pid_expr} * {LBLOCK} + {Lr} + {Lbase}")
                     self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
                     # Re-emit normal body so aliases (x0/x1/…) are derived from the new {L.name}
@@ -5510,13 +5511,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         x = entry.prefix
         
-        # If this is the chosen PW looped tree, its header is emitted inside the loop (not here).
+        # 1) If we are in the PW lanes-reindexed mode and *this* is the chosen
+        #    looped tree, skip emitting its header here; it's built inside the loop.
         if (
             getattr(self, "pointwise_lanes_enabled", False)
             and getattr(self, "pointwise_loop_tree", None) is entry
             and not self.inside_reduction
-            and not entry.is_loop
         ):
+            return
+        # 2) Never emit reduction headers in the PW body (no reduction loop active).
+        if entry.is_loop and not self.inside_reduction:
             return
 
         if entry.is_loop:
