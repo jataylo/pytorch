@@ -4586,6 +4586,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 tree.cache_clear()
         else:
             # ---- Pointwise path ----            
+            import os
             self.pointwise_lanes_enabled = os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
             self.pointwise_loop_tree = None
             if self.pointwise_lanes_enabled:
@@ -4607,29 +4608,32 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 Lr     = f"{L.prefix}r"
                 Lnum   = f"{L.prefix}numel"
                 Loff   = f"{L.prefix}offset"
- 
+
                 # Emit headers for all NON-loop trees once (reused inside the loop)
                 for t in self.range_trees:
-                    if t is L:
+                    if getattr(t, "prefix", None) == L.prefix:
                         continue
                     self.iteration_ranges_codegen_header(t, self.body)
- 
-                # Local constexpr for lanes width
+
+                # Local constexpr for lanes width (no signature change)
+                import os
                 rblock = int(os.environ.get("INDUCTOR_POINTWISE_RBLOCK", "64"))
                 self.body.writeline(f"R0_BLOCK: tl.constexpr = {rblock}")
                 self.body.writeline(f"tl.static_assert({LBLOCK} % R0_BLOCK == 0)")
                 size = self.indexing_size_str(L.tensor_dim)
                 self.body.writeline(f"{Lbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
+
+                # Pipelined loop; compute offset per chunk (pid * BLOCK + r)
                 self.body.writeline(f"for {Lr} in tl.range(0, {LBLOCK}, R0_BLOCK, num_stages=2):")
                 with self.body.indent():
-                    # per-iter offset and current lanes for the looped PW dim
                     pid_expr = self.iteration_ranges_get_pid(L)
                     self.body.writeline(f"{Loff} = {pid_expr} * {LBLOCK} + {Lr}")
                     self.body.writeline(f"{L.name} = {Loff} + {Lbase}")
-                    self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
- 
-                    # Normal body now runs with the updated {L.name}; any aliases like
-                    # "x0 = xindex" are emitted via indexing_code *inside* this loop.
+                    if not self._has_constant_mask(L):
+                        self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
+
+                    # Re-bind aliases like x0=xindex, etc. to current [R0_BLOCK] lanes
+                    self.body.splice(self.indexing_aliasing)
                     self.body.splice(self.indexing_code)
                     self.body.splice(self.loads)
                     self.body.splice(self.compute)
@@ -5323,7 +5327,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
         line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
-        # Emit inside the PW lanes loop if this entry depends on the looped PW root.
+        # If this entry depends on the looped pointwise root, emit it INSIDE the lanes loop.
         emit_inside_pw_loop = (
             getattr(self, "pointwise_lanes_enabled", False)
             and getattr(self, "pointwise_loop_tree", None) is entry.root
@@ -5518,11 +5522,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         x = entry.prefix
         
-        # Skip header for the chosen PW loop tree: it will be built inside the loop.
-        if getattr(self, "pointwise_lanes_enabled", False) and getattr(self, "pointwise_loop_tree", None) is entry and not self.inside_reduction:
-            return
-        # Never emit reduction headers during PW path.
-        if entry.is_loop and not self.inside_reduction:
+        # Skip header for the chosen PW loop tree (we'll build its index/mask inside the loop).
+        if (
+            getattr(self, "pointwise_lanes_enabled", False)
+            and not self.inside_reduction
+            and getattr(self, "pointwise_loop_tree", None) is not None
+            and getattr(self.pointwise_loop_tree, "prefix", None) == entry.prefix
+        ):
             return
 
         if entry.is_loop:
