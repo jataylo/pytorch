@@ -2350,6 +2350,15 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         pw = [t for t in self.range_trees if t.prefix in {"x","y","z"}]
         if not pw:
             return False
+        # GEMM / tl.dot kernels: skip pipelined pointwise
+        buf_txt = "".join([
+            getattr(self.indexing_code, "getvalue", lambda: "")(),
+            getattr(self.loads, "getvalue", lambda: "")(),
+            getattr(self.compute, "getvalue", lambda: "")(),
+            getattr(self.stores, "getvalue", lambda: "")(),
+        ])
+        if "tl.dot(" in buf_txt or "BLOCK_M" in buf_txt or "BLOCK_N" in buf_txt:
+            return False
         # any non-trivial reductions? bail
         for t in self.range_trees:
             if t.prefix.startswith("r") and not V.graph.sizevars.statically_known_equals(t.numel, 1):
@@ -2387,21 +2396,61 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return "tl.program_id(2)"
         return "tl.program_id(0)"
 
-    def _compute_r0_block_value(self, split_tree) -> int:
+    def _fix_block_sized_nodes_for_pipeline(self, src_text, split_prefix: str) -> str:
         """
-        Choose R0_BLOCK as half of the tuned {SPLIT}BLOCK.
-        Ensure it's a positive divisor of {SPLIT}BLOCK (downshift by /2 until it divides).
-        """
-        try:
-            split_block = int(self.max_block(split_tree.prefix))  # tuned {SPLIT}BLOCK
-        except Exception:
-            split_block = 128  # safe fallback
+        Rewrite pre-generated loads/compute/store blocks for inner-loop (R0_BLOCK)
+        on the *split* dimension only.
 
-        r = max(1, split_block // 2)
-        while split_block % r != 0 and r > 1:
-            r //= 2
-        return 8
-        #return max(1, r)
+        Rules:
+        1) In ANY bracketed list '[ ... ]', replace exact '{SPLIT}BLOCK' tokens with 'R0_BLOCK'.
+            Works for 1D or ND: [YBLOCK], [YBLOCK, XBLOCK], [ZBLOCK, YBLOCK, XBLOCK], etc.
+        2) Drop unary broadcasts to the split 1D shape:
+                tl.broadcast_to(expr, [SPLITBLOCK])  ->  expr
+            (Optional; not required once #1 is in place, but keeps code tidy.)
+        """
+        import re
+
+        # --- coerce to string safely ---
+        if src_text is None:
+            txt = ""
+        elif hasattr(src_text, "getvalue"):  # IndentedBuffer
+            txt = src_text.getvalue()
+        else:
+            txt = str(src_text)
+
+        if not txt:
+            return ""
+
+        SPLIT = split_prefix.upper()
+
+        # (1) Replace split-block tokens inside ANY bracketed list '[ ... ]'
+        #     We reconstruct the list so commas / spacing are preserved.
+        def replace_in_list(m):
+            inside = m.group(1)
+            # split preserving separators: tokens at even idx, separators at odd idx
+            parts = re.split(r'(\s*,\s*)', inside)
+            for i in range(0, len(parts), 2):
+                parts[i] = re.sub(rf'\b{SPLIT}BLOCK\b', 'R0_BLOCK', parts[i])
+            return '[' + ''.join(parts) + ']'
+
+        # Handle nested lists on the same line; run repeatedly until no change
+        prev = None
+        while prev != txt:
+            prev = txt
+            txt = re.sub(r'\[([^\[\]]+)\]', replace_in_list, txt)
+
+        # (2) Drop unary broadcast_to(expr, [SPLITBLOCK]) → expr
+        txt = re.sub(
+            rf"""\btl\.broadcast_to\(
+                    \s* (?P<expr>[^,()]+ | \([^()]*\)) \s* ,
+                    \s* \[\s*{SPLIT}BLOCK\s*\] \s*
+                \)""",
+            r"\g<expr>",
+            txt,
+            flags=re.VERBOSE,
+        )
+
+        return txt
 
     def _emit_pointwise_pipeline(self) -> None:
         """
@@ -2423,13 +2472,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             if t.prefix in {"x", "y", "z"} and t.prefix != split:
                 self.iteration_ranges_codegen_header(t, self.body)
 
-        # 2) compute a static R0_BLOCK in Python (literal)
-        r0_val = self._compute_r0_block_value(split_tree)
-
-        # 3) split offset and inner pipelined loop
+        # 2) split offset and inner pipelined loop
         pid = self._pid_expr_for_prefix(split)
         self.body.writeline(f"{split}offset = {pid} * {SPLIT}BLOCK")
-        self.body.writeline(f"R0_BLOCK: tl.constexpr = {r0_val}")
+        #self.body.writeline(f"R0_BLOCK: tl.constexpr = {r0_val}") - Now included in signature
         self.body.writeline(f"tl.static_assert({SPLIT}BLOCK % R0_BLOCK == 0)")
         self.body.writeline(f"for r in tl.range(0, {SPLIT}BLOCK, R0_BLOCK, num_stages=2):")
         with self.body.indent():
@@ -2450,11 +2496,18 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
                 )
 
-            # Splice stages; constants will broadcast from scalars
-            self.body.splice(self.loads)
-            self.body.splice(self.compute)
-            self.body.splice(self.stores)
+            # --- before splicing, fix the split-dim shapes in the captured blocks ---
+            fixed_loads   = self._fix_block_sized_nodes_for_pipeline(self.loads.getvalue(),   split)
+            fixed_compute = self._fix_block_sized_nodes_for_pipeline(self.compute.getvalue(), split)
+            fixed_stores  = self._fix_block_sized_nodes_for_pipeline(self.stores.getvalue(),  split)
 
+            # --- splice the fixed text directly (no loops needed) ---
+            self.body.splice(fixed_loads)
+            self.body.splice(fixed_compute)
+            self.body.splice(fixed_stores)
+
+            # optional: prevent accidental reuse later
+            self.loads.clear(); self.compute.clear(); self.stores.clear()
 
 
     @property
@@ -5084,6 +5137,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 continue
 
             add_constexpr_arg(f"{tree.prefix.upper()}BLOCK")
+
+        if self._should_use_pointwise_pipeline():
+            add_constexpr_arg("R0_BLOCK")
 
         if self.cooperative_reduction:
             add_constexpr_arg("RSPLIT")
