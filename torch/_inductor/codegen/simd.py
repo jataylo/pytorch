@@ -572,17 +572,10 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if tree.tensor_dim is None:
                 continue
 
+            # pyrefly: ignore  # missing-argument
             if not tree.is_reduction or self.inside_reduction:
-                if (
-                    getattr(self, "pointwise_lanes_enabled", False)
-                    and getattr(self, "pointwise_loop_tree", None) is tree
-                    and not self.inside_reduction
-                ):
-                    sizes[tree.tensor_dim] = "R0_BLOCK"
-                else:
-                    sizes[tree.tensor_dim] = f"{tree.prefix.upper()}BLOCK"
-
-            return sizes
+                sizes[tree.tensor_dim] = f"{tree.prefix.upper()}BLOCK"
+        return sizes
 
     def dense_size_str(self) -> str:
         sizes = self.dense_size_list()
@@ -972,6 +965,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
     def active_range_trees(self) -> list[IterationRangesRoot]:
         return [
+            # pyrefly: ignore  # missing-argument
             t
             for t in self.range_trees
             # pyrefly: ignore  # missing-argument

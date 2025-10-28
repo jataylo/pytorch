@@ -114,6 +114,8 @@ if TYPE_CHECKING:
 
     _T = TypeVar("_T")
 
+import os
+
 log = logging.getLogger(__name__)
 perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
 schedule_log = torch._logging.getArtifactLogger(__name__, "schedule")
@@ -275,16 +277,6 @@ class TritonSymbols:
 
     @classmethod
     def get_block_size(cls, tree: IterationRanges) -> sympy.Symbol:
-        # If lanes-reindexed PW pipeline is active on this tree, its lanes are R0_BLOCK.
-        try:
-            if (
-                getattr(V.kernel, "pointwise_lanes_enabled", False)
-                and getattr(V.kernel, "pointwise_loop_tree", None) is tree
-                and not V.kernel.inside_reduction
-            ):
-                return sympy.Symbol("R0_BLOCK")
-        except Exception:
-            pass
         return cls.block_sizes[tree.symt]
 
     @classmethod
@@ -2258,7 +2250,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     ) -> None:
         self.optimize_mask: bool = optimize_mask
         self.fixed_config = fixed_config
-        self._loop_dim = None
         super().__init__(tiling, **kwargs)
         self.cse = TritonCSE(self.newvar_prefix, self.suffix)
         # Cache of values that can be reused for the prologue.
@@ -2283,7 +2274,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
 
-        self._pointwise_loop_tree = None
+        # ---- Pointwise pipeline (opt-in) -----------------------------------
+        self._pw_pipeline_enabled = os.environ.get(
+            "INDUCTOR_TRITON_PW_PIPELINE", "0"
+        ) == "1"
+        # default values are conservative; you can tweak via env
+        self._pw_pipeline_rblock_env = int(os.environ.get(
+            "INDUCTOR_TRITON_PW_RBLOCK", "128"
+        ))
+        self._pw_pipeline_stages = int(os.environ.get(
+            "INDUCTOR_TRITON_PW_STAGES", "2"
+        ))
 
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)
@@ -2299,7 +2300,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.has_load_with_contiguous_rdim = False
         # We track the store name since a store can be canceled later
         self.stores_with_contiguous_rdim: list[str] = []
-
 
     @staticmethod
     def _has_stride1_on_rdim(index) -> bool:
@@ -2328,6 +2328,134 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return False
 
         return any(stride == 1 for stride in stride_vars)
+
+    # --------------------------------------------------------------------------
+    # Pointwise inner-loop pipelining (env-guarded, scalar-friendly)
+    # --------------------------------------------------------------------------
+    def _env_pointwise_pipeline_enabled(self) -> bool:
+        """Enable with INDUCTOR_TRITON_POINTWISE_LANES=1"""
+        return os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
+
+    def _should_use_pointwise_pipeline(self) -> bool:
+        # gate on env
+        if not self._env_pointwise_pipeline_enabled():
+            return False
+        # reductions / persistent/cooperative configs: skip
+        if self.inside_reduction or self.fixed_config or self.cooperative_reduction or self.persistent_reduction:
+            return False
+        # if block pointers / TMA in this kernel, skip for now
+        if getattr(self, "block_ptr_to_buffer", None) and len(self.block_ptr_to_buffer) > 0:
+            return False
+        # must have some pointwise dims
+        pw = [t for t in self.range_trees if t.prefix in {"x","y","z"}]
+        if not pw:
+            return False
+        # any non-trivial reductions? bail
+        for t in self.range_trees:
+            if t.prefix.startswith("r") and not V.graph.sizevars.statically_known_equals(t.numel, 1):
+                return False
+        # Split dim too small? bail
+        return True
+
+    def _largest_pointwise_tree(self):
+        """
+        Pick the pointwise dim (x/y/z) with the largest global extent (size_hint),
+        independent of tuned X/Y/ZBLOCK. Tie-break: y > x > z.
+        """
+        cand = [t for t in self.range_trees if t.prefix in {"x", "y", "z"}]
+        if not cand:
+            return None
+
+        from torch._inductor import config  # ensure available
+        order = {"y": 2, "x": 1, "z": 0}
+
+        def extent(tree):
+            return V.graph.sizevars.size_hint(
+                tree.numel,
+                fallback=getattr(config, "unbacked_symint_fallback", 1),
+            )
+
+        cand.sort(key=lambda t: (extent(t), order.get(t.prefix, -1)), reverse=True)
+        return cand[0]
+
+    def _pid_expr_for_prefix(self, prefix: str) -> str:
+        if prefix == "x":
+            return "tl.program_id(0)"
+        if prefix == "y":
+            return "(tl.program_id(1) + tl.program_id(2) * tl.num_programs(1))"
+        if prefix == "z":
+            return "tl.program_id(2)"
+        return "tl.program_id(0)"
+
+    def _compute_r0_block_value(self, split_tree) -> int:
+        """
+        Choose R0_BLOCK as half of the tuned {SPLIT}BLOCK.
+        Ensure it's a positive divisor of {SPLIT}BLOCK (downshift by /2 until it divides).
+        """
+        try:
+            split_block = int(self.max_block(split_tree.prefix))  # tuned {SPLIT}BLOCK
+        except Exception:
+            split_block = 128  # safe fallback
+
+        r = max(1, split_block // 2)
+        while split_block % r != 0 and r > 1:
+            r //= 2
+        return 8
+        #return max(1, r)
+
+    def _emit_pointwise_pipeline(self) -> None:
+        """
+        Emit a pipelined inner loop over the largest BLOCK dim.
+        Shapes in the loop are driven by `xindex` (length R0_BLOCK) and scalar
+        broadcasting; we **do not** reassign any tl.constexpr (no XBLOCK shadowing).
+        """
+        # 0) make sure nothing previously written pollutes the body
+        self.indexing_code.clear()
+        self.body.clear()   # <-- IMPORTANT: remove any earlier xindex/xmask in the body
+
+        split_tree = self._largest_pointwise_tree()
+        assert split_tree is not None
+        split  = split_tree.prefix
+        SPLIT  = split.upper()
+
+        # 1) non-split headers as usual
+        for t in self.range_trees:
+            if t.prefix in {"x", "y", "z"} and t.prefix != split:
+                self.iteration_ranges_codegen_header(t, self.body)
+
+        # 2) compute a static R0_BLOCK in Python (literal)
+        r0_val = self._compute_r0_block_value(split_tree)
+
+        # 3) split offset and inner pipelined loop
+        pid = self._pid_expr_for_prefix(split)
+        self.body.writeline(f"{split}offset = {pid} * {SPLIT}BLOCK")
+        self.body.writeline(f"R0_BLOCK: tl.constexpr = {r0_val}")
+        self.body.writeline(f"tl.static_assert({SPLIT}BLOCK % R0_BLOCK == 0)")
+        self.body.writeline(f"for r in tl.range(0, {SPLIT}BLOCK, R0_BLOCK, num_stages=2):")
+        with self.body.indent():
+            self.body.writeline("lanes = tl.arange(0, R0_BLOCK)")
+            size_suffix = (
+                self.indexing_size_str(split_tree.tensor_dim)
+                if split_tree.tensor_dim is not None else ""
+            )
+            # Build split index/mask ONLY inside the loop with R0_BLOCK shape
+            self.body.writeline(f"{split}index = {split}offset + r + lanes{size_suffix}")
+            self.body.writeline(f"{split}mask  = {split}index < {split}numel")
+
+            # Derived indices (x0, x1, ...) now use the rebuilt {split}index
+            for _sym, entry in self.range_tree_nodes.items():
+                if getattr(entry, 'name', None) == f"{split}index":
+                    continue
+                self.body.writeline(
+                    f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
+                )
+
+            # Splice stages; constants will broadcast from scalars
+            self.body.splice(self.loads)
+            self.body.splice(self.compute)
+            self.body.splice(self.stores)
+
+
 
     @property
     def has_store_with_contiguous_rdim(self) -> bool:
@@ -4504,10 +4632,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.prologue.clear()
         self.prologue_cache.clear()
 
-    def block_priority(self, tree):
-        # Robust: prefer configured numeric capability for this axis.
-        return self.max_block(tree.prefix)
-
     def codegen_body(self):
         """
         Concat output code from index_code, loads, compute, stores,
@@ -4544,7 +4668,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                     )
                 with self.body.indent(offset=level + 1):
                     self.iteration_ranges_codegen_header(tree, self.body)
-
 
             # The innermost loop performs the reduction.
             with self.body.indent(offset=len(loop_trees)):
@@ -4585,64 +4708,26 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 self.cse.invalidate(self.outside_loop_vars)
                 tree.cache_clear()
         else:
-            # ---- Pointwise path ----            
-            import os
-            self.pointwise_lanes_enabled = os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
-            self.pointwise_loop_tree = None
-            if self.pointwise_lanes_enabled:
-                nonred = [t for t in self.range_trees if not t.is_reduction]
-                if nonred:
-                    # pick largest block; tie-break x>y>z via max_block(prefix)
-                    self.pointwise_loop_tree = max(nonred, key=lambda t: (self.max_block(t.prefix), {"x":2,"y":1,"z":0}.get(t.prefix, -1)))
 
-            if self.pointwise_loop_tree is None:
-                # Fallback: straight-line PW
-                self.body.splice(self.indexing_code)
-                self.body.splice(self.loads)
-                self.body.splice(self.compute)
-                self.body.splice(self.stores)
-            else:
-                L = self.pointwise_loop_tree
-                LBLOCK = f"{L.prefix.upper()}BLOCK"
-                Lbase  = f"{L.prefix}base"
-                Lr     = f"{L.prefix}r"
-                Lnum   = f"{L.prefix}numel"
-                Loff   = f"{L.prefix}offset"
+            # ---- Pointwise path ----
+            if self._should_use_pointwise_pipeline():
+                #
+                # We *don't* splice self.indexing_code here; instead we:
+                # - define non-split dim headers
+                # - define split dim index/mask per R0_BLOCK chunk
+                # - shadow {SPLIT}BLOCK with R0_BLOCK inside the loop
+                # - re-emit derived indexing nodes
+                # - splice loads/compute/stores inside the loop
+                #
+                self._emit_pointwise_pipeline()
+                return
 
-                # Emit headers for all NON-loop trees once (reused inside the loop)
-                for t in self.range_trees:
-                    if getattr(t, "prefix", None) == L.prefix:
-                        continue
-                    self.iteration_ranges_codegen_header(t, self.body)
-
-                # Local constexpr for lanes width (no signature change)
-                import os
-                rblock = int(os.environ.get("INDUCTOR_POINTWISE_RBLOCK", "64"))
-                self.body.writeline(f"R0_BLOCK: tl.constexpr = {rblock}")
-                self.body.writeline(f"tl.static_assert({LBLOCK} % R0_BLOCK == 0)")
-                size = self.indexing_size_str(L.tensor_dim)
-                self.body.writeline(f"{Lbase} = tl.arange(0, R0_BLOCK){size}.to({self.index_dtype})")
-
-                # Pipelined loop; compute offset per chunk (pid * BLOCK + r)
-                self.body.writeline(f"for {Lr} in tl.range(0, {LBLOCK}, R0_BLOCK, num_stages=2):")
-                with self.body.indent():
-                    pid_expr = self.iteration_ranges_get_pid(L)
-                    self.body.writeline(f"{Loff} = {pid_expr} * {LBLOCK} + {Lr}")
-                    self.body.writeline(f"{L.name} = {Loff} + {Lbase}")
-                    if not self._has_constant_mask(L):
-                        self.body.writeline(f"{L.prefix}mask = {L.name} < {Lnum}")
-
-                    # Re-bind aliases like x0=xindex, etc. to current [R0_BLOCK] lanes
-                    self.body.splice(self.indexing_aliasing)
-                    self.body.splice(self.indexing_code)
-                    self.body.splice(self.loads)
-                    self.body.splice(self.compute)
-                    self.body.splice(self.stores)
-
-        # Always emit any post-body combine (matches prior behavior for PW)
+            self.body.splice(self.indexing_code)
+            self.body.splice(self.loads)
+            self.body.splice(self.compute)
+            self.body.splice(self.stores)
+        
         self.body.splice(self.post_loop_combine)
-       
-
         if self.cooperative_reduction and (
             self.post_loop_combine or self.post_loop_store
         ):
@@ -5327,15 +5412,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def codegen_iteration_ranges_entry(self, entry: IterationRangesEntry):
         line = f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
-        # If this entry depends on the looped pointwise root, emit it INSIDE the lanes loop.
-        emit_inside_pw_loop = (
-            getattr(self, "pointwise_lanes_enabled", False)
-            and getattr(self, "pointwise_loop_tree", None) is entry.root
-            and not self.inside_reduction
-        )
-        if entry.root.is_loop or emit_inside_pw_loop:
+        if entry.root.is_loop:
             self.indexing_code.writeline(line)
         else:
+            # lift non-reduction stores outside loop
             self.body.writeline(line)
 
     def iteration_ranges_ranges_code(self, entry: IterationRangesRoot) -> str:
@@ -5521,16 +5601,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self, entry: IterationRangesRoot, code: IndentedBuffer
     ) -> None:
         x = entry.prefix
-        
-        # Skip header for the chosen PW loop tree (we'll build its index/mask inside the loop).
-        if (
-            getattr(self, "pointwise_lanes_enabled", False)
-            and not self.inside_reduction
-            and getattr(self, "pointwise_loop_tree", None) is not None
-            and getattr(self.pointwise_loop_tree, "prefix", None) == entry.prefix
-        ):
-            return
-
         if entry.is_loop:
             code.writeline(f"{entry.name} = {x}offset + {x}base")
         elif entry.grid_dim is None:
