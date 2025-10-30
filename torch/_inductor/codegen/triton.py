@@ -2274,18 +2274,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
 
-        # ---- Pointwise pipeline (opt-in) -----------------------------------
-        self._pw_pipeline_enabled = os.environ.get(
-            "INDUCTOR_TRITON_PW_PIPELINE", "0"
-        ) == "1"
-        # default values are conservative; you can tweak via env
-        self._pw_pipeline_rblock_env = int(os.environ.get(
-            "INDUCTOR_TRITON_PW_RBLOCK", "128"
-        ))
-        self._pw_pipeline_stages = int(os.environ.get(
-            "INDUCTOR_TRITON_PW_STAGES", "2"
-        ))
-
         if self.inside_reduction:
             self.codegen_reduction_numels(self.body)
 
@@ -2333,61 +2321,90 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
     # Pointwise inner-loop pipelining (env-guarded, scalar-friendly)
     # --------------------------------------------------------------------------
     def _env_pointwise_pipeline_enabled(self) -> bool:
-        """Enable with INDUCTOR_TRITON_POINTWISE_LANES=1"""
+        """Feature flag: enable with INDUCTOR_TRITON_POINTWISE_LANES=1."""
         return os.environ.get("INDUCTOR_TRITON_POINTWISE_LANES", "0") == "1"
-
+  
     def _should_use_pointwise_pipeline(self) -> bool:
-        # gate on env
+        """
+        Decide if we switch the *pointwise* kernel body to a pipelined inner loop:
+        - env must be on
+        - only non-reduction, non-persistent/cooperative, non-blockptr/TMA kernels
+        - must have at least one pointwise dim (x/y/z)
+        - skip GEMM/dot-style kernels (BLOCK_M/BLOCK_N or tl.dot)
+        - skip kernels with non-trivial r* reductions
+        - skip foreach/for kernels (detected from node_schedule types)
+        """
+        import re
+
         if not self._env_pointwise_pipeline_enabled():
             return False
-        # reductions / persistent/cooperative configs: skip
-        if self.inside_reduction or self.fixed_config or self.cooperative_reduction or self.persistent_reduction:
+
+        if (
+            self.inside_reduction
+            or self.fixed_config
+            or self.cooperative_reduction
+            or self.persistent_reduction
+        ):
             return False
-        # if block pointers / TMA in this kernel, skip for now
+
+        # Skip foreach/for combo kernels (reliable)
+        if getattr(self, '_force_skip_pointwise_pipeline', False):
+            return False
+        
+        # block_ptr/TMA not yet supported on this path
         if getattr(self, "block_ptr_to_buffer", None) and len(self.block_ptr_to_buffer) > 0:
             return False
-        # must have some pointwise dims
-        pw = [t for t in self.range_trees if t.prefix in {"x","y","z"}]
-        if not pw:
+
+        # must have x/y/z pointwise dims
+        if not any(t.prefix in {"x", "y", "z"} for t in self.range_trees):
             return False
-        # GEMM / tl.dot kernels: skip pipelined pointwise
-        buf_txt = "".join([
-            getattr(self.indexing_code, "getvalue", lambda: "")(),
-            getattr(self.loads, "getvalue", lambda: "")(),
-            getattr(self.compute, "getvalue", lambda: "")(),
-            getattr(self.stores, "getvalue", lambda: "")(),
-        ])
+
+        # Skip GEMM / matmul style
+        buf_txt = "".join(
+            [
+                getattr(self.indexing_code, "getvalue", lambda: "")(),
+                getattr(self.loads, "getvalue", lambda: "")(),
+                getattr(self.compute, "getvalue", lambda: "")(),
+                getattr(self.stores, "getvalue", lambda: "")(),
+            ]
+        )
         if "tl.dot(" in buf_txt or "BLOCK_M" in buf_txt or "BLOCK_N" in buf_txt:
             return False
-        # any non-trivial reductions? bail
+
+        # HACK
+        if "num_xblocks_" in buf_txt:
+            # foreach/for kernels synthesize num_xblocks_* accumulators
+            return False
+
+        # Skip if any non-trivial reductions exist
         for t in self.range_trees:
             if t.prefix.startswith("r") and not V.graph.sizevars.statically_known_equals(t.numel, 1):
                 return False
-        # Split dim too small? bail
+
         return True
 
     def _largest_pointwise_tree(self):
         """
-        Pick the pointwise dim (x/y/z) with the largest global extent (size_hint),
-        independent of tuned X/Y/ZBLOCK. Tie-break: y > x > z.
+        Pick the split dimension by *global extent* (size_hint), not tuned BLOCK size.
+        Stable tie-break: y > x > z to keep codegen deterministic.
         """
         cand = [t for t in self.range_trees if t.prefix in {"x", "y", "z"}]
         if not cand:
             return None
 
-        from torch._inductor import config  # ensure available
-        order = {"y": 2, "x": 1, "z": 0}
+        from torch._inductor import config  # local import to avoid cycles
 
         def extent(tree):
             return V.graph.sizevars.size_hint(
-                tree.numel,
-                fallback=getattr(config, "unbacked_symint_fallback", 1),
+                tree.numel, fallback=getattr(config, "unbacked_symint_fallback", 1)
             )
 
+        order = {"y": 2, "x": 1, "z": 0}
         cand.sort(key=lambda t: (extent(t), order.get(t.prefix, -1)), reverse=True)
         return cand[0]
 
     def _pid_expr_for_prefix(self, prefix: str) -> str:
+        """Map pointwise axis -> triton program_id expression."""
         if prefix == "x":
             return "tl.program_id(0)"
         if prefix == "y":
@@ -2398,19 +2415,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _fix_block_sized_nodes_for_pipeline(self, src_text, split_prefix: str) -> str:
         """
-        Rewrite pre-generated loads/compute/store blocks for inner-loop (R0_BLOCK)
-        on the *split* dimension only.
+        Normalize pre-generated stage code (loads/compute/stores/indexing) to work
+        inside the inner loop whose vector length is R0_BLOCK on the *split* axis.
 
-        Rules:
-        1) In ANY bracketed list '[ ... ]', replace exact '{SPLIT}BLOCK' tokens with 'R0_BLOCK'.
-            Works for 1D or ND: [YBLOCK], [YBLOCK, XBLOCK], [ZBLOCK, YBLOCK, XBLOCK], etc.
-        2) Drop unary broadcasts to the split 1D shape:
-                tl.broadcast_to(expr, [SPLITBLOCK])  ->  expr
-            (Optional; not required once #1 is in place, but keeps code tidy.)
+        Rules (split dimension only):
+        1) In ANY bracketed list '[ ... ]', replace '{SPLIT}BLOCK' with 'R0_BLOCK'.
+            Works for 1D/ND: [YBLOCK], [YBLOCK,XBLOCK], [ZBLOCK,YBLOCK,XBLOCK], ...
+        2) Drop unary broadcasts to [SPLITBLOCK]:  tl.broadcast_to(expr, [SPLITBLOCK]) -> expr
+            (Scalar broadcasts stay implicit and match R0_BLOCK lanes.)
         """
         import re
-
-        # --- coerce to string safely ---
+        # coerce to a string
         if src_text is None:
             txt = ""
         elif hasattr(src_text, "getvalue"):  # IndentedBuffer
@@ -2423,23 +2438,20 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         SPLIT = split_prefix.upper()
 
-        # (1) Replace split-block tokens inside ANY bracketed list '[ ... ]'
-        #     We reconstruct the list so commas / spacing are preserved.
+        # (1) rewrite lists, token-preserving
         def replace_in_list(m):
             inside = m.group(1)
-            # split preserving separators: tokens at even idx, separators at odd idx
-            parts = re.split(r'(\s*,\s*)', inside)
+            parts = re.split(r"(\s*,\s*)", inside)  # tokens at even idx, commas at odd
             for i in range(0, len(parts), 2):
-                parts[i] = re.sub(rf'\b{SPLIT}BLOCK\b', 'R0_BLOCK', parts[i])
-            return '[' + ''.join(parts) + ']'
+                parts[i] = re.sub(rf"\b{SPLIT}BLOCK\b", "R0_BLOCK", parts[i])
+            return "[" + "".join(parts) + "]"
 
-        # Handle nested lists on the same line; run repeatedly until no change
         prev = None
         while prev != txt:
             prev = txt
-            txt = re.sub(r'\[([^\[\]]+)\]', replace_in_list, txt)
+            txt = re.sub(r"\[([^\[\]]+)\]", replace_in_list, txt)
 
-        # (2) Drop unary broadcast_to(expr, [SPLITBLOCK]) → expr
+        # (2) drop unary 1D broadcasts to the split block
         txt = re.sub(
             rf"""\btl\.broadcast_to\(
                     \s* (?P<expr>[^,()]+ | \([^()]*\)) \s* ,
@@ -2452,63 +2464,145 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         return txt
 
+    def _filter_and_fix_indexing_for_pipeline(self, src_text, split_prefix: str) -> str:
+        """
+        Reuse the regular path's indexing_code, but:
+        - drop raw headers we now re-emit (x/y/z offset/index/mask),
+        - map [{SPLIT}BLOCK] -> [R0_BLOCK] on the split axis only.
+        This preserves *exactly* the derived indexing (x0, x1, ...) regular code used.
+        """
+        import re
+        # coerce
+        if src_text is None:
+            txt = ""
+        elif hasattr(src_text, "getvalue"):
+            txt = src_text.getvalue()
+        else:
+            txt = str(src_text)
+        if not txt:
+            return ""
+
+        def is_header(line: str) -> bool:
+            s = line.strip()
+            return (
+                s.startswith("xoffset =")
+                or s.startswith("xindex =")
+                or s.startswith("xmask =")
+                or s.startswith("yoffset =")
+                or s.startswith("yindex =")
+                or s.startswith("ymask =")
+                or s.startswith("zoffset =")
+                or s.startswith("zindex =")
+                or s.startswith("zmask =")
+            )
+
+        derived = "\n".join(ln for ln in txt.splitlines() if not is_header(ln))
+        return self._fix_block_sized_nodes_for_pipeline(derived, split_prefix)
+
+
+    def _collect_used_pointwise_symbols(self) -> set[str]:
+        """Gather x*/y*/z* symbols actually used by loads/compute/stores (fallback path)."""
+        import re
+        txt = ""
+        for buf in (self.loads, self.compute, self.stores):
+            if hasattr(buf, "getvalue"):
+                v = buf.getvalue()
+                if v:
+                    txt += v
+        return set(re.findall(r"\b[xyz]\d+\b", txt))
+
+
+    def _emit_derived_indexing_fallback(self, split_prefix: str) -> str:
+        """
+        If, for some edge case, indexing_code didn't carry derived indices,
+        synthesize only the *used* ones from range_tree_nodes. This avoids
+        emitting dead symbols that can drag in bogus ks* names.
+        """
+        import re
+        used = self._collect_used_pointwise_symbols()
+        if not used:
+            return ""
+
+        by_name = {}
+        for _, entry in self.range_tree_nodes.items():
+            nm = getattr(entry, "name", None)
+            if nm:
+                by_name[nm] = entry
+
+        lines = []
+        # deterministic order: axis then numeric suffix
+        for nm in sorted(used, key=lambda s: (s[0], int(s[1:]) if s[1:].isdigit() else 0)):
+            if nm == f"{split_prefix}index":
+                continue
+            ent = by_name.get(nm)
+            if ent is None:
+                continue
+            lines.append(f"{nm} = {self.kexpr(self.rename_indexing(ent.expr))}")
+        text = "\n".join(lines)
+        return self._fix_block_sized_nodes_for_pipeline(text, split_prefix)
+        
     def _emit_pointwise_pipeline(self) -> None:
         """
-        Emit a pipelined inner loop over the largest BLOCK dim.
-        Shapes in the loop are driven by `xindex` (length R0_BLOCK) and scalar
-        broadcasting; we **do not** reassign any tl.constexpr (no XBLOCK shadowing).
+        Emit:
+        - non-split headers exactly like the regular path,
+        - split offset, then a pipelined inner loop over R0_BLOCK lanes,
+        - inside the loop: rebuild split index/mask, splice *derived* indexing,
+            then splice loads/compute/stores after normalizing split shapes to R0_BLOCK.
+
+        We never reassign any tl.constexpr (no XBLOCK shadowing).
         """
-        # 0) make sure nothing previously written pollutes the body
+        import re 
+
+        # 0) capture what the regular path would have spliced, then clear buffers
+        saved_indexing = self.indexing_code.getvalue()
         self.indexing_code.clear()
-        self.body.clear()   # <-- IMPORTANT: remove any earlier xindex/xmask in the body
+        self.body.clear()
 
         split_tree = self._largest_pointwise_tree()
         assert split_tree is not None
-        split  = split_tree.prefix
-        SPLIT  = split.upper()
+        split, SPLIT = split_tree.prefix, split_tree.prefix.upper()
 
-        # 1) non-split headers as usual
+        # 1) non-split headers (same API as regular path)
         for t in self.range_trees:
             if t.prefix in {"x", "y", "z"} and t.prefix != split:
                 self.iteration_ranges_codegen_header(t, self.body)
 
-        # 2) split offset and inner pipelined loop
+        # 2) split offset + inner loop
         pid = self._pid_expr_for_prefix(split)
         self.body.writeline(f"{split}offset = {pid} * {SPLIT}BLOCK")
-        #self.body.writeline(f"R0_BLOCK: tl.constexpr = {r0_val}") - Now included in signature
         self.body.writeline(f"tl.static_assert({SPLIT}BLOCK % R0_BLOCK == 0)")
         self.body.writeline(f"for r in tl.range(0, {SPLIT}BLOCK, R0_BLOCK, num_stages=2):")
         with self.body.indent():
             self.body.writeline("lanes = tl.arange(0, R0_BLOCK)")
             size_suffix = (
                 self.indexing_size_str(split_tree.tensor_dim)
-                if split_tree.tensor_dim is not None else ""
+                if split_tree.tensor_dim is not None
+                else ""
             )
-            # Build split index/mask ONLY inside the loop with R0_BLOCK shape
             self.body.writeline(f"{split}index = {split}offset + r + lanes{size_suffix}")
             self.body.writeline(f"{split}mask  = {split}index < {split}numel")
 
-            # Derived indices (x0, x1, ...) now use the rebuilt {split}index
-            for _sym, entry in self.range_tree_nodes.items():
-                if getattr(entry, 'name', None) == f"{split}index":
-                    continue
-                self.body.writeline(
-                    f"{entry.name} = {self.kexpr(self.rename_indexing(entry.expr))}"
-                )
+            # 3) derived indexing just like regular path (x0, x1, ...), minus headers
+            fixed_indexing = self._filter_and_fix_indexing_for_pipeline(
+                saved_indexing, split
+            )
+            if not re.search(r"\b[xyz]\d+\s*=", fixed_indexing):
+                # safety: if nothing found, synthesize the *used* ones only
+                fixed_indexing = self._emit_derived_indexing_fallback(split)
+            self.body.splice(fixed_indexing)
 
-            # --- before splicing, fix the split-dim shapes in the captured blocks ---
-            fixed_loads   = self._fix_block_sized_nodes_for_pipeline(self.loads.getvalue(),   split)
-            fixed_compute = self._fix_block_sized_nodes_for_pipeline(self.compute.getvalue(), split)
-            fixed_stores  = self._fix_block_sized_nodes_for_pipeline(self.stores.getvalue(),  split)
-
-            # --- splice the fixed text directly (no loops needed) ---
+            # 4) load/compute/store with split-dim shapes normalized to R0_BLOCK
+            fixed_loads = self._fix_block_sized_nodes_for_pipeline(self.loads, split)
+            fixed_compute = self._fix_block_sized_nodes_for_pipeline(self.compute, split)
+            fixed_stores = self._fix_block_sized_nodes_for_pipeline(self.stores, split)
             self.body.splice(fixed_loads)
             self.body.splice(fixed_compute)
             self.body.splice(fixed_stores)
 
-            # optional: prevent accidental reuse later
-            self.loads.clear(); self.compute.clear(); self.stores.clear()
-
+            # not needed again in this codegen pass
+            self.loads.clear()
+            self.compute.clear()
+            self.stores.clear()
 
     @property
     def has_store_with_contiguous_rdim(self) -> bool:

@@ -3574,6 +3574,7 @@ class CommonTemplate:
 
     @skip_if_halide  # only 32-bit indexing
     @largeTensorTest("4GB", inductor=True)
+    @skipIfRocm
     def test_large_pointwise(self):
         def fn(a):
             return a + 1

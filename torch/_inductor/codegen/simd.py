@@ -1980,6 +1980,8 @@ class SIMDScheduling(BaseScheduling):
                 features=SIMDKernelFeatures(node_schedule, numel, rnumel),
                 optimize_mask=not mixed_sizes,
             )
+            # Mark as combo subkernel to skip pointwise pipelining
+            subkernel_map[pn]._force_skip_pointwise_pipeline = True
 
         partitions = ComboKernel.horizontal_partition(
             nodes=subkernel_nodes,
@@ -2004,9 +2006,13 @@ class SIMDScheduling(BaseScheduling):
             )
 
             for pn, nodes in zip(node_group, fused_node_lists):
+                # Create and mark the wrapped subkernel
+                wrapped_subkernel = kernel.create_sub_kernel(subkernel_map[pn])
+                wrapped_subkernel._force_skip_pointwise_pipeline = True
+                
                 self.codegen_node_schedule_with_kernel(
                     node_schedule_map[pn][0],
-                    kernel.create_sub_kernel(subkernel_map[pn]),
+                    wrapped_subkernel,
                 )
                 subkernel = subkernel_map[pn]
                 node_schedule = node_schedule_map[pn][0]

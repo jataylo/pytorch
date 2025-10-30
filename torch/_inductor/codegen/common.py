@@ -2081,6 +2081,9 @@ class Kernel(CodeGen, Generic[CSEVariableType]):
         self.min_elem_per_thread = 1
         self.kernel_name: Optional[str] = None
 
+        # To force disable pipeline pointwise optimization for combo kernels
+        self._force_skip_pointwise_pipeline = False
+
     @contextlib.contextmanager
     def set_current_node(self, node: SchedulerNode) -> Iterator[None]:
         prior = self.current_node

@@ -2559,6 +2559,52 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _pick_split_prefix_from_size_hints(size_hints) -> str:
+    """
+    Stable choice: largest extent; tie-break y > x > z.
+    size_hints keys are usually 'X','Y','Z' (or similar).
+    """
+    # normalize to ('x'|'y'|'z', extent)
+    cand = []
+    for k, v in size_hints.items():
+        p = k[0].lower()  # 'X' -> 'x'
+        if p in ("x", "y", "z"):
+            cand.append((p, int(v)))
+    if not cand:
+        return "x"  # harmless default
+
+    order = {"y": 2, "x": 1, "z": 0}
+    cand.sort(key=lambda kv: (kv[1], order.get(kv[0], -1)), reverse=True)
+    return cand[0][0]
+
+def _compute_r0_from_pb(pb: int) -> int:
+    """
+    R0_BLOCK = pb // 2, then downshift by /2 until it divides pb.
+    """
+    pb = max(1, int(pb))
+    r = max(1, pb // 2)
+    while pb % r != 0 and r > 1:
+        r //= 2
+    return max(1, r)
+
+def _attach_r0_block_to_configs(size_hints, configs, inductor_meta):
+    """
+    For each Triton config, add R0_BLOCK in cfg.kwargs based on the split dim's BLOCK.
+    Only when the pipeline feature is enabled.
+    """
+    split = _pick_split_prefix_from_size_hints(size_hints)           # 'x'|'y'|'z'
+    pb_key = f"{split.upper()}BLOCK"                                 # e.g. 'YBLOCK'
+
+    for cfg in configs:
+        # TritonConfig stores constexprs in cfg.kwargs (common Inductor pattern)
+        # Make sure key exists (e.g., 1D configs only have 'XBLOCK')
+        kwargs = getattr(cfg, "kwargs", None)
+        if not isinstance(kwargs, dict) or pb_key not in kwargs:
+            continue
+        pb = int(kwargs[pb_key])
+        kwargs["R0_BLOCK"] = _compute_r0_from_pb(pb)
+    return configs
+
 def pointwise(
     size_hints,
     triton_meta,
@@ -2572,6 +2618,11 @@ def pointwise(
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
     assert not inductor_meta.get("no_x_dim")
+
+    use_looped_pointwise = any(
+        arg == "R0_BLOCK" 
+        for arg in triton_meta.get("signature", {}).keys()
+    )
 
     numel = functools.reduce(operator.mul, size_hints.values())
     bs = max(256, min(numel // 128, 1024))
@@ -2661,6 +2712,24 @@ def pointwise(
                         ),  # +30% for some kernels
                     ]
                 )
+
+                if use_looped_pointwise:
+                    configs.extend(
+                        [
+                            triton_config_with_settings(
+                                size_hints, 1024, 32
+                            ),  # better for some kernels
+                            triton_config_with_settings(
+                                size_hints, 32, 1024
+                            ),  # +10% for some kernels
+                            triton_config_with_settings(
+                                size_hints, 2048, 64
+                            ),  # additional 10% more
+                            triton_config_with_settings(
+                                size_hints, 2048, 64
+                            ),  # +30% for some kernels
+                        ]
+                    )  
     if len(size_hints) == 3:
         if not inductor_meta.get("autotune_pointwise", True):
             configs = [triton_config_with_settings(size_hints, 16, 16, 16)]
@@ -2681,6 +2750,9 @@ def pointwise(
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
 
+    if use_looped_pointwise:
+        configs = _attach_r0_block_to_configs(size_hints, configs, inductor_meta)
+
     return cached_autotune(
         size_hints,
         configs,
@@ -2689,7 +2761,6 @@ def pointwise(
         heuristic_type=HeuristicType.POINTWISE,
         filename=filename,
     )
-
 
 def make_matmul_triton_config(sizes: dict[str, int], num_warps: int, num_stages: int):
     config = {
