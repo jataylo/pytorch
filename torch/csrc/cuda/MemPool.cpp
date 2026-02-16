@@ -4,8 +4,8 @@
 #include <torch/csrc/utils/device_lazy_init.h>
 #include <torch/csrc/utils/pybind.h>
 
-#include <ATen/cuda/MemPool.h>
-#include <c10/cuda/CUDACachingAllocator.h>
+#include <ATen/hip/MemPool.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
 
 template <typename T>
 using shared_ptr_class_ = py::class_<T, std::shared_ptr<T>>;
@@ -15,7 +15,7 @@ void THCPMemPool_init(PyObject* module) {
   auto torch_C_m = py::handle(module).cast<py::module>();
   shared_ptr_class_<::at::cuda::MemPool>(torch_C_m, "_MemPool")
       .def(
-          py::init([](c10::cuda::CUDACachingAllocator::CUDAAllocator* allocator,
+          py::init([](c10::hip::HIPCachingAllocator::HIPAllocator* allocator,
                       bool is_user_created,
                       bool use_on_oom,
                       bool no_split) {

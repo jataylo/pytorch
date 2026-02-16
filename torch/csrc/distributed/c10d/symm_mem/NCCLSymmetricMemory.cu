@@ -1,5 +1,5 @@
 #ifdef USE_C10D_NCCL
-#include <nccl.h>
+#include <rccl/rccl.h>
 #include <torch/csrc/cuda/nccl.h>
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 27, 1)
@@ -16,9 +16,9 @@
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
 #include <ATen/ceil_div.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/util/error.h>
 
 namespace c10d {
@@ -50,7 +50,7 @@ class NCCLSymmetricMemory : public SymmetricMemory {
         group_name_(group_name),
         handle_(handle),
         signal_handle_(signal_handle) {
-    c10::cuda::CUDAGuard guard(device_idx_);
+    c10::hip::HIPGuardMasqueradingAsCUDA guard(device_idx_);
 
     // We need some API like nvshmem_extension::nvshmem_ptr()
     // put API to get the reference of remote memory.
@@ -153,7 +153,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
     auto group_info = get_group_info("0");
     auto store = group_info.store;
-    c10::cuda::CUDAGuard guard(device_idx);
+    c10::hip::HIPGuardMasqueradingAsCUDA guard(device_idx);
     // TODO: we might need to use a roundup or mempool for mem allocation.
     void* ptr;
     C10D_NCCL_CHECK(ncclMemAlloc(&ptr, size), "ncclMemAlloc");
@@ -195,7 +195,7 @@ class NCCLSymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
     auto group = resolve_process_group(group_name.value());
     auto alloc = it->second;
-    c10::cuda::CUDAGuard guard(alloc->device_idx);
+    c10::hip::HIPGuardMasqueradingAsCUDA guard(alloc->device_idx);
     ncclWindow_t handle;
     ncclWindow_t signal_handle;
 

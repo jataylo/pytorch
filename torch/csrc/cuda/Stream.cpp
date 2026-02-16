@@ -6,9 +6,9 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_numbers.h>
 
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime_api.h>
 #include <structmember.h>
 
 PyObject* THCPStreamClass = nullptr;
@@ -19,7 +19,7 @@ static PyObject* THCPStream_pynew(
     PyObject* kwargs) {
   HANDLE_TH_ERRORS
 
-  const auto current_device = c10::cuda::current_device();
+  const auto current_device = c10::hip::current_device();
 
   int priority = 0;
   int64_t stream_id = 0;
@@ -58,30 +58,30 @@ static PyObject* THCPStream_pynew(
     TORCH_CHECK(
         priority == 0, "Priority was explicitly set for a external stream")
   }
-  at::cuda::CUDAStream stream = (stream_id || device_index || device_type)
-      ? at::cuda::CUDAStream::unpack3(
+  at::hip::HIPStreamMasqueradingAsCUDA stream = (stream_id || device_index || device_type)
+      ? at::hip::HIPStreamMasqueradingAsCUDA::unpack3(
             stream_id,
             static_cast<c10::DeviceIndex>(device_index),
             static_cast<c10::DeviceType>(device_type))
-      : stream_ptr ? at::cuda::getStreamFromExternal(
+      : stream_ptr ? at::hip::getStreamFromExternalMasqueradingAsCUDA(
                          // NOLINTNEXTLINE(performance-no-int-to-ptr)
-                         reinterpret_cast<cudaStream_t>(stream_ptr),
+                         reinterpret_cast<hipStream_t>(stream_ptr),
                          current_device)
-                   : at::cuda::getStreamFromPool(priority);
+                   : at::hip::getStreamFromPoolMasqueradingAsCUDA(priority);
 
   THCPStream* self = (THCPStream*)ptr.get();
   self->stream_id = static_cast<int64_t>(stream.id());
   // NOLINTNEXTLINE(bugprone-signed-char-misuse)
   self->device_index = static_cast<int64_t>(stream.device_index());
   self->device_type = static_cast<int64_t>(stream.device_type());
-  new (&self->cuda_stream) at::cuda::CUDAStream(stream);
+  new (&self->cuda_stream) at::hip::HIPStreamMasqueradingAsCUDA(stream);
 
   return (PyObject*)ptr.release();
   END_HANDLE_TH_ERRORS
 }
 
 static void THCPStream_dealloc(THCPStream* self) {
-  self->cuda_stream.~CUDAStream();
+  self->cuda_stream.~HIPStreamMasqueradingAsCUDA();
   Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -102,7 +102,7 @@ static PyObject* THCPStream_priority_range(
     PyObject* noargs) {
   HANDLE_TH_ERRORS
   auto [least_priority, greatest_priority] =
-      at::cuda::CUDAStream::priority_range();
+      at::hip::HIPStreamMasqueradingAsCUDA::priority_range();
   return Py_BuildValue("(ii)", least_priority, greatest_priority);
   END_HANDLE_TH_ERRORS
 }

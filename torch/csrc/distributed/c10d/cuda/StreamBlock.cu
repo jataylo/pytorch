@@ -1,8 +1,8 @@
-#include <ATen/cuda/CachingHostAllocator.h>
+#include <ATen/hip/CachingHostAllocator.h>
 #include <ATen/native/TensorFactories.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <cuda_runtime.h>
+#include <c10/hip/HIPException.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <hip/hip_runtime.h>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.h>
 #include <torch/csrc/distributed/c10d/cuda/StreamBlock.cuh>
 
@@ -90,13 +90,13 @@ StreamBlock::StreamBlock(std::chrono::milliseconds timeout)
       at::zeros({2}, at::TensorOptions().dtype(at::kInt)).pin_memory()
     },
       timeout_{timeout} {
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
   auto* ptr = comm_.mutable_data_ptr<int32_t>();
   auto* ctx = comm_.storage().data_ptr().get_context();
 
   // grid size 1, block size 1, 0 bytes of shared memory
   kernel_barrier<<<1, 1, 0, stream>>>(ptr, timeout_.count());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_HIP_KERNEL_LAUNCH_CHECK();
 
   // This object may be deallocated before the CUDA kernel completes. We need to
   // register the CPU tensor so it's only freed after the kernel completes

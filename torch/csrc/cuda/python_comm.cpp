@@ -49,7 +49,7 @@ void initCommMethods(PyObject* module) {
              const std::optional<std::vector<int64_t>>& chunk_sizes,
              int64_t dim,
              std::optional<py::object> py_streams) {
-            std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>
+            std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>
                 streams;
             if (py_streams) {
               py::handle handle = *py_streams;
@@ -70,7 +70,7 @@ void initCommMethods(PyObject* module) {
              std::vector<at::Tensor>& out_tensors,
              int64_t dim,
              std::optional<py::object> py_streams) {
-            std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>
+            std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>
                 streams;
             if (py_streams) {
               py::handle handle = *py_streams;

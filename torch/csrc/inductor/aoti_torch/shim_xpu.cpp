@@ -39,7 +39,7 @@ AOTITorchError aoti_torch_create_xpu_stream_guard(
   AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
     assert(stream);
     at::StreamGuard* guard =
-        new at::StreamGuard(at::xpu::getStreamFromExternal(
+        new at::StreamGuard(at::xpu::getStreamFromExternalMasqueradingAsCUDA(
                                 static_cast<sycl::queue*>(stream), device_index)
                                 .unwrap());
     *ret_guard = reinterpret_cast<XPUStreamGuardHandle>(guard);

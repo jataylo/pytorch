@@ -33,6 +33,306 @@ from . import triton_helpers
 from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
 from .coordinate_descent_tuner import CoordescTuner
+
+# Import pointwise heuristics for intelligent config selection
+# Can be disabled via environment variable for testing
+def _is_pointwise_heuristics_enabled():
+    """Check if pointwise heuristics are enabled at runtime (not import time)"""
+    return os.environ.get("TORCHINDUCTOR_POINTWISE_HEURISTICS", "1") == "1"
+
+
+# Global storage for heuristics validation data
+# Maps problem_key -> {problem_metadata, predicted_scores: [(score, config)], actual_timings: [(time, config)], top_n_configs: [configs]}
+_HEURISTICS_VALIDATION_DATA = {}
+
+# Global storage for top-N predicted configs per problem
+# Maps problem_key -> [list of top N configs to use for selection]
+_TOP_N_CONFIGS_FOR_SELECTION = {}
+
+
+def _normalize_problem_key(size_hints):
+    """
+    Normalize size_hints to a consistent problem key string.
+    size_hints can be:
+    - tuple: (32768,) or (32, 1024)
+    - dict: {'x': 32768} or {'x': 32, 'y': 1024}
+    """
+    if isinstance(size_hints, dict):
+        # Sort by key to ensure consistent ordering
+        values = tuple(size_hints[k] for k in sorted(size_hints.keys()))
+        return str(values)
+    elif isinstance(size_hints, (tuple, list)):
+        return str(tuple(size_hints))
+    else:
+        return str((size_hints,))
+
+
+def _store_heuristics_predictions(problem_key, problem_metadata, predicted_scores):
+    """Store predicted scores for later comparison with actual performance"""
+    if problem_key not in _HEURISTICS_VALIDATION_DATA:
+        _HEURISTICS_VALIDATION_DATA[problem_key] = {
+            'problem_metadata': problem_metadata,
+            'predicted_scores': predicted_scores,
+            'actual_timings': []
+        }
+
+
+def _store_actual_timing(problem_key, config, timing_ms):
+    """Store actual benchmark timing for a config"""
+    if problem_key in _HEURISTICS_VALIDATION_DATA:
+        _HEURISTICS_VALIDATION_DATA[problem_key]['actual_timings'].append((timing_ms, config))
+
+
+def _print_heuristics_validation_summary(problem_key):
+    """Print comparison of predicted vs actual performance"""
+    if problem_key not in _HEURISTICS_VALIDATION_DATA:
+        return
+    
+    data = _HEURISTICS_VALIDATION_DATA[problem_key]
+    predicted = data['predicted_scores']
+    actual = data['actual_timings']
+    
+    if not actual:
+        return  # No timing data yet
+    
+    # Sort actual by performance (lowest time = best)
+    actual_sorted = sorted(actual, key=lambda x: x[0])
+    best_actual = actual_sorted[0]
+    
+    # Find what we predicted would be best
+    predicted_sorted = sorted(predicted, reverse=True, key=lambda x: x[0])
+    if not predicted_sorted:
+        return
+    
+    best_predicted_score, best_predicted_cfg = predicted_sorted[0]
+    
+    # Find actual timing for our predicted best config
+    predicted_actual_time = None
+    for time, cfg in actual:
+        if cfg == best_predicted_cfg:
+            predicted_actual_time = time
+            break
+    
+    if predicted_actual_time is None:
+        return  # Predicted config wasn't benchmarked
+    
+    # Calculate gap
+    slowdown = predicted_actual_time / best_actual[0] if best_actual[0] > 0 else 1.0
+    
+    # Find the predicted score for the actual best config
+    actual_best_predicted_score = None
+    actual_best_rank = None
+    for rank, (score, cfg) in enumerate(predicted_sorted, 1):
+        if cfg == best_actual[1]:
+            actual_best_predicted_score = score
+            actual_best_rank = rank
+            break
+    
+    msg = "\n" + "="*80
+    print(msg, flush=True)
+    msg = "[HEURISTICS VALIDATION] Predicted vs Actual Performance"
+    print(msg, flush=True)
+    msg = "="*80
+    print(msg, flush=True)
+    
+    msg = f"Problem: {data['problem_metadata'].get('dimensions', 'N/A')}, Total elements: {data['problem_metadata'].get('total_elements', 'N/A'):,}"
+    print(msg, flush=True)
+    msg = f"Generated: {len(predicted)} configs, Benchmarked: {len(actual)} configs"
+    print(msg, flush=True)
+    
+    # Check if we have top N configs stored
+    # Use the original problem_key that was passed to the function
+    # (already normalized earlier in the call chain)
+    top_n_configs = _TOP_N_CONFIGS_FOR_SELECTION.get(problem_key, [])
+    if top_n_configs:
+        msg = f"Selection: Winner chosen from top {len(top_n_configs)} predicted configs only"
+        print(msg, flush=True)
+        msg = f"Validation: Comparing predicted #1 vs actual best from ALL {len(actual)} benchmarked"
+        print(msg, flush=True)
+    
+    # Get detailed scores for both configs
+    if POINTWISE_HEURISTICS_AVAILABLE:
+        try:
+            predicted_best_details = PointwiseHeuristics.get_detailed_scores(best_predicted_cfg, data['problem_metadata'])
+            actual_best_details = None
+            if actual_best_predicted_score is not None:
+                actual_best_details = PointwiseHeuristics.get_detailed_scores(best_actual[1], data['problem_metadata'])
+        except Exception:
+            predicted_best_details = None
+            actual_best_details = None
+    else:
+        predicted_best_details = None
+        actual_best_details = None
+    
+    msg = f"\n📊 PREDICTED Best Config (rank #1, score={best_predicted_score:.4f}):"
+    print(msg, flush=True)
+    msg = f"  Config: {best_predicted_cfg}"
+    print(msg, flush=True)
+    msg = f"  Actual time: {predicted_actual_time:.6f}ms"
+    print(msg, flush=True)
+    
+    if predicted_best_details:
+        msg = (
+            f"  Factors: "
+            f"bandwidth={predicted_best_details['memory_bandwidth']:.3f}(40%), "
+            f"launch={predicted_best_details['launch_overhead']:.3f}(30%), "
+            f"grid={predicted_best_details['grid_granularity']:.3f}(20%), "
+            f"occup={predicted_best_details['occupancy']:.3f}(10%)"
+        )
+        print(msg, flush=True)
+        msg = (
+            f"  Grid: {predicted_best_details['num_blocks']} blocks, "
+            f"{predicted_best_details['threads_per_block']} threads/block"
+        )
+        print(msg, flush=True)
+    
+    msg = f"\n🏆 ACTUAL Best Config:"
+    print(msg, flush=True)
+    msg = f"  Config: {best_actual[1]}"
+    print(msg, flush=True)
+    msg = f"  Actual time: {best_actual[0]:.6f}ms (fastest)"
+    print(msg, flush=True)
+    
+    if actual_best_predicted_score is not None:
+        msg = f"  Predicted score: {actual_best_predicted_score:.4f} (rank #{actual_best_rank})"
+        print(msg, flush=True)
+        
+        if actual_best_details:
+            msg = (
+                f"  Factors: "
+                f"bandwidth={actual_best_details['memory_bandwidth']:.3f}(40%), "
+                f"launch={actual_best_details['launch_overhead']:.3f}(30%), "
+                f"grid={actual_best_details['grid_granularity']:.3f}(20%), "
+                f"occup={actual_best_details['occupancy']:.3f}(10%)"
+            )
+            print(msg, flush=True)
+            msg = (
+                f"  Grid: {actual_best_details['num_blocks']} blocks, "
+                f"{actual_best_details['threads_per_block']} threads/block"
+            )
+            print(msg, flush=True)
+        
+        # Show why prediction was wrong
+        score_diff = best_predicted_score - actual_best_predicted_score
+        rank_diff = actual_best_rank - 1
+        
+        msg = f"\n🔍 ANALYSIS:"
+        print(msg, flush=True)
+        
+        if rank_diff == 0:
+            msg = f"  ✅ Heuristics correctly identified the best config!"
+            print(msg, flush=True)
+        else:
+            msg = f"  ⚠️  Heuristics ranked actual best as #{actual_best_rank} (off by {rank_diff} positions)"
+            print(msg, flush=True)
+            msg = f"  Score gap: {score_diff:.4f} ({score_diff/best_predicted_score*100:.1f}% difference)"
+            print(msg, flush=True)
+            
+            # Show performance vs prediction mismatch
+            speedup_actual = predicted_actual_time / best_actual[0]
+            msg = f"  Real speedup: {speedup_actual:.3f}x (actual best vs predicted best)"
+            print(msg, flush=True)
+            msg = f"  Heuristic ranking: Predicted #1 > #{actual_best_rank} (score: {best_predicted_score:.4f} > {actual_best_predicted_score:.4f})"
+            print(msg, flush=True)
+            
+            # Show factor-by-factor comparison
+            if predicted_best_details and actual_best_details:
+                msg = f"\n  📋 Factor Comparison (Predicted #1 vs Actual Best #{actual_best_rank}):"
+                print(msg, flush=True)
+                
+                # NEW V2 factors (from first principles)
+                factors = [
+                    ('memory_bandwidth', 'Bandwidth', 40),
+                    ('launch_overhead', 'Launch', 30),
+                    ('grid_granularity', 'Grid', 20),
+                    ('occupancy', 'Occupancy', 10),
+                ]
+                
+                for factor_key, factor_name, weight in factors:
+                    pred_val = predicted_best_details[factor_key]
+                    actual_val = actual_best_details[factor_key]
+                    diff = pred_val - actual_val
+                    
+                    # Highlight significant differences
+                    if abs(diff) > 0.01:  # More than 1% difference
+                        arrow = "🔴" if diff > 0 else "🟢"  # Red if predicted higher, green if actual higher
+                        msg = f"    {arrow} {factor_name:10s}: Predicted={pred_val:.3f} vs Actual={actual_val:.3f} (Δ={diff:+.3f}, weight={weight}%)"
+                        print(msg, flush=True)
+                    else:
+                        msg = f"       {factor_name:10s}: Predicted={pred_val:.3f} vs Actual={actual_val:.3f} (≈ same)"
+                        print(msg, flush=True)
+                
+                # Explain the mismatch
+                msg = f"\n  💡 Root Cause Analysis:"
+                print(msg, flush=True)
+                
+                # Find which factor contributed most to wrong ranking
+                weighted_diffs = []
+                for factor_key, factor_name, weight in factors:
+                    pred_val = predicted_best_details[factor_key]
+                    actual_val = actual_best_details[factor_key]
+                    diff = pred_val - actual_val
+                    weighted_diff = abs(diff) * (weight / 100.0)
+                    weighted_diffs.append((weighted_diff, factor_name, diff, weight))
+                
+                weighted_diffs.sort(reverse=True)
+                
+                if weighted_diffs[0][0] > 0.01:  # Significant weighted difference
+                    factor_name = weighted_diffs[0][1]
+                    diff = weighted_diffs[0][2]
+                    weight = weighted_diffs[0][3]
+                    
+                    if diff > 0:
+                        msg = f"    • {factor_name} scored HIGHER for predicted config (+{abs(diff):.3f})"
+                        print(msg, flush=True)
+                        msg = f"      But actual best performed {speedup_actual:.3f}x better despite lower {factor_name}"
+                        print(msg, flush=True)
+                        msg = f"      → Suggests {factor_name} weight ({weight}%) may be too high"
+                        print(msg, flush=True)
+                    else:
+                        msg = f"    • {factor_name} scored LOWER for predicted config ({diff:.3f})"
+                        print(msg, flush=True)
+                        msg = f"      Actual best has better {factor_name} and performed {speedup_actual:.3f}x better"
+                        print(msg, flush=True)
+                        msg = f"      → Suggests {factor_name} weight ({weight}%) may be too low"
+                        print(msg, flush=True)
+                else:
+                    msg = f"    • All factors very similar - ranking difference likely due to scoring noise"
+                    print(msg, flush=True)
+                    msg = f"      Consider: more discriminating factors or better weight calibration"
+                    print(msg, flush=True)
+    else:
+        msg = f"  ❌ Predicted score: N/A (config was NOT in generated configs!)"
+        print(msg, flush=True)
+        msg = f"\n🔍 ANALYSIS:"
+        print(msg, flush=True)
+        msg = f"  ❌ CRITICAL: Heuristics didn't generate the actual best config!"
+        print(msg, flush=True)
+        msg = f"  This indicates a gap in config generation logic."
+        print(msg, flush=True)
+    
+    msg = f"\n📈 ACCURACY: Predicted config is {slowdown:.2f}x vs actual best"
+    print(msg, flush=True)
+    
+    if slowdown < 1.05:
+        msg = "  ✅ EXCELLENT: Within 5% of optimal"
+    elif slowdown < 1.15:
+        msg = "  ✓ GOOD: Within 15% of optimal"
+    elif slowdown < 1.30:
+        msg = "  ⚠ ACCEPTABLE: Within 30% of optimal"
+    else:
+        msg = "  ❌ POOR: >30% slower than optimal"
+    print(msg, flush=True)
+    
+    msg = "="*80 + "\n"
+    print(msg, flush=True)
+
+try:
+    from torch._inductor.codegen.triton_heuristics_pointwise import PointwiseHeuristics
+    POINTWISE_HEURISTICS_AVAILABLE = True
+except ImportError:
+    POINTWISE_HEURISTICS_AVAILABLE = False
+    logging.warning("Pointwise heuristics not available, falling back to default configs")
 from .hints import (
     _NUM_THREADS_PER_WARP,
     AutotuneHint,
@@ -925,18 +1225,38 @@ class CachingAutotuner(KernelInterface):
         if with_profiler and not autograd_profiler._is_profiler_enabled:
             from torch._inductor.utils import do_bench_using_profiling
 
-            return do_bench_using_profiling(kernel_call, warmup=10, rep=40)
-
-        benchmark_kwargs = (
-            {}
-            if self.device_props.type == "cpu"
-            else {"rep": 40, "is_vetted_benchmarking": True}
-        )
-        return benchmarker.benchmark(
-            fn=kernel_call,
-            device=self.device_props.type,
-            **benchmark_kwargs,  # type: ignore[arg-type]
-        )
+            timing = do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+        else:
+            benchmark_kwargs = (
+                {}
+                if self.device_props.type == "cpu"
+                else {"rep": 40, "is_vetted_benchmarking": True}
+            )
+            timing = benchmarker.benchmark(
+                fn=kernel_call,
+                device=self.device_props.type,
+                **benchmark_kwargs,  # type: ignore[arg-type]
+            )
+        
+        # Store timing for heuristics validation if enabled
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+        if (inductor_config.heuristics_real_bench and 
+            self.heuristic_type == HeuristicType.POINTWISE and 
+            self.size_hints is not None):
+            problem_key = _normalize_problem_key(self.size_hints)
+            # Extract config dict from launcher
+            config_dict = {
+                'XBLOCK': launcher.config.kwargs.get('XBLOCK'),
+                'YBLOCK': launcher.config.kwargs.get('YBLOCK'),
+                'ZBLOCK': launcher.config.kwargs.get('ZBLOCK'),
+                'num_warps': launcher.config.num_warps,
+            }
+            # Remove None values
+            config_dict = {k: v for k, v in config_dict.items() if v is not None}
+            _store_actual_timing(problem_key, config_dict, timing)
+        
+        return timing
 
     def copy_args_to_cpu_if_needed(self, *args, **kwargs):
         """
@@ -1111,7 +1431,59 @@ class CachingAutotuner(KernelInterface):
         start_time = time.time_ns()
         timings = self.benchmark_all_configs(*args, **kwargs)
         benchmark_time_taken_ns = time.time_ns() - start_time
-        self.launchers = [builtins.min(timings, key=timings.get)]
+        
+        # If using pointwise heuristics with REAL_BENCH mode:
+        # - Benchmark ALL configs for validation
+        # - But only select winner from top N predicted configs
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+        
+        if (inductor_config.heuristics_real_bench and 
+            self.heuristic_type == HeuristicType.POINTWISE and 
+            self.size_hints is not None):
+            problem_key = _normalize_problem_key(self.size_hints)
+            top_n_configs = _TOP_N_CONFIGS_FOR_SELECTION.get(problem_key, [])
+            
+            if top_n_configs:
+                # Filter timings to only include top N predicted configs
+                # Match launcher configs to top_n_configs
+                filtered_timings = {}
+                for launcher, timing in timings.items():
+                    # Extract config dict from launcher
+                    launcher_cfg = {
+                        'XBLOCK': launcher.config.kwargs.get('XBLOCK'),
+                        'YBLOCK': launcher.config.kwargs.get('YBLOCK'),
+                        'ZBLOCK': launcher.config.kwargs.get('ZBLOCK'),
+                        'num_warps': launcher.config.num_warps,
+                    }
+                    # Remove None values
+                    launcher_cfg = {k: v for k, v in launcher_cfg.items() if v is not None}
+                    
+                    # Check if this launcher's config is in top N
+                    if launcher_cfg in top_n_configs:
+                        filtered_timings[launcher] = timing
+                
+                # Select best from top N only
+                if filtered_timings:
+                    self.launchers = [builtins.min(filtered_timings, key=filtered_timings.get)]
+                    
+                    # Log that we're restricting selection
+                    msg = (
+                        f"[HEURISTICS] Selected from top {len(top_n_configs)} predicted configs "
+                        f"(benchmarked {len(timings)} total for validation)"
+                    )
+                    print(msg, flush=True)
+                    log.info(msg)
+                else:
+                    # Fallback: use all timings if matching failed
+                    self.launchers = [builtins.min(timings, key=timings.get)]
+            else:
+                # No top N configs stored, use all timings
+                self.launchers = [builtins.min(timings, key=timings.get)]
+        else:
+            # Not using heuristics, select from all configs
+            self.launchers = [builtins.min(timings, key=timings.get)]
+        
         self.autotune_time_taken_ns = (
             self.precompile_time_taken_ns + benchmark_time_taken_ns
         )
@@ -1134,6 +1506,15 @@ class CachingAutotuner(KernelInterface):
                 self.autotune_time_taken_ns,
                 triton_cache_hash=launcher.cache_hash,
             )
+        
+        # Print heuristics validation summary if enabled
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+        if (inductor_config.heuristics_real_bench and 
+            self.heuristic_type == HeuristicType.POINTWISE and 
+            self.size_hints is not None):
+            problem_key = _normalize_problem_key(self.size_hints)
+            _print_heuristics_validation_summary(problem_key)
 
     def save_gpu_kernel(self, stream, launcher):
         key = self.inductor_meta.get("kernel_name", None)  # unique kernel name
@@ -2617,6 +2998,291 @@ def _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs: list[Conf
     return configs
 
 
+def _convert_to_pointwise_heuristics_metadata(size_hints, inductor_meta, triton_meta):
+    """
+    Convert Triton heuristics metadata to format expected by PointwiseHeuristics.
+    
+    Args:
+        size_hints: Dict of dimension sizes
+        inductor_meta: Inductor metadata dict
+        triton_meta: Triton metadata dict
+        
+    Returns:
+        problem_metadata dict for PointwiseHeuristics
+    """
+    # Extract dimensions from size_hints
+    dimensions = tuple(size_hints.values())
+    total_elements = functools.reduce(operator.mul, dimensions, 1)
+    
+    # Estimate number of inputs/outputs from metadata
+    num_inputs = inductor_meta.get("num_inputs", 2)
+    num_outputs = inductor_meta.get("num_outputs", 1)
+    
+    # Fusion depth - count fused operations
+    fusion_depth = inductor_meta.get("fusion_depth", 1)
+    
+    # Element size - try to infer from dtype
+    element_size = 4  # Default to fp32
+    if "dtype" in triton_meta:
+        dtype_str = str(triton_meta["dtype"])
+        if "float16" in dtype_str or "half" in dtype_str or "bfloat16" in dtype_str:
+            element_size = 2
+        elif "float64" in dtype_str or "double" in dtype_str:
+            element_size = 8
+    
+    # Vectorization - infer from problem, don't assume
+    # Only use vector_width if explicitly provided by the caller
+    vector_width = inductor_meta.get("vector_width", 1)  # Conservative default
+    
+    # Masking requirements
+    has_mask = inductor_meta.get("has_mask", False)
+    
+    # Broadcasting detection
+    has_broadcast = inductor_meta.get("has_broadcast", False)
+    broadcast_tensor_bytes = inductor_meta.get("broadcast_tensor_bytes", 0)
+    
+    # Get device properties for hardware-specific parameters
+    device_props = triton_meta.get("device")
+    warp_size = device_props.warp_size if device_props and device_props.warp_size else 64  # Default to 64 for AMD
+    max_threads_per_block = device_props.max_threads_per_block if device_props and device_props.max_threads_per_block else 1024
+    
+    return {
+        'dimensions': dimensions,
+        'total_elements': total_elements,
+        'num_inputs': num_inputs,
+        'num_outputs': num_outputs,
+        'fusion_depth': fusion_depth,
+        'element_size': element_size,
+        'vector_width': vector_width,
+        'has_mask': has_mask,
+        'has_broadcast': has_broadcast,
+        'broadcast_tensor_bytes': broadcast_tensor_bytes,
+        'warp_size': warp_size,
+        'max_threads_per_block': max_threads_per_block,
+    }
+
+
+def _apply_pointwise_heuristics(size_hints, inductor_meta, triton_meta, triton_config_with_settings, filename=None):
+    """
+    Use advanced pointwise heuristics to generate optimal configs.
+    
+    Returns:
+        List of Triton configs or None if heuristics not available
+    """
+    if not POINTWISE_HEURISTICS_AVAILABLE:
+        return None
+    
+    try:
+        # Convert to heuristics format
+        problem_metadata = _convert_to_pointwise_heuristics_metadata(
+            size_hints, inductor_meta, triton_meta
+        )
+        
+        # Generate all candidate configs
+        all_configs = PointwiseHeuristics.generate_all_candidate_configs(problem_metadata)
+        
+        # Score ALL configs for comprehensive view
+        scored_all_configs = []
+        for cfg in all_configs:
+            try:
+                score = PointwiseHeuristics.score_config(cfg, problem_metadata)
+                if score > 0:
+                    scored_all_configs.append((score, cfg))
+            except Exception:
+                continue
+        
+        # Sort by predicted score (descending)
+        scored_all_configs.sort(reverse=True, key=lambda x: x[0])
+        
+        # Get ALL valid configs for comprehensive benchmarking
+        # This allows us to validate heuristics against real performance
+        all_valid_configs = PointwiseHeuristics.prune_configs(
+            all_configs, 
+            problem_metadata, 
+            top_n=999  # Get all valid configs
+        )
+        
+        # Also get top 5 for comparison
+        top_configs = all_valid_configs[:5] if len(all_valid_configs) >= 5 else all_valid_configs
+        
+        # Log comprehensive results
+        if top_configs:
+            # Header
+            msg = "[POINTWISE HEURISTICS] " + "="*70
+            log.info(msg)
+            print(msg, flush=True)
+            
+            msg = (
+                f"[POINTWISE HEURISTICS] Problem: {problem_metadata['dimensions']}, "
+                f"Elements: {problem_metadata['total_elements']:,}"
+            )
+            log.info(msg)
+            print(msg, flush=True)
+            
+            msg = (
+                f"[POINTWISE HEURISTICS] Generated: {len(all_configs)} configs, "
+                f"Valid: {len(scored_all_configs)}, Top-N: {len(top_configs)}"
+            )
+            log.info(msg)
+            print(msg, flush=True)
+            
+            msg = "[POINTWISE HEURISTICS] " + "="*70
+            log.info(msg)
+            print(msg, flush=True)
+            
+            # Show ALL configs sorted by predicted score
+            msg = "[POINTWISE HEURISTICS] ALL CONFIGS (sorted by predicted score):"
+            log.info(msg)
+            print(msg, flush=True)
+            
+            for i, (score, cfg) in enumerate(scored_all_configs, 1):
+                details = PointwiseHeuristics.get_detailed_scores(cfg, problem_metadata)
+                
+                # Check if this config is valid (passed validation) and if it's in top-N
+                is_valid = cfg in all_valid_configs
+                is_top = cfg in top_configs
+                
+                if is_top:
+                    rank_marker = f"[TOP-{top_configs.index(cfg)+1}]"
+                elif is_valid:
+                    rank_marker = "[VALID]"
+                else:
+                    rank_marker = "[FILTERED]"
+                
+                # Format config string
+                cfg_str = ", ".join(f"{k}={v}" for k, v in cfg.items())
+                
+                # Main line with ranking
+                msg = f"[POINTWISE HEURISTICS]   #{i:2d}: {rank_marker:9s} score={score:.4f} | {cfg_str}"
+                log.info(msg)
+                print(msg, flush=True)
+                
+                # Detailed factors (compact format) - NEW V2 factors
+                factors = (
+                    f"bw={details['memory_bandwidth']:.3f}(40%) "
+                    f"lnch={details['launch_overhead']:.3f}(30%) "
+                    f"grid={details['grid_granularity']:.3f}(20%) "
+                    f"occ={details['occupancy']:.3f}(10%) | "
+                    f"{details['num_blocks']}blk {details['threads_per_block']}thr"
+                )
+                msg = f"[POINTWISE HEURISTICS]        {factors}"
+                log.info(msg)
+                print(msg, flush=True)
+            
+            msg = "[POINTWISE HEURISTICS] " + "="*70
+            log.info(msg)
+            print(msg, flush=True)
+            
+            # Show detailed breakdown for top configs (prediction)
+            msg = "[POINTWISE HEURISTICS] TOP CONFIGS (by predicted score):"
+            log.info(msg)
+            print(msg, flush=True)
+            
+            for i, cfg in enumerate(top_configs, 1):
+                score = PointwiseHeuristics.score_config(cfg, problem_metadata)
+                details = PointwiseHeuristics.get_detailed_scores(cfg, problem_metadata)
+                
+                # Main config line
+                cfg_msg = f"[POINTWISE HEURISTICS]   #{i}: {cfg} (score={score:.4f})"
+                log.info(cfg_msg)
+                print(cfg_msg, flush=True)
+                try:
+                    with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                        f.write(cfg_msg + "\n")
+                except:
+                    pass
+                
+                # Detailed scoring breakdown - NEW V2 factors
+                breakdown_msg = (
+                    f"[POINTWISE HEURISTICS]       Factors: "
+                    f"bandwidth={details['memory_bandwidth']:.3f}(40%), "
+                    f"launch={details['launch_overhead']:.3f}(30%), "
+                    f"grid={details['grid_granularity']:.3f}(20%), "
+                    f"occup={details['occupancy']:.3f}(10%)"
+                )
+                log.info(breakdown_msg)
+                print(breakdown_msg, flush=True)
+                try:
+                    with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                        f.write(breakdown_msg + "\n")
+                except:
+                    pass
+                
+                # Grid info
+                grid_msg = (
+                    f"[POINTWISE HEURISTICS]       Grid: {details['num_blocks']} blocks, "
+                    f"{details['threads_per_block']} threads/block"
+                )
+                log.info(grid_msg)
+                print(grid_msg, flush=True)
+                try:
+                    with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                        f.write(grid_msg + "\n")
+                except:
+                    pass
+        
+        # Determine which configs to benchmark based on config option
+        from torch._inductor import config as inductor_config
+        
+        if inductor_config.heuristics_real_bench:
+            # Benchmark ALL valid configs to validate heuristics predictions
+            configs_to_benchmark = all_valid_configs
+            msg = f"[POINTWISE HEURISTICS] REAL_BENCH mode: Benchmarking ALL {len(configs_to_benchmark)} valid configs..."
+        else:
+            # Only benchmark top 5 for faster tuning
+            configs_to_benchmark = top_configs
+            msg = f"[POINTWISE HEURISTICS] Fast mode: Benchmarking top {len(configs_to_benchmark)} configs only..."
+        
+        log.info(msg)
+        print(msg, flush=True)
+        
+        # Convert configs to Triton configs
+        triton_configs = []
+        ndims = len(size_hints)
+        
+        for cfg in configs_to_benchmark:
+            num_warps = cfg.get('num_warps', 4)  # Default to 4 if not specified
+            
+            if ndims == 1:
+                xblock = cfg.get('XBLOCK', 256)
+                triton_configs.append(
+                    triton_config_with_settings(size_hints, xblock, num_warps=num_warps)
+                )
+            elif ndims == 2:
+                xblock = cfg.get('XBLOCK', 32)
+                yblock = cfg.get('YBLOCK', 32)
+                triton_configs.append(
+                    triton_config_with_settings(size_hints, xblock, yblock, num_warps=num_warps)
+                )
+            elif ndims == 3:
+                xblock = cfg.get('XBLOCK', 16)
+                yblock = cfg.get('YBLOCK', 16)
+                zblock = cfg.get('ZBLOCK', 16)
+                triton_configs.append(
+                    triton_config_with_settings(size_hints, xblock, yblock, zblock, num_warps=num_warps)
+                )
+        
+        # Store predictions for validation (if REAL_BENCH mode is enabled)
+        from torch._inductor import config as inductor_config
+        if inductor_config.heuristics_real_bench and scored_all_configs:
+            problem_key = _normalize_problem_key(size_hints)
+            _store_heuristics_predictions(problem_key, problem_metadata, scored_all_configs)
+            
+            # Store top N configs for selection (only use top 5 for final selection)
+            # We benchmark all for validation, but only select winner from top 5
+            _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_configs
+        
+        return triton_configs if triton_configs else None
+        
+    except Exception as e:
+        log.warning(
+            "[POINTWISE HEURISTICS] Failed to apply heuristics: %s. "
+            "Falling back to default configs.", 
+            str(e)
+        )
+        return None
+
+
 def pointwise(
     size_hints,
     triton_meta,
@@ -2630,6 +3296,17 @@ def pointwise(
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
     assert not inductor_meta.get("no_x_dim")
+    
+    # Debug: Show we're being called
+    if torch.version.hip:
+        msg = f"[POINTWISE] Called for problem size: {tuple(size_hints.values())}"
+        print(msg, flush=True)
+        # Also write to file to ensure we see it
+        try:
+            with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                f.write(msg + "\n")
+        except:
+            pass
 
     numel = functools.reduce(operator.mul, size_hints.values())
     bs = max(256, min(numel // 128, 1024))
@@ -2645,9 +3322,64 @@ def pointwise(
         triton_config, min_elem_per_thread=min_elem_per_thread
     )
 
+    # Try to use advanced pointwise heuristics for ROCm builds
+    # This runs REGARDLESS of autotune_pointwise setting to provide optimal default configs
+    # Can be disabled via TORCHINDUCTOR_POINTWISE_HEURISTICS=0 for testing/comparison
     configs = None
-    if len(size_hints) == 1:
-        if not inductor_meta.get("autotune_pointwise", True) and not (
+    use_heuristics = torch.version.hip and POINTWISE_HEURISTICS_AVAILABLE and _is_pointwise_heuristics_enabled()
+    
+    if not _is_pointwise_heuristics_enabled() and torch.version.hip and POINTWISE_HEURISTICS_AVAILABLE:
+        msg = f"[POINTWISE] Advanced heuristics DISABLED (TORCHINDUCTOR_POINTWISE_HEURISTICS=0) - using original configs"
+        log.info(msg)
+        print(msg, flush=True)
+    
+    if use_heuristics:
+        msg = f"[POINTWISE HEURISTICS] ROCm detected - Using advanced heuristics for problem: {tuple(size_hints.values())}"
+        log.info(msg)
+        print(msg, flush=True)
+        # Log to file as well
+        try:
+            with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                f.write(msg + "\n")
+        except:
+            pass
+        
+        # Always benchmark top 5 configs to find the true best for this hardware
+        msg = "[POINTWISE HEURISTICS] Generating top 5 configs for benchmarking"
+        log.info(msg)
+        print(msg, flush=True)
+        try:
+            with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                f.write(msg + "\n")
+        except:
+            pass
+        
+        configs = _apply_pointwise_heuristics(
+            size_hints, 
+            inductor_meta, 
+            triton_meta, 
+            triton_config_with_settings,
+            filename
+        )
+        
+        if configs:
+            # Always benchmark all top configs to find the true best
+            msg = f"[POINTWISE HEURISTICS] Generated {len(configs)} configs for autotuning/benchmarking"
+            log.info(msg)
+            print(msg, flush=True)
+            try:
+                with open("/tmp/pointwise_heuristics_calls.log", "a") as f:
+                    f.write(msg + "\n")
+            except:
+                pass
+        else:
+            msg = "[POINTWISE HEURISTICS] Heuristics failed - falling back to defaults"
+            log.info(msg)
+            print(msg, flush=True)
+    
+    # Fall back to default config generation if heuristics not used or failed
+    if configs is None and len(size_hints) == 1:
+        if not inductor_meta.get("autotune_pointwise", False) and not (
             inductor_meta.get("max_autotune")
             or inductor_meta.get("max_autotune_pointwise")
         ):
@@ -2691,11 +3423,11 @@ def pointwise(
                             )
                         ]
                     )
-    if len(size_hints) == 2:
+    if configs is None and len(size_hints) == 2:
         # Only avoiding tuning on TileHint.SQUARE if not on ROCm builds
         # ROCm has observed improvement by diverging here
         if (
-            not inductor_meta.get("autotune_pointwise", True)
+            not inductor_meta.get("autotune_pointwise", False)
             or (torch.version.hip is None and tile_hint == TileHint.SQUARE)
         ) and not (
             inductor_meta.get("max_autotune")
@@ -2730,8 +3462,8 @@ def pointwise(
                         ),  # +30% for some kernels
                     ]
                 )
-    if len(size_hints) == 3:
-        if not inductor_meta.get("autotune_pointwise", True):
+    if configs is None and len(size_hints) == 3:
+        if not inductor_meta.get("autotune_pointwise", False):
             configs = [triton_config_with_settings(size_hints, 16, 16, 16)]
         else:
             configs = [
@@ -2983,8 +3715,8 @@ def _reduction_configs(
 
     result_configs = []
 
-    # For 3d tiling, default to more autotuning initially
-    if "y" in size_hints:
+    # For 3d tiling, default to more autotuning only if max_autotune is enabled
+    if "y" in size_hints and max_autotune_enabled:
         pass
     elif max_autotune_enabled:
         pass  # skip all these cases
@@ -2994,10 +3726,12 @@ def _reduction_configs(
         return configs + [outer_config]
     elif reduction_hint == ReductionHint.OUTER_TINY:
         return configs + [tiny_config]
+    else:
+        # Default case: return a single config when autotuning is not enabled
+        return configs + [contiguous_config]
 
     # We continue here under the following conditions:
     # - max_autotune_enabled is True
-    # - max_autotune_enabled is False and reduction_hint is NOT one of the above cases
     result_configs = configs + [
         contiguous_config,
         outer_config,
@@ -3369,8 +4103,8 @@ def _persistent_reduction_configs(
         )
     ]
 
-    # defer to more autotuning, initially
-    if "y" in size_hints:
+    # defer to more autotuning only when max_autotune is enabled
+    if "y" in size_hints and max_autotune_enabled:
         pass
     # TODO(jansel): we should be able to improve these heuristics
     elif not max_autotune_enabled:  # Do not filter configs when tuning
@@ -3408,6 +4142,9 @@ def _persistent_reduction_configs(
             configs = configs[-1:]
         elif reduction_hint == ReductionHint.OUTER_TINY:
             configs = tiny_configs
+        else:
+            # Default case: return first config when autotuning is not enabled
+            configs = configs[:1] if configs else tiny_configs
     else:
         if torch.version.hip:
             # If autotune is enabled append tiny configs

@@ -1015,7 +1015,7 @@ This class does not support ``__members__`` property.)");
   });
 
 #ifdef USE_NVSHMEM
-  // Initializes the device state in CUmodule so that it’s able to perform
+  // Initializes the device state in hipModule_t so that it’s able to perform
   // NVSHMEM operations.
   module.def(
       "_nvshmemx_cumodule_init",

@@ -1,9 +1,9 @@
 #pragma once
 
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/csrc/utils/python_numbers.h>
 
 #include <vector>
 
-std::vector<std::optional<at::cuda::CUDAStream>>
+std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>
 THPUtils_PySequence_to_CUDAStreamList(PyObject* obj);

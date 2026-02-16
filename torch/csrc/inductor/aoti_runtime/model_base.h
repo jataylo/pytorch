@@ -309,7 +309,7 @@ extern uint8_t _binary_constants_bin_start[];
 // NOLINTNEXTLINE(*array*)
 extern uint8_t _binary_constants_bin_end[];
 
-#if defined(USE_CUDA) || defined(USE_XPU)
+#if defined(USE_ROCM) || defined(USE_XPU)
 // Compute required blob size with 64-alignment if on GPU.
 #define AOTI_CONST_ALIGNMENT 64
 #else
@@ -321,7 +321,7 @@ namespace {
 
 using RAIIDataPtr = std::unique_ptr<void, std::function<void(void*)>>;
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
 
 // NOLINTNEXTLINE(clang-diagnostic-unneeded-internal-declaration)
 RAIIDataPtr RAII_gpuMalloc(size_t num_bytes) {
@@ -336,10 +336,10 @@ RAIIDataPtr RAII_gpuMalloc(size_t num_bytes) {
   };
   return RAIIDataPtr(data_ptr, deleter);
 #else
-  // Use cudaMalloc directly for allocating GPU memory
+  // Use hipMalloc directly for allocating GPU memory
   void* data_ptr = nullptr;
-  AOTI_RUNTIME_CUDA_CHECK(cudaMalloc((void**)&data_ptr, num_bytes));
-  auto deleter = [](void* ptr) { AOTI_RUNTIME_CUDA_CHECK(cudaFree(ptr)); };
+  AOTI_RUNTIME_CUDA_CHECK(hipMalloc((void**)&data_ptr, num_bytes));
+  auto deleter = [](void* ptr) { AOTI_RUNTIME_CUDA_CHECK(hipFree(ptr)); };
   return RAIIDataPtr(data_ptr, deleter);
 #endif
 }
@@ -374,7 +374,7 @@ RAIIDataPtr RAII_cpuMalloc(size_t num_bytes) {
   return RAIIDataPtr(data_ptr, deleter);
 }
 
-#endif // USE_CUDA
+#endif // USE_ROCM
 
 } // anonymous namespace
 
@@ -439,14 +439,14 @@ class AOTInductorModelBase {
         include_weights(include_weights) {
     parse_device_str(device_str, device_type_, device_idx_);
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (device_idx_ == -1) {
-      AOTI_RUNTIME_CUDA_CHECK(cudaGetDevice(&device_idx_));
+      AOTI_RUNTIME_CUDA_CHECK(hipGetDevice(&device_idx_));
     } else {
       // If device_idx_ is passed in, we need to set the current device to it
-      AOTI_RUNTIME_CUDA_CHECK(cudaSetDevice(device_idx_));
+      AOTI_RUNTIME_CUDA_CHECK(hipSetDevice(device_idx_));
     }
-#endif // USE_CUDA
+#endif // USE_ROCM
 #ifdef USE_XPU
     if (device_idx_ == -1) {
       aoti_torch_get_current_xpu_device(&device_idx_);
@@ -463,15 +463,15 @@ class AOTInductorModelBase {
 
   // NOLINTNEXTLINE(modernize-use-equals-default)
   ~AOTInductorModelBase() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (run_finished_) {
-      auto code = cudaEventDestroy(*run_finished_);
-      if (code != cudaSuccess) {
+      auto code = hipEventDestroy(*run_finished_);
+      if (code != hipSuccess) {
         std::cerr << "Failed to destroy CUDA event in AOTInductor model: "
-                  << cudaGetErrorString(code) << '\n';
+                  << hipGetErrorString(code) << '\n';
       }
     }
-#endif // USE_CUDA
+#endif // USE_ROCM
 #ifdef USE_XPU
     if (run_finished_) {
       (*run_finished_)->wait_and_throw();
@@ -495,10 +495,10 @@ class AOTInductorModelBase {
                           // borrowed
       DeviceStreamType stream,
       AOTIProxyExecutorHandle proxy_executor) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
-      cudaEvent_t run_finished = nullptr;
-      AOTI_RUNTIME_CUDA_CHECK(cudaEventCreate(&run_finished));
+      hipEvent_t run_finished = nullptr;
+      AOTI_RUNTIME_CUDA_CHECK(hipEventCreate(&run_finished));
       run_finished_.emplace(run_finished);
     }
 #elif defined(USE_XPU)
@@ -507,21 +507,21 @@ class AOTInductorModelBase {
       delete *run_finished_;
       run_finished_.reset();
     }
-#else // !USE_CUDA && !USE_XPU
+#else // !USE_ROCM && !USE_XPU
     run_finished_ = false;
 #endif
 
     auto* model = static_cast<Model*>(this);
     model->run_impl(input_handles, output_handles, stream, proxy_executor);
 
-#ifdef USE_CUDA
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventRecord(*run_finished_, stream));
+#ifdef USE_ROCM
+    AOTI_RUNTIME_CUDA_CHECK(hipEventRecord(*run_finished_, stream));
 #elif defined(USE_XPU)
     run_finished_ = std::make_optional<sycl::event*>(new sycl::event(
         static_cast<sycl::queue*>(stream)->ext_oneapi_submit_barrier()));
-#else // !USE_CUDA && !USE_XPU
+#else // !USE_ROCM && !USE_XPU
     run_finished_ = true;
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   // Non-thread-aware variant of run(). Obviously unsafe to use in a threaded
@@ -546,10 +546,10 @@ class AOTInductorModelBase {
       DeviceStreamType stream,
       AOTIProxyExecutorHandle proxy_executor,
       bool initialization = false) {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
-      cudaEvent_t run_finished = nullptr;
-      AOTI_RUNTIME_CUDA_CHECK(cudaEventCreate(&run_finished));
+      hipEvent_t run_finished = nullptr;
+      AOTI_RUNTIME_CUDA_CHECK(hipEventCreate(&run_finished));
       run_finished_.emplace(run_finished);
     }
 #elif defined(USE_XPU)
@@ -558,7 +558,7 @@ class AOTInductorModelBase {
       delete *run_finished_;
       run_finished_.reset();
     }
-#else // !USE_CUDA && !USE_XPU
+#else // !USE_ROCM && !USE_XPU
     run_finished_ = false;
 #endif
 
@@ -566,17 +566,17 @@ class AOTInductorModelBase {
     auto folded_constants =
         model->const_run_impl(stream, proxy_executor, initialization);
 
-#ifdef USE_CUDA
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventRecord(*run_finished_, stream));
+#ifdef USE_ROCM
+    AOTI_RUNTIME_CUDA_CHECK(hipEventRecord(*run_finished_, stream));
 #elif defined(USE_XPU)
     // sycl::queue* queue_ptr = nullptr;
     // aoti_torch_get_current_sycl_queue((void**)&queue_ptr);
     run_finished_ = std::make_optional<sycl::event*>(new sycl::event(
         static_cast<sycl::queue*>(stream)->ext_oneapi_submit_barrier()));
 
-#else // !USE_CUDA && !USE_XPU
+#else // !USE_ROCM && !USE_XPU
     run_finished_ = true;
-#endif // USE_CUDA
+#endif // USE_ROCM
 
     return folded_constants;
   }
@@ -600,7 +600,7 @@ class AOTInductorModelBase {
     if (!force && !include_weights) {
       return;
     }
-#if defined(USE_CUDA) || defined(USE_XPU) || defined(USE_MPS)
+#if defined(USE_ROCM) || defined(USE_XPU) || defined(USE_MPS)
     constant_blob_ = RAII_gpuMalloc(blob_size);
 #else
     constant_blob_ = RAII_cpuMalloc(blob_size);
@@ -692,12 +692,12 @@ class AOTInductorModelBase {
       queue_ptr
           ->memcpy(internal_ptr, _get_constants_start() + bytes_read, data_size)
           .wait();
-#elif USE_CUDA
-      AOTI_RUNTIME_CUDA_CHECK(cudaMemcpy(
+#elif USE_ROCM
+      AOTI_RUNTIME_CUDA_CHECK(hipMemcpy(
           internal_ptr,
           _get_constants_start() + bytes_read,
           data_size,
-          cudaMemcpyHostToDevice));
+          hipMemcpyHostToDevice));
 #elif USE_MPS
       aoti_torch_mps_memcpy(
           constants_ptr,
@@ -874,21 +874,21 @@ class AOTInductorModelBase {
 
   /// Returns true if the model is complete.
   bool is_finished() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
       throw std::runtime_error{"Model CUDA event was not initialized"};
     }
 
-    auto event_status = cudaEventQuery(*run_finished_);
-    if (event_status == cudaSuccess) {
+    auto event_status = hipEventQuery(*run_finished_);
+    if (event_status == hipSuccess) {
       return true;
-    } else if (event_status == cudaErrorNotReady) {
+    } else if (event_status == hipErrorNotReady) {
       return false;
     }
 
     throw std::runtime_error(
         std::string("The model did not finish successfully. Error: ") +
-        cudaGetErrorString(cudaGetLastError()));
+        hipGetErrorString(hipGetLastError()));
 #elif defined(USE_XPU)
     if (!run_finished_) {
       throw std::runtime_error{"Model XPU event was not initialized"};
@@ -897,20 +897,20 @@ class AOTInductorModelBase {
     return (*run_finished_)->get_info<event::command_execution_status>() ==
         event_command_status::complete;
 
-#else // !USE_CUDA && !USE_XPU
+#else // !USE_ROCM && !USE_XPU
     return run_finished_;
-#endif // USE_CUDA
+#endif // USE_ROCM
   }
 
   /// Synchronizes completion event.
   void wait_for_completion() {
-#ifdef USE_CUDA
+#ifdef USE_ROCM
     if (!run_finished_) {
       throw std::runtime_error{"Model event was not initialized"};
     }
 
-    AOTI_RUNTIME_CUDA_CHECK(cudaEventSynchronize(*run_finished_));
-#endif // USE_CUDA
+    AOTI_RUNTIME_CUDA_CHECK(hipEventSynchronize(*run_finished_));
+#endif // USE_ROCM
 #ifdef USE_XPU
     if (!run_finished_) {
       throw std::runtime_error{"Model event was not initialized"};
@@ -1021,11 +1021,11 @@ class AOTInductorModelBase {
 
   // Record if the model finishes an inference run so that its owning
   // AOTModelContainer can reuse this instance.
-#ifdef USE_CUDA
-  std::optional<cudaEvent_t> run_finished_;
+#ifdef USE_ROCM
+  std::optional<hipEvent_t> run_finished_;
 #elif defined(USE_XPU)
   std::optional<sycl::event*> run_finished_;
-#else // !USE_CUDA
+#else // !USE_ROCM
   bool run_finished_{};
 #endif
 

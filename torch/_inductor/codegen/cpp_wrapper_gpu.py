@@ -560,7 +560,7 @@ class CppWrapperGpu(CppWrapperCpu):
         self.writeline(f"alignas(64) CUtensorMap {desc_name};")
 
         # `source` is in the form of `&var_x`, where `var_x` is the data pointer
-        # (CUdeviceptr); we dereference `source` and cast to `void*` to pass to
+        # (hipDeviceptr_t); we dereference `source` and cast to `void*` to pass to
         # the data pointer of the source tensor to the helper function
         # `init{1,2}DTMADescriptor`
         ptr = f"reinterpret_cast<void*>(*({source}))"

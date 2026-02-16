@@ -426,7 +426,7 @@ static void initXpuMethodBindings(PyObject* module) {
             // NOLINTNEXTLINE(performance-no-int-to-ptr)
             reinterpret_cast<sycl::queue*>(reinterpret_cast<void*>(data_ptr));
         at::xpu::XPUStream stream =
-            c10::xpu::getStreamFromExternal(ext_queue, device_index);
+            c10::xpu::getStreamFromExternalMasqueradingAsCUDA(ext_queue, device_index);
         return std::make_tuple(
             stream.id(), stream.device_index(), stream.device_type());
       });

@@ -9,7 +9,7 @@ namespace torch::cuda {
 
 // C++-only versions of these, for python use
 // those defined in cuda/Module.cpp which also record python state.
-TORCH_CUDA_CU_API void _record_memory_history(
+TORCH_HIP_API void _record_memory_history(
     bool enabled,
     bool record_context = true,
     int64_t trace_alloc_max_entries = 1,
@@ -19,7 +19,7 @@ TORCH_CUDA_CU_API void _record_memory_history(
     bool compileContext = false,
     bool globalRecordAllocations = false);
 
-TORCH_CUDA_CU_API void _record_memory_history(
+TORCH_HIP_API void _record_memory_history(
     std::optional<std::string> enabled = "all",
     std::optional<std::string> context = "all",
     const std::string& stacks = "all",
@@ -28,6 +28,6 @@ TORCH_CUDA_CU_API void _record_memory_history(
     bool compileContext = false,
     bool globalRecordAllocations = false);
 
-TORCH_CUDA_CU_API std::string _memory_snapshot_pickled();
+TORCH_HIP_API std::string _memory_snapshot_pickled();
 
 } // namespace torch::cuda

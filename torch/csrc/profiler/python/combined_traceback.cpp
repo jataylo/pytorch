@@ -7,7 +7,7 @@ namespace py = pybind11;
 namespace torch {
 // Locking:
 // We need to free PyCodeObjects when ~StackContext runs, but
-// CUDACachingAllocator may hold its device lock when ~StackContext runs.
+// HIPCachingAllocator may hold its device lock when ~StackContext runs.
 
 // Because the thread calling the allocator _may_ hold the GIL,
 // attempting to lock the GIL in ~StackContext can deadlock:

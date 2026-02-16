@@ -9,8 +9,8 @@
 
 #include <ATen/ATen.h>
 #include <ATen/WrapDimUtils.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/util/irange.h>
 #include <torch/csrc/autograd/variable.h>
 #include <optional>
@@ -176,7 +176,7 @@ tensor_list2d broadcast_coalesced(
     o.reserve(tensors.size());
 
   unique_type_checker type_checker;
-  at::cuda::CUDAGuard device_guard(static_cast<DeviceIndex>(devices[0]));
+  at::hip::HIPGuardMasqueradingAsCUDA device_guard(static_cast<DeviceIndex>(devices[0]));
   for (auto& chunk : torch::utils::take_tensors(tensors, buffer_size)) {
     auto type_id = chunk.type_id();
     type_checker.show(type_id);
@@ -229,7 +229,7 @@ std::vector<at::Tensor>& scatter_out(
     const at::Tensor& tensor,
     std::vector<at::Tensor>& out_tensors,
     int64_t dim,
-    const std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>&
+    const std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>&
         streams) {
   TORCH_CHECK(
       !out_tensors.empty(),
@@ -279,7 +279,7 @@ std::vector<at::Tensor>& scatter_out(
 
   auto chunks =
       tensor.split_with_sizes(/*split_sizes=*/chunk_sizes, /*dim=*/dim);
-  at::cuda::OptionalCUDAStreamGuard cuda_guard;
+  at::hip::OptionalHIPStreamGuardMasqueradingAsCUDA cuda_guard;
   for (const auto i : c10::irange(chunks.size())) {
     if (i < (streams ? streams->size() : 0U) && (*streams)[i]) {
       const auto device_index = out_tensors[i].get_device();
@@ -310,7 +310,7 @@ std::vector<at::Tensor> scatter(
     at::IntArrayRef devices,
     const std::optional<std::vector<int64_t>>& chunk_sizes,
     int64_t dim,
-    const std::optional<std::vector<std::optional<at::cuda::CUDAStream>>>&
+    const std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>>&
         streams) {
   TORCH_CHECK(!devices.empty(), "Expected at least one device to scatter to");
   if (chunk_sizes.has_value()) {
@@ -327,7 +327,7 @@ std::vector<at::Tensor> scatter(
       ? tensor.split_with_sizes(/*split_sizes=*/*chunk_sizes, /*dim=*/dim)
       : tensor.chunk(
             /*chunks=*/static_cast<int64_t>(devices.size()), /*dim=*/dim);
-  at::cuda::OptionalCUDAStreamGuard cuda_guard;
+  at::hip::OptionalHIPStreamGuardMasqueradingAsCUDA cuda_guard;
   for (const auto i : c10::irange(chunks.size())) {
     const auto device_index = static_cast<int16_t>(devices[i]);
     if (device_index != tensor.get_device()) {

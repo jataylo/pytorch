@@ -1,6 +1,6 @@
 #ifdef USE_C10D_NCCL
-#include <ATen/cuda/CUDAEvent.h>
-#include <cuda_runtime.h>
+#include <ATen/hip/HIPEvent.h>
+#include <hip/hip_runtime.h>
 
 #include <nlohmann/json.hpp>
 #include <fstream>

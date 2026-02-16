@@ -484,6 +484,14 @@ max_autotune_prune_choices_based_on_shared_mem = (
     == "1"
 )
 
+# pass ALL valid heuristic configs to autotuner (no pruning to top-N)
+# enables full benchmarking to validate heuristic predictions vs reality
+# when True: benchmarks ALL configs, compares predicted vs actual performance
+# when False: only benchmarks top-5 predicted configs (faster but less validation)
+heuristics_real_bench = (
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "1") == "1"
+)
+
 # Disable triton from trying to initialize and detect devices on the host
 triton_disable_device_detection = (
     os.environ.get("TORCHINDUCTOR_TRITON_DISABLE_DEVICE_DETECTION", "0") == "1"
@@ -1490,7 +1498,7 @@ class triton:
 
     # use triton.autotune for pointwise ops with complex layouts
     # this should only be disabled for debugging/testing
-    autotune_pointwise = True
+    autotune_pointwise = False
 
     # max autotune gemm with cublasLt
     autotune_cublasLt = True

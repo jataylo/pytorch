@@ -1,4 +1,4 @@
-#include <ATen/cuda/CUDAGreenContext.h>
+#include <ATen/hip/HIPGreenContext.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/pybind.h>
 

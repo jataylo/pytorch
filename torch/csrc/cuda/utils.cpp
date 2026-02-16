@@ -5,9 +5,9 @@
 #include <cstdarg>
 #include <string>
 
-// NB: It's a list of *optional* CUDAStream; when nullopt, that means to use
+// NB: It's a list of *optional* HIPStreamMasqueradingAsCUDA; when nullopt, that means to use
 // whatever the current stream of the device the input is associated with was.
-std::vector<std::optional<at::cuda::CUDAStream>>
+std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>
 THPUtils_PySequence_to_CUDAStreamList(PyObject* obj) {
   TORCH_CHECK(
       PySequence_Check(obj),
@@ -17,7 +17,7 @@ THPUtils_PySequence_to_CUDAStreamList(PyObject* obj) {
       seq.get() != nullptr,
       "expected PySequence, but got " + std::string(THPUtils_typename(obj)));
 
-  std::vector<std::optional<at::cuda::CUDAStream>> streams;
+  std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>> streams;
   Py_ssize_t length = PySequence_Fast_GET_SIZE(seq.get());
   streams.reserve(length);
   for (Py_ssize_t i = 0; i < length; i++) {
@@ -25,7 +25,7 @@ THPUtils_PySequence_to_CUDAStreamList(PyObject* obj) {
 
     if (PyObject_IsInstance(stream, (PyObject*)THPStreamClass)) {
       // Spicy hot reinterpret cast!!
-      streams.emplace_back(at::cuda::CUDAStream::unpack3(
+      streams.emplace_back(at::hip::HIPStreamMasqueradingAsCUDA::unpack3(
           (reinterpret_cast<THPStream*>(stream))->stream_id,
           static_cast<c10::DeviceIndex>(
               reinterpret_cast<THPStream*>(stream)->device_index),

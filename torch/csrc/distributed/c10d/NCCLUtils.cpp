@@ -64,7 +64,7 @@ std::shared_ptr<NCCLComm> NCCLComm::create(
     int rank,
     ncclUniqueId commId,
     at::DeviceIndex deviceIndex) {
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex);
   auto comm = std::make_shared<NCCLComm>();
   C10D_NCCL_CHECK(
       ncclCommInitRank(&(comm->ncclComm_), numRanks, commId, rank),
@@ -85,7 +85,7 @@ std::shared_ptr<NCCLComm> NCCLComm::create(
     ncclUniqueId commId,
     at::DeviceIndex deviceIndex,
     ncclConfig_t& config) {
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex);
   auto comm = std::make_shared<NCCLComm>();
   comm->nonBlocking_ = config.blocking == 0;
   LOG(INFO) << "Rank " << rank << ": creating NCCL communicator with mode: "
@@ -110,7 +110,7 @@ std::shared_ptr<NCCLComm> NCCLComm::create_scalable(
     std::vector<ncclUniqueId>& commIds,
     at::DeviceIndex deviceIndex,
     ncclConfig_t& config) {
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex);
   auto comm = std::make_shared<NCCLComm>();
   comm->nonBlocking_ = config.blocking == 0;
   LOG(INFO) << "Rank " << rank << ": creating NCCL communicator with mode: "
@@ -232,7 +232,7 @@ std::shared_ptr<NCCLComm> NCCLComm::split(
   LOG(INFO) << "Rank " << source->rank_ << ": split from parent comm "
             << source->repr() << " with color_id " << color_id << " and rank "
             << rank;
-  at::cuda::OptionalCUDAGuard gpuGuard(source->deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(source->deviceIndex_);
   auto comm = std::make_shared<NCCLComm>();
   // This call will block until the source communicator is initialized
   auto sourceComm = source->getNcclComm();
@@ -293,7 +293,7 @@ std::shared_ptr<NCCLComm> NCCLComm::shrink(
   LOG(INFO) << "Rank " << source->rank_ << ": shrinking comm " << source->repr()
             << " excluding " << ranks_to_exclude.size() << " ranks";
 
-  at::cuda::OptionalCUDAGuard gpuGuard(source->deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(source->deviceIndex_);
   auto comm = std::make_shared<NCCLComm>();
 
   // This call will block until the source communicator is initialized
@@ -348,7 +348,7 @@ void NCCLComm::finalize() {
               << ": NCCL communicator already Invalidated. Skip finalize.";
     return;
   }
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex_);
   auto comm = getNcclComm();
   C10D_NCCL_CHECK_NONBLOCKING(ncclCommFinalize(comm), std::nullopt);
 }
@@ -360,7 +360,7 @@ void NCCLComm::destroy() {
               << ": NCCL communicator already Invalidated. Skip destroy.";
     return;
   }
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex_);
   auto comm = getNcclComm();
   C10D_NCCL_CHECK(ncclCommDestroy(comm), std::nullopt);
   // Poison future getNcclComm
@@ -369,7 +369,7 @@ void NCCLComm::destroy() {
 
 void NCCLComm::abort(std::optional<std::string> commFailureReason) {
   LockType lock(mutex_);
-  at::cuda::OptionalCUDAGuard gpuGuard(deviceIndex_);
+  at::hip::OptionalHIPGuardMasqueradingAsCUDA gpuGuard(deviceIndex_);
 #ifdef ENABLE_NCCL_ERROR_CHECKING
   if (aborted_ && !initialized_) {
     // Should not abort twice.
@@ -671,7 +671,7 @@ size_t hashTensors(const std::vector<at::Tensor>& tensors) {
         // This is needed so that we trigger a device synchronization so we can
         // get the collective finished if launched on GPU and hash its output.
         AT_CUDA_CHECK(
-            cudaMemcpy(dst.data(), src, data_size, cudaMemcpyDeviceToHost));
+            hipMemcpy(dst.data(), src, data_size, hipMemcpyDeviceToHost));
         for (size_t i = 0; i < data_size; ++i) {
           // Update the hash for each byte in the tensor
           hash = c10::hash_combine(hash, c10::get_hash(dst[i], data_size));

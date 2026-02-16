@@ -1,5 +1,5 @@
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <mutex>
 #include <utility>
 
@@ -16,7 +16,7 @@ _AllocationMetadata::_AllocationMetadata() : size(0), device_idx(-1) {}
 _AllocationMetadata::_AllocationMetadata(
     size_t size,
     c10::DeviceIndex device_idx,
-    cudaStream_t stream)
+    hipStream_t stream)
     : size(size), device_idx(device_idx), stream(stream) {}
 
 // This is a fast API to just register allocators
@@ -24,8 +24,8 @@ _AllocationMetadata::_AllocationMetadata(
 // This avoids having to link against libtorch for C++ based custom allocators
 // And also use this from python
 CUDAPluggableAllocator::CUDAPluggableAllocator(
-    std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
-    std::function<void(void*, size_t, int, cudaStream_t)> free_fn)
+    std::function<void*(size_t, int, hipStream_t)> alloc_fn,
+    std::function<void(void*, size_t, int, hipStream_t)> free_fn)
     : alloc_fn_(std::move(alloc_fn)), free_fn_(std::move(free_fn)) {}
 
 CUDAPluggableAllocator::CUDAPluggableAllocator(CUDAPluggableAllocator& other)
@@ -59,31 +59,31 @@ void CUDAPluggableAllocator::set_base_alloc_fn(
 }
 
 void CUDAPluggableAllocator::set_record_stream_fn(
-    std::function<void(void* ptr, cudaStream_t stream)> record_stream_fn) {
+    std::function<void(void* ptr, hipStream_t stream)> record_stream_fn) {
   record_stream_fn_ = std::move(record_stream_fn);
 }
 
 void CUDAPluggableAllocator::set_begin_allocate_to_pool(
     std::function<
-        void(int, c10::cuda::MempoolId_t, std::function<bool(cudaStream_t)>)>
+        void(int, c10::hip::MempoolId_t, std::function<bool(hipStream_t)>)>
         capture_begin_fn) {
   begin_allocate_to_pool_fn_ = std::move(capture_begin_fn);
 }
 
 void CUDAPluggableAllocator::set_end_allocate_to_pool_fn(
-    std::function<void(int, c10::cuda::MempoolId_t)> capture_about_to_end_fn) {
+    std::function<void(int, c10::hip::MempoolId_t)> capture_about_to_end_fn) {
   end_allocate_to_pool_fn_ = std::move(capture_about_to_end_fn);
 }
 
 void CUDAPluggableAllocator::set_release_pool(
-    std::function<void(int, c10::cuda::MempoolId_t)> capture_destroy_fn) {
+    std::function<void(int, c10::hip::MempoolId_t)> capture_destroy_fn) {
   relase_pool_fn_ = std::move(capture_destroy_fn);
 }
 
 void* CUDAPluggableAllocator::malloc(
     size_t size,
     c10::DeviceIndex device,
-    cudaStream_t stream) {
+    hipStream_t stream) {
   void* r = alloc_fn_(size, device, stream);
   {
     const std::lock_guard<std::mutex> lock(allocator_mutex_);
@@ -94,8 +94,8 @@ void* CUDAPluggableAllocator::malloc(
 
 c10::DataPtr CUDAPluggableAllocator::allocate(size_t size) {
   c10::DeviceIndex device = -1;
-  C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device);
+  C10_HIP_CHECK(c10::hip::GetDevice(&device));
+  hipStream_t stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device);
   void* r = this->malloc(size, device, stream);
   c10::DataPtr data_ptr = {
       r, r, raw_deleter(), c10::Device(c10::DeviceType::CUDA, device)};
@@ -108,21 +108,21 @@ c10::DeleterFnPtr CUDAPluggableAllocator::raw_deleter() const {
 
 void* CUDAPluggableAllocator::raw_alloc(size_t nbytes) {
   c10::DeviceIndex device = -1;
-  C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device);
+  C10_HIP_CHECK(c10::hip::GetDevice(&device));
+  hipStream_t stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA(device);
   return malloc(nbytes, device, stream);
 }
 
 void* CUDAPluggableAllocator::raw_alloc_with_stream(
     size_t nbytes,
-    cudaStream_t stream) {
+    hipStream_t stream) {
   c10::DeviceIndex device = -1;
-  C10_CUDA_CHECK(c10::cuda::GetDevice(&device));
+  C10_HIP_CHECK(c10::hip::GetDevice(&device));
   return malloc(nbytes, device, stream);
 }
 
 void CUDAPluggableAllocator::raw_delete(void* ptr) {
-  cudaStream_t stream{};
+  hipStream_t stream{};
   c10::DeviceIndex device_idx = -1;
   size_t size = 0;
   {
@@ -165,7 +165,7 @@ void CUDAPluggableAllocator::setMemoryFraction(
   }
 }
 
-std::vector<c10::cuda::CUDACachingAllocator::StreamSegmentSize>
+std::vector<c10::hip::HIPCachingAllocator::StreamSegmentSize>
 CUDAPluggableAllocator::getExpandableSegmentSizes(c10::DeviceIndex device) {
   TORCH_CHECK(
       false,
@@ -173,7 +173,7 @@ CUDAPluggableAllocator::getExpandableSegmentSizes(c10::DeviceIndex device) {
 }
 
 void CUDAPluggableAllocator::emptyCache(
-    /*unused*/ c10::cuda::MempoolId_t mempool_id) {
+    /*unused*/ c10::hip::MempoolId_t mempool_id) {
   if (reset_fn_) {
     return reset_fn_();
   }
@@ -226,15 +226,15 @@ void CUDAPluggableAllocator::resetPeakStats(c10::DeviceIndex device) {
       "If you need it, please file an issue describing your use case.");
 }
 
-c10::cuda::CUDACachingAllocator::SnapshotInfo CUDAPluggableAllocator::snapshot(
-    c10::cuda::MempoolId_t mempool_id) {
+c10::hip::HIPCachingAllocator::SnapshotInfo CUDAPluggableAllocator::snapshot(
+    c10::hip::MempoolId_t mempool_id) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support snapshot. "
       "If you need it, please file an issue describing your use case.");
 }
 
-c10::cuda::CUDACachingAllocator::ShareableHandle CUDAPluggableAllocator::
+c10::hip::HIPCachingAllocator::ShareableHandle CUDAPluggableAllocator::
     shareIpcHandle(void* ptr) {
   TORCH_CHECK(
       false,
@@ -252,8 +252,8 @@ std::shared_ptr<void> CUDAPluggableAllocator::getIpcDevPtr(std::string handle) {
 // CUDAGraph interactions
 void CUDAPluggableAllocator::beginAllocateToPool(
     c10::DeviceIndex device,
-    c10::cuda::MempoolId_t mempool_id,
-    std::function<bool(cudaStream_t)> filter) {
+    c10::hip::MempoolId_t mempool_id,
+    std::function<bool(hipStream_t)> filter) {
   if (begin_allocate_to_pool_fn_) {
     begin_allocate_to_pool_fn_(device, mempool_id, std::move(filter));
   }
@@ -261,7 +261,7 @@ void CUDAPluggableAllocator::beginAllocateToPool(
 
 void CUDAPluggableAllocator::endAllocateToPool(
     c10::DeviceIndex device,
-    c10::cuda::MempoolId_t mempool_id) {
+    c10::hip::MempoolId_t mempool_id) {
   if (end_allocate_to_pool_fn_) {
     end_allocate_to_pool_fn_(device, mempool_id);
   }
@@ -269,7 +269,7 @@ void CUDAPluggableAllocator::endAllocateToPool(
 
 void CUDAPluggableAllocator::releasePool(
     c10::DeviceIndex device,
-    c10::cuda::MempoolId_t mempool_id) {
+    c10::hip::MempoolId_t mempool_id) {
   if (relase_pool_fn_) {
     relase_pool_fn_(device, mempool_id);
   }
@@ -277,9 +277,9 @@ void CUDAPluggableAllocator::releasePool(
 
 void CUDAPluggableAllocator::recordHistory(
     bool enabled,
-    c10::cuda::CUDACachingAllocator::CreateContextFn context_recorder,
+    c10::hip::HIPCachingAllocator::CreateContextFn context_recorder,
     size_t alloc_trace_max_entries,
-    c10::cuda::CUDACachingAllocator::RecordContext when,
+    c10::hip::HIPCachingAllocator::RecordContext when,
     bool clearHistory) {
   TORCH_CHECK(
       false,
@@ -288,7 +288,7 @@ void CUDAPluggableAllocator::recordHistory(
 }
 
 void CUDAPluggableAllocator::attachOutOfMemoryObserver(
-    c10::cuda::CUDACachingAllocator::OutOfMemoryObserver observer) {
+    c10::hip::HIPCachingAllocator::OutOfMemoryObserver observer) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support attachOutOfMemoryObserver. "
@@ -296,14 +296,14 @@ void CUDAPluggableAllocator::attachOutOfMemoryObserver(
 }
 
 void CUDAPluggableAllocator::attachAllocatorTraceTracker(
-    c10::cuda::CUDACachingAllocator::AllocatorTraceTracker tracker) {
+    c10::hip::HIPCachingAllocator::AllocatorTraceTracker tracker) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not support attachAllocatorTraceTracker. "
       "attachAllocatorTraceTracker is only used inside Pytorch.");
 }
 
-std::shared_ptr<c10::cuda::CUDACachingAllocator::AllocatorState>
+std::shared_ptr<c10::hip::HIPCachingAllocator::AllocatorState>
 CUDAPluggableAllocator::getCheckpointState(
     c10::DeviceIndex device,
     at::cuda::MempoolId_t id) {
@@ -313,10 +313,10 @@ CUDAPluggableAllocator::getCheckpointState(
       "If you need it, please file an issue describing your use case.");
 }
 
-c10::cuda::CUDACachingAllocator::CheckpointDelta CUDAPluggableAllocator::
+c10::hip::HIPCachingAllocator::CheckpointDelta CUDAPluggableAllocator::
     setCheckpointPoolState(
         c10::DeviceIndex device,
-        std::shared_ptr<c10::cuda::CUDACachingAllocator::AllocatorState> pps) {
+        std::shared_ptr<c10::hip::HIPCachingAllocator::AllocatorState> pps) {
   TORCH_CHECK(
       false,
       "CUDAPluggableAllocator does not yet support setCheckpointPoolState. "
@@ -326,25 +326,25 @@ c10::cuda::CUDACachingAllocator::CheckpointDelta CUDAPluggableAllocator::
 void CUDAPluggableAllocator::enablePeerAccess(
     c10::DeviceIndex dev,
     c10::DeviceIndex dev_to_access) {
-  c10::cuda::CUDAGuard device_guard(dev);
-  cudaError_t err = cudaDeviceEnablePeerAccess(dev_to_access, 0);
-  if (err == cudaErrorPeerAccessAlreadyEnabled) {
+  c10::hip::HIPGuardMasqueradingAsCUDA device_guard(dev);
+  hipError_t err = hipDeviceEnablePeerAccess(dev_to_access, 0);
+  if (err == hipErrorPeerAccessAlreadyEnabled) {
     // ignore and clear the error if access was already enabled
-    (void)cudaGetLastError();
+    (void)hipGetLastError();
   } else {
-    C10_CUDA_CHECK(err);
+    C10_HIP_CHECK(err);
   }
 }
 
-cudaError_t CUDAPluggableAllocator::memcpyAsync(
+hipError_t CUDAPluggableAllocator::memcpyAsync(
     void* dst,
     int dstDevice,
     const void* src,
     int srcDevice,
     size_t count,
-    cudaStream_t stream,
+    hipStream_t stream,
     bool p2p_enabled) {
-  return cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream);
+  return hipMemcpyAsync(dst, src, count, hipMemcpyDeviceToDevice, stream);
 }
 
 std::string CUDAPluggableAllocator::name() {
@@ -355,23 +355,23 @@ void CUDAPluggableAllocator::copy_data(
     void* dest,
     const void* src,
     std::size_t count) const {
-  C10_CUDA_CHECK(
-      cudaMemcpy(dest, src, count, cudaMemcpyKind::cudaMemcpyDeviceToDevice));
+  C10_HIP_CHECK(
+      hipMemcpy(dest, src, count, hipMemcpyKind::hipMemcpyDeviceToDevice));
 }
 
-std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+std::shared_ptr<c10::hip::HIPCachingAllocator::HIPAllocator>
     current_custom_allocator;
 
-std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+std::shared_ptr<c10::hip::HIPCachingAllocator::HIPAllocator>
 getCurrentAllocator() {
   return current_custom_allocator;
 }
 
 // TODO: add more functions in the argument
-std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+std::shared_ptr<c10::hip::HIPCachingAllocator::HIPAllocator>
 createCustomAllocator(
-    std::function<void*(size_t, int, cudaStream_t)> alloc_fn,
-    std::function<void(void*, size_t, int, cudaStream_t)> free_fn) {
+    std::function<void*(size_t, int, hipStream_t)> alloc_fn,
+    std::function<void(void*, size_t, int, hipStream_t)> free_fn) {
   std::shared_ptr<CUDAPluggableAllocator> allocator(
       new CUDAPluggableAllocator(std::move(alloc_fn), std::move(free_fn)));
   allocator->init(device_count);
@@ -379,12 +379,12 @@ createCustomAllocator(
 }
 
 void changeCurrentAllocator(
-    const std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>&
+    const std::shared_ptr<c10::hip::HIPCachingAllocator::HIPAllocator>&
         allocator) {
   TORCH_CHECK(
-      !c10::cuda::CUDACachingAllocator::allocator.load()->initialized(),
+      !c10::hip::HIPCachingAllocator::allocator.load()->initialized(),
       "Can't swap an already initialized allocator");
-  c10::cuda::CUDACachingAllocator::allocator.store(allocator.get());
+  c10::hip::HIPCachingAllocator::allocator.store(allocator.get());
   current_custom_allocator = allocator;
 }
 

@@ -4,9 +4,9 @@
 #include <torch/csrc/utils/pybind.h>
 
 #if defined(USE_CUFILE)
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <cufile.h>
 
 namespace {
@@ -30,7 +30,7 @@ std::string cuGDSFileGetErrorString(T status) {
   std::string errStr = cuGDSFileGetErrorString(static_cast<int>(status.err));
   if (IS_CUDA_ERR(status))
     errStr.append(".").append(
-        cudaGetErrorString(static_cast<cudaError_t>(status.cu_err)));
+        hipGetErrorString(static_cast<hipError_t>(status.cu_err)));
   return errStr;
 }
 } // namespace
@@ -41,7 +41,7 @@ void gds_load_storage(
     off_t offset) {
   // NOLINTNEXTLINE(performance-no-int-to-ptr)
   CUfileHandle_t cf_handle = reinterpret_cast<CUfileHandle_t>(handle);
-  c10::cuda::CUDAGuard gpuGuard(storage.device());
+  c10::hip::HIPGuardMasqueradingAsCUDA gpuGuard(storage.device());
 
   void* dataPtr = storage.mutable_data();
   const size_t nbytes = storage.nbytes();
@@ -57,7 +57,7 @@ void gds_save_storage(
     off_t offset) {
   // NOLINTNEXTLINE(performance-no-int-to-ptr)
   CUfileHandle_t cf_handle = reinterpret_cast<CUfileHandle_t>(handle);
-  c10::cuda::CUDAGuard gpuGuard(storage.device());
+  c10::hip::HIPGuardMasqueradingAsCUDA gpuGuard(storage.device());
 
   void* dataPtr = storage.mutable_data();
   const size_t nbytes = storage.nbytes();

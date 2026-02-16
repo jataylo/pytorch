@@ -1,14 +1,14 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #include <torch/csrc/utils/pybind.h>
 #if !defined(USE_ROCM)
-#include <cuda_profiler_api.h>
+#include <hip/hip_runtime_api.h>
 #else
 #include <hip/hip_runtime_api.h>
 #endif
 
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <c10/hip/HIPException.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 namespace torch::cuda::shared {
 
@@ -28,23 +28,23 @@ void initCudartBindings(PyObject* module) {
   // By splitting the names of these objects into two literals we prevent the
   // HIP rewrite rules from changing these names when building with HIP.
 
-  py::enum_<cudaError_t>(
+  py::enum_<hipError_t>(
       cudart,
       "cuda"
       "Error")
-      .value("success", cudaSuccess);
+      .value("success", hipSuccess);
 
   cudart.def(
       "cuda"
       "GetErrorString",
-      cudaGetErrorString);
+      hipGetErrorString);
   cudart.def(
       "cuda"
       "ProfilerStart",
 #ifdef USE_ROCM
       hipReturnSuccess
 #else
-      cudaProfilerStart
+      hipProfilerStart
 #endif
   );
   cudart.def(
@@ -53,51 +53,51 @@ void initCudartBindings(PyObject* module) {
 #ifdef USE_ROCM
       hipReturnSuccess
 #else
-      cudaProfilerStop
+      hipProfilerStop
 #endif
   );
   cudart.def(
       "cuda"
       "HostRegister",
-      [](uintptr_t ptr, size_t size, unsigned int flags) -> cudaError_t {
+      [](uintptr_t ptr, size_t size, unsigned int flags) -> hipError_t {
         py::gil_scoped_release no_gil;
-        return C10_CUDA_ERROR_HANDLED(
+        return C10_HIP_ERROR_HANDLED(
             // NOLINTNEXTLINE(performance-no-int-to-ptr)
-            cudaHostRegister((void*)ptr, size, flags));
+            hipHostRegister((void*)ptr, size, flags));
       });
   cudart.def(
       "cuda"
       "HostUnregister",
-      [](uintptr_t ptr) -> cudaError_t {
+      [](uintptr_t ptr) -> hipError_t {
         py::gil_scoped_release no_gil;
         // NOLINTNEXTLINE(performance-no-int-to-ptr)
-        return C10_CUDA_ERROR_HANDLED(cudaHostUnregister((void*)ptr));
+        return C10_HIP_ERROR_HANDLED(hipHostUnregister((void*)ptr));
       });
   cudart.def(
       "cuda"
       "StreamCreate",
-      [](uintptr_t ptr) -> cudaError_t {
+      [](uintptr_t ptr) -> hipError_t {
         py::gil_scoped_release no_gil;
         // NOLINTNEXTLINE(performance-no-int-to-ptr)
-        return C10_CUDA_ERROR_HANDLED(cudaStreamCreate((cudaStream_t*)ptr));
+        return C10_HIP_ERROR_HANDLED(hipStreamCreate((hipStream_t*)ptr));
       });
   cudart.def(
       "cuda"
       "StreamDestroy",
-      [](uintptr_t ptr) -> cudaError_t {
+      [](uintptr_t ptr) -> hipError_t {
         py::gil_scoped_release no_gil;
         // NOLINTNEXTLINE(performance-no-int-to-ptr)
-        return C10_CUDA_ERROR_HANDLED(cudaStreamDestroy((cudaStream_t)ptr));
+        return C10_HIP_ERROR_HANDLED(hipStreamDestroy((hipStream_t)ptr));
       });
   cudart.def(
       "cuda"
       "MemGetInfo",
       [](c10::DeviceIndex device) -> std::pair<size_t, size_t> {
-        c10::cuda::CUDAGuard guard(device);
+        c10::hip::HIPGuardMasqueradingAsCUDA guard(device);
         size_t device_free = 0;
         size_t device_total = 0;
         py::gil_scoped_release no_gil;
-        C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
+        C10_HIP_CHECK(hipMemGetInfo(&device_free, &device_total));
         return {device_free, device_total};
       });
 }

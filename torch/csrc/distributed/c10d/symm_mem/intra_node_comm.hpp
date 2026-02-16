@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
@@ -57,11 +57,11 @@ class TORCH_API IntraNodeComm : public c10::intrusive_ptr_target {
  private:
   at::Tensor oneShotAllReduce(
       const at::Tensor& input,
-      at::cuda::CUDAStream& stream);
+      at::hip::HIPStreamMasqueradingAsCUDA& stream);
 
   at::Tensor twoShotAllReduce(
       const at::Tensor& input,
-      at::cuda::CUDAStream& stream);
+      at::hip::HIPStreamMasqueradingAsCUDA& stream);
 
   c10::intrusive_ptr<Store> store_;
   size_t rank_;

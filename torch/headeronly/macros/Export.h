@@ -100,10 +100,10 @@
 #define TORCH_API C10_IMPORT
 #endif
 
-// You may be wondering why we have TORCH_CUDA_CPP_API and TORCH_CUDA_CU_API
+// You may be wondering why we have TORCH_HIP_CPP_API and TORCH_HIP_API
 // belonging to the same library instead of just one TORCH_CUDA_API. Well, it
-// can indeed just be one TORCH_CUDA_API (and used to be)! TORCH_CUDA_CPP_API
-// and TORCH_CUDA_CU_API are artifacts of when we needed a split build to
+// can indeed just be one TORCH_CUDA_API (and used to be)! TORCH_HIP_CPP_API
+// and TORCH_HIP_API are artifacts of when we needed a split build to
 // avoid relocation marker linking errors. The context is as follows:
 //
 // Once upon a time, there _was_ only TORCH_CUDA_API. All was happy until we
@@ -123,11 +123,11 @@
 // libtorch_cuda.so (where torch_cuda_cu and torch_cuda_cpp are a part of the
 // same api)
 #ifdef TORCH_CUDA_BUILD_MAIN_LIB
-#define TORCH_CUDA_CPP_API C10_EXPORT
-#define TORCH_CUDA_CU_API C10_EXPORT
+#define TORCH_HIP_CPP_API C10_EXPORT
+#define TORCH_HIP_API C10_EXPORT
 #else
-#define TORCH_CUDA_CPP_API C10_IMPORT
-#define TORCH_CUDA_CU_API C10_IMPORT
+#define TORCH_HIP_CPP_API C10_IMPORT
+#define TORCH_HIP_API C10_IMPORT
 #endif
 
 #if defined(TORCH_HIP_BUILD_MAIN_LIB)
@@ -145,7 +145,7 @@
 #endif
 
 // Enums only need to be exported on windows for non-CUDA files
-#if defined(_WIN32) && defined(__CUDACC__)
+#if defined(_WIN32) && defined(__HIPCC__)
 #define C10_API_ENUM C10_API
 #else
 #define C10_API_ENUM

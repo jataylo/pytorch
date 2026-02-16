@@ -1,8 +1,9 @@
+#include "hip/hip_runtime.h"
 #ifdef USE_C10D_NCCL
 
 #include <ATen/Dispatch.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/torch.h>
 #include <algorithm>
 #include <torch/csrc/distributed/c10d/NanCheck.hpp>
@@ -223,7 +224,7 @@ __global__ void checkForNaN(T* data, size_t size) {
 }
 
 // CHECK if a Tensor contains NAN in any of its element
-void checkForNan(const at::Tensor& tensor, at::cuda::CUDAStream& stream) {
+void checkForNan(const at::Tensor& tensor, at::hip::HIPStreamMasqueradingAsCUDA& stream) {
   // skip check for non float types
   if (!torch::is_floating_point(tensor)) {
     return;
@@ -251,7 +252,7 @@ void checkForNan(const at::Tensor& tensor, at::cuda::CUDAStream& stream) {
       [&] {
         checkForNaN<scalar_t><<<numBlocks, numThreadsPerBlock, 0, stream>>>(
             tensor.data_ptr<scalar_t>(), tensor.numel());
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        C10_HIP_KERNEL_LAUNCH_CHECK();
       });
 }
 

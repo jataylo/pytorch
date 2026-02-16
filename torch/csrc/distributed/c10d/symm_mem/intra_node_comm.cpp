@@ -158,7 +158,7 @@ bool IntraNodeComm::rendezvous() {
   }
 
   // NOLINTNEXTLINE(bugprone-signed-char-misuse)
-  deviceIdx_ = at::cuda::current_device();
+  deviceIdx_ = at::hip::current_device();
 
   // Exchange hostname and device bus ID
   struct DevInfo {

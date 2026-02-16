@@ -1,7 +1,8 @@
+#include "hip/hip_runtime.h"
 #include <ATen/ATen.h>
 #include <ATen/ceil_div.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/library.h>
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
@@ -70,7 +71,7 @@ namespace {
 using namespace c10d::symmetric_memory;
 
 size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
-  const size_t min_alignment = std::max(4l, input.element_size());
+  const size_t min_alignment = ::max(4l, input.element_size());
   // Only check the offset since the multicast address is always at least
   // 128-bit aligned
   const size_t ptr_alignment = at::native::memory::get_alignment(
@@ -94,7 +95,7 @@ size_t get_and_verify_alignment(const at::Tensor& input, const char* op_name) {
       ">: input size must be at least ",
       min_alignment,
       "-byte aligned.");
-  return std::min(ptr_alignment, size_alignment);
+  return ::min(ptr_alignment, size_alignment);
 }
 
 void init_elementwise_launch_config(
@@ -120,7 +121,7 @@ void init_elementwise_launch_config(
     num_threads = max(num_threads, world_size);
     num_threads = at::round_up(num_threads, at::cuda::warp_size());
   } else {
-    num_blocks = std::min(
+    num_blocks = ::min(
         at::ceil_div(numel_per_split, max_num_threads * numel_per_thread),
         max_num_blocks);
     num_threads = max_num_threads;
@@ -199,7 +200,7 @@ at::Tensor multimem_all_reduce_(
               <<<num_blocks,
                  num_threads,
                  0,
-                 at::cuda::getCurrentCUDAStream()>>>(
+                 at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                   reinterpret_cast<scalar_t*>(symm_mem->get_multicast_ptr()) +
                       input.storage_offset(),
                   input.numel(),
@@ -207,7 +208,7 @@ at::Tensor multimem_all_reduce_(
                       symm_mem->get_signal_pad_ptrs_dev()),
                   symm_mem->get_rank(),
                   symm_mem->get_world_size());
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
+          C10_HIP_KERNEL_LAUNCH_CHECK();
         });
       });
   return input;
@@ -299,7 +300,7 @@ at::Tensor multimem_one_shot_reduce_out(
               <<<num_blocks,
                  num_threads,
                  0,
-                 at::cuda::getCurrentCUDAStream()>>>(
+                 at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                   reinterpret_cast<scalar_t*>(symm_mem->get_multicast_ptr()) +
                       input.storage_offset(),
                   out.data_ptr<scalar_t>(),
@@ -309,7 +310,7 @@ at::Tensor multimem_one_shot_reduce_out(
                   rank,
                   world_size,
                   root);
-          C10_CUDA_KERNEL_LAUNCH_CHECK();
+          C10_HIP_KERNEL_LAUNCH_CHECK();
         });
       });
   return out;
@@ -413,7 +414,7 @@ at::Tensor multimem_all_gather_out(
 
   DISPATCH_ALIGNMENTS_16_8_4(alignment, [&]() {
     multimem_all_gather_kernel<k_alignment>
-        <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        <<<num_blocks, num_threads, 0, at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
             static_cast<char*>(input.data_ptr()),
             reinterpret_cast<char*>(symm_mem->get_multicast_ptr()) +
                 out.storage_offset() * out.element_size(),
@@ -421,7 +422,7 @@ at::Tensor multimem_all_gather_out(
             reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev()),
             symm_mem->get_rank(),
             symm_mem->get_world_size());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
   });
   return out;
 }
@@ -535,7 +536,7 @@ at::Tensor one_shot_all_reduce_out_impl(
                 <<<num_blocks,
                    num_threads,
                    0,
-                   at::cuda::getCurrentCUDAStream()>>>(
+                   at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                     reinterpret_cast<scalar_t**>(
                         symm_mem->get_buffer_ptrs_dev()),
                     out.data_ptr<scalar_t>(),
@@ -547,7 +548,7 @@ at::Tensor one_shot_all_reduce_out_impl(
                         symm_mem->get_signal_pad_ptrs_dev()),
                     symm_mem->get_rank(),
                     symm_mem->get_world_size());
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            C10_HIP_KERNEL_LAUNCH_CHECK();
           });
         });
       });
@@ -795,7 +796,7 @@ at::Tensor two_shot_all_reduce_impl(
                   <<<num_blocks,
                      num_threads,
                      0,
-                     at::cuda::getCurrentCUDAStream()>>>(
+                     at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       input.storage_offset(),
@@ -804,7 +805,7 @@ at::Tensor two_shot_all_reduce_impl(
                           symm_mem->get_signal_pad_ptrs_dev()),
                       symm_mem->get_rank(),
                       symm_mem->get_world_size());
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              C10_HIP_KERNEL_LAUNCH_CHECK();
             });
           });
         });
@@ -818,7 +819,7 @@ at::Tensor two_shot_all_reduce_impl(
                   <<<num_blocks,
                      num_threads,
                      0,
-                     at::cuda::getCurrentCUDAStream()>>>(
+                     at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output->data_ptr<scalar_t>(),
@@ -828,7 +829,7 @@ at::Tensor two_shot_all_reduce_impl(
                           symm_mem->get_signal_pad_ptrs_dev()),
                       symm_mem->get_rank(),
                       symm_mem->get_world_size());
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              C10_HIP_KERNEL_LAUNCH_CHECK();
             });
           });
         });
@@ -944,7 +945,7 @@ at::Tensor reduce_scatter_out(
                   <<<num_blocks,
                      num_threads,
                      0,
-                     at::cuda::getCurrentCUDAStream()>>>(
+                     at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output.data_ptr<scalar_t>(),
@@ -955,7 +956,7 @@ at::Tensor reduce_scatter_out(
                       symm_mem->get_rank(),
                       symm_mem->get_world_size(),
                       input.size(-1));
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              C10_HIP_KERNEL_LAUNCH_CHECK();
             });
           });
         });
@@ -973,7 +974,7 @@ at::Tensor reduce_scatter_out(
                   <<<num_blocks,
                      num_threads,
                      0,
-                     at::cuda::getCurrentCUDAStream()>>>(
+                     at::hip::getCurrentHIPStreamMasqueradingAsCUDA()>>>(
                       reinterpret_cast<scalar_t**>(
                           symm_mem->get_buffer_ptrs_dev()),
                       output.data_ptr<scalar_t>(),
@@ -984,7 +985,7 @@ at::Tensor reduce_scatter_out(
                       symm_mem->get_rank(),
                       symm_mem->get_world_size(),
                       input.size(-1));
-              C10_CUDA_KERNEL_LAUNCH_CHECK();
+              C10_HIP_KERNEL_LAUNCH_CHECK();
             });
           });
         });
@@ -1141,20 +1142,20 @@ at::Tensor memset32_(
       ")");
 
   auto addr = reinterpret_cast<uint32_t*>(input.data_ptr()) + offset;
-  c10::cuda::CUDAGuard guard(input.device());
+  c10::hip::HIPGuardMasqueradingAsCUDA guard(input.device());
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
-  auto driver_api = c10::cuda::DriverAPI::get();
+  auto driver_api = c10::hip::DriverAPI::get();
   C10_CUDA_DRIVER_CHECK(driver_api->cuMemsetD32Async_(
-      reinterpret_cast<CUdeviceptr>(addr),
+      reinterpret_cast<hipDeviceptr_t>(addr),
       val,
       count,
-      at::cuda::getCurrentCUDAStream()));
+      at::hip::getCurrentHIPStreamMasqueradingAsCUDA()));
 #elif defined(USE_ROCM)
   C10_HIP_CHECK(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(addr),
                                    val,
                                    count,
-                                   at::cuda::getCurrentCUDAStream()));
+                                   at::hip::getCurrentHIPStreamMasqueradingAsCUDA()));
 #else
   TORCH_CHECK(
       false, "CUDASymmetricMemory requires PYTORCH_C10_DRIVER_API_SUPPORTED");
@@ -1194,22 +1195,22 @@ at::Tensor stream_write_value32_(
       ")");
 
   auto addr = reinterpret_cast<uint32_t*>(input.data_ptr()) + offset;
-  c10::cuda::CUDAGuard guard(input.device());
+  c10::hip::HIPGuardMasqueradingAsCUDA guard(input.device());
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
-  auto driver_api = c10::cuda::DriverAPI::get();
-  // According to the documentation of CUstreamWriteValue_flags,
-  // cuStreamWriteValue32 will provide a memory fence before the write, which
+  auto driver_api = c10::hip::DriverAPI::get();
+  // According to the documentation of hipStreamWriteValueFlags,
+  // hipStreamWriteValue32 will provide a memory fence before the write, which
   // has similar semantics to __threadfence_system() but is scoped to the
   // stream rather than a CUDA thread.
   C10_CUDA_DRIVER_CHECK(driver_api->cuStreamWriteValue32_(
-      at::cuda::getCurrentCUDAStream(),
-      reinterpret_cast<CUdeviceptr>(addr),
+      at::hip::getCurrentHIPStreamMasqueradingAsCUDA(),
+      reinterpret_cast<hipDeviceptr_t>(addr),
       val,
       0));
 #elif defined(USE_ROCM)
   C10_HIP_CHECK(hipStreamWriteValue32(
-                                      at::cuda::getCurrentCUDAStream(),
+                                      at::hip::getCurrentHIPStreamMasqueradingAsCUDA(),
                                       reinterpret_cast<void*>(addr),
                                       val,
                                       0));

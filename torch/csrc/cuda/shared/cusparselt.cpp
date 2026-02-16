@@ -1,7 +1,7 @@
 #include <torch/csrc/utils/pybind.h>
 
 #ifdef USE_CUSPARSELT
-#include <ATen/native/sparse/cuda/cuSPARSELtOps.h>
+#include <ATen/native/sparse/hip/cuSPARSELtOps.h>
 
 namespace {
 

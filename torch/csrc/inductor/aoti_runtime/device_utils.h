@@ -5,20 +5,20 @@
 // C ABI defined in torch/csrc/inductor/aoti_torch/c/shim.h. The same rule
 // applies to other files under torch/csrc/inductor/aoti_runtime/.
 
-#ifdef USE_CUDA
+#ifdef USE_ROCM
 
 // FIXME: Currently, CPU and CUDA backend are mutually exclusive.
 // This is a temporary workaround. We need a better way to support
 // multi devices.
 
-#include <cuda.h>
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
 #define AOTI_RUNTIME_CUDA_CHECK(EXPR)                      \
   do {                                                     \
-    const cudaError_t code = EXPR;                         \
-    const char* msg = cudaGetErrorString(code);            \
-    if (code != cudaSuccess) {                             \
+    const hipError_t code = EXPR;                         \
+    const char* msg = hipGetErrorString(code);            \
+    if (code != hipSuccess) {                             \
       throw std::runtime_error(                            \
           std::string("CUDA error: ") + std::string(msg)); \
     }                                                      \
@@ -26,7 +26,7 @@
 
 namespace torch::aot_inductor {
 
-using DeviceStreamType = cudaStream_t;
+using DeviceStreamType = hipStream_t;
 
 } // namespace torch::aot_inductor
 
@@ -64,4 +64,4 @@ using DeviceStreamType = void*;
 
 } // namespace torch::aot_inductor
 
-#endif // USE_CUDA
+#endif // USE_ROCM

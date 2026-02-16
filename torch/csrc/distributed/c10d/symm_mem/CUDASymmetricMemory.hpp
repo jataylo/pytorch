@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <c10/cuda/CUDAAllocatorConfig.h>
+#include <c10/hip/HIPAllocatorConfig.h>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryTypes.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
@@ -144,8 +144,8 @@ class CUDASymmetricMemoryAllocator : public SymmetricMemoryAllocator {
 
   std::shared_mutex mutex_;
   std::unordered_map<void*, c10::intrusive_ptr<Block>> ptr_to_block_;
-  c10::cuda::CUDACachingAllocator::Expandable_Segments_Handle_Type
-      handle_type_ = c10::cuda::CUDACachingAllocator::
+  c10::hip::HIPCachingAllocator::Expandable_Segments_Handle_Type
+      handle_type_ = c10::hip::HIPCachingAllocator::
           Expandable_Segments_Handle_Type::UNSPECIFIED;
 };
 

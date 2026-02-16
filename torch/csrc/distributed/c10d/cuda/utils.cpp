@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 
 #include <torch/csrc/distributed/c10d/cuda/utils.hpp>
 
@@ -21,7 +21,7 @@ bool deviceSupportsMulticast(int device_idx) {
   // cuMulticastCreate_.
   // - Device support: Determined by querying
   // CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED at runtime.
-  auto driver_api = c10::cuda::DriverAPI::get();
+  auto driver_api = c10::hip::DriverAPI::get();
   int multicast_supported = 0;
   C10_CUDA_DRIVER_CHECK(driver_api->cuDeviceGetAttribute_(
       &multicast_supported,

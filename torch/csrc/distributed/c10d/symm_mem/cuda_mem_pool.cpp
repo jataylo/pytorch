@@ -21,7 +21,7 @@ void cuda_symm_free(void* ptr, size_t size, int device, void* stream) {
 // Register allocator for CUDA MemPool
 struct RegisterCUDAMemPoolAllocator {
   RegisterCUDAMemPoolAllocator() {
-    std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator> allocator =
+    std::shared_ptr<c10::hip::HIPCachingAllocator::HIPAllocator> allocator =
         torch::cuda::CUDAPluggableAllocator::createCustomAllocator(
             cuda_symm_alloc, cuda_symm_free);
     register_mempool_allocator(c10::DeviceType::CUDA, allocator);

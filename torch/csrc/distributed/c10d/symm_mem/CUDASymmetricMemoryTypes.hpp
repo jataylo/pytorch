@@ -21,7 +21,7 @@ constexpr size_t default_signal_pad_size =
     symm_max_nblocks * max_cuda_p2p_domain_size * sizeof(uint32_t);
 
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
-using HandleType = CUmemGenericAllocationHandle;
+using HandleType = hipMemGenericAllocationHandle_t;
 #elif defined(USE_ROCM)
 using HandleType = hipMemGenericAllocationHandle_t;
 #else

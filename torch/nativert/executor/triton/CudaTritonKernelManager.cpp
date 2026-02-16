@@ -1,9 +1,9 @@
 #include <torch/nativert/executor/triton/TritonKernelManager.h>
 
-#include <ATen/cuda/Exceptions.h>
-#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
-#include <c10/cuda/CUDAStream.h>
-#include <cuda_runtime.h>
+#include <ATen/hip/Exceptions.h>
+#include <ATen/hip/nvrtc_stub/ATenNVRTC.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include <hip/hip_runtime.h>
 
 #include <c10/util/FbcodeMaps.h>
 #include <c10/util/Logging.h>
@@ -18,8 +18,8 @@ const at::cuda::NVRTC& get_nvrtc() {
   {                                                     \
     LOG(ERROR) << #fn << " returned error: " << result; \
     const char* errMsg = nullptr;                       \
-    get_nvrtc().cuGetErrorString(result, &errMsg);      \
-    LOG(ERROR) << "cuGetErrorString: " << errMsg;       \
+    get_nvrtc().hipDrvGetErrorString(result, &errMsg);      \
+    LOG(ERROR) << "hipDrvGetErrorString: " << errMsg;       \
   }
 
 namespace torch::nativert {
@@ -45,7 +45,7 @@ class CudaKernelInputs final : public KernelInputs {
 
  private:
   std::vector<void*> arg_ptrs_;
-  CUdeviceptr global_scratch_;
+  hipDeviceptr_t global_scratch_;
 };
 
 class CudaTritonKernelManager final : public TritonKernelManager {
@@ -66,9 +66,9 @@ class CudaTritonKernelManager final : public TritonKernelManager {
   }
 
  private:
-  CUfunction load();
-  c10::FastMap<c10::DeviceIndex, CUfunction> cache_;
-  std::vector<CUmodule> loaded_modules_;
+  hipFunction_t load();
+  c10::FastMap<c10::DeviceIndex, hipFunction_t> cache_;
+  std::vector<hipModule_t> loaded_modules_;
 };
 
 CudaTritonKernelManager::CudaTritonKernelManager(
@@ -83,34 +83,34 @@ CudaTritonKernelManager::CudaTritonKernelManager(
 CudaTritonKernelManager::~CudaTritonKernelManager() {
   const auto& nvrtc = get_nvrtc();
   for (auto& mod : loaded_modules_) {
-    if (CUresult err = nvrtc.cuModuleUnload(mod); err != 0) {
-      CU_LOG_ERROR(nvrtc.cuModuleUnload, err);
+    if (hipError_t err = nvrtc.hipModuleUnload(mod); err != 0) {
+      CU_LOG_ERROR(nvrtc.hipModuleUnload, err);
     }
   }
 }
 
-CUfunction CudaTritonKernelManager::load() {
-  const auto idx = c10::cuda::current_device();
+hipFunction_t CudaTritonKernelManager::load() {
+  const auto idx = c10::hip::current_device();
   if (const auto res = cache_.find(idx); res != cache_.end()) {
     return res->second;
   }
 
   const auto& nvrtc = get_nvrtc();
 
-  CUmodule mod_ptr = nullptr;
+  hipModule_t mod_ptr = nullptr;
 
-  if (CUresult err = nvrtc.cuModuleLoad(&mod_ptr, kernel_bin_path_.c_str());
+  if (hipError_t err = nvrtc.hipModuleLoad(&mod_ptr, kernel_bin_path_.c_str());
       err != 0) {
-    CU_LOG_ERROR(nvrtc.cuModuleLoad, err);
+    CU_LOG_ERROR(nvrtc.hipModuleLoad, err);
     return nullptr;
   }
 
-  CUfunction func = nullptr;
+  hipFunction_t func = nullptr;
 
-  if (CUresult err =
-          nvrtc.cuModuleGetFunction(&func, mod_ptr, kernel_name_.c_str());
+  if (hipError_t err =
+          nvrtc.hipModuleGetFunction(&func, mod_ptr, kernel_name_.c_str());
       err != 0) {
-    CU_LOG_ERROR(nvrtc.cuModuleGetFunction, err);
+    CU_LOG_ERROR(nvrtc.hipModuleGetFunction, err);
     return nullptr;
   }
 
@@ -126,9 +126,9 @@ void CudaTritonKernelManager::launch(
   auto kernel_fn = load();
   TORCH_CHECK(
       kernel_fn != nullptr, "failed to load triton kernel: ", kernel_name_);
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  hipStream_t stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
-  AT_CUDA_DRIVER_CHECK(get_nvrtc().cuLaunchKernel(
+  AT_CUDA_DRIVER_CHECK(get_nvrtc().hipModuleLaunchKernel(
       kernel_fn,
       launch_params.grid_dims.x,
       launch_params.grid_dims.y,

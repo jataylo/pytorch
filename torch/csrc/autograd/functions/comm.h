@@ -5,7 +5,7 @@
 #include <torch/csrc/autograd/variable.h>
 
 #include <ATen/ATen.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 #include <optional>
 
 #include <cstddef>
@@ -13,12 +13,12 @@
 
 namespace torch::autograd {
 
-struct TORCH_CUDA_CU_API Scatter : public Node {
+struct TORCH_HIP_API Scatter : public Node {
   explicit Scatter(
       std::vector<at::Device> devices,
       std::optional<std::vector<int64_t>> chunk_sizes = std::nullopt,
       int64_t dim = 0,
-      std::optional<std::vector<std::optional<at::cuda::CUDAStream>>> streams =
+      std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>> streams =
           std::nullopt,
       bool unsqueeze_scalars = false);
   ~Scatter() override;
@@ -28,11 +28,11 @@ struct TORCH_CUDA_CU_API Scatter : public Node {
   std::vector<at::Device> devices_;
   std::optional<std::vector<int64_t>> chunk_sizes_;
   int64_t dim_;
-  std::optional<std::vector<std::optional<at::cuda::CUDAStream>>> streams_;
+  std::optional<std::vector<std::optional<at::hip::HIPStreamMasqueradingAsCUDA>>> streams_;
   bool unsqueeze_scalars_;
 };
 
-struct TORCH_CUDA_CU_API Gather : public Node {
+struct TORCH_HIP_API Gather : public Node {
   explicit Gather(const at::Device& destination_device, int64_t dim = 0);
   ~Gather() override;
 

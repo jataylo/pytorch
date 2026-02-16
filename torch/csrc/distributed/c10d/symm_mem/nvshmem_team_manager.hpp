@@ -1,8 +1,8 @@
 #pragma once
 
-#include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h>
+#include <c10/hip/HIPException.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/util/Exception.h>
 #include <string>
 #include <unordered_map>
@@ -58,7 +58,7 @@ class TeamManager {
       const std::vector<int>& global_ranks,
       const int need_n) {
     // A device guard is required for malloc and memcpy below
-    c10::cuda::CUDAGuard guard(device_);
+    c10::hip::HIPGuardMasqueradingAsCUDA guard(device_);
     // Get the team pool with the requested number of teams
     auto [team_pool, pool_updated] =
         group_to_team_pool(group_name, global_ranks, need_n);
@@ -69,7 +69,7 @@ class TeamManager {
     if (it == team_pool_devptrs_.end()) {
       // If not, allocate a new pool in device memory
       team_pool_dev = reinterpret_cast<nvshmem_team_t*>(
-          c10::cuda::CUDACachingAllocator::raw_alloc(pool_bytes));
+          c10::hip::HIPCachingAllocatorMasqueradingAsCUDA::raw_alloc(pool_bytes));
       team_pool_devptrs_[group_name] = team_pool_dev;
     } else {
       team_pool_dev = it->second;
@@ -77,12 +77,12 @@ class TeamManager {
     // Update the pool in device memory if host side pool is updated
     if (pool_updated) {
       TORCH_INTERNAL_ASSERT(team_pool.size() == MAX_N_TEAMS);
-      auto stream = at::cuda::getCurrentCUDAStream();
-      C10_CUDA_CHECK(cudaMemcpyAsync(
+      auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+      C10_HIP_CHECK(hipMemcpyAsync(
           team_pool_dev,
           team_pool.data(),
           pool_bytes,
-          cudaMemcpyHostToDevice,
+          hipMemcpyHostToDevice,
           stream));
     }
     return std::make_pair(std::cref(team_pool), team_pool_dev);
@@ -93,14 +93,14 @@ class TeamManager {
     // Note that we do it in a best effort manner because the team pool is
     // managed by a static TeamManager and the destruction order of static
     // objects is undetermined. If the destructor is called after the CUDA
-    // context is destroyed, cudaFree would fail.
+    // context is destroyed, hipFree would fail.
     try {
-      // cudaFree generally implies a device synchronization, meaning it will
+      // hipFree generally implies a device synchronization, meaning it will
       // block until all preceding CUDA operations on the device have completed
       // before freeing the memory. Thus we don't need to worry about freeing
       // the memory before CUDA kernels complete.
       for (auto& [_, team_pool_dev] : team_pool_devptrs_) {
-        c10::cuda::CUDACachingAllocator::raw_delete(team_pool_dev);
+        c10::hip::HIPCachingAllocatorMasqueradingAsCUDA::raw_delete(team_pool_dev);
       }
     } catch (...) {
       // Ignore the error
@@ -120,7 +120,7 @@ class TeamManager {
       const int need_n) {
     TORCH_CHECK(need_n < MAX_N_TEAMS, "Too many teams requested");
     // Guarding the NVSHMEM API calls below just to be safe
-    c10::cuda::CUDAGuard guard(device_);
+    c10::hip::HIPGuardMasqueradingAsCUDA guard(device_);
 
     // Insert a new team pool if not exists
     auto [it, inserted] = group_name_to_team_pool_.emplace(
