@@ -380,7 +380,9 @@ class TestPatternMatcher(TestCase):
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     @parametrize("dtype_left", (torch.float16, torch.float32, torch.bfloat16))
     @parametrize("dtype_right", (torch.int8, torch.uint8))
-    @skipIfRocmArch(NAVI_ARCH, msg="Temporary skip due to regression in triton 3.7 - slow test only on NAVI")
+    @skipIfRocmArch(
+        NAVI_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - slow test only on NAVI
     def test_mixed_mm_exhaustive(self, dtype_left, dtype_right):
         def fn(a, b):
             return torch.mm(a, b.to(a.dtype))
@@ -2083,7 +2085,9 @@ class TestPatternMatcherLogging(LoggingTestCase):
             specific_record.getMessage(),
         )
 
-    @skipIfRocmArch(NAVI_ARCH, msg="Temporary skip due to regression in triton 3.7 - slow test only on NAVI")
+    @skipIfRocmArch(
+        NAVI_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - slow test only on NAVI
     def test_gumbel_max_trick(self):
         counters.clear()
 

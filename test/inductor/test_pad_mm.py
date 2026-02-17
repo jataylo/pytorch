@@ -28,7 +28,9 @@ class PadMMTest(TestCase):
     @inductor_config.patch(
         max_autotune=True, max_autotune_gemm_backends="TRITON", force_shape_pad=True
     )
-    @skipIfRocmArch(NAVI_ARCH, msg="Temporary skip due to regression in triton 3.7 - slow test only on NAVI")
+    @skipIfRocmArch(
+        NAVI_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - slow test only on NAVI
     def test_pad_mm_dyn_m(self):
         M = 40
         K1 = 581
@@ -228,7 +230,9 @@ class PadMMTest(TestCase):
     @inductor_config.patch(
         max_autotune=True, max_autotune_gemm_backends="TRITON", force_shape_pad=True
     )
-    @skipIfRocmArch(NAVI_ARCH, msg="Temporary skip due to regression in triton 3.7 - slow test only on NAVI")
+    @skipIfRocmArch(
+        NAVI_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - slow test only on NAVI
     def test_pad_bmm_dyn_k(self):
         B = 10
         M = 128

@@ -1775,7 +1775,9 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         self.assertEqual(ref, res)
 
     @requires_cuda_and_triton
-    @skipIfRocmArch(MI200_ARCH, msg="Temporary skip due to regression in triton 3.7 - MI200 specific failure")
+    @skipIfRocmArch(
+        MI200_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - MI200 specific failure
     def test_pattern_matcher(self, device):
         # Check that the sdpa op is recomputed in the backward graph
         # tests percolate_tags

@@ -332,7 +332,7 @@ def forward(self, x_1, output_1):
             )
 
     @requires_gpu
-    @skipIfRocm(msg="Temporary skip due to regression in triton 3.7 - codegen def error")
+    @skipIfRocm  # Temporary skip due to regression in triton 3.7 - codegen def error
     def test_triton_kernel_clone_wekdeps(self):
         from functorch import make_fx
         from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
@@ -2731,7 +2731,9 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     @inductor_config.patch("emulate_precision_casts", True)
-    @skipIfRocmArch(NAVI_ARCH, msg="Temporary skip due to regression in triton 3.7 - slow test only on NAVI")
+    @skipIfRocmArch(
+        NAVI_ARCH
+    )  # Temporary skip due to regression in triton 3.7 - slow test only on NAVI
     def test_triton_kernel_emulate_precision_unaffected(self):
         @triton.jit
         def triton_(in_ptr, out_ptr, numel, add_amount, BLOCK_SIZE: tl.constexpr):
