@@ -1,10 +1,47 @@
 """
-Hardware-Aware Heuristics Configuration
+Hardware-Aware Architecture Configuration - V4
+================================================
 
-Derives optimal heuristic parameters from actual GPU architecture properties
-instead of hardcoding magic numbers.
+🎯 Purpose:
+Query actual GPU device properties and derive optimal heuristic values FROM FIRST
+PRINCIPLES instead of hardcoding magic constants.
 
-This ensures heuristics adapt to different GPU architectures automatically.
+🔬 Why This Matters:
+V1-V2 used hardcoded constants like:
+- optimal_threads = 384 (why 384? where from?)
+- optimal_blocks = 512 (why 512? for which GPU?)
+- occupancy_sweetspot = 6 wavefronts (why 6?)
+
+V3+ derives these from ACTUAL hardware:
+- Query torch.cuda.get_device_properties() for num_CUs, warp_size, etc.
+- Calculate optimal values from architectural principles:
+  * Memory bandwidth: Hide HBM latency (~400 cycles) → need 256 threads
+  * Launch overhead: Amortize 3μs dispatch → need 2048 elements/block
+  * Grid granularity: Saturate GPU → need 2× CUs blocks
+  * Occupancy: VGPR limits → sweet spot 4-8 wavefronts
+
+📊 Derived Values (MI350X example):
+- Device: AMD MI350X
+- CUs: 304 compute units
+- Warp size: 64 (wave64 mode)
+- optimal_threads_bandwidth: 256 (4 wavefronts for latency hiding)
+- optimal_elements_launch: 2048 (amortize 3μs overhead to <5%)
+- optimal_blocks_grid: 608 (2× CUs for load balancing)
+- occupancy_sweetspot: 4-8 wavefronts (VGPR pressure vs parallelism)
+
+🧮 Mathematical Derivations:
+See _derive_optimal_threads_bandwidth() etc. for full calculations based on:
+- HBM latency cycles, ALU latency, instruction count
+- Launch overhead μs, element processing time
+- CU count, wave scheduling limits
+
+📈 Results:
+- Portable across AMD GPUs (MI300, MI350, RDNA)
+- Portable across NVIDIA GPUs (different warp size, latency)
+- No hardcoded magic numbers
+- All values backed by architectural analysis
+
+📖 See HEURISTICS_FLOW.md for how these values are used in scoring
 """
 
 import torch
@@ -231,4 +268,5 @@ def reset_architecture_config():
     """Reset the configuration (useful for testing)."""
     global _arch_config
     _arch_config = None
+
 

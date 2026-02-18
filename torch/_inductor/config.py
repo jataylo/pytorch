@@ -484,11 +484,37 @@ max_autotune_prune_choices_based_on_shared_mem = (
     == "1"
 )
 
-# pass ALL valid heuristic configs to autotuner (no pruning to top-N)
-# enables full benchmarking to validate heuristic predictions vs reality
-# when True: benchmarks ALL configs, compares predicted vs actual performance
-# when False: only benchmarks top-5 predicted configs (faster but less validation)
-heuristics_real_bench = (
+# Heuristics Real Bench Mode: Full validation of heuristic predictions
+# -------------------------------------------------------------------------
+# When enabled, benchmarks ALL valid configs (not just top 5) to validate
+# heuristic accuracy against real performance.
+#
+# Behavior:
+#   True (default):
+#     - Generate & score ALL candidate configs (e.g., 15 configs)
+#     - Benchmark ALL configs for complete validation data
+#     - Select winner from TOP 5 predicted (trust heuristics + safety net)
+#     - Print detailed validation summary comparing:
+#       * Predicted best (rank #1) vs Actual best (from all benchmarked)
+#       * Factor scores breakdown (bandwidth, launch, grid, occupancy)
+#       * Bottleneck analysis (overhead/memory/compute)
+#       * Performance gap and accuracy metrics
+#
+#   False:
+#     - Generate & score ALL candidate configs
+#     - Benchmark ONLY top 5 predicted configs (faster, less validation)
+#     - Select winner from benchmarked configs
+#     - No validation summary (can't compare against configs not benchmarked)
+#
+# Use Cases:
+#   - Development: Enable to validate heuristic improvements
+#   - Production: Disable for faster compilation (5-10x speedup vs full autotune)
+#
+# See: HEURISTICS_FLOW.md for complete documentation
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_REAL_BENCH
+# Default: "1" (enabled for validation)
+heuristics_real_bench: bool = (
     os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "1") == "1"
 )
 

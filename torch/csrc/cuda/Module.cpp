@@ -1116,6 +1116,73 @@ static void registerCudaDeviceProperties(PyObject* module) {
       .def_readonly("pci_device_id", &hipDeviceProp_t::pciDeviceID)
       .def_readonly("pci_domain_id", &hipDeviceProp_t::pciDomainID)
       .def_readonly("L2_cache_size", &hipDeviceProp_t::l2CacheSize)
+      // Computed properties for performance modeling
+      .def_property_readonly(
+          "memory_bandwidth_gb_s",
+          [](const hipDeviceProp_t& prop) {
+            // Calculate memory bandwidth from memory clock rate and bus width
+            // Bandwidth (GB/s) = (memory_clock_khz * memory_bus_width_bits / 8) * 2 (DDR) / 1e6
+#if USE_ROCM
+            // ROCm: Calculate from device attributes
+            int mem_clk_khz = 0;
+            int bus_width = 0;
+            if (hipDeviceGetAttribute(&mem_clk_khz, hipDeviceAttributeMemoryClockRate,
+                                     c10::hip::current_device()) == hipSuccess &&
+                hipDeviceGetAttribute(&bus_width, hipDeviceAttributeMemoryBusWidth,
+                                     c10::hip::current_device()) == hipSuccess) {
+              double bandwidth_gb_s = (static_cast<double>(mem_clk_khz) *
+                                      static_cast<double>(bus_width) / 8.0) *
+                                      2.0 / 1e6;
+              return bandwidth_gb_s;
+            }
+            return 0.0;  // Fallback if attributes not available
+#else
+            // NVIDIA: Calculate from prop fields
+            if (prop.memoryClockRate > 0 && prop.memoryBusWidth > 0) {
+              double bandwidth_gb_s = (static_cast<double>(prop.memoryClockRate) *
+                                      static_cast<double>(prop.memoryBusWidth) / 8.0) *
+                                      2.0 / 1e6;
+              return bandwidth_gb_s;
+            }
+            return 0.0;
+#endif
+          })
+      .def_property_readonly(
+          "compute_throughput_tflops",
+          [](const hipDeviceProp_t& prop) {
+            // Estimate peak compute throughput for FP32
+            // Formula: (num_CUs * clock_rate_mhz * ops_per_clock) / 1e6
+#if USE_ROCM
+            // AMD: 64 lanes * 2 (FMA) ops per CU
+            int clock_rate_khz = 0;
+            if (hipDeviceGetAttribute(&clock_rate_khz, hipDeviceAttributeClockRate,
+                                     c10::hip::current_device()) == hipSuccess) {
+              int num_cus = prop.multiProcessorCount;
+              double ops_per_cu_per_clock = 64.0 * 2.0;  // 128 FP32 ops/clock
+              double clock_rate_mhz = clock_rate_khz / 1000.0;
+              double tflops = (num_cus * ops_per_cu_per_clock * clock_rate_mhz) / 1e6;
+              return tflops;
+            }
+            return 0.0;
+#else
+            // NVIDIA: Estimate based on architecture
+            int clock_rate_khz = 0;
+            if (hipDeviceGetAttribute(&clock_rate_khz, hipDeviceAttributeClockRate,
+                                     c10::hip::current_device()) == hipSuccess) {
+              int num_sms = prop.multiProcessorCount;
+              double clock_rate_mhz = clock_rate_khz / 1000.0;
+              // Estimate CUDA cores per SM based on compute capability
+              int cuda_cores_per_sm = 128;  // Default
+              if (prop.major == 7) cuda_cores_per_sm = 64;   // Volta/Turing
+              else if (prop.major == 8) cuda_cores_per_sm = 64;   // Ampere
+              else if (prop.major == 9) cuda_cores_per_sm = 128;  // Hopper
+              double ops_per_sm_per_clock = cuda_cores_per_sm * 2.0;  // FMA
+              double tflops = (num_sms * ops_per_sm_per_clock * clock_rate_mhz) / 1e6;
+              return tflops;
+            }
+            return 0.0;
+#endif
+          })
       .def("__repr__", [](const hipDeviceProp_t& prop) {
         std::ostringstream stream;
         stream << "_CudaDeviceProperties(name='" << prop.name
