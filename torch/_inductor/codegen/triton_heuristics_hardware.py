@@ -53,20 +53,21 @@ import math
 @dataclass
 class ArchitectureConfig:
     """Hardware-derived configuration for heuristics."""
-    
+
     # Device properties
     device_name: str
-    num_cus: int  # Compute units / multiprocessors
+    num_cus: int            # Compute units / multiprocessors
     warp_size: int
     max_threads_per_block: int
     max_wavefronts_per_cu: int
-    l2_cache_size: int
-    
+    l1_cache_size: int      # Per-CU L1 cache in bytes (32 KB for AMD CDNA/RDNA)
+    l2_cache_size: int      # Total L2 cache in bytes
+
     # Derived optimal values (calculated from hardware)
-    optimal_threads_bandwidth: int  # For memory bandwidth utilization
-    optimal_blocks_grid: int        # For grid granularity
-    occupancy_sweetspot_min: int    # Min wavefronts for good occupancy
-    occupancy_sweetspot_max: int    # Max wavefronts for good occupancy
+    optimal_threads_bandwidth: int   # For memory bandwidth utilization
+    optimal_blocks_grid: int         # For grid granularity
+    occupancy_sweetspot_min: int     # Min wavefronts for good occupancy
+    occupancy_sweetspot_max: int     # Max wavefronts for good occupancy
     optimal_elements_per_block: int  # For launch overhead
     
     @classmethod
@@ -92,7 +93,9 @@ class ArchitectureConfig:
         max_threads_per_block = props.max_threads_per_block
         max_threads_per_cu = props.max_threads_per_multi_processor
         max_wavefronts_per_cu = max_threads_per_cu // warp_size
-        l2_cache_size = getattr(props, 'l2_cache_size', 0)
+        # Try both capitalizations – ROCm exposes 'L2_cache_size' (uppercase)
+        l2_cache_size = getattr(props, 'L2_cache_size',
+                         getattr(props, 'l2_cache_size', 4 * 1024 * 1024))
         
         # =====================================================================
         # BANDWIDTH: Optimal threads per block
@@ -199,12 +202,20 @@ class ArchitectureConfig:
         optimal_elements_per_block = 2 ** math.ceil(math.log2(optimal_elements))  # Round to power of 2
         optimal_elements_per_block = max(256, min(optimal_elements_per_block, 2048))  # Clamp
         
+        # L1 cache is per-CU and architecturally fixed:
+        #   AMD CDNA/RDNA: 32 KB  (wave64/wave32 – same L1 size)
+        #   NVIDIA Ampere+: 128 KB unified L1 + shared memory per SM
+        # We detect AMD via the presence of torch.version.hip.
+        is_hip = bool(getattr(torch.version, 'hip', None))
+        l1_cache_size = 32 * 1024 if is_hip else 128 * 1024
+
         return cls(
             device_name=device_name,
             num_cus=num_cus,
             warp_size=warp_size,
             max_threads_per_block=max_threads_per_block,
             max_wavefronts_per_cu=max_wavefronts_per_cu,
+            l1_cache_size=l1_cache_size,
             l2_cache_size=l2_cache_size,
             optimal_threads_bandwidth=optimal_threads_bandwidth,
             optimal_blocks_grid=optimal_blocks_grid,
@@ -222,6 +233,7 @@ class ArchitectureConfig:
             warp_size=32,
             max_threads_per_block=1024,
             max_wavefronts_per_cu=32,
+            l1_cache_size=32 * 1024,
             l2_cache_size=0,
             optimal_threads_bandwidth=256,
             optimal_blocks_grid=32,
@@ -240,6 +252,7 @@ class ArchitectureConfig:
         print(f"Warp Size: {self.warp_size}")
         print(f"Max Threads/Block: {self.max_threads_per_block}")
         print(f"Max Wavefronts/CU: {self.max_wavefronts_per_cu}")
+        print(f"L1 Cache (per CU): {self.l1_cache_size // 1024} KB")
         print(f"L2 Cache: {self.l2_cache_size / 1024:.0f} KB" if self.l2_cache_size else "L2 Cache: Unknown")
         print()
         print("DERIVED OPTIMAL VALUES:")

@@ -78,19 +78,6 @@ class PointwiseHeuristics:
     # These are now lazily initialized from actual device properties
     _arch_config = None
     
-    # Legacy constants (for reference, not used anymore)
-    # DEPRECATED: Use _get_arch() to get runtime values
-    VGPR_POOL_WAVE64 = 512 * 1024      # 512 KB total VGPRs for wave64
-    VGPR_POOL_WAVE32 = 1024 * 1024     # 1024 KB total VGPRs for wave32
-    L1_CACHE_SIZE = 32 * 1024          # 32 KB L1 cache per CU
-    L2_CACHE_SIZE = 4 * 1024 * 1024    # 4 MB L2 cache per XCD
-    MAX_BLOCKS_PER_CU = 16             # Hardware limit
-    MAX_WAVES_PER_CU = 40              # Practical maximum
-    
-    # Launch overhead (empirical measurements)
-    BASE_LAUNCH_OVERHEAD_NS = 5000     # ~5μs base
-    PER_BLOCK_OVERHEAD_NS = 100        # ~100ns per block
-    
     # Block size ranges
     MIN_BLOCK_SIZE = 16
     MAX_BLOCK_SIZE = 2048
@@ -161,25 +148,32 @@ class PointwiseHeuristics:
     def estimate_memory_bandwidth(config: Dict, problem_metadata: Dict) -> float:
         """
         Estimate memory bandwidth utilization for memory-bound pointwise kernels.
-        
+
         V3: Continuous scoring with Gaussian peak to avoid clustering at 1.0
         V4: Hardware-aware - optimal threads derived from actual architecture
-        
+        V5: 2D/3D XBLOCK coalescing awareness
+
         Peak at optimal threads (derived from latency hiding requirements),
         decays smoothly on both sides.
-        This ensures every config gets a unique score based on distance from optimal.
-        
+
+        For 2D/3D kernels, also applies a coalescing factor based on XBLOCK:
+        - On GPU (cache line = 64 bytes = 16 float32s), XBLOCK < 16 causes
+          partial cache-line utilisation per tile row.
+        - coalescing = min(1.0, XBLOCK / 16)  →  [0.25 .. 1.0]
+        - Applied as a soft multiplier: score * (0.65 + 0.35 * coalescing)
+          so XBLOCK=4 → ×0.74, XBLOCK=8 → ×0.82, XBLOCK≥16 → ×1.00
+
         Returns:
-            Score 0.60-1.00 (continuous, no flat regions)
+            Score 0.45-1.00 (continuous, no flat regions)
         """
         block_dims = PointwiseHeuristics.get_block_dimensions(config)
         threads_per_block = PointwiseHeuristics.prod(block_dims)
-        
+
         # Get hardware-derived optimal (based on latency hiding requirements)
         arch = PointwiseHeuristics._get_arch()
         optimal_threads = arch.optimal_threads_bandwidth
         sigma = optimal_threads  # Adaptive width based on optimal
-        
+
         if threads_per_block < 64:
             # Too few threads - very poor bandwidth
             score = 0.60
@@ -187,13 +181,28 @@ class PointwiseHeuristics:
             # Gaussian curve centered at optimal
             diff = (threads_per_block - optimal_threads) / sigma
             gaussian = math.exp(-0.5 * diff * diff)
-            
+
             # Scale to 0.75-1.0 range (floor at 0.75, peak at 1.0)
             score = 0.75 + 0.25 * gaussian
-            
+
             # Hard floor at 0.60
             score = max(0.60, min(1.0, score))
-        
+
+        # ── 2D / 3D coalescing factor ─────────────────────────────────────
+        # XBLOCK is the "fast" (x) dimension – consecutive XBLOCK elements
+        # in memory are contiguous (row-major).  For AMD GPUs the cache line
+        # holds 64 B = 16 fp32s.  If XBLOCK < 16, each tile row spans less
+        # than one cache line, so the fetch is partially wasted relative to
+        # a full-line access.  Adjacent blocks will eventually reuse the
+        # rest of the line via L2, so the penalty is mild rather than full.
+        xblock = config.get('XBLOCK', 256)
+        yblock = config.get('YBLOCK', 0)
+        if yblock > 0:          # 2-D or higher kernel
+            cache_line_elems = 16   # 64 B / 4 B per float32
+            coalescing = min(1.0, xblock / cache_line_elems)
+            # soft penalty: full penalty for XBLOCK=1, none for XBLOCK≥16
+            score *= (0.65 + 0.35 * coalescing)
+
         return score
     
     # =====================================================================
@@ -248,17 +257,17 @@ class PointwiseHeuristics:
         """
         num_blocks = PointwiseHeuristics.prod(grid_size)
         total_elements = problem_metadata.get('total_elements', 1)
-        
+
         if total_elements == 0 or num_blocks == 0:
             return 1.0
-        
+
         elements_per_block = total_elements / num_blocks
-        
+
         # Get hardware-derived optimal (based on launch overhead amortization)
         arch = PointwiseHeuristics._get_arch()
         optimal_elem = arch.optimal_elements_per_block
         sigma = optimal_elem // 2  # Adaptive width
-        
+
         if elements_per_block < 64:
             # Too little work per block - overhead dominates
             score = 0.70
@@ -266,11 +275,34 @@ class PointwiseHeuristics:
             # Gaussian curve centered at optimal
             diff = (elements_per_block - optimal_elem) / sigma
             gaussian = math.exp(-0.5 * diff * diff)
-            
+
             # Scale to 0.75-1.0 range
             score = 0.75 + 0.25 * gaussian
             score = max(0.70, min(1.0, score))
-        
+
+        # ── Large-grid scheduler penalty ──────────────────────────────────
+        # AMD hardware has a finite command processor queue.  Very large grids
+        # (>32 K blocks for typical 120-CU GPUs) impose measurable dispatch
+        # overhead.  Blocks beyond ~256×num_CUs have diminishing scheduling
+        # benefit while the per-kernel grid-setup cost keeps rising.
+        # We apply a soft log-space penalty to further separate e.g. 4 K vs
+        # 262 K blocks for configs with the same elements_per_block size.
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _num_cus = _torch.cuda.get_device_properties(0).multi_processor_count
+            else:
+                _num_cus = 120
+        except Exception:
+            _num_cus = 120
+        # Threshold: up to 4× occupancy-fill is beneficial; beyond that penalise
+        _max_good_blocks = _num_cus * 4
+        if num_blocks > _max_good_blocks:
+            excess_ratio = num_blocks / _max_good_blocks   # e.g. 8.0 for 262 K vs 4 K
+            # log2(8) = 3 → 0.03 penalty (3%)
+            grid_excess_penalty = 1.0 - 0.01 * math.log2(excess_ratio)
+            score *= max(0.88, grid_excess_penalty)
+
         return score
     
     # =====================================================================
@@ -294,32 +326,36 @@ class PointwiseHeuristics:
         num_tensors = (problem_metadata.get('num_inputs', 2) + 
                       problem_metadata.get('num_outputs', 1))
         
+        arch = PointwiseHeuristics._get_arch()
+        l1_cache_size = arch.l1_cache_size
+        l2_cache_size = arch.l2_cache_size if arch.l2_cache_size > 0 else 4 * 1024 * 1024
+
         # === L1 Cache Scoring (working set per block) ===
         block_elements = PointwiseHeuristics.prod(block_dims)
         working_set_per_block = block_elements * element_size * num_tensors
-        
-        if working_set_per_block <= PointwiseHeuristics.L1_CACHE_SIZE:
-            l1_score = 1.0      # Fits perfectly in L1
-        elif working_set_per_block <= PointwiseHeuristics.L1_CACHE_SIZE * 2:
+
+        if working_set_per_block <= l1_cache_size:
+            l1_score = 1.0      # Fits in L1
+        elif working_set_per_block <= l1_cache_size * 2:
             l1_score = 0.9      # Mostly fits
-        elif working_set_per_block <= PointwiseHeuristics.L1_CACHE_SIZE * 4:
+        elif working_set_per_block <= l1_cache_size * 4:
             l1_score = 0.8      # Partial fit
         else:
-            l1_score = 0.7      # L2 bound
-        
+            l1_score = 0.7      # L2-bound
+
         # === L2 Cache Bonus ===
         l2_bonus = 1.0
-        
+
         # Check for broadcast patterns (major benefit)
         if problem_metadata.get('has_broadcast', False):
             broadcast_size = problem_metadata.get('broadcast_tensor_bytes', 0)
-            if broadcast_size > 0 and broadcast_size <= PointwiseHeuristics.L2_CACHE_SIZE:
-                l2_bonus = 1.15  # Significant benefit - all blocks reuse
+            if broadcast_size > 0 and broadcast_size <= l2_cache_size:
+                l2_bonus = 1.15  # Broadcast tensor cached in L2 – all blocks reuse
         else:
             # Check if entire problem fits in L2
-            total_size = (problem_metadata.get('total_elements', 1) * 
-                         element_size * num_tensors)
-            if total_size <= PointwiseHeuristics.L2_CACHE_SIZE:
+            total_size = (problem_metadata.get('total_elements', 1) *
+                          element_size * num_tensors)
+            if total_size <= l2_cache_size:
                 l2_bonus = 1.02  # Small benefit for tiny problems
         
         # === Spatial Locality Bonus (multi-dimensional blocking) ===
@@ -373,12 +409,12 @@ class PointwiseHeuristics:
     def estimate_occupancy_impact(config: Dict, problem_metadata: Dict) -> float:
         """
         Estimate occupancy and latency hiding capability.
-        
+
         V3: Adds num_warps preference as tie-breaker
         V4: Hardware-aware - sweet spot ranges derived from architecture
-        
+
         For same thread count, prefer fewer warps (less resource pressure).
-        
+
         Returns:
             Score (0.7-1.0)
         """
@@ -386,16 +422,16 @@ class PointwiseHeuristics:
         threads_per_block = PointwiseHeuristics.prod(block_dims)
         warp_size = problem_metadata.get('warp_size', 64)
         num_warps = config.get('num_warps', 4)
-        
+
         # Get hardware-derived sweet spot
         arch = PointwiseHeuristics._get_arch()
         sweet_min = arch.occupancy_sweetspot_min
         sweet_max = arch.occupancy_sweetspot_max
-        
+
         # Calculate wavefronts per block
         wavefronts_per_block = (threads_per_block + warp_size - 1) // warp_size
         aligned = (threads_per_block % warp_size == 0)
-        
+
         # Base score from wavefront count and alignment
         if sweet_min <= wavefronts_per_block <= sweet_max and aligned:
             base_score = 1.00  # In sweet spot
@@ -407,11 +443,11 @@ class PointwiseHeuristics:
             base_score = 0.90  # Not aligned
         else:
             base_score = 0.75  # Outside reasonable range
-        
+
         # Tie-breaker: Prefer num_warps that MATCHES actual wavefronts
         # For memory-bound kernels, we want ALL wavefronts active for latency hiding
         actual_wavefronts = (threads_per_block + warp_size - 1) // warp_size
-        
+
         if num_warps == actual_wavefronts:
             # Perfect match - all wavefronts utilized
             warp_multiplier = 1.00
@@ -426,7 +462,7 @@ class PointwiseHeuristics:
             # Over-specified (num_warps > actual wavefronts)
             # Triton will clamp it, but shows misconfiguration
             warp_multiplier = 0.90
-        
+
         score = base_score * warp_multiplier
         return max(0.70, min(1.0, score))
     
@@ -578,28 +614,32 @@ class PointwiseHeuristics:
                 (occupancy ** occ_exp)
             ) ** (1.0 / total_exp)  # Normalize by sum of exponents
             
-            # V3: Add block shape tie-breaker for 2D configs
-            # Prefer larger innermost dimension (YBLOCK) for better memory coalescing
+            # V3/V5: Add block shape tie-breaker for 2D configs.
+            # For row-major tensors the X dimension is the fast (contiguous)
+            # axis.  We therefore reward larger XBLOCK (better cache-line
+            # fill) rather than larger YBLOCK.
             if len(block_dims) == 2:
                 xblock, yblock = block_dims
-                
-                # Factor 1: Prefer balanced shapes (aspect ratio close to 1.0)
+
+                # Factor 1: Mildly prefer square-ish tiles (aspect ratio ≈ 1).
+                # Very elongated tiles (e.g. 4×256) can misalign with the
+                # hardware prefetcher for some access patterns.
                 ratio = max(xblock, yblock) / max(min(xblock, yblock), 1)
-                # ratio=1.0 (square) → 1.00
-                # ratio=2.0 → 0.995
-                # ratio=4.0 → 0.990
+                # ratio=1.0 → 1.00 | ratio=4 → 0.990 | ratio=16 → 0.980
                 balance_multiplier = 1.0 - 0.005 * math.log2(max(ratio, 1.0))
-                
-                # Factor 2: Prefer larger innermost dimension (YBLOCK)
-                # For 16x32 vs 32x16 with same ratio, prefer 16x32 (larger Y)
-                # yblock=128 → 1.00
-                # yblock=64  → 0.998
-                # yblock=32  → 0.996
-                # yblock=16  → 0.994
-                # yblock=8   → 0.992
-                innermost_multiplier = 1.0 - 0.002 * (7 - math.log2(max(yblock, 8)))
-                
-                score *= max(0.98, balance_multiplier * innermost_multiplier)
+
+                # Factor 2: Reward larger XBLOCK (fast dimension = better
+                # cache-line utilisation for row-major tensors).
+                # xblock=256 → 1.00
+                # xblock=128 → 0.992
+                # xblock=64  → 0.984
+                # xblock=32  → 0.976
+                # xblock=16  → 0.968
+                # xblock=8   → 0.960
+                # xblock=4   → 0.952
+                innermost_multiplier = 1.0 - 0.008 * max(0, 5 - math.log2(max(xblock, 4)))
+
+                score *= max(0.95, balance_multiplier * innermost_multiplier)
             
             return max(0.0, min(1.0, score))
             
@@ -640,10 +680,10 @@ class PointwiseHeuristics:
         warp_size = problem_metadata.get('warp_size', 64)  # Query from device
         max_threads = problem_metadata.get('max_threads_per_block', 1024)
         max_warps = max_threads // warp_size  # Calculate max warps from device limits
-        
+
         # Candidate warp counts to try (powers of 2: 1, 2, 4, 8, 16)
         warp_candidates = [1, 2, 4, 8, 16]
-        
+
         if ndims == 1:
             xnumel = problem_dims[0]
             # 1D configs - try all block sizes that fit
@@ -651,7 +691,7 @@ class PointwiseHeuristics:
                 # Don't exceed problem size
                 if xblock > xnumel:
                     continue
-                
+
                 # Try multiple warp counts for this block size
                 total_threads = xblock
                 for num_warps in warp_candidates:
@@ -661,12 +701,9 @@ class PointwiseHeuristics:
                     # Skip if num_warps * warp_size > total_threads (not enough threads)
                     if num_warps * warp_size > total_threads:
                         continue
-                    
-                    configs.append({
-                        'XBLOCK': xblock,
-                        'num_warps': num_warps
-                    })
-        
+
+                    configs.append({'XBLOCK': xblock, 'num_warps': num_warps})
+
         elif ndims == 2:
             xnumel, ynumel = problem_dims[0], problem_dims[1]
             # 2D configs - try combinations that make sense
@@ -678,7 +715,7 @@ class PointwiseHeuristics:
                     # Don't exceed Y dimension
                     if yblock > ynumel:
                         continue
-                    
+
                     total_threads = xblock * yblock
                     # Keep reasonable thread counts (64-1024)
                     if 64 <= total_threads <= max_threads:
@@ -690,19 +727,17 @@ class PointwiseHeuristics:
                             # Skip if not enough threads to support this many warps
                             if num_warps * warp_size > total_threads:
                                 continue
-                            
+
                             configs.append({
-                                'XBLOCK': xblock,
-                                'YBLOCK': yblock,
-                                'num_warps': num_warps
+                                'XBLOCK': xblock, 'YBLOCK': yblock, 'num_warps': num_warps
                             })
-        
+
         elif ndims == 3:
             xnumel, ynumel, znumel = problem_dims[0], problem_dims[1], problem_dims[2]
             # 3D configs - use smaller block sizes to keep thread counts manageable
             # For 3D, total threads = XBLOCK * YBLOCK * ZBLOCK can get large quickly
             max_threads_3d = min(max_threads, 1024)  # Allow up to 1024 threads for 3D
-            
+
             for xblock in block_sizes_3d:
                 if xblock > xnumel:
                     continue
@@ -712,7 +747,7 @@ class PointwiseHeuristics:
                     for zblock in block_sizes_3d:
                         if zblock > znumel:
                             continue
-                        
+
                         total_threads = xblock * yblock * zblock
                         # Keep reasonable thread counts for 3D (wider range than before)
                         if 64 <= total_threads <= max_threads_3d:
@@ -724,14 +759,12 @@ class PointwiseHeuristics:
                                 # Skip if not enough threads to support this many warps
                                 if num_warps * warp_size > total_threads:
                                     continue
-                                
+
                                 configs.append({
-                                    'XBLOCK': xblock,
-                                    'YBLOCK': yblock,
-                                    'ZBLOCK': zblock,
-                                    'num_warps': num_warps
+                                    'XBLOCK': xblock, 'YBLOCK': yblock,
+                                    'ZBLOCK': zblock, 'num_warps': num_warps
                                 })
-        
+
         return configs
     
     # =====================================================================
@@ -741,7 +774,8 @@ class PointwiseHeuristics:
     @staticmethod
     def prune_configs(configs: List[Dict], 
                      problem_metadata: Dict,
-                     top_n: int = 12) -> List[Dict]:
+                     top_n: int = 12,
+                     kernel_code: str = None) -> List[Dict]:
         """
         Prune and rank configs based on comprehensive scoring.
         
@@ -749,6 +783,7 @@ class PointwiseHeuristics:
             configs: List of candidate configs
             problem_metadata: Problem characteristics
             top_n: Number of top configs to return
+            kernel_code: Optional kernel source for accurate bottleneck analysis
             
         Returns:
             Top N configs sorted by score (descending)
@@ -831,11 +866,11 @@ class PointwiseHeuristics:
             except Exception:
                 continue
         
-        # Score all valid configs
+        # Score all valid configs (with real kernel_code when available)
         scored_configs = []
         for cfg in valid_configs:
             try:
-                score = PointwiseHeuristics.score_config(cfg, problem_metadata)
+                score = PointwiseHeuristics.score_config(cfg, problem_metadata, kernel_code)
                 if score > 0:
                     scored_configs.append((score, cfg))
             except Exception:

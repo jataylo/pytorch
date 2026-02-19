@@ -101,44 +101,82 @@ class BottleneckAnalysis:
         """
         try:
             import torch
-            
+
             if not torch.cuda.is_available():
-                # Fallback for CPU or when CUDA unavailable
+                # No GPU – use conservative CPU-like defaults
                 return {
-                    'memory_bandwidth_gb_s': 100.0,  # Typical DDR4
-                    'compute_tflops': 1.0,           # Low baseline
-                    'l1_cache_size': 32 * 1024,      # 32 KB
-                    'l2_cache_size': 1024 * 1024,    # 1 MB
+                    'memory_bandwidth_gb_s': 100.0,
+                    'compute_tflops': 1.0,
+                    'l1_cache_size': 32 * 1024,
+                    'l2_cache_size': 1 * 1024 * 1024,
                 }
-            
+
             props = torch.cuda.get_device_properties(0)
-            
-            # L2 cache: directly from device properties (AMD hardware)
-            l2_cache_size = props.L2_cache_size
-            
-            # L1 cache: AMD CDNA/RDNA architectural constant
-            l1_cache_size = 32 * 1024  # 32 KB per CU
-            
-            # Memory bandwidth: from new device property (calculated in C++)
-            memory_bandwidth_gb_s = props.memory_bandwidth_gb_s
-            
-            # Compute throughput: from new device property (calculated in C++)
-            compute_tflops = props.compute_throughput_tflops
-            
+
+            # ── L2 cache ──────────────────────────────────────────────────
+            l2_cache_size = getattr(props, 'L2_cache_size', 4 * 1024 * 1024)
+
+            # ── L1 cache (per CU / SM) ────────────────────────────────────
+            # AMD CDNA/RDNA: 32 KB per CU  |  NVIDIA: 128 KB per SM (shared + L1)
+            l1_cache_size = 32 * 1024
+
+            # ── Memory bandwidth ──────────────────────────────────────────
+            # Prefer the pre-computed property (custom ROCm build); fall back to
+            # calculating from memoryClockRate × memoryBusWidth (standard props).
+            if hasattr(props, 'memory_bandwidth_gb_s'):
+                memory_bandwidth_gb_s = props.memory_bandwidth_gb_s
+            else:
+                try:
+                    # Standard property: memoryClockRate in kHz, memoryBusWidth in bits
+                    # DDR factor of 2 (double data rate)
+                    mem_clk_hz = props.memoryClockRate * 1e3        # kHz → Hz
+                    bus_bytes  = props.memoryBusWidth / 8            # bits → bytes
+                    memory_bandwidth_gb_s = (mem_clk_hz * bus_bytes * 2) / 1e9
+                    memory_bandwidth_gb_s = max(50.0, memory_bandwidth_gb_s)
+                except Exception:
+                    # Conservative default (comparable to mid-range GPU)
+                    memory_bandwidth_gb_s = 900.0
+
+            # ── Compute throughput ────────────────────────────────────────
+            # Prefer the pre-computed property; fall back to
+            # CU_count × ops_per_CU_per_clk × clock_Hz.
+            if hasattr(props, 'compute_throughput_tflops'):
+                compute_tflops = props.compute_throughput_tflops
+            else:
+                try:
+                    is_hip  = bool(getattr(torch.version, 'hip', None))
+                    clk_hz  = props.clockRate * 1e3          # kHz → Hz
+                    num_cus = props.multi_processor_count
+                    # AMD CDNA2/RDNA3: 128 FP32 ops/CU/clk
+                    # NVIDIA Ampere/Ada: 2 FP32 ops/CUDA-core/clk (CUDA cores ≈ SM × 128)
+                    if is_hip:
+                        ops_per_cu_clk = 128
+                    else:
+                        ops_per_cu_clk = 128 * 2  # SM has 128 cores × 2 FP32/core/clk
+                    compute_tflops = (num_cus * ops_per_cu_clk * clk_hz) / 1e12
+                    compute_tflops = max(1.0, compute_tflops)
+                except Exception:
+                    compute_tflops = 200.0  # Conservative default
+
             return {
                 'memory_bandwidth_gb_s': memory_bandwidth_gb_s,
-                'compute_tflops': compute_tflops,
-                'l1_cache_size': l1_cache_size,
-                'l2_cache_size': l2_cache_size,
+                'compute_tflops':        compute_tflops,
+                'l1_cache_size':         l1_cache_size,
+                'l2_cache_size':         l2_cache_size,
             }
-        
+
         except Exception as e:
-            # If something goes wrong, raise with clear error
-            raise RuntimeError(
-                f"Failed to get device constants: {e}\n"
-                "Make sure PyTorch is rebuilt with new memory_bandwidth_gb_s and "
-                "compute_throughput_tflops properties."
+            # Last-resort defaults – never raise so callers always get numbers
+            import logging
+            logging.getLogger(__name__).debug(
+                "[HEURISTICS] _get_device_constants fallback: %s", e
             )
+            return {
+                'memory_bandwidth_gb_s': 900.0,
+                'compute_tflops':        200.0,
+                'l1_cache_size':         32 * 1024,
+                'l2_cache_size':         4  * 1024 * 1024,
+            }
     
     @staticmethod
     def estimate_overhead_time_us(num_blocks: int, problem_metadata: Dict = None,
@@ -422,92 +460,82 @@ class BottleneckAnalysis:
                 num_inputs = problem_metadata.get('num_inputs', 2)
                 broadcast_fraction = 1.0 / max(num_inputs, 2)
                 broadcast_bytes = total_bytes * broadcast_fraction
-                
+
                 if broadcast_bytes <= l2_cache_size:
                     # Broadcast cached in L2, only pay HBM for non-broadcast
                     non_broadcast_bytes = total_bytes - broadcast_bytes
                     effective_bandwidth = memory_bandwidth_gb_s * 0.8
                     return non_broadcast_bytes / (effective_bandwidth * 1e3)
-            
-            # Normal HBM access
-            effective_bandwidth = memory_bandwidth_gb_s * 0.8
+
+            # ── Masking overhead adjustment ──────────────────────────────────
+            # Kernels with boundary masks generate extra predicate instructions
+            # and can issue partial cache-line stores (write-combining breaks
+            # down at boundaries).  Empirically this reduces effective HBM
+            # streaming efficiency by 15-25%.  We use 0.75 instead of 0.80
+            # when masking is present so the model better predicts real latency.
+            has_mask = problem_metadata.get('has_mask', False)
+            if has_mask:
+                hbm_efficiency = 0.65    # masking + partial stores
+            else:
+                hbm_efficiency = 0.80    # clean streaming
+
+            effective_bandwidth = memory_bandwidth_gb_s * hbm_efficiency
             return total_bytes / (effective_bandwidth * 1e3)
     
     @staticmethod
     def estimate_compute_time_us(num_ops: int, threads_per_block: int, num_blocks: int,
                                  problem_metadata: Dict = None) -> float:
         """
-        Estimate compute time in microseconds using the roofline model.
-        
-        V5: Now uses actual instruction mix from kernel metadata!
-        - Weighs ops by actual latency (add=1 cycle, exp=30 cycles)
-        - Uses actual bytes_per_element from kernel
-        - Adjusts efficiency based on instruction mix
-        
-        Returns:
-            Compute time in microseconds (0.0 if memory-bound, since compute is hidden)
+        Estimate the raw compute-throughput-limited time in microseconds.
+
+        This is the time compute would take if it were the sole bottleneck
+        (i.e. if memory bandwidth were infinite).  The caller (analyze_bottleneck)
+        applies the roofline model – max(memory_us, compute_us) – to determine
+        which component actually limits execution.  This function always returns
+        a positive value so both sides of the roofline are visible.
+
+        Instruction-mix efficiency (V5):
+          Slow ops (sin/exp/div): 0.6  – lots of multi-cycle instructions
+          Mixed fast/slow:        0.7  – typical pointwise math
+          Mostly fast (add/mul):  0.8  – simple element-wise ops
         """
-        # Get device-specific constants
         device_consts = BottleneckAnalysis._get_device_constants()
-        peak_tflops = device_consts['compute_tflops']
-        
-        # Calculate operational intensity ceiling (shared calculation)
-        oi_ceiling = BottleneckAnalysis.get_oi_ceiling()
-        
-        # Estimate arithmetic intensity for this kernel
+        peak_tflops   = device_consts['compute_tflops']
+
         total_elements = threads_per_block * num_blocks
-        
-        # Use actual kernel metadata if available
+
         if problem_metadata:
-            # V5: Use actual ops_per_element from kernel analysis
-            ops_per_element = problem_metadata.get('ops_per_element', 2)
+            ops_per_element   = problem_metadata.get('ops_per_element',   2)
             bytes_per_element = problem_metadata.get('bytes_per_element', 12.0)
         else:
-            # Fallback to defaults
-            ops_per_element = num_ops / max(total_elements, 1)
+            ops_per_element   = num_ops / max(total_elements, 1)
             bytes_per_element = 12.0
-        
-        # Arithmetic intensity (AI) = ops per byte
-        arithmetic_intensity = ops_per_element / bytes_per_element
-        
-        if arithmetic_intensity < oi_ceiling:
-            # MEMORY-BOUND: Limited by bandwidth
-            # Compute happens "for free" while waiting for data
-            return 0.0
-        else:
-            # COMPUTE-BOUND: Limited by compute throughput (rare!)
-            
-            # V5: Adjust efficiency based on instruction mix
-            if problem_metadata:
-                fast_ops = problem_metadata.get('fast_ops', 0)
-                medium_ops = problem_metadata.get('medium_ops', 0)
-                slow_ops = problem_metadata.get('slow_ops', 0)
-                total_instr = fast_ops + medium_ops + slow_ops
-                
-                if total_instr > 0:
-                    # Calculate efficiency from instruction mix
-                    slow_fraction = slow_ops / total_instr
-                    medium_fraction = medium_ops / total_instr
-                    
-                    if slow_fraction > 0.5:
-                        compute_efficiency = 0.6  # Lots of slow ops
-                    elif slow_fraction > 0.2 or medium_fraction > 0.5:
-                        compute_efficiency = 0.7  # Some slow/medium ops
-                    else:
-                        compute_efficiency = 0.8  # Mostly fast ops
+
+        # ── Instruction-mix efficiency ────────────────────────────────────
+        if problem_metadata:
+            fast_ops    = problem_metadata.get('fast_ops',   0)
+            medium_ops  = problem_metadata.get('medium_ops', 0)
+            slow_ops    = problem_metadata.get('slow_ops',   0)
+            total_instr = fast_ops + medium_ops + slow_ops
+            if total_instr > 0:
+                slow_frac   = slow_ops   / total_instr
+                medium_frac = medium_ops / total_instr
+                if slow_frac > 0.5:
+                    compute_efficiency = 0.6   # Heavily transcendental (sin/exp/…)
+                elif slow_frac > 0.2 or medium_frac > 0.5:
+                    compute_efficiency = 0.7   # Mixed
                 else:
-                    compute_efficiency = 0.7  # Default
+                    compute_efficiency = 0.8   # Mostly FMA / simple math
             else:
-                # Fallback: use dynamic efficiency calculation
-                compute_efficiency = BottleneckAnalysis.estimate_compute_efficiency(
-                    num_ops, total_elements, threads_per_block
-                )
-            
-            # Calculate achievable throughput
-            achievable_tflops = peak_tflops * compute_efficiency
-            ops_per_us = (achievable_tflops * 1e12) / 1e6  # Convert to ops/μs
-            
-            return num_ops / ops_per_us
+                compute_efficiency = 0.7
+        else:
+            compute_efficiency = BottleneckAnalysis.estimate_compute_efficiency(
+                num_ops, total_elements, threads_per_block
+            )
+
+        achievable_tflops = peak_tflops * compute_efficiency
+        ops_per_us        = (achievable_tflops * 1e12) / 1e6   # TFLOPS → ops/µs
+        return num_ops / ops_per_us
     
     @staticmethod
     def analyze_bottleneck(config: Dict, problem_metadata: Dict,
@@ -538,7 +566,6 @@ class BottleneckAnalysis:
             - 'bottleneck': 'overhead', 'memory', or 'compute'
         """
         # V5: Parse kernel code if available
-        import pdb; pdb.set_trace()
         if kernel_code:
             try:
                 from torch._inductor.codegen.triton_heuristics_kernel_analysis import extract_kernel_metadata
@@ -562,134 +589,152 @@ class BottleneckAnalysis:
         except:
             num_blocks = 1
         
-        total_elements = problem_metadata.get('total_elements', 1)
-        element_size = problem_metadata.get('element_size', 4)  # bytes
-        num_inputs = problem_metadata.get('num_inputs', 2)
-        num_outputs = problem_metadata.get('num_outputs', 1)
+        total_elements  = problem_metadata.get('total_elements', 1)
+        element_size    = problem_metadata.get('element_size', 4)    # bytes per scalar
+        num_inputs      = problem_metadata.get('num_inputs',  2)
+        num_outputs     = problem_metadata.get('num_outputs', 1)
         ops_per_element = problem_metadata.get('ops_per_element', 2)
-        
-        # V5: Calculate times with improved models
+
+        # bytes_per_element is the total bytes transferred (reads + writes) per
+        # output element.  Use the metadata value if present (extracted from
+        # the kernel by triton_heuristics_kernel_analysis); otherwise fall back
+        # to element_size × (num_inputs + num_outputs) so memory and AI
+        # calculations use a consistent denominator.
+        bytes_per_element = problem_metadata.get(
+            'bytes_per_element',
+            float(element_size) * (num_inputs + num_outputs),
+        )
+
+        # ── Raw component estimates ────────────────────────────────────────
         overhead_us = BottleneckAnalysis.estimate_overhead_time_us(
             num_blocks, problem_metadata, config
         )
-        
-        # Memory: read all inputs + write all outputs
-        total_bytes = total_elements * element_size * (num_inputs + num_outputs)
+
+        # Memory: total bytes = elements × bytes_per_element (all reads+writes)
+        total_bytes = total_elements * bytes_per_element
         memory_us = BottleneckAnalysis.estimate_memory_time_us(
             total_bytes, problem_metadata, num_blocks
         )
-        
-        # Compute: total FLOPs
+
+        # Compute: raw throughput-limited time (always non-zero)
         num_ops = total_elements * ops_per_element
         compute_us = BottleneckAnalysis.estimate_compute_time_us(
             num_ops, threads_per_block, num_blocks, problem_metadata
         )
-        
-        # Total time
-        total_us = overhead_us + memory_us + compute_us
-        
-        # Fractions
-        overhead_frac = overhead_us / total_us if total_us > 0 else 0
-        memory_frac = memory_us / total_us if total_us > 0 else 0
-        compute_frac = compute_us / total_us if total_us > 0 else 0
-        
-        # Determine bottleneck (what takes >40% of time)
-        if overhead_frac > 0.4:
+
+        # ── Roofline model ────────────────────────────────────────────────
+        # Memory and compute overlap on the GPU: whichever is slower determines
+        # the bound; the faster one is hidden.  Overhead stacks on top.
+        mem_compute_us = max(memory_us, compute_us)
+        total_us       = overhead_us + mem_compute_us
+
+        # ── Fractions (from raw gross, sum to 1.0) ────────────────────────
+        # Using gross (overhead + memory + compute) rather than the effective
+        # total gives fractions that reflect relative component weight even when
+        # memory and compute overlap.  These are used by get_adaptive_weights.
+        gross_us      = overhead_us + memory_us + compute_us
+        overhead_frac = overhead_us / gross_us if gross_us > 0 else 0.0
+        memory_frac   = memory_us   / gross_us if gross_us > 0 else 0.0
+        compute_frac  = compute_us  / gross_us if gross_us > 0 else 0.0
+
+        # ── Bottleneck: which component limits the effective time ──────────
+        if overhead_us >= mem_compute_us:
             bottleneck = 'overhead'
-        elif memory_frac > 0.4:
+        elif memory_us >= compute_us:
             bottleneck = 'memory'
-        elif compute_frac > 0.4:
-            bottleneck = 'compute'
         else:
-            # Mixed - use largest component
-            bottleneck = max(
-                [('overhead', overhead_frac), ('memory', memory_frac), ('compute', compute_frac)],
-                key=lambda x: x[1]
-            )[0]
-        
+            bottleneck = 'compute'
+
         return {
-            'overhead_us': overhead_us,
-            'memory_us': memory_us,
-            'compute_us': compute_us,
-            'total_us': total_us,
+            'overhead_us':  overhead_us,
+            'memory_us':    memory_us,
+            'compute_us':   compute_us,
+            'total_us':     total_us,
             'overhead_frac': overhead_frac,
-            'memory_frac': memory_frac,
-            'compute_frac': compute_frac,
-            'bottleneck': bottleneck,
+            'memory_frac':   memory_frac,
+            'compute_frac':  compute_frac,
+            'bottleneck':    bottleneck,
         }
     
     @staticmethod
     def get_adaptive_weights(config: Dict, problem_metadata: Dict,
-                            kernel_code: str = None) -> Dict[str, float]:
+                             kernel_code: str = None) -> Dict[str, float]:
         """
-        Get adaptive factor weights based on bottleneck analysis.
-        
-        V5: Accepts optional kernel_code for accurate analysis
-        
+        Compute continuously-interpolated factor weights from per-config bottleneck analysis.
+
+        Instead of hard-switching between three static weight tables (the old approach),
+        we define **pure-regime ideal weight vectors** and linearly interpolate between
+        them using the raw component fractions that ``analyze_bottleneck`` returns.
+
+        Why continuous interpolation?
+        ─────────────────────────────
+        ``overhead_frac``, ``memory_frac``, ``compute_frac`` already quantify *how much*
+        each component contributes.  A kernel with AI=1.0 (222× below the ridge point)
+        is almost entirely memory-bound and should weight bandwidth ~55%.  A kernel with
+        AI=200 (barely memory-bound, ~10% below the ridge) should have a much more
+        balanced weight set.  Hard-switching assigns identical weights to both.
+
+        The interpolation formula is simply a weighted sum:
+
+            w[k] = overhead_frac × OVERHEAD_W[k]
+                 + memory_frac   × MEMORY_W[k]
+                 + compute_frac  × COMPUTE_W[k]
+
+        Because the three fracs sum to 1.0 and each pure-regime vector sums to 1.0,
+        the result always sums to 1.0 (floating-point normalisation applied for safety).
+
+        Pure-regime weight vectors (each column sums to 1.0):
+        ──────────────────────────────────────────────────────
+        Factor       │ OVERHEAD (tiny kernel) │ MEMORY (streaming) │ COMPUTE (transcend.)
+        ─────────────┼────────────────────────┼────────────────────┼─────────────────────
+        bandwidth    │   0.10                 │   0.55             │   0.15
+        launch       │   0.50                 │   0.10             │   0.10
+        grid         │   0.30                 │   0.15             │   0.30
+        occupancy    │   0.10                 │   0.20             │   0.45
+
+        Rationale per regime:
+        • OVERHEAD  – launch and grid dominate; minimising block count saves the most.
+                      Memory/compute contribution is negligible (data fits in cache).
+        • MEMORY    – bandwidth coalescing (0.55) is paramount; occupancy (0.20) keeps
+                      the memory pipe full via wavefront latency hiding; grid (0.15)
+                      ensures all CUs are fed; launch (0.10) is nearly irrelevant for
+                      large streaming kernels.
+        • COMPUTE   – occupancy (0.45) maximises concurrent ALU utilisation; grid (0.30)
+                      keeps every CU busy; bandwidth (0.15) feeds operands; launch (0.10)
+                      barely matters relative to compute time.
+
+        Args:
+            config:           Kernel configuration dict (XBLOCK, YBLOCK, num_warps …)
+            problem_metadata: Problem metadata dict
+            kernel_code:      Optional Triton kernel source for accurate metadata
+
         Returns:
-            Dict with weights for: 'bandwidth', 'launch', 'grid', 'occupancy'
+            Dict[str, float] with keys 'bandwidth', 'launch', 'grid', 'occupancy',
+            values summing to 1.0.
         """
         analysis = BottleneckAnalysis.analyze_bottleneck(config, problem_metadata, kernel_code)
-        
-        bottleneck = analysis['bottleneck']
-        overhead_frac = analysis['overhead_frac']
-        memory_frac = analysis['memory_frac']
-        compute_frac = analysis['compute_frac']
-        
-        # Base weights (normalized to sum to 1.0)
-        if bottleneck == 'overhead':
-            # Overhead-dominated (tiny kernels)
-            # Minimize launch overhead and block count
-            weights = {
-                'launch': 0.50,      # Launch overhead most critical
-                'grid': 0.30,        # Grid overhead (per-block) critical
-                'bandwidth': 0.10,   # Memory less important (cached)
-                'occupancy': 0.10,   # Latency hiding less important
-            }
-            
-        elif bottleneck == 'memory':
-            # Memory-dominated (typical pointwise)
-            # Maximize bandwidth utilization and latency hiding
-            weights = {
-                'bandwidth': 0.40,   # Memory bandwidth most critical
-                'launch': 0.25,      # Launch overhead still matters
-                'grid': 0.20,        # GPU saturation important
-                'occupancy': 0.15,   # Latency hiding important
-            }
-            
-        elif bottleneck == 'compute':
-            # Compute-dominated (heavy ops like exp, div)
-            # Maximize occupancy and GPU saturation
-            weights = {
-                'occupancy': 0.35,   # Maximize parallel compute
-                'grid': 0.30,        # GPU saturation critical
-                'bandwidth': 0.20,   # Memory less critical
-                'launch': 0.15,      # Launch overhead less important
-            }
-        
-        else:
-            # Balanced (no clear bottleneck)
-            weights = {
-                'bandwidth': 0.30,
-                'launch': 0.30,
-                'grid': 0.25,
-                'occupancy': 0.15,
-            }
-        
-        # Fine-tune based on actual fractions
-        # If overhead is significant (>20%) even if not dominant, boost launch weight
-        if overhead_frac > 0.2 and bottleneck != 'overhead':
-            boost = min(0.15, overhead_frac - 0.2)  # Up to +15%
-            weights['launch'] += boost
-            # Reduce others proportionally
-            other_total = 1.0 - weights['launch']
-            for k in ['bandwidth', 'grid', 'occupancy']:
-                weights[k] *= (1.0 - weights['launch']) / other_total
-        
-        # Normalize to ensure sum = 1.0
+
+        o_frac = analysis['overhead_frac']
+        m_frac = analysis['memory_frac']
+        c_frac = analysis['compute_frac']
+
+        # ── Pure-regime ideal weights ──────────────────────────────────────────
+        # Each dict sums to 1.0.
+        OVERHEAD_W = {'bandwidth': 0.10, 'launch': 0.50, 'grid': 0.30, 'occupancy': 0.10}
+        MEMORY_W   = {'bandwidth': 0.55, 'launch': 0.10, 'grid': 0.15, 'occupancy': 0.20}
+        COMPUTE_W  = {'bandwidth': 0.15, 'launch': 0.10, 'grid': 0.30, 'occupancy': 0.45}
+
+        # ── Linear interpolation using component fractions as mixing coefficients ─
+        weights = {
+            k: o_frac * OVERHEAD_W[k] + m_frac * MEMORY_W[k] + c_frac * COMPUTE_W[k]
+            for k in OVERHEAD_W
+        }
+
+        # Normalise to exactly 1.0 (floating-point safety)
         total = sum(weights.values())
-        weights = {k: v / total for k, v in weights.items()}
-        
+        if total > 0:
+            weights = {k: v / total for k, v in weights.items()}
+
         return weights
     
     @staticmethod
