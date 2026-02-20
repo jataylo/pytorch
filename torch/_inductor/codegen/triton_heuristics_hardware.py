@@ -122,10 +122,18 @@ class ArchitectureConfig:
             (warp_size * instructions_per_thread)
         )
         
-        # Clamp to reasonable range (4-8 wavefronts)
-        # Lower bound: need at least 4 for pipelining
-        # Upper bound: 8+ starts to increase register pressure
-        wavefronts_for_latency = max(4, min(wavefronts_for_latency, 8))
+        # Clamp to hardware-appropriate range.
+        #
+        # The theoretical formula gives ceil(400/(4×warp×2)):
+        #   NVIDIA (warp=32): ceil(100/128) = 1  → clamped to min
+        #   AMD    (warp=64): ceil(100/256) = 1  → clamped to min
+        # Both architectures saturate HBM bandwidth better with 8 wavefronts
+        # per block than 4, so we use 8 as the lower bound:
+        #   AMD    (warp=64): 8 × 64 = 512 threads  ← empirically best on MI3xx
+        #   NVIDIA (warp=32): 8 × 32 = 256 threads  ← common sweet spot on A100
+        # Upper bound of 12 allows the Gaussian to reward even wider blocks for
+        # large compute-heavy kernels while keeping register pressure manageable.
+        wavefronts_for_latency = max(8, min(wavefronts_for_latency, 12))
         optimal_threads_bandwidth = wavefronts_for_latency * warp_size
         
         # =====================================================================

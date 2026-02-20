@@ -906,8 +906,30 @@ class CachingAutotuner(KernelInterface):
                 eff_bw      = peak_bw * 0.8
                 eff_tflops  = peak_tflops * compute_eff
                 oi_eff      = (eff_tflops * 1e12) / (eff_bw * 1e9)
-                regime   = 'MEMORY-BOUND' if ai < oi_eff else 'COMPUTE-BOUND'
-                ai_cmp   = f'AI {ai:.2f} {"<" if ai < oi_eff else "≥"} eff. OI {oi_eff:.1f}'
+                # ── Roofline regime (AI vs ridge point) ───────────────────
+                roofline_regime = 'MEMORY-BOUND' if ai < oi_eff else 'COMPUTE-BOUND'
+                ai_cmp          = f'AI {ai:.2f} {"<" if ai < oi_eff else "≥"} eff. OI {oi_eff:.1f}'
+
+                # ── Overhead regime check ─────────────────────────────────
+                # For small problems the GPU dispatch overhead can dwarf
+                # memory and compute time completely.  We probe a
+                # representative mid-size config (XBLOCK=256, num_warps=4)
+                # to decide whether overhead > 50 % of gross time.
+                try:
+                    _rep_xblock = min(256, max(64, n_elem))
+                    _rep_cfg    = {'XBLOCK': _rep_xblock, 'num_warps': 4}
+                    _rep_bn     = BottleneckAnalysis.analyze_bottleneck(
+                        _rep_cfg, problem_metadata
+                    )
+                    if _rep_bn.get('launch_bound', False):
+                        regime = (
+                            f'LAUNCH-BOUND  (overhead {_rep_bn["overhead_frac"]*100:.0f}% '
+                            f'of gross time; roofline: {roofline_regime})'
+                        )
+                    else:
+                        regime = roofline_regime
+                except Exception:
+                    regime = roofline_regime
                 src_info = f'fn.src ({len(kernel_code)} chars)' if kernel_code else 'no source'
 
                 _W = 72

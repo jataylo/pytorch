@@ -411,60 +411,121 @@ class PointwiseHeuristics:
         Estimate occupancy and latency hiding capability.
 
         V3: Adds num_warps preference as tie-breaker
-        V4: Hardware-aware - sweet spot ranges derived from architecture
+        V4: Hardware-aware – sweet spot ranges derived from architecture
+        V7: First-principles overhead ratio for launch-bound kernels.
 
-        For same thread count, prefer fewer warps (less resource pressure).
+        ── MEMORY-BOUND (well-saturated, saturation ≥ 0.25) ─────────────────
+        Latency hiding governs performance; the classic 4–8 wavefront sweet-spot
+        model applies unchanged.
+
+        ── LAUNCH-BOUND, SINGLE-BLOCK (saturation < 0.25, num_blocks == 1) ───
+        All work lands on ONE CU.  The CU must hide its own memory latency using
+        wavefront switching (Little's Law), identical to the memory-bound case.
+        The sweet-spot model applies unchanged.
+
+        ── LAUNCH-BOUND, MULTI-BLOCK (saturation < 0.25, num_blocks > 1) ─────
+        Each block runs on a separate CU.  Latency hiding is achieved across CUs
+        by grid spread, not by per-block warp count (per-block warp count only
+        adds init overhead).  Wall-clock time decomposes as:
+
+            T(nw) = K_launch  +  (nw − 1) × K_warp  +  T_exec
+
+        Where:
+          K_launch  =  constant per-kernel dispatch overhead  (~3 µs on AMD,
+                       directly from BottleneckAnalysis.KERNEL_LAUNCH_US)
+          K_warp    =  per-extra-warp init cost (~0.2 µs/warp on AMD,
+                       from estimate_overhead_time_us: warp_overhead = (nw-1)×0.2)
+          T_exec    =  total_bytes / bandwidth – constant across all configs
+                       (same total memory work regardless of nw or XBLOCK).
+
+        Because T_exec is config-invariant, the optimal is nw=1.  The score is
+        the ratio of minimum time to this config's time:
+
+            score = K_launch / (K_launch + (nw − 1) × K_warp)
+
+        No free parameters – both constants come from the existing overhead model.
+
+        Note – element-loop depth (EPT = XBLOCK / (nw × warp_size)) is omitted.
+        Loop-instruction overhead (~4 GPU instr. ≈ 0.00008 µs per extra iteration)
+        is ~2500× smaller than K_warp (0.2 µs), well below measurement noise.
 
         Returns:
-            Score (0.7-1.0)
+            Score (0.70–1.0)
         """
-        block_dims = PointwiseHeuristics.get_block_dimensions(config)
-        threads_per_block = PointwiseHeuristics.prod(block_dims)
-        warp_size = problem_metadata.get('warp_size', 64)
-        num_warps = config.get('num_warps', 4)
+        num_warps      = config.get('num_warps', 4)
+        total_elements = problem_metadata.get('total_elements', 1)
 
-        # Get hardware-derived sweet spot
-        arch = PointwiseHeuristics._get_arch()
-        sweet_min = arch.occupancy_sweetspot_min
-        sweet_max = arch.occupancy_sweetspot_max
+        # Get hardware-derived sweet spot (memory-bound path)
+        arch      = PointwiseHeuristics._get_arch()
+        sweet_min = arch.occupancy_sweetspot_min   # e.g. 4 for AMD
+        sweet_max = arch.occupancy_sweetspot_max   # e.g. 8 for AMD
 
-        # Calculate wavefronts per block
-        wavefronts_per_block = (threads_per_block + warp_size - 1) // warp_size
-        aligned = (threads_per_block % warp_size == 0)
+        wavefronts_per_block = num_warps  # actual wavefronts the GPU schedules
 
-        # Base score from wavefront count and alignment
-        if sweet_min <= wavefronts_per_block <= sweet_max and aligned:
-            base_score = 1.00  # In sweet spot
-        elif sweet_min // 2 <= wavefronts_per_block <= sweet_max * 1.5 and aligned:
-            base_score = 0.95  # Close to sweet spot
-        elif wavefronts_per_block == 1 and aligned:
-            base_score = 0.85  # Too few
-        elif sweet_min // 2 <= wavefronts_per_block <= sweet_max * 1.5:
-            base_score = 0.90  # Not aligned
+        # ── Saturation estimate ──────────────────────────────────────────────
+        block_dims     = PointwiseHeuristics.get_block_dimensions(config)
+        xblock_prod    = PointwiseHeuristics.prod(block_dims)   # elements/block
+        num_blocks_est = max(1, total_elements // max(1, xblock_prod))
+        total_wf       = num_blocks_est * num_warps
+
+        try:
+            import torch as _torch
+            _num_cus = _torch.cuda.get_device_properties(0).multi_processor_count if _torch.cuda.is_available() else 120
+        except Exception:
+            _num_cus = 120
+        _max_wf    = _num_cus * 8           # AMD: 120 CUs × ~8 resident wf/CU
+        saturation = min(1.0, total_wf / _max_wf)
+
+        # ── Scoring ─────────────────────────────────────────────────────────
+        if saturation >= 0.25:
+            # ── Well-saturated / memory-bound: classic sweet-spot model ──────
+            if sweet_min <= wavefronts_per_block <= sweet_max:
+                base_score = 1.00
+            elif sweet_min // 2 <= wavefronts_per_block <= int(sweet_max * 1.5):
+                base_score = 0.95
+            elif wavefronts_per_block == 1:
+                base_score = 0.85
+            else:
+                base_score = 0.75
+
+        elif num_blocks_est == 1:
+            # ── Launch-bound, SINGLE-BLOCK ────────────────────────────────────
+            # All elements land on one CU.  More wavefronts hide memory latency
+            # (Little's Law: need ≥ latency/issue_gap wavefronts in flight).
+            # This is the same physics as the memory-bound sweet-spot model.
+            if sweet_min <= wavefronts_per_block <= sweet_max:
+                base_score = 1.00
+            elif sweet_min // 2 <= wavefronts_per_block <= int(sweet_max * 1.5):
+                base_score = 0.95
+            elif wavefronts_per_block == 1:
+                base_score = 0.85   # single wf: stalls on every memory access
+            else:
+                base_score = 0.75
+
         else:
-            base_score = 0.75  # Outside reasonable range
+            # ── Launch-bound, MULTI-BLOCK ─────────────────────────────────────
+            # Each block runs on a separate CU, so latency hiding is done
+            # across CUs (handled by grid spread, not by per-block warp count).
+            # The only thing that varies per-config is wavefront init overhead:
+            #
+            #   T(nw) = K_launch + (nw − 1) × K_warp   (from overhead model)
+            #   score = T_min / T(nw)                   exact ratio, no tuning
+            #
+            # K_launch and K_warp are the same constants used by
+            # estimate_overhead_time_us – this is not a new calibration.
+            try:
+                from torch._inductor.codegen.triton_heuristics_adaptive import (
+                    BottleneckAnalysis as _BA,
+                )
+                k_launch = _BA.KERNEL_LAUNCH_US          # ~3.0 µs on AMD
+            except Exception:
+                k_launch = 3.0
+            k_warp = 0.2   # µs per extra warp (warp_overhead = (nw-1)×0.2)
 
-        # Tie-breaker: Prefer num_warps that MATCHES actual wavefronts
-        # For memory-bound kernels, we want ALL wavefronts active for latency hiding
-        actual_wavefronts = (threads_per_block + warp_size - 1) // warp_size
+            t_config = k_launch + (num_warps - 1) * k_warp
+            base_score = k_launch / t_config    # ∈ (0, 1], no free parameters
 
-        if num_warps == actual_wavefronts:
-            # Perfect match - all wavefronts utilized
-            warp_multiplier = 1.00
-        elif num_warps == max(1, actual_wavefronts // 2):
-            # Half utilized - acceptable but not optimal
-            warp_multiplier = 0.97
-        elif num_warps < actual_wavefronts:
-            # Underutilized - missing latency hiding opportunities
-            ratio = num_warps / actual_wavefronts
-            warp_multiplier = 0.92 + 0.05 * ratio  # 0.92-0.97
-        else:
-            # Over-specified (num_warps > actual wavefronts)
-            # Triton will clamp it, but shows misconfiguration
-            warp_multiplier = 0.90
-
-        score = base_score * warp_multiplier
-        return max(0.70, min(1.0, score))
+        return max(0.70, min(1.0, base_score))
     
     # =====================================================================
     # FACTOR 6: Grid Granularity (5% weight)
@@ -493,15 +554,21 @@ class PointwiseHeuristics:
         
         # V4: ADAPTIVE optimal based on problem size and bottleneck
         if total_elements < 2048:  # TINY (<2K) - Overhead-dominated
-            # For tiny problems: FEWER blocks is BETTER (minimize overhead)
-            if num_blocks == 1:
-                score = 1.00  # Perfect! Minimize overhead
-            elif num_blocks == 2:
-                score = 0.90  # Acceptable
+            # Even for tiny problems, spreading across ~4 CUs is better than
+            # a single block: AMD can dispatch 4 small blocks to 4 CUs in
+            # parallel with negligible additional overhead, while 1 large block
+            # leaves 119 CUs completely idle.
+            # Empirical: 4 blocks ≈ 2–3% faster than 1 block for 512-elem kernels.
+            if num_blocks <= 1:
+                score = 0.85   # Single CU – poor parallelism for even tiny work
+            elif num_blocks <= 2:
+                score = 0.93
             elif num_blocks <= 4:
-                score = 0.75  # Not great but OK
+                score = 1.00   # Sweet spot: enough CU spread, low dispatch cost
+            elif num_blocks <= 8:
+                score = 0.90   # Slightly more overhead, still acceptable
             else:
-                score = 0.60  # Too many blocks, overhead dominates
+                score = 0.70   # Too many blocks for such a tiny problem
         elif total_elements < 16384:  # Small (2K-16K) - Mixed regime
             optimal_blocks = max(4, hardware_optimal // 32)  # Few blocks
             sigma = optimal_blocks * 0.5

@@ -638,6 +638,9 @@ class BottleneckAnalysis:
         compute_frac  = compute_us  / gross_us if gross_us > 0 else 0.0
 
         # ── Bottleneck: which component limits the effective time ──────────
+        # 'overhead' (LAUNCH-BOUND): dispatch cost >= max(memory, compute)
+        # 'memory':  streaming HBM bandwidth is the wall
+        # 'compute': ALU throughput is the wall
         if overhead_us >= mem_compute_us:
             bottleneck = 'overhead'
         elif memory_us >= compute_us:
@@ -645,15 +648,22 @@ class BottleneckAnalysis:
         else:
             bottleneck = 'compute'
 
+        # ── Overhead-fraction threshold for regime labelling ───────────────
+        # When overhead accounts for >50 % of gross time the kernel is
+        # "launch-bound": minimising block count and dispatch pressure matters
+        # more than memory coalescing or GPU coverage.
+        launch_bound = overhead_frac > 0.50
+
         return {
-            'overhead_us':  overhead_us,
-            'memory_us':    memory_us,
-            'compute_us':   compute_us,
-            'total_us':     total_us,
+            'overhead_us':   overhead_us,
+            'memory_us':     memory_us,
+            'compute_us':    compute_us,
+            'total_us':      total_us,
             'overhead_frac': overhead_frac,
             'memory_frac':   memory_frac,
             'compute_frac':  compute_frac,
             'bottleneck':    bottleneck,
+            'launch_bound':  launch_bound,   # True when overhead dominates
         }
     
     @staticmethod
@@ -720,7 +730,18 @@ class BottleneckAnalysis:
 
         # ── Pure-regime ideal weights ──────────────────────────────────────────
         # Each dict sums to 1.0.
-        OVERHEAD_W = {'bandwidth': 0.10, 'launch': 0.50, 'grid': 0.30, 'occupancy': 0.10}
+        #
+        # OVERHEAD regime rationale (launch-dominated kernels):
+        #   • Launch (0.65): fewer blocks = less dispatch cost → this is THE signal
+        #   • Grid   (0.10): granularity matters little; the launch score already
+        #                    encodes amortisation via elements_per_block.  Keeping
+        #                    Grid high would reward "more blocks" configs that the
+        #                    grid score happens to give 1.0, which fights the Launch
+        #                    signal and causes the heuristic to prefer e.g. 16 blocks
+        #                    over 8 blocks even when 8 is actually faster.
+        #   • Bandwidth (0.10): data is tiny, fits in L2 / L1 → BW score noise
+        #   • Occupancy (0.15): a few extra threads can hide the one dispatch stall
+        OVERHEAD_W = {'bandwidth': 0.10, 'launch': 0.65, 'grid': 0.10, 'occupancy': 0.15}
         MEMORY_W   = {'bandwidth': 0.55, 'launch': 0.10, 'grid': 0.15, 'occupancy': 0.20}
         COMPUTE_W  = {'bandwidth': 0.15, 'launch': 0.10, 'grid': 0.30, 'occupancy': 0.45}
 
