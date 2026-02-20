@@ -34,6 +34,9 @@ class PointwiseBenchmark:
         self.bench_iters = bench_iters
         self.results = []
         self.clear_cache_per_shape = clear_cache_per_shape  # Clear cache after each shape
+        # Timing tracking
+        self._bench_timings: list = []   # [(benchmark_label, wall_seconds, n_subproblems)]
+        self._total_start: float = 0.0
         
         # Define test shapes (name, shape) - including odd shapes and larger ranges
         self.shapes = [
@@ -91,10 +94,12 @@ class PointwiseBenchmark:
     def benchmark_op(self, name: str, eager_fn, compile_fn, inputs: List[torch.Tensor]) -> Dict:
         """
         Benchmark a single operation.
-        
+
         Returns:
-            dict with timing results and speedup
+            dict with timing results and speedup (includes wall_time_s for sub-problem timing)
         """
+        _sub_t0 = time.perf_counter()
+
         # Warmup eager
         for _ in range(self.warmup_iters):
             _ = eager_fn(*inputs)
@@ -134,6 +139,7 @@ class PointwiseBenchmark:
             'eager_ms': eager_time,
             'compile_ms': compile_time,
             'speedup': speedup,
+            'wall_time_s': time.perf_counter() - _sub_t0,
         }
     
     def bench_elementwise_add(self):
@@ -812,8 +818,52 @@ class PointwiseBenchmark:
             if speedups:
                 gmean = geometric_mean(speedups)
                 print(f"  {size:20s}: {gmean:6.3f}x ({len(speedups)} kernels)")
-        
+
         print("="*80)
+
+        # ── Wall-Clock Timing Breakdown ──────────────────────────────────────
+        if self._bench_timings:
+            total_elapsed = time.perf_counter() - self._total_start
+            print("\n" + "="*80)
+            print("  WALL-CLOCK TIMING BREAKDOWN")
+            print("="*80)
+            print(f"\n  {'Benchmark':<32}  {'Time':>8}  {'Sub-probs':>9}  {'Avg/sub':>8}  {'% total':>7}")
+            print(f"  {'-'*32}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*7}")
+
+            sum_bench = 0.0
+            for label, elapsed, n_sub in self._bench_timings:
+                avg = elapsed / n_sub if n_sub else 0.0
+                pct = elapsed / total_elapsed * 100 if total_elapsed > 0 else 0.0
+                sum_bench += elapsed
+                print(f"  {label:<32}  {elapsed:7.1f}s  {n_sub:9d}  {avg:7.2f}s  {pct:6.1f}%")
+
+            print(f"  {'-'*32}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*7}")
+
+            # Per-sub-problem detail (one line per result, grouped by benchmark)
+            # Only printed if there are timings to show
+            print(f"\n  Sub-problem detail (wall time per shape):")
+            bench_idx = 0
+            result_ptr = 0
+            for label, _elapsed, n_sub in self._bench_timings:
+                if n_sub == 0:
+                    continue
+                sub_results = self.results[result_ptr: result_ptr + n_sub]
+                result_ptr += n_sub
+                print(f"\n  ┌─ {label} ({'%d shapes' % n_sub}) ─")
+                for r in sub_results:
+                    wt = r.get('wall_time_s', 0.0)
+                    print(
+                        f"  │  {r['shape']:<22}  {wt:6.2f}s  "
+                        f"(eager {r['eager_ms']:.4f}ms  "
+                        f"compile {r['compile_ms']:.4f}ms  "
+                        f"speedup {r['speedup']:.3f}x)"
+                    )
+
+            overhead = total_elapsed - sum_bench
+            print(f"\n  {'Benchmarks total':<32}  {sum_bench:7.1f}s")
+            print(f"  {'Overhead/summary/csv':<32}  {overhead:7.1f}s")
+            print(f"  {'TOTAL wall time':<32}  {total_elapsed:7.1f}s")
+            print("="*80)
     
     def save_csv(self, filename='pointwise_benchmark_results.csv'):
         """Save results to CSV"""
@@ -868,9 +918,18 @@ class PointwiseBenchmark:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
+    def _time_bench(self, label: str, fn):
+        """Run a benchmark function, record wall time, store in _bench_timings."""
+        results_before = len(self.results)
+        t0 = time.perf_counter()
+        fn()
+        elapsed = time.perf_counter() - t0
+        n_sub = len(self.results) - results_before
+        self._bench_timings.append((label, elapsed, n_sub))
+
     def run_all(self, show_all_heuristics=False, clear_every=5):
         """Run all benchmarks
-        
+
         Args:
             show_all_heuristics: Clear cache periodically to show heuristics
             clear_every: Clear cache every N benchmarks
@@ -882,20 +941,20 @@ class PointwiseBenchmark:
         print(f"  Warmup iterations: {self.warmup_iters}")
         print(f"  Benchmark iterations: {self.bench_iters}")
         print(f"  Pointwise heuristics: {os.environ.get('TORCHINDUCTOR_POINTWISE_HEURISTICS', '?')}")
-        
+
         if self.clear_cache_per_shape:
             print(f"  🔄 Cache clearing: After EACH shape (to show heuristics for every sub-problem)")
         elif show_all_heuristics:
             print(f"  🔄 Cache clearing: Every {clear_every} benchmarks (to show heuristics)")
-        
+
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(0)
             print(f"  GPU: {props.name}")
             if torch.version.hip:
                 print(f"  ROCm version: {torch.version.hip}")
-        
+
         print("="*80)
-        
+
         bench_count = 0
         def maybe_clear_cache():
             nonlocal bench_count
@@ -903,63 +962,49 @@ class PointwiseBenchmark:
             if show_all_heuristics and bench_count % clear_every == 0:
                 print(f"\n🔄 Clearing cache (benchmark #{bench_count}) to show heuristics...")
                 self.clear_compilation_cache()
-        
-        # Run all benchmarks
+
+        self._total_start = time.perf_counter()
+
+        # Run all benchmarks — each wrapped in _time_bench for wall-clock tracking
         print("\n" + "="*80)
         print("  PHASE 1: Basic Elementwise Operations (5 ops)")
         print("="*80)
-        self.bench_elementwise_add()
-        maybe_clear_cache()
-        self.bench_elementwise_mul()
-        maybe_clear_cache()
-        self.bench_relu_sigmoid()
-        maybe_clear_cache()
-        self.bench_gelu()
-        maybe_clear_cache()
-        
+        self._time_bench("Elementwise Add",      self.bench_elementwise_add);  maybe_clear_cache()
+        self._time_bench("Elementwise Multiply",  self.bench_elementwise_mul);  maybe_clear_cache()
+        self._time_bench("ReLU + Sigmoid",        self.bench_relu_sigmoid);     maybe_clear_cache()
+        self._time_bench("GELU",                  self.bench_gelu);             maybe_clear_cache()
+
         print("\n" + "="*80)
         print("  PHASE 2: Additional Elementwise Operations (5 new ops)")
         print("="*80)
-        self.bench_tanh()
-        maybe_clear_cache()
-        self.bench_silu()
-        maybe_clear_cache()
-        self.bench_squared_relu()
-        maybe_clear_cache()
-        self.bench_bias_add_relu()
-        maybe_clear_cache()
-        self.bench_leaky_relu()
-        maybe_clear_cache()
-        
+        self._time_bench("Tanh",                  self.bench_tanh);             maybe_clear_cache()
+        self._time_bench("SiLU/Swish",            self.bench_silu);             maybe_clear_cache()
+        self._time_bench("Squared ReLU",          self.bench_squared_relu);     maybe_clear_cache()
+        self._time_bench("Bias Add + ReLU",       self.bench_bias_add_relu);    maybe_clear_cache()
+        self._time_bench("Leaky ReLU",            self.bench_leaky_relu);       maybe_clear_cache()
+
         print("\n" + "="*80)
         print("  PHASE 3: Multi-Dimensional Kernels (Tests YBLOCK/ZBLOCK)")
         print("="*80)
-        self.bench_2d_specific()
-        maybe_clear_cache()
-        self.bench_3d_specific()
-        maybe_clear_cache()
-        
+        self._time_bench("2D Pointwise",          self.bench_2d_specific);      maybe_clear_cache()
+        self._time_bench("3D Pointwise",          self.bench_3d_specific);      maybe_clear_cache()
+
         print("\n" + "="*80)
         print("  PHASE 4: Basic Fusion")
         print("="*80)
-        self.bench_fused_pointwise()
-        maybe_clear_cache()
-        
+        self._time_bench("Fused Pointwise",       self.bench_fused_pointwise);  maybe_clear_cache()
+
         print("\n" + "="*80)
         print("  PHASE 5: Heavy Fusion Patterns (4 variants)")
         print("="*80)
-        self.bench_heavy_fusion_mlp()
-        maybe_clear_cache()
-        self.bench_heavy_fusion_attention()
-        maybe_clear_cache()
-        self.bench_heavy_fusion_conv_style()
-        maybe_clear_cache()
-        self.bench_heavy_fusion_branching()
-        maybe_clear_cache()
-        
-        # Print summary
+        self._time_bench("Heavy Fusion – MLP",    self.bench_heavy_fusion_mlp);         maybe_clear_cache()
+        self._time_bench("Heavy Fusion – Attn",   self.bench_heavy_fusion_attention);    maybe_clear_cache()
+        self._time_bench("Heavy Fusion – Conv",   self.bench_heavy_fusion_conv_style);   maybe_clear_cache()
+        self._time_bench("Heavy Fusion – Branch", self.bench_heavy_fusion_branching);    maybe_clear_cache()
+
+        # Print summary (includes timing)
         self.print_summary()
-        
+
         # Save results
         self.save_csv()
 

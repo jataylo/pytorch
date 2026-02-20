@@ -7893,8 +7893,6 @@ CPU_TEST_FAILURES = {
 
 # test_failures, xfail by default, set is_skip=True to skip
 GPU_TEST_FAILURES = {
-    # multi-arch kernel not supported on CUDA
-    "test_simple_multi_arch_embed_kernel_binary_False": fail_gpu(("cuda",), is_skip=True),
     # quantized unsupported for GPU
     "test_quantized_linear": fail_gpu(("cuda", "xpu")),
     "test_quanatized_int8_linear": fail_gpu(("cuda", "xpu")),

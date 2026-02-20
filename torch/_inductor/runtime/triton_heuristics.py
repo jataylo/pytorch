@@ -167,7 +167,14 @@ def _print_heuristics_validation_summary(problem_key):
       • 🔍 ANALYSIS – rank error, real speedup, per-factor diff table
       • 💡 Root Cause – which factor drove the misprediction
       • 📈 ACCURACY – Excellent / Good / Acceptable / Poor verdict
+
+    Gated by ``inductor_config.heuristics_verbose``.  Set
+    ``TORCHINDUCTOR_HEURISTICS_VERBOSE=0`` to suppress.
     """
+    from torch._inductor import config as inductor_config
+    if not inductor_config.heuristics_verbose:
+        return
+
     if problem_key not in _HEURISTICS_VALIDATION_DATA:
         return
 
@@ -848,130 +855,120 @@ class CachingAutotuner(KernelInterface):
                 "[HEURISTICS] Failed to refine tensor counts from arg_names: %s", e
             )
 
-        # ── 2.5  Print kernel + problem + device analysis block ───────────────
-        # Runs the kernel parser and device-constant lookup once, prints a
-        # compact summary of everything that will drive the scoring.
-        try:
-            from torch._inductor.codegen.triton_heuristics_kernel_analysis import (
-                extract_kernel_metadata,
-            )
-            from torch._inductor.codegen.triton_heuristics_adaptive import (
-                BottleneckAnalysis,
-            )
+        # ── 2.5  Verbosity flag ─────────────────────────────────────────────────
+        # All detailed print() blocks (analysis box, scoring table, validation
+        # summary) are gated by this flag.  Set
+        # TORCHINDUCTOR_HEURISTICS_VERBOSE=0 to suppress them in production.
+        from torch._inductor import config as inductor_config
+        _verbose = inductor_config.heuristics_verbose
 
-            km   = extract_kernel_metadata(kernel_code) if kernel_code else {}
-            dc   = BottleneckAnalysis._get_device_constants()
-            oi_c = BottleneckAnalysis.get_oi_ceiling()
+        # ── 2.6  Print kernel + problem + device analysis block ───────────────
+        if _verbose:
+            try:
+                from torch._inductor.codegen.triton_heuristics_kernel_analysis import (
+                    extract_kernel_metadata,
+                )
+                from torch._inductor.codegen.triton_heuristics_adaptive import (
+                    BottleneckAnalysis,
+                )
 
-            # ── kernel parse row ──
-            n_fast   = km.get('fast_ops',   0)
-            n_med    = km.get('medium_ops',  0)
-            n_slow   = km.get('slow_ops',    0)
-            n_in     = km.get('num_inputs',  problem_metadata.get('num_inputs',  '?'))
-            n_out    = km.get('num_outputs', problem_metadata.get('num_outputs', '?'))
-            n_tens   = km.get('num_tensors', '?')
-            ops_el   = km.get('ops_per_element', problem_metadata.get('ops_per_element', '?'))
-            bcast    = '✓' if km.get('has_broadcast', False) else '✗'
-            masking  = '✓' if km.get('has_mask',      False) else '✗'
+                km  = extract_kernel_metadata(kernel_code) if kernel_code else {}
+                dc  = BottleneckAnalysis._get_device_constants()
 
-            # ── problem row ──
-            n_elem    = problem_metadata.get('total_elements', 1)
-            elem_sz   = problem_metadata.get('element_size', 4)
-            bpe       = km.get('bytes_per_element',
-                               problem_metadata.get('bytes_per_element', float(elem_sz) * 3))
-            total_kb  = (n_elem * bpe) / 1024
-            total_op  = n_elem * (ops_el if isinstance(ops_el, (int, float)) else 2)
-            ai        = total_op / max(n_elem * bpe, 1)
+                n_fast  = km.get('fast_ops',   0)
+                n_med   = km.get('medium_ops',  0)
+                n_slow  = km.get('slow_ops',    0)
+                n_in    = km.get('num_inputs',  problem_metadata.get('num_inputs',  '?'))
+                n_out   = km.get('num_outputs', problem_metadata.get('num_outputs', '?'))
+                n_tens  = km.get('num_tensors', '?')
+                ops_el  = km.get('ops_per_element', problem_metadata.get('ops_per_element', '?'))
+                bcast   = '✓' if km.get('has_broadcast', False) else '✗'
+                masking = '✓' if km.get('has_mask',      False) else '✗'
 
-            # ── compute efficiency from instruction mix (mirrors estimate_compute_time_us) ──
-            _total_instr = n_fast + n_med + n_slow
-            if _total_instr > 0:
-                _slow_frac   = n_slow / _total_instr
-                _medium_frac = n_med  / _total_instr
-                if _slow_frac > 0.5:
-                    compute_eff = 0.6
-                elif _slow_frac > 0.2 or _medium_frac > 0.5:
-                    compute_eff = 0.7
+                n_elem   = problem_metadata.get('total_elements', 1)
+                elem_sz  = problem_metadata.get('element_size', 4)
+                bpe      = km.get('bytes_per_element',
+                                  problem_metadata.get('bytes_per_element', float(elem_sz) * 3))
+                total_kb = (n_elem * bpe) / 1024
+                total_op = n_elem * (ops_el if isinstance(ops_el, (int, float)) else 2)
+                ai       = total_op / max(n_elem * bpe, 1)
+
+                _ti = n_fast + n_med + n_slow
+                if _ti > 0:
+                    _sf, _mf = n_slow / _ti, n_med / _ti
+                    compute_eff = 0.6 if _sf > 0.5 else (0.7 if _sf > 0.2 or _mf > 0.5 else 0.8)
                 else:
-                    compute_eff = 0.8
-            else:
-                compute_eff = 0.7   # default when no instruction data
+                    compute_eff = 0.7
 
-            # ── roofline ceilings ─────────────────────────────────────────────
-            # Theoretical (pure peak hardware numbers)
-            peak_bw     = dc['memory_bandwidth_gb_s']
-            peak_tflops = dc['compute_tflops']
-            oi_peak = (peak_tflops * 1e12) / (peak_bw * 1e9)   # same as get_oi_ceiling()
+                peak_bw     = dc['memory_bandwidth_gb_s']
+                peak_tflops = dc['compute_tflops']
+                oi_peak = (peak_tflops * 1e12) / (peak_bw * 1e9)
+                eff_bw      = peak_bw * 0.8
+                eff_tflops  = peak_tflops * compute_eff
+                oi_eff      = (eff_tflops * 1e12) / (eff_bw * 1e9)
+                regime   = 'MEMORY-BOUND' if ai < oi_eff else 'COMPUTE-BOUND'
+                ai_cmp   = f'AI {ai:.2f} {"<" if ai < oi_eff else "≥"} eff. OI {oi_eff:.1f}'
+                src_info = f'fn.src ({len(kernel_code)} chars)' if kernel_code else 'no source'
 
-            # Effective (what the time model actually uses):
-            #   memory side : peak_bw × 0.8  (HBM streaming efficiency in estimate_memory_time_us)
-            #   compute side: peak_tflops × compute_eff  (instruction-mix efficiency)
-            eff_bw      = peak_bw * 0.8
-            eff_tflops  = peak_tflops * compute_eff
-            oi_eff      = (eff_tflops * 1e12) / (eff_bw * 1e9)
+                _W = 72
+                def _box_line(text=''):
+                    return f"[HEURISTICS] │  {text}"
+                def _box_sep(label=''):
+                    pad = _W - len(label) - 4
+                    return f"[HEURISTICS] ├─ {label} {'─'*max(pad,0)}┤"
 
-            # Regime: compare AI against the EFFECTIVE ridge (matches the time model)
-            # The time model classifies via max(memory_us, compute_us); this is equivalent.
-            regime    = 'MEMORY-BOUND'  if ai < oi_eff else 'COMPUTE-BOUND'
-            ai_cmp    = f'AI {ai:.2f} {"<" if ai < oi_eff else "≥"} eff. OI {oi_eff:.1f}'
+                print(f"[HEURISTICS] ┌─ Kernel & Problem Analysis {'─'*(_W-27)}┐", flush=True)
+                print(_box_line(f"Source         :  {src_info}"), flush=True)
+                print(_box_line(f"Tensor args    :  {n_tens} ptr args  →  {n_in} inputs  /  {n_out} output(s)"), flush=True)
+                print(_box_line(
+                    f"Instruction mix:  {n_fast} fast (add/mul/fma)  ·  {n_med} medium (div/sqrt)  ·  {n_slow} slow (exp/sin/log)"
+                ), flush=True)
+                print(_box_line(
+                    f"Ops / element  :  {ops_el}  (weighted)   ·   Compute eff: {compute_eff:.1f}"
+                    f"   ·   Broadcast: {bcast}   ·   Masking: {masking}"
+                ), flush=True)
+                print(_box_sep('Problem'), flush=True)
+                print(_box_line(
+                    f"{n_elem:,} elements  ·  {elem_sz} B/scalar  ·  {bpe:.1f} B/elem (r+w)"
+                    f"  →  {total_kb:.1f} KB total"
+                ), flush=True)
+                top_str = (
+                    f"{total_op/1e9:.2f}G" if total_op >= 1e9 else
+                    f"{total_op/1e6:.2f}M" if total_op >= 1e6 else
+                    f"{total_op/1e3:.1f}K"
+                )
+                print(_box_line(f"Total FLOPs    :  ~{top_str}   ·   Arithmetic intensity: {ai:.2f} ops/byte"), flush=True)
+                print(_box_sep('Device / Roofline'), flush=True)
+                print(_box_line(
+                    f"Peak HW        :  {peak_tflops:.1f} TFLOPS  ·  {peak_bw:.1f} GB/s BW"
+                    f"  →  peak OI ceiling {oi_peak:.1f} ops/byte"
+                ), flush=True)
+                print(_box_line(
+                    f"Effective      :  {eff_tflops:.1f} TFLOPS (×{compute_eff})  ·  {eff_bw:.1f} GB/s (×0.8 stream)"
+                    f"  →  eff. OI ridge {oi_eff:.1f} ops/byte"
+                ), flush=True)
+                print(_box_line(
+                    f"Regime         :  {regime}  ({ai_cmp})"
+                    f"  ← time model: max(memory_us, compute_us)"
+                ), flush=True)
+                print(f"[HEURISTICS] └{'─'*(_W+2)}┘", flush=True)
+                print(flush=True)
 
-            # ── source tag ──
-            src_info = f'fn.src ({len(kernel_code)} chars)' if kernel_code else 'no source'
+            except Exception as _analysis_err:
+                log.debug("[HEURISTICS] Analysis summary failed: %s", _analysis_err)
 
-            _W = 72  # inner width of the box
-            def _box_line(text=''):
-                return f"[HEURISTICS] │  {text}"
-            def _box_sep(label=''):
-                pad = _W - len(label) - 4
-                return f"[HEURISTICS] ├─ {label} {'─'*max(pad,0)}┤"
+        # ── 3. Score all configs in ONE parallel pass ──────────────────────
+        # Worker computes score + detailed factor breakdown + bottleneck for
+        # each config simultaneously.  This eliminates the old two-pass design
+        # (score loop then a second get_detailed_scores+analyze_bottleneck loop
+        # during printing) and gives real parallelism on calls that release the
+        # GIL (torch.cuda.get_device_properties in _get_device_constants).
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from torch._inductor.codegen.triton_heuristics_adaptive import (
+            BottleneckAnalysis,
+        )
 
-            print(f"[HEURISTICS] ┌─ Kernel & Problem Analysis {'─'*(_W-27)}┐", flush=True)
-            print(_box_line(f"Source         :  {src_info}"), flush=True)
-            print(_box_line(f"Tensor args    :  {n_tens} ptr args  →  {n_in} inputs  /  {n_out} output(s)"), flush=True)
-            print(_box_line(
-                f"Instruction mix:  {n_fast} fast (add/mul/fma)  ·  {n_med} medium (div/sqrt)  ·  {n_slow} slow (exp/sin/log)"
-            ), flush=True)
-            print(_box_line(
-                f"Ops / element  :  {ops_el}  (weighted)   ·   Compute eff: {compute_eff:.1f}"
-                f"   ·   Broadcast: {bcast}   ·   Masking: {masking}"
-            ), flush=True)
-            print(_box_sep('Problem'), flush=True)
-            print(_box_line(
-                f"{n_elem:,} elements  ·  {elem_sz} B/scalar  ·  {bpe:.1f} B/elem (r+w)"
-                f"  →  {total_kb:.1f} KB total"
-            ), flush=True)
-            total_op_str = (
-                f"{total_op/1e9:.2f}G" if total_op >= 1e9 else
-                f"{total_op/1e6:.2f}M" if total_op >= 1e6 else
-                f"{total_op/1e3:.1f}K"
-            )
-            print(_box_line(f"Total FLOPs    :  ~{total_op_str}   ·   Arithmetic intensity: {ai:.2f} ops/byte"), flush=True)
-            print(_box_sep('Device / Roofline'), flush=True)
-            print(_box_line(
-                f"Peak HW        :  {peak_tflops:.1f} TFLOPS  ·  {peak_bw:.1f} GB/s BW"
-                f"  →  peak OI ceiling {oi_peak:.1f} ops/byte"
-            ), flush=True)
-            print(_box_line(
-                f"Effective      :  {eff_tflops:.1f} TFLOPS (×{compute_eff})  ·  {eff_bw:.1f} GB/s (×0.8 stream)"
-                f"  →  eff. OI ridge {oi_eff:.1f} ops/byte"
-            ), flush=True)
-            print(_box_line(
-                f"Regime         :  {regime}  ({ai_cmp})"
-                f"  ← time model: max(memory_us, compute_us)"
-            ), flush=True)
-            print(f"[HEURISTICS] └{'─'*(_W+2)}┘", flush=True)
-            print(flush=True)
-
-        except Exception as _analysis_err:
-            log.debug("[HEURISTICS] Analysis summary failed: %s", _analysis_err)
-
-        # ── 3. Score every Triton Config directly from its effective kwargs ─
-        # We extract the actual block-size kwargs from each Triton Config object
-        # (post triton_config() adjustment) and feed those into score_config.
-        # This means there is NO matching step – we score what the compiler will
-        # actually use, and track the Triton Config object alongside the score.
-        scored = []   # (score, triton_cfg, effective_dict)
-        for triton_cfg in self.configs:
+        def _score_one_config(triton_cfg):
             try:
                 effective = {
                     k: triton_cfg.kwargs[k]
@@ -979,80 +976,87 @@ class CachingAutotuner(KernelInterface):
                     if k in triton_cfg.kwargs
                 }
                 effective['num_warps'] = triton_cfg.num_warps
-                score = PointwiseHeuristics.score_config(effective, problem_metadata, kernel_code)
-                scored.append((score, triton_cfg, effective))
+                sc = PointwiseHeuristics.score_config(effective, problem_metadata, kernel_code)
+                d  = PointwiseHeuristics.get_detailed_scores(effective, problem_metadata, kernel_code)
+                bn = BottleneckAnalysis.analyze_bottleneck(effective, problem_metadata, kernel_code)
+                return (sc, triton_cfg, effective, d, bn)
             except Exception:
-                continue
+                return None
 
-        if not scored:
+        _max_workers = min(8, max(1, len(self.configs)))
+        _scored_raw = []
+        with ThreadPoolExecutor(max_workers=_max_workers) as _pool:
+            _futs = {_pool.submit(_score_one_config, cfg): cfg for cfg in self.configs}
+            for _fut in as_completed(_futs):
+                _res = _fut.result()
+                if _res is not None:
+                    _scored_raw.append(_res)
+
+        if not _scored_raw:
             log.warning("[HEURISTICS] No configs could be scored – keeping all configs")
             return
 
-        scored.sort(reverse=True, key=lambda x: x[0])
+        _scored_raw.sort(key=lambda x: x[0], reverse=True)
 
-        # ── 4. Print full scoring table for debugging ──────────────────────
-        _BN_ICON = {'overhead': '🚀 LAUNCH ', 'memory': '💾 MEMORY ', 'compute': '⚡ COMPUTE'}
-        src_tag = f"fn.src ({len(kernel_code)} chars)" if kernel_code else "no kernel src"
-        hdr1 = (
-            f"  {'Rank':>4}  {'Score':>7}  {'Bottleneck':13s}  "
-            f"{'Ohd_µs':>7}  {'Mem_µs':>7}  {'Cmp_µs':>7}  {'Tot_µs':>7}  │  "
-            f"{'BW':>6}  {'Lnch':>6}  {'Grid':>6}  {'Occup':>6}  │  "
-            f"{'Blks':>6}  {'Thr/blk':>7}  Config"
-        )
-        sep = f"  {'-'*len(hdr1)}"
-        print(
-            f"\n[HEURISTICS] Scoring table – {len(scored)} configs | {src_tag} | "
-            f"problem: {problem_metadata.get('total_elements', '?'):,} elements",
-            flush=True,
-        )
-        print(hdr1, flush=True)
-        print(sep, flush=True)
-        for rank, (score, triton_cfg, effective) in enumerate(scored, 1):
-            # Fetch factor scores and bottleneck analysis independently so a
-            # failure in one doesn't blank out the other.
-            try:
-                d = PointwiseHeuristics.get_detailed_scores(effective, problem_metadata, kernel_code)
-            except Exception as _e:
-                log.debug("[HEURISTICS] get_detailed_scores failed for %s: %s", effective, _e)
-                d = {}
-            try:
-                bn = BottleneckAnalysis.analyze_bottleneck(effective, problem_metadata, kernel_code)
-            except Exception as _e:
-                log.debug("[HEURISTICS] analyze_bottleneck failed for %s: %s", effective, _e)
-                bn = {}
-
-            bn_label = _BN_ICON.get(bn.get('bottleneck', ''), '?         ')
-            marker = "  ◄ top-5" if rank <= 5 else ""
+        # ── 4. Print full scoring table (verbose only) ─────────────────────
+        if _verbose:
+            _BN_ICON = {'overhead': '🚀 LAUNCH ', 'memory': '💾 MEMORY ', 'compute': '⚡ COMPUTE'}
+            src_tag = f"fn.src ({len(kernel_code)} chars)" if kernel_code else "no kernel src"
+            hdr1 = (
+                f"  {'Rank':>4}  {'Score':>7}  {'Bottleneck':13s}  "
+                f"{'Ohd_µs':>7}  {'Mem_µs':>7}  {'Cmp_µs':>7}  {'Tot_µs':>7}  │  "
+                f"{'BW':>6}  {'Lnch':>6}  {'Grid':>6}  {'Occup':>6}  │  "
+                f"{'Blks':>6}  {'Thr/blk':>7}  Config"
+            )
+            sep = f"  {'-'*len(hdr1)}"
             print(
-                f"  #{rank:3d}  {score:7.4f}  {bn_label}  "
-                f"{bn.get('overhead_us', 0):7.2f}  "
-                f"{bn.get('memory_us', 0):7.2f}  "
-                f"{bn.get('compute_us', 0):7.2f}  "
-                f"{bn.get('total_us', 0):7.2f}  │  "
-                f"{d.get('memory_bandwidth', 0):6.3f}  "
-                f"{d.get('launch_overhead', 0):6.3f}  "
-                f"{d.get('grid_granularity', 0):6.3f}  "
-                f"{d.get('occupancy', 0):6.3f}  │  "
-                f"{d.get('num_blocks', 0):6d}  "
-                f"{d.get('threads_per_block', 0):7d}  "
-                f"{effective}{marker}",
+                f"\n[HEURISTICS] Scoring table – {len(_scored_raw)} configs | {src_tag} | "
+                f"problem: {problem_metadata.get('total_elements', '?'):,} elements",
                 flush=True,
             )
-        print(flush=True)
+            print(hdr1, flush=True)
+            print(sep, flush=True)
+            _top_n = inductor_config.heuristics_top_n_configs
+            for _rank, (_sc, _tcfg, _eff, _d, _bn) in enumerate(_scored_raw, 1):
+                _bn_label = _BN_ICON.get(_bn.get('bottleneck', ''), '?         ')
+                _marker = f"  ◄ top-{_top_n}" if _rank <= _top_n else ""
+                print(
+                    f"  #{_rank:3d}  {_sc:7.4f}  {_bn_label}  "
+                    f"{_bn.get('overhead_us', 0):7.2f}  "
+                    f"{_bn.get('memory_us',  0):7.2f}  "
+                    f"{_bn.get('compute_us', 0):7.2f}  "
+                    f"{_bn.get('total_us',   0):7.2f}  │  "
+                    f"{_d.get('memory_bandwidth', 0):6.3f}  "
+                    f"{_d.get('launch_overhead',  0):6.3f}  "
+                    f"{_d.get('grid_granularity', 0):6.3f}  "
+                    f"{_d.get('occupancy',        0):6.3f}  │  "
+                    f"{_d.get('num_blocks',        0):6d}  "
+                    f"{_d.get('threads_per_block', 0):7d}  "
+                    f"{_eff}{_marker}",
+                    flush=True,
+                )
+            print(flush=True)
 
-        top_5_scored = scored[:5]
-        top_5_triton = [tcfg for _, tcfg, _ in top_5_scored]
-        top_5_heuristic = [hdict for _, _, hdict in top_5_scored]   # for _TOP_N_CONFIGS_FOR_SELECTION
+        # Collapse to (score, triton_cfg, effective) for downstream use
+        scored = [(_sc, _tc, _eff) for _sc, _tc, _eff, _d, _bn in _scored_raw]
+
+        # ── How many configs form the selection pool? ──────────────────────
+        # Controlled by TORCHINDUCTOR_HEURISTICS_TOP_N (default 5).
+        # Clamp to [1, len(scored)] so the value is always valid.
+        _top_n = max(1, min(inductor_config.heuristics_top_n_configs, len(scored)))
+
+        top_n_scored    = scored[:_top_n]
+        top_n_triton    = [tcfg  for _, tcfg, _    in top_n_scored]
+        top_n_heuristic = [hdict for _, _,    hdict in top_n_scored]
 
         log.info(
-            "[HEURISTICS] Top config: score=%.4f  %s",
-            top_5_scored[0][0], top_5_scored[0][2],
+            "[HEURISTICS] Top config (N=%d): score=%.4f  %s",
+            _top_n, top_n_scored[0][0], top_n_scored[0][2],
         )
 
         # ── 5. Store predictions for _print_heuristics_validation_summary ──
         # predicted_scores is a list of (score, effective_dict) pairs in
         # descending score order, matching the format _store_actual_timing uses.
-        from torch._inductor import config as inductor_config
         problem_key = _normalize_problem_key(size_hints)
         predicted_scores = [(score, hdict) for score, _, hdict in scored]
         _store_heuristics_predictions(problem_key, problem_metadata, predicted_scores, kernel_code)
@@ -1060,28 +1064,29 @@ class CachingAutotuner(KernelInterface):
         # ── 6. Apply mode logic ────────────────────────────────────────────
         if inductor_config.heuristics_real_bench:
             # REAL_BENCH: benchmark ALL configs for full validation data.
-            # Winner is chosen only from the heuristic top-5 (stored below).
+            # Winner is chosen only from the heuristic top-N (stored below).
             # self.configs is left unchanged – every config gets compiled.
-            _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_5_heuristic
+            _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_n_heuristic
             log.info(
                 "[HEURISTICS] REAL_BENCH mode: all %d configs will be benchmarked, "
-                "winner selected from top-5 predicted",
-                len(self.configs),
+                "winner selected from top-%d predicted",
+                len(self.configs), _top_n,
             )
             print(
                 f"[HEURISTICS] REAL_BENCH mode: benchmarking all {len(self.configs)} configs, "
-                f"selecting winner from heuristic top-5",
+                f"selecting winner from heuristic top-{_top_n}",
                 flush=True,
             )
         else:
-            # Heuristics-only: prune self.configs to top-5 before compilation.
-            self.configs = top_5_triton
+            # Heuristics-only: prune self.configs to top-N before compilation.
+            self.configs = top_n_triton
             log.info(
-                "[HEURISTICS] Heuristics-only mode: pruned to %d configs",
-                len(self.configs),
+                "[HEURISTICS] Heuristics-only mode: pruned to top-%d configs",
+                _top_n,
             )
             print(
-                f"[HEURISTICS] Heuristics-only mode: pruned to {len(self.configs)} configs",
+                f"[HEURISTICS] Heuristics-only mode: pruned to top-{_top_n} configs"
+                f" ({len(self.configs)} total)",
                 flush=True,
             )
 

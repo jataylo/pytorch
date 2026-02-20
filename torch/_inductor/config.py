@@ -518,6 +518,47 @@ heuristics_real_bench: bool = (
     os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "1") == "1"
 )
 
+# ── Heuristics top-N selection pool ──────────────────────────────────────────
+#
+# Number of top-scoring configs that form the "selection pool" for the
+# heuristic winner:
+#
+#   REAL_BENCH mode  (heuristics_real_bench=True):
+#     All candidate configs are compiled and benchmarked, but the final
+#     kernel is chosen only from the top-N predicted by the heuristic.
+#     Raising N gives the benchmark more candidates to pick from (safer);
+#     lowering N tests the heuristic more aggressively.
+#
+#   Heuristics-only mode  (heuristics_real_bench=False):
+#     Only the top-N configs are compiled at all.  Lower = faster compilation;
+#     higher = more robustness if the #1 prediction is occasionally wrong.
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_TOP_N
+# Default: 5
+heuristics_top_n_configs: int = int(
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_TOP_N", "5")
+)
+
+# ── Heuristics verbosity ─────────────────────────────────────────────────────
+#
+# Controls whether the pointwise heuristics system prints detailed diagnostic
+# output: the Kernel & Problem Analysis box, the full per-config scoring table,
+# and the predicted-vs-actual validation summary.
+#
+# When disabled (0), only compact one-liners are printed:
+#   • "[HEURISTICS] REAL_BENCH mode: benchmarking N configs …"
+#   • "[HEURISTICS] Selected from top 5 predicted configs …"
+# This is suitable for production runs where the extra output is noise.
+#
+# When enabled (1, default), all diagnostic tables are printed.
+# Useful during heuristic development and performance analysis.
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_VERBOSE
+# Default: "1" (verbose – matches current behaviour)
+heuristics_verbose: bool = (
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_VERBOSE", "1") == "1"
+)
+
 # Disable triton from trying to initialize and detect devices on the host
 triton_disable_device_detection = (
     os.environ.get("TORCHINDUCTOR_TRITON_DISABLE_DEVICE_DETECTION", "0") == "1"
