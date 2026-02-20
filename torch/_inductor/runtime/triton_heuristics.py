@@ -49,6 +49,11 @@ _HEURISTICS_VALIDATION_DATA = {}
 # Maps problem_key -> [list of top N configs to use for selection]
 _TOP_N_CONFIGS_FOR_SELECTION = {}
 
+# Global storage for the full ranked heuristic config list (heuristics-only mode).
+# Maps problem_key -> [list of all scored effective-dicts in score order].
+# Used as a fallback when all top-N configs register-spill at runtime.
+_HEURISTICS_FULL_RANKED_HDICTS = {}
+
 
 def _normalize_problem_key(size_hints):
     """
@@ -85,6 +90,73 @@ def _store_actual_timing(problem_key, config, timing_ms):
     """Store actual benchmark timing for a config"""
     if problem_key in _HEURISTICS_VALIDATION_DATA:
         _HEURISTICS_VALIDATION_DATA[problem_key]['actual_timings'].append((timing_ms, config))
+
+
+def _estimate_spill_risk(config_dict, problem_metadata):
+    """
+    Lightweight heuristic to estimate register-spill risk before compilation.
+
+    Triton compiles each config independently; spills are only known after
+    compilation.  This function provides a cheap pre-compile signal so that
+    the scoring table can flag high-risk configs.
+
+    Model (AMD CDNA / ROCm, generalises to NVIDIA with smaller warp_size):
+      - Hardware VGPRs per CU:    65 536  (CDNA2/CDNA3)
+      - Max VGPRs per wavefront:  256
+      - Threads per block:        num_warps * warp_size
+      - Max VGPRs per thread:     min(256, 65536 // threads_per_block)
+
+    Kernel VGPR estimate (rough, no compilation needed):
+      - Base (loop vars, addresses):           16
+      - Per tensor operand (input+output):     8 each
+      - Per operation in the compute graph:    1.5
+      - 2-D/3-D kernels (YBLOCK present):     +10  (extra loop vars, stride regs)
+      - XBLOCK ≥ 512 unrolling overhead:      +8   (more live values in the loop)
+
+    This estimate is intentionally conservative (tends to over-estimate) so
+    that it flags potential spills without aggressively suppressing configs.
+    The risk level is purely informational; it does NOT affect ranking.
+
+    Returns:
+        (risk_label, ratio, estimated_vgprs, max_vgprs)
+        risk_label: 'LOW' | 'MED' | 'HIGH'
+        ratio:      estimated_vgprs / max_vgprs  (>1.0 → very likely to spill)
+    """
+    warp_size        = problem_metadata.get('warp_size', 32)
+    num_warps        = config_dict.get('num_warps', 4)
+    threads_per_block = num_warps * warp_size
+
+    # Hardware limit: AMD 65536 VGPRs/CU, max 256/thread
+    total_vgprs      = 65536
+    max_vgprs        = min(256, total_vgprs // max(1, threads_per_block))
+
+    # Kernel VGPR estimate
+    num_inputs       = problem_metadata.get('num_inputs',  2)
+    num_outputs      = problem_metadata.get('num_outputs', 1)
+    ops_per_element  = problem_metadata.get('ops_per_element', 4)
+
+    estimated_vgprs  = 16                                   # base
+    estimated_vgprs += (num_inputs + num_outputs) * 8       # operand regs
+    estimated_vgprs += ops_per_element * 1.5                # compute temporaries
+
+    yblock = config_dict.get('YBLOCK', 0)
+    if yblock:
+        estimated_vgprs += 10                               # 2-D loop overhead
+
+    xblock = config_dict.get('XBLOCK', 256)
+    if xblock >= 512:
+        estimated_vgprs += 8                                # loop-unroll live values
+
+    ratio = estimated_vgprs / max(1, max_vgprs)
+
+    if ratio > 1.0:
+        risk_label = 'HIGH'
+    elif ratio > 0.75:
+        risk_label = 'MED '
+    else:
+        risk_label = 'low '
+
+    return risk_label, ratio, int(estimated_vgprs), max_vgprs
 
 
 def _bottleneck_bar(ohd_frac, mem_frac, cmp_frac, width=30):
@@ -197,16 +269,29 @@ def _print_heuristics_validation_summary(problem_key):
     if not predicted_sorted:
         return
 
-    best_predicted_score, best_predicted_cfg = predicted_sorted[0]
-
-    # find measured time for what we predicted was #1
-    predicted_actual_ms = None
-    for t, cfg in actual:
-        if cfg == best_predicted_cfg:
-            predicted_actual_ms = t
+    # Walk down predicted ranking to find the highest-ranked config that was
+    # actually benchmarked.  Configs that exceeded the register-spill threshold
+    # in bench() return float("inf") early and never reach _store_actual_timing,
+    # so they won't appear in actual_timings.  This is common for 2-D/3-D kernels
+    # with large block products (high register pressure).  We skip those and use
+    # the next best predicted config that has a real timing entry.
+    best_predicted_score = None
+    best_predicted_cfg   = None
+    best_predicted_rank  = None   # 1-based rank among all predicted (incl. spills)
+    predicted_actual_ms  = None
+    for rank, (score, cfg) in enumerate(predicted_sorted, 1):
+        for t, acfg in actual:
+            if acfg == cfg:
+                best_predicted_score = score
+                best_predicted_cfg   = cfg
+                best_predicted_rank  = rank
+                predicted_actual_ms  = t
+                break
+        if predicted_actual_ms is not None:
             break
+
     if predicted_actual_ms is None:
-        return  # our top pick wasn't benchmarked (shouldn't happen in REAL_BENCH)
+        return  # no predicted config was benchmarked at all
 
     slowdown = predicted_actual_ms / best_actual_ms if best_actual_ms > 0 else 1.0
 
@@ -285,9 +370,18 @@ def _print_heuristics_validation_summary(problem_key):
             print(line, flush=True)
 
     # ── predicted best ────────────────────────────────────────────────────
+    # best_predicted_rank is 1 normally; >1 means higher-ranked configs were
+    # spill-skipped in bench() and never stored in actual_timings.
+    if best_predicted_rank == 1:
+        pred_label = "📊 PREDICTED #1  (heuristic top pick)"
+    else:
+        pred_label = (
+            f"📊 PREDICTED #{best_predicted_rank}  "
+            f"(ranks 1–{best_predicted_rank - 1} spill-skipped, using next available)"
+        )
     _print_config_block(
-        "📊 PREDICTED #1  (heuristic top pick)",
-        best_predicted_score, "#1",
+        pred_label,
+        best_predicted_score, f"#{best_predicted_rank}",
         best_predicted_cfg, predicted_actual_ms, pred_details,
     )
 
@@ -307,16 +401,16 @@ def _print_heuristics_validation_summary(problem_key):
     if actual_best_rank is None:
         print("  ❌ CRITICAL: actual best config was NOT generated by the heuristic!", flush=True)
         print("     This indicates a gap in the config generation logic.", flush=True)
-    elif actual_best_rank == 1:
+    elif actual_best_rank == best_predicted_rank:
         print(f"  ✅ Heuristics correctly identified the best config!", flush=True)
-        print(f"     Predicted #1 = Actual #1  (slowdown: {slowdown:.3f}x)", flush=True)
+        print(f"     Predicted #{best_predicted_rank} = Actual #{actual_best_rank}  (slowdown: {slowdown:.3f}x)", flush=True)
     else:
-        rank_diff    = actual_best_rank - 1
+        rank_diff    = actual_best_rank - best_predicted_rank
         speedup_real = predicted_actual_ms / best_actual_ms
         score_gap    = best_predicted_score - actual_best_score
         print(
             f"  ⚠️  Heuristics ranked actual best as #{actual_best_rank} "
-            f"(off by {rank_diff} positions)",
+            f"(off by {rank_diff:+d} positions vs effective pick #{best_predicted_rank})",
             flush=True,
         )
         print(f"     Score gap  : {score_gap:+.4f}  "
@@ -331,7 +425,7 @@ def _print_heuristics_validation_summary(problem_key):
                 ('grid_granularity', 'Grid',      20),
                 ('occupancy',        'Occupancy', 10),
             ]
-            print(f"\n  📋 Factor comparison  (Predicted #1  vs  Actual Best #{actual_best_rank}):", flush=True)
+            print(f"\n  📋 Factor comparison  (Predicted #{best_predicted_rank}  vs  Actual Best #{actual_best_rank}):", flush=True)
             print(f"     {'Factor':10s}  {'Pred':>7}  {'Actual':>7}  {'Delta':>7}  {'Wt':>4}  Note", flush=True)
             print(f"     {'-'*60}", flush=True)
             weighted_diffs = []
@@ -1028,7 +1122,7 @@ class CachingAutotuner(KernelInterface):
                 f"  {'Rank':>4}  {'Score':>7}  {'Bottleneck':13s}  "
                 f"{'Ohd_µs':>7}  {'Mem_µs':>7}  {'Cmp_µs':>7}  {'Tot_µs':>7}  │  "
                 f"{'BW':>6}  {'Lnch':>6}  {'Grid':>6}  {'Occup':>6}  │  "
-                f"{'Blks':>6}  {'Thr/blk':>7}  Config"
+                f"{'Blks':>6}  {'Thr/blk':>7}  {'Spill?':>9}  Config"
             )
             sep = f"  {'-'*len(hdr1)}"
             print(
@@ -1042,6 +1136,8 @@ class CachingAutotuner(KernelInterface):
             for _rank, (_sc, _tcfg, _eff, _d, _bn) in enumerate(_scored_raw, 1):
                 _bn_label = _BN_ICON.get(_bn.get('bottleneck', ''), '?         ')
                 _marker = f"  ◄ top-{_top_n}" if _rank <= _top_n else ""
+                _srisk, _sratio, _sest, _smax = _estimate_spill_risk(_eff, problem_metadata)
+                _spill_col = f"{_srisk}({_sratio:.2f})"
                 print(
                     f"  #{_rank:3d}  {_sc:7.4f}  {_bn_label}  "
                     f"{_bn.get('overhead_us', 0):7.2f}  "
@@ -1054,9 +1150,16 @@ class CachingAutotuner(KernelInterface):
                     f"{_d.get('occupancy',        0):6.3f}  │  "
                     f"{_d.get('num_blocks',        0):6d}  "
                     f"{_d.get('threads_per_block', 0):7d}  "
+                    f"{_spill_col:>9}  "
                     f"{_eff}{_marker}",
                     flush=True,
                 )
+            print(
+                f"  Spill? column: estimated VGPRs / max VGPRs per thread "
+                f"(LOW<0.75, MED 0.75-1.0, HIGH>1.0 → likely spill)  "
+                f"[heuristic only – actual spills known after compile]",
+                flush=True,
+            )
             print(flush=True)
 
         # Collapse to (score, triton_cfg, effective) for downstream use
@@ -1100,15 +1203,35 @@ class CachingAutotuner(KernelInterface):
                 flush=True,
             )
         else:
-            # Heuristics-only: prune self.configs to top-N before compilation.
-            self.configs = top_n_triton
+            # Heuristics-only: prune self.configs before compilation.
+            #
+            # Base pool: top-N configs (heuristic selection).
+            # Spill buffer: if heuristics_spill_fallback_buffer > 0, compile an
+            # additional BUFFER configs ranked N+1 to N+BUFFER.  These are never
+            # used for selection unless all top-N configs register-spill at runtime,
+            # in which case autotune_to_one_config falls back to the best
+            # non-spilling config from the extended pool.
+            _spill_buf = max(0, inductor_config.heuristics_spill_fallback_buffer)
+            _compile_n = min(_top_n + _spill_buf, len(scored))
+            self.configs = [tcfg for _, tcfg, _ in scored[:_compile_n]]
+
+            # Store the full ranked hdict list so autotune_to_one_config can
+            # match fallback configs back to launcher timings.
+            _HEURISTICS_FULL_RANKED_HDICTS[problem_key] = [
+                hdict for _, _, hdict in scored
+            ]
+
             log.info(
-                "[HEURISTICS] Heuristics-only mode: pruned to top-%d configs",
-                _top_n,
+                "[HEURISTICS] Heuristics-only mode: compiling top-%d configs "
+                "(top-%d selection + %d spill-buffer)",
+                _compile_n, _top_n, _compile_n - _top_n,
+            )
+            _buf_note = (
+                f" + {_compile_n - _top_n} spill-buffer" if _compile_n > _top_n else ""
             )
             print(
-                f"[HEURISTICS] Heuristics-only mode: pruned to top-{_top_n} configs"
-                f" ({len(self.configs)} total)",
+                f"[HEURISTICS] Heuristics-only mode: compiling top-{_compile_n} configs"
+                f" (top-{_top_n} selection{_buf_note})",
                 flush=True,
             )
 
@@ -1897,6 +2020,85 @@ class CachingAutotuner(KernelInterface):
                 
         See: TOP_N_SELECTION_FEATURE.md for complete rationale
         """
+        # ── Post-compile spill eviction (heuristics-only + buffer mode) ───────
+        # n_spills is populated in each launcher by _make_launchers() from the
+        # compiled binary metadata — it is fully known here, before any GPU
+        # benchmark call.  When the spill fallback buffer is enabled, we screen
+        # the top-N selection pool now and swap out any config that exceeds the
+        # spill threshold with the highest-ranked buffer config that doesn't.
+        # This avoids wasting GPU bench time on configs that will return inf.
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+
+        if (
+            not inductor_config.heuristics_real_bench
+            and inductor_config.heuristics_spill_fallback_buffer > 0
+            and self.heuristic_type == HeuristicType.POINTWISE
+            and self.size_hints is not None
+        ):
+            _pk = _normalize_problem_key(self.size_hints)
+            _top_n_sel = _TOP_N_CONFIGS_FOR_SELECTION.get(_pk, [])
+            _full_ranked = _HEURISTICS_FULL_RANKED_HDICTS.get(_pk, [])
+            if _top_n_sel and _full_ranked:
+                _spill_thresh = self.inductor_meta.get(
+                    "spill_threshold", 32 if torch.version.hip else 16
+                )
+
+                def _launcher_hdict(lnch):
+                    c = {
+                        'XBLOCK': lnch.config.kwargs.get('XBLOCK'),
+                        'YBLOCK': lnch.config.kwargs.get('YBLOCK'),
+                        'ZBLOCK': lnch.config.kwargs.get('ZBLOCK'),
+                        'num_warps': lnch.config.num_warps,
+                    }
+                    return {k: v for k, v in c.items() if v is not None}
+
+                # Build a fast lookup: hdict → launcher (for all compiled configs)
+                _hdict_to_launcher = {
+                    tuple(sorted(_launcher_hdict(ln).items())): ln
+                    for ln in self.launchers
+                }
+
+                def _spills(lnch):
+                    return (
+                        lnch.n_spills is not None
+                        and lnch.n_spills > _spill_thresh
+                    )
+
+                new_top_n = list(_top_n_sel)
+                evicted = 0
+                # Walk buffer pool ranked N+1, N+2, … as candidate replacements
+                buffer_candidates = [
+                    hdict for hdict in _full_ranked[len(_top_n_sel):]
+                    if not _spills(
+                        _hdict_to_launcher.get(tuple(sorted(hdict.items())),
+                                               type('_', (), {'n_spills': 0})())
+                    )
+                ]
+                buf_idx = 0
+                for i, hdict in enumerate(new_top_n):
+                    key = tuple(sorted(hdict.items()))
+                    launcher = _hdict_to_launcher.get(key)
+                    if launcher is not None and _spills(launcher):
+                        if buf_idx < len(buffer_candidates):
+                            replacement = buffer_candidates[buf_idx]
+                            new_top_n[i] = replacement
+                            buf_idx += 1
+                            evicted += 1
+                        # else: no buffer replacement available, leave as-is
+                        # (bench() will return inf as before)
+
+                if evicted:
+                    _TOP_N_CONFIGS_FOR_SELECTION[_pk] = new_top_n
+                    msg = (
+                        f"[HEURISTICS] Post-compile spill eviction: "
+                        f"{evicted} top-N config(s) exceeded spill threshold "
+                        f"(>{_spill_thresh} spills) and were replaced with "
+                        f"buffer configs before benchmarking"
+                    )
+                    print(msg, flush=True)
+                    log.info(msg)
+
         start_time = time.time_ns()
         timings = self.benchmark_all_configs(*args, **kwargs)
         benchmark_time_taken_ns = time.time_ns() - start_time
@@ -1935,15 +2137,63 @@ class CachingAutotuner(KernelInterface):
                 
                 # Select best from top N only
                 if filtered_timings:
-                    self.launchers = [builtins.min(filtered_timings, key=filtered_timings.get)]
-                    
-                    # Log that we're restricting selection
-                    msg = (
-                        f"[HEURISTICS] Selected from top {len(top_n_configs)} predicted configs "
-                        f"(benchmarked {len(timings)} total for validation)"
-                    )
-                    print(msg, flush=True)
-                    log.info(msg)
+                    best_top_n_timing = builtins.min(filtered_timings.values())
+
+                    if best_top_n_timing == float("inf"):
+                        # ── Spill fallback ──────────────────────────────────
+                        # All top-N compiled configs hit the register-spill
+                        # threshold in bench() and returned inf.  Walk the full
+                        # heuristic ranking (which covers the extended compile
+                        # pool: top-N + spill-buffer) and pick the fastest
+                        # non-spilling config from those actually benchmarked.
+                        full_ranked = _HEURISTICS_FULL_RANKED_HDICTS.get(problem_key, [])
+                        fallback_launcher = None
+                        fallback_rank = None
+                        for _fb_rank, _fb_hdict in enumerate(full_ranked[len(top_n_configs):], len(top_n_configs) + 1):
+                            for launcher, timing in timings.items():
+                                if timing < float("inf"):
+                                    # Check if this launcher matches the fallback hdict
+                                    launcher_cfg = {
+                                        'XBLOCK': launcher.config.kwargs.get('XBLOCK'),
+                                        'YBLOCK': launcher.config.kwargs.get('YBLOCK'),
+                                        'ZBLOCK': launcher.config.kwargs.get('ZBLOCK'),
+                                        'num_warps': launcher.config.num_warps,
+                                    }
+                                    launcher_cfg = {k: v for k, v in launcher_cfg.items() if v is not None}
+                                    if launcher_cfg == _fb_hdict:
+                                        fallback_launcher = launcher
+                                        fallback_rank = _fb_rank
+                                        break
+                            if fallback_launcher is not None:
+                                break
+
+                        if fallback_launcher is not None:
+                            self.launchers = [fallback_launcher]
+                            msg = (
+                                f"[HEURISTICS] SPILL FALLBACK: top-{len(top_n_configs)} configs "
+                                f"all spilled, using heuristic rank #{fallback_rank} "
+                                f"({fallback_launcher.config})"
+                            )
+                        else:
+                            # Last resort: all benchmarked configs spilled; pick
+                            # the one with the fewest spills (min timing, all inf)
+                            self.launchers = [builtins.min(timings, key=timings.get)]
+                            msg = (
+                                f"[HEURISTICS] SPILL FALLBACK: all {len(timings)} benchmarked "
+                                f"configs spilled – using global best (all inf)"
+                            )
+                        print(msg, flush=True)
+                        log.warning(msg)
+                    else:
+                        self.launchers = [builtins.min(filtered_timings, key=filtered_timings.get)]
+
+                        # Log that we're restricting selection
+                        msg = (
+                            f"[HEURISTICS] Selected from top {len(top_n_configs)} predicted configs "
+                            f"(benchmarked {len(timings)} total for validation)"
+                        )
+                        print(msg, flush=True)
+                        log.info(msg)
                 else:
                     # Fallback: use all timings if matching failed
                     self.launchers = [builtins.min(timings, key=timings.get)]

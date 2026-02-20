@@ -539,6 +539,27 @@ heuristics_top_n_configs: int = int(
     os.environ.get("TORCHINDUCTOR_HEURISTICS_TOP_N", "5")
 )
 
+# ── Heuristics spill fallback buffer ─────────────────────────────────────────
+#
+# In heuristics-only mode (heuristics_real_bench=False), normally only the
+# top-N predicted configs are compiled and benchmarked.  If those N configs
+# all exceed the register-spill threshold at runtime, the autotuner has no
+# valid fallback and is forced to pick the "best" spilling config.
+#
+# When this option is > 0, an additional BUFFER configs (ranked N+1 to N+BUFFER
+# by the heuristic score) are also compiled and benchmarked as a safety net.
+# If all top-N configs spill, the autotuner walks down to these backup configs
+# and picks the fastest non-spilling one.
+#
+# Cost: BUFFER extra Triton JIT compilations on first run (cached after that).
+# Setting to 0 disables the feature and restores the old behaviour.
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER
+# Default: 0 (disabled)
+heuristics_spill_fallback_buffer: int = int(
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER", "0")
+)
+
 # ── Heuristics verbosity ─────────────────────────────────────────────────────
 #
 # Controls whether the pointwise heuristics system prints detailed diagnostic
