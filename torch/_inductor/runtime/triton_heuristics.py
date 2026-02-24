@@ -800,12 +800,21 @@ class CachingAutotuner(KernelInterface):
         # that we never need to read the kernel off disk at all.
         #
         # We skip scoring when:
-        #   • There was an autotune cache hit (cached_config is set) – a best
-        #     config is already known, no need to re-score.
+        #   • lookup_autotune_config found a cached best config (cached_config set).
+        #   • check_autotune_cache hit on disk and collapsed configs to [winner]
+        #     (autotune_cache_state == "hit") – scoring 1 config is pointless.
         #   • _heuristics_pending is absent – heuristics were not enabled or
         #     the kernel type is not pointwise.
+        # Skip heuristic scoring if the autotune cache already returned a winner.
+        # In that case check_autotune_cache() already pruned self.configs to
+        # [winner], so running heuristics on 1 config is both pointless and
+        # misleading (it would print "compiling top-1 configs").
+        _autotune_cache_hit = (
+            (autotune_cache_info or {}).get("autotune_cache_state") == "hit"
+        )
         if (
             not cached_config
+            and not _autotune_cache_hit
             and '_heuristics_pending' in self.inductor_meta
             and POINTWISE_HEURISTICS_AVAILABLE
         ):

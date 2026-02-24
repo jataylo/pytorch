@@ -179,9 +179,9 @@ Pure-regime anchor vectors (each sums to 1.0):
 | Factor     | Overhead-bound | Memory-bound | Compute-bound |
 |------------|----------------|--------------|---------------|
 | bandwidth  | 0.10           | 0.55         | 0.15          |
-| launch     | 0.50           | 0.10         | 0.10          |
-| grid       | 0.30           | 0.15         | 0.30          |
-| occupancy  | 0.10           | 0.20         | 0.45          |
+| launch     | 0.65           | 0.10         | 0.10          |
+| grid       | 0.10           | 0.15         | 0.30          |
+| occupancy  | 0.15           | 0.20         | 0.45          |
 
 Interpolation (continuous, not switch-based):
 ```
