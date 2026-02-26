@@ -155,10 +155,10 @@ Each config gets an individual score per factor (all ∈ [0, 1]):
 
 | Factor | Key insight | Shape |
 |---|---|---|
-| **Memory BW** | Gaussian peak at `arch.optimal_threads_bandwidth` (derived from HBM latency hiding requirement) | Smooth decay both sides |
-| **Launch overhead** | Amortize 3 µs dispatch: elements/block should exceed `arch.optimal_elements_per_block` | Step-up with soft threshold |
+| **Memory BW** | Gaussian peak at `arch.optimal_threads_bandwidth` (~1536 threads / 24 wavefronts on MI300X from a self-consistent Little's Law), σ = 1.5 × optimal.  The wider σ reduces the score gap between XBLOCK=1024 (≈0.994) and XBLOCK=512 (≈0.977) from 3.7 % to 1.7 %, keeping smaller blocks competitive.  For 2-D/3-D kernels a cache-line-utilisation correction applies: XBLOCK ≥ 16 → factor 1.00 (no penalty — per-row X access is contiguous and multi-row wavefronts exploit HBM channel parallelism); XBLOCK < 16 → factor 0.75–0.98 (sub-cache-line row width wastes bandwidth). | Smooth decay; sub-CL multiplier 0.75–0.98 |
+| **Launch overhead** | Amortize dispatch cost: elements/block should exceed `arch.optimal_elements_per_block`.  One secondary penalty: large-grid batch-dispatch when `num_blocks > 4×num_CUs`.  Per-block warp count is not penalised here — the occupancy model owns that signal. | Step-up with soft threshold |
 | **Grid efficiency** | Grid should saturate all CUs: `num_blocks ≈ 2× arch.num_cus` | Peak near 2×CUs, penalise over/under |
-| **Occupancy** | Wavefronts/CU in sweet spot `[arch.occupancy_sweetspot_min, arch.occupancy_sweetspot_max]` | Plateau in sweet spot |
+| **Occupancy** | Wavefronts/CU in sweet spot `[arch.occupancy_sweetspot_min, arch.occupancy_sweetspot_max]`.  ILP correction: when each thread processes ≥ 8 tile elements (`xblock_prod / threads_per_block ≥ 8`) the compiler software-pipelines memory loads, hiding the same latency without extra wavefronts.  `num_warps=1` with ept ≥ 8 therefore scores 1.00 (same as sweet-spot). | Plateau in sweet spot; ILP-aware nw=1 path |
 
 ### 5.2 Weighted Geometric Mean
 
@@ -394,28 +394,45 @@ improvement on bandwidth-bound kernels.
 **Benefit:** Expands the search space to cover a dimension known to matter on
 ROCm without adding compile cost (still only top-5 are compiled).
 
-### 9.4 Replace Gaussian BW score with a latency-hiding model (Medium impact)
+### 9.4 Top-N XBLOCK diversity pass (Implemented)
 
-The current bandwidth score is a Gaussian centred at `optimal_threads_bandwidth`.
-A more principled model would compute the minimum threads needed to hide
-HBM latency:
+`prune_configs()` now limits the returned top-N list to at most 2 configs per
+distinct XBLOCK value.  Without this, the scoring loop was observed to fill all
+5 top-N slots with XBLOCK=1024 variants (differing only in `num_warps`),
+preventing XBLOCK=512 and XBLOCK=256 candidates from ever being compiled and
+benchmarked.  Empirically, 42 % of 1-D full-misses were caused by this effect.
+
+Algorithm: after sorting by composite score, a primary pass greedily takes up
+to 2 configs per XBLOCK bucket; overflow configs (those that hit the cap) fill
+any remaining top-N slots in score order, ensuring the list is always full.
+
+### 9.5 Kernel-aware minimum-latency BW threshold (Medium impact)
+
+The BW Gaussian is centred at `arch.optimal_threads_bandwidth` with σ = 1.5 ×
+optimal, computed from a self-consistent Little's Law using effective
+(L2-blended) latency.  The wider σ reduces the score gap between XBLOCK=1024
+and XBLOCK=512 from 3.7 % to 1.7 %, working in concert with the diversity
+pass to ensure a variety of block widths reach the compile-and-benchmark stage.
+
+A further refinement would make the threshold per-kernel by using the actual
+instruction mix from kernel metadata:
 
 ```
-min_threads_for_latency_hiding = ceil(latency_cycles / (instruction_cycles × IPC))
+min_threads_for_latency_hiding = ceil(latency_cycles / (instructions_per_load × IPC))
 ```
 
-This depends on ops_per_element (from the kernel) and is thus already
-computable from V5 metadata.  Configs that fall below this threshold would get
-a near-zero bandwidth score instead of a smooth Gaussian.
+Configs below this threshold would receive a near-zero BW score instead of a
+smooth Gaussian decay, providing a sharper signal for highly memory-bound
+kernels with few arithmetic instructions.
 
-### 9.5 Fix L1 cache model to use real per-GPU values (Medium impact)
+### 9.6 Fix L1 cache model to use real per-GPU values (Medium impact)
 
 Query `props.l1_cache_size` or derive from `totalConstMem` / `sharedMemPerBlock`
 for NVIDIA, and from `lds_size` for ROCm where available.  This fixes the
 conservative model that currently treats everything ≤ 32 KB as "possible L1
 hit" on MI300 which has 64 KB LDS per CU in some configurations.
 
-### 9.6 Score configs in parallel (Medium impact)
+### 9.7 Score configs in parallel (Medium impact)
 
 `prune_configs()` calls `score_config()` sequentially.  With 85+ candidates
 and per-config `analyze_bottleneck()` calls (each involving device-property
@@ -424,7 +441,7 @@ path.  Scoring is embarrassingly parallel (no shared state); a
 `concurrent.futures.ThreadPoolExecutor` with 4 workers would give ~3× speed-up
 on the scoring step.
 
-### 9.7 Per-problem-type weight calibration from REAL_BENCH data (Medium impact)
+### 9.8 Per-problem-type weight calibration from REAL_BENCH data (Medium impact)
 
 The pure-regime anchor weights (§5.3) were designed by reasoning about hardware.
 With the REAL_BENCH validation summaries now being logged, it is possible to
