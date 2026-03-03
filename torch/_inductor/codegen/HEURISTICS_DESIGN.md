@@ -155,10 +155,10 @@ Each config gets an individual score per factor (all ∈ [0, 1]):
 
 | Factor | Key insight | Shape |
 |---|---|---|
-| **Memory BW** | Gaussian peak at `arch.optimal_threads_bandwidth` (~1536 threads / 24 wavefronts on MI300X from a self-consistent Little's Law), σ = 1.5 × optimal.  The wider σ reduces the score gap between XBLOCK=1024 (≈0.994) and XBLOCK=512 (≈0.977) from 3.7 % to 1.7 %, keeping smaller blocks competitive.  For 2-D/3-D kernels a cache-line-utilisation correction applies: XBLOCK ≥ 16 → factor 1.00 (no penalty — per-row X access is contiguous and multi-row wavefronts exploit HBM channel parallelism); XBLOCK < 16 → factor 0.75–0.98 (sub-cache-line row width wastes bandwidth). | Smooth decay; sub-CL multiplier 0.75–0.98 |
+| **Memory BW** | Gaussian peak at `arch.optimal_threads_bandwidth` (~1536 threads / 24 wavefronts on MI300X from a self-consistent Little's Law), σ = 1.5 × optimal.  The wider σ reduces the score gap between XBLOCK=1024 (≈0.994) and XBLOCK=512 (≈0.977) from 3.7 % to 1.7 %, keeping smaller blocks competitive.  **1-D and 2-D kernels**: XBLOCK ≥ 16 → factor 1.00; XBLOCK < 16 → factor 0.75–0.98.  **3-D kernels** use shape-aware coalescing: for *cube-like* problems (max/min dim ratio < 2, e.g. 64×64×64) both X and Y accesses are symmetric so `warp_align = 0.75 + 0.25 × avg(cl_x, cl_y)` (0.75–1.00) is applied; for *non-cube* problems (ratio ≥ 2) only the XBLOCK sub-cache-line rule applies (XBLOCK ≥ 16 → 1.00). | Smooth decay; warp-align 0.75–1.00 |
 | **Launch overhead** | Amortize dispatch cost: elements/block should exceed `arch.optimal_elements_per_block`.  One secondary penalty: large-grid batch-dispatch when `num_blocks > 4×num_CUs`.  Per-block warp count is not penalised here — the occupancy model owns that signal. | Step-up with soft threshold |
-| **Grid efficiency** | Grid should saturate all CUs: `num_blocks ≈ 2× arch.num_cus` | Peak near 2×CUs, penalise over/under |
-| **Occupancy** | Wavefronts/CU in sweet spot `[arch.occupancy_sweetspot_min, arch.occupancy_sweetspot_max]`.  ILP correction: when each thread processes ≥ 8 tile elements (`xblock_prod / threads_per_block ≥ 8`) the compiler software-pipelines memory loads, hiding the same latency without extra wavefronts.  `num_warps=1` with ept ≥ 8 therefore scores 1.00 (same as sweet-spot). | Plateau in sweet spot; ILP-aware nw=1 path |
+| **Grid efficiency** | Grid should saturate all CUs.  Target: **1-D/2-D** → `2× arch.num_cus`; **3-D cube-like** (ratio < 2) → `arch.num_cus` (L2 locality prefers fewer, larger tiles); **3-D non-cube** (ratio ≥ 2) → `4× arch.num_cus` (mixed-stride traffic needs more wavefronts). | Peak near target, penalise over/under |
+| **Occupancy** | Wavefronts/CU in sweet spot `[arch.occupancy_sweetspot_min, arch.occupancy_sweetspot_max]`.  ILP correction applied in **both** the well-saturated path and the launch-bound path: `num_warps=1` with ept ≥ 8 scores 1.00 (compiler-pipelined loads fully hide HBM latency for the single wavefront), ept ≥ 4 scores 0.93. | Plateau in sweet spot; ILP-aware in all paths |
 
 ### 5.2 Weighted Geometric Mean
 
@@ -405,6 +405,86 @@ benchmarked.  Empirically, 42 % of 1-D full-misses were caused by this effect.
 Algorithm: after sorting by composite score, a primary pass greedily takes up
 to 2 configs per XBLOCK bucket; overflow configs (those that hit the cap) fill
 any remaining top-N slots in score order, ensuring the list is always full.
+
+### 9.4a 3-D coalescing: shape-aware (cube symmetric, elongated XBLOCK-only)
+
+For 3-D kernels the coalescing penalty is **problem-shape-aware**:
+
+**Cube-like problems** (max/min dimension ratio < 2, e.g. 64×64×64):  
+All three loop axes are nearly the same length and each can be stride-1 in
+permute/broadcast kernels.  Wide YBLOCK tiles genuinely improve spatial reuse
+because both X and Y accesses are symmetric.  The model averages X and Y
+coalescing:
+
+```
+cl_x = min(XBLOCK, 16) / 16
+cl_y = min(YBLOCK, 16) / 16
+warp_align = 0.75 + 0.25 × (cl_x + cl_y) / 2    # range [0.75, 1.00]
+```
+
+This correctly scores `{X16,Y16}` higher than `{X16,Y8}` for 64×64×64, where
+the empirically best configs use wide, balanced tiles.
+
+**Non-cube problems** (ratio ≥ 2, e.g. 256×64×32):  
+The YBLOCK axis is often mixed-stride: stride-1 for one tensor, stride-N for
+another.  Applying a YBLOCK penalty is empirically harmful here — `{X32,Y8}`
+beats `{X16,Y16}` by 3–5 % on MI300X.  Only the XBLOCK sub-cache-line rule
+applies:
+
+```
+warp_align = 1.00  if XBLOCK ≥ 16
+warp_align = 0.75 + 0.23 × (XBLOCK / 16)  otherwise   # range [0.75, 0.98]
+```
+
+The threshold of ratio < 2 (not < 4) ensures the cube path is used only for
+genuinely symmetric workloads; moderately elongated shapes like 128×64×64
+(ratio=2) take the XBLOCK-only path.
+
+### 9.4b ILP boost in launch-bound occupancy path (Implemented)
+
+The ILP correction (high `elements_per_thread` ≥ 8 → score 1.00) was previously
+only applied in the well-saturated occupancy branch.  Configs in the
+launch-bound path (grid saturation < 0.25) with high ept were scored by the
+`natural_warps` ratio alone, systematically under-estimating their capability.
+The ILP check is now applied in both branches.
+
+### 9.4c 3-D tile balance tie-breaker (Problem-shape aware)
+
+For **cube-like problems** (max/min dimension ratio < 2, e.g. 64×64×64) a mild
+multiplier prefers cube-like tiles and a minimum YBLOCK:
+
+```
+balance_mult = 1 − 0.003 × log2(max_tile / min_tile)
+yblock_mult  = 1 − 0.008 × max(0, 4 − log2(YBLOCK))
+score       *= max(0.97, balance_mult × yblock_mult)
+```
+
+Examples: `{16,16,8}` (tile ratio 2) → ×0.997; `{64,4,4}` (tile ratio 16)
+→ ×0.988.  For cube problems the optimal tile is empirically cube-like, so
+this mild bias is correct.
+
+The threshold of ratio < 2 (tightened from the earlier < 4) ensures the
+tie-breaker only fires on genuinely symmetric workloads.  Moderately elongated
+shapes like 128×64×64 (ratio=2) **skip** the tie-breaker; their optimal tile
+may itself be elongated (e.g. {X32,Y4,Z4}).
+
+For **non-cube problems** (ratio ≥ 2) the tie-breaker is **skipped**.  These
+benefit from tile shapes that align with the problem dimensions, and a
+cube-shape bias would penalise those configs incorrectly.
+
+### 9.4d 3-D grid target: shape-aware block count (Implemented)
+
+The optimal number of thread-blocks depends on the 3-D problem shape:
+
+| Shape | Target | Rationale |
+|---|---|---|
+| Cube-like (ratio < 2) | `arch.num_cus / 2` (~228 on MI300X) | Symmetric regular-stride access → excellent L2 spatial reuse. Fewer, larger blocks keep their working set in L2 across wavefront-switches. Empirically, 256-block configs beat 512-block ones for 64×64×64. |
+| Non-cube (ratio ≥ 2) | `2 × arch.num_cus` (×2 vs 1-D/2-D) | Mixed-stride / permute access → irregular HBM traffic. More wavefronts needed per CU to hide round-trip latency; 1024-block configs beat 512-block ones by 2–5 % on MI300X. |
+
+Using the standard 1-D/2-D target (2×CUs = 456) for cube problems caused
+512-block configs to score Grid≈0.993 while the empirically best 256-block
+configs scored only Grid≈0.920 — a 7 % gap that outweighed the BW and
+coalescing advantages of balanced tiles.
 
 ### 9.5 Kernel-aware minimum-latency BW threshold (Medium impact)
 

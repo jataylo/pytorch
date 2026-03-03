@@ -6,6 +6,63 @@
 
 ---
 
+## System Overview
+
+The pointwise heuristics system replaces exhaustive autotuning (benchmarking every
+possible Triton config on the GPU) with a **static performance model** that predicts the
+best config from first principles in 1–2 ms.  The goal is to achieve >90% top-1 accuracy
+and >99% top-5 accuracy while eliminating the per-kernel GPU benchmarking cost that can
+add hundreds of milliseconds to cold-start compilation.
+
+### Architecture
+
+```
+  Inductor code-gen                    triton_heuristics.py
+  ───────────────────────              ──────────────────────────────────────────────────
+  pointwise() →                        CachingAutotuner.__init__()
+    size_hints, dtype,                   _score_and_prune_heuristic_configs()
+    device props          ──────►          │  Stage 1: generate_all_candidate_configs()
+    ↓                                      │  Stage 2: extract_kernel_metadata() (regex)
+  problem_metadata                         │           fn.arg_names (authoritative counts)
+  injected into                            │           BottleneckAnalysis (device model)
+  inductor_meta as                         │  Stage 3: analyze_bottleneck() per config
+  '_heuristics_pending'                    │  Stage 4: _score_one_config() × N (parallel)
+                                           │  Stage 5: _estimate_spill_risk() per config
+                                           │  → prune self.configs to top-N (+buffer)
+                                           │
+                                         _make_launchers()   ← Triton compilation
+                                           │  launcher.n_spills populated from binary
+                                           │
+                                         autotune_to_one_config()
+                                           │  Stage 5B: _evict_spill_configs() (if buffer>0)
+                                           │  bench() → float("inf") for spilled configs
+                                           │  Stage 6: _print_heuristics_validation_summary()
+                                           └─► select winner
+```
+
+### Global State Dictionaries
+
+| Dict | Key | Value | Purpose |
+|---|---|---|---|
+| `_HEURISTICS_VALIDATION_DATA` | `problem_key` | `{problem_metadata, predicted_scores, actual_timings, kernel_code}` | Stores predictions + benchmark results for the validation summary |
+| `_TOP_N_CONFIGS_FOR_SELECTION` | `problem_key` | `[list of top-N effective dicts]` | Restricts winner selection to heuristic top-N in real-bench mode |
+| `_HEURISTICS_FULL_RANKED_HDICTS` | `problem_key` | `[all effective dicts in score order]` | Full ranked list used for spill-fallback in heuristics-only mode |
+
+`problem_key` is produced by `_normalize_problem_key(size_hints)` — a canonical string
+representation of the problem dimensions (e.g. `"(32768,)"` for a 1-D 32K-element problem).
+
+### Environment Variables
+
+| Variable | Config attribute | Default | Effect |
+|---|---|---|---|
+| `TORCHINDUCTOR_POINTWISE_HEURISTICS` | — | `1` | Master on/off switch; set to `0` to disable entirely and fall back to standard autotuning |
+| `TORCHINDUCTOR_HEURISTICS_REAL_BENCH` | `heuristics_real_bench` | `1` | `1` = compile + benchmark all configs, select winner from top-N (validation/dev mode); `0` = heuristics-only, compile only top-N |
+| `TORCHINDUCTOR_HEURISTICS_TOP_N` | `heuristics_top_n_configs` | `5` | Size of the selection pool.  In heuristics-only mode, only this many configs are compiled |
+| `TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER` | `heuristics_spill_fallback_buffer` | `0` | Extra configs compiled as a spill safety net (heuristics-only mode only); `0` disables |
+| `TORCHINDUCTOR_HEURISTICS_VERBOSE` | `heuristics_verbose` | `1` | `1` = print full scoring table, bottleneck analysis, and validation summary; `0` = compact one-liners only |
+
+---
+
 ## Stage 1 — Exhaustive Configuration Proposal
 
 ### Technical
@@ -98,8 +155,10 @@ arithmetic is cheapest when the tile boundary is a power-of-two-aligned address.
 
 #### Phase 2 — Kernel operand counts (in `_score_and_prune_heuristic_configs`)
 
-After the Triton function is generated but before compilation, a lightweight regex pass
-over `fn.src` counts tensor arguments and store instructions:
+After the Triton function is generated but before compilation, two complementary passes
+count tensor arguments:
+
+**Pass A — regex over `fn.src` (fast, always available):**
 
 ```python
 num_inputs  = len(re.findall(r'\btl\.load\b',  kernel_code))
@@ -107,10 +166,57 @@ num_outputs = len(re.findall(r'\btl\.store\b', kernel_code))
 num_tensors = num_inputs + num_outputs
 ```
 
+**Pass B — authoritative from `fn.arg_names` (preferred when available):**
+
+After `self.fn` is set, `_score_and_prune_heuristic_configs` checks if the JIT function
+exposes `arg_names`.  Every `_ptr`-suffixed argument is a tensor pointer; the number of
+`tl.store` calls in the source determines how many are outputs:
+
+```python
+ptr_args    = [a for a in self.fn.arg_names if a.endswith('_ptr')]
+num_outputs = max(1, kernel_code.count('tl.store'))
+num_inputs  = max(0, len(ptr_args) - num_outputs)
+```
+
+This pass supersedes the regex result and is more accurate because:
+- `fn.arg_names` is the *compiler's* parameter list — it cannot be confused by comments
+  or string literals in the source.
+- Counting `tl.store` calls is exact (there is exactly one `tl.store` per output tensor
+  in Inductor-generated code).
+
 `bytes_per_element` defaults to `element_size × (num_inputs + num_outputs)` — i.e. every
 tensor is a full read or write pass over all elements — but `extract_kernel_metadata()`
 in `triton_heuristics_kernel_analysis.py` can refine this with broadcast detection (a
 broadcast input contributes far fewer bytes per output element than a full-tensor read).
+
+#### Phase 2.5 — Cache-hit recovery
+
+`_score_and_prune_heuristic_configs` is called from `CachingAutotuner.__init__`.  On a
+**cold path**, `pointwise()` executes and injects `_heuristics_pending` into
+`inductor_meta` with the pre-built `problem_metadata`.  On a **cache hit** (the compiled
+module is loaded from `PyCodeCache`, `FxGraphCache`, or any other Inductor cache layer),
+`pointwise()` is *not* re-executed — the decorator is never re-applied — so
+`_heuristics_pending` is absent.
+
+In this case the system recovers by calling:
+
+```python
+problem_metadata = _convert_to_pointwise_heuristics_metadata(
+    self.size_hints, self.inductor_meta, self.triton_meta
+)
+```
+
+which reconstructs `problem_metadata` from `size_hints` (always available in the
+constructor), re-deriving device constants and dimension info.  The reconstruction is
+logged at `INFO` level as:
+
+```
+[HEURISTICS] Reconstructed problem_metadata from size_hints=…
+(module was loaded from cache; pointwise() was not re-executed)
+```
+
+This ensures heuristic scoring is applied correctly even on cache hits, rather than
+silently falling back to non-heuristic config selection.
 
 #### Phase 3 — Instruction-mix & op density (in `extract_kernel_metadata`)
 
@@ -358,13 +464,21 @@ w[k] = overhead_frac × W_overhead[k]
 | Factor | W_overhead | W_memory | W_compute |
 |---|---|---|---|
 | bandwidth | 0.10 | 0.55 | 0.15 |
-| launch | 0.65 | 0.10 | 0.10 |
-| grid | 0.10 | 0.15 | 0.30 |
+| launch | 0.57 | 0.10 | 0.10 |
+| grid | 0.18 | 0.15 | 0.30 |
 | occupancy | 0.15 | 0.20 | 0.45 |
 
+> **W_overhead rationale (launch 0.57, grid 0.18):** The Launch factor's EPB Gaussian
+> is near-flat for multi-block kernels (wide sigma makes all reasonable block sizes
+> score ≈ 0.88–1.00), so it barely discriminates configs in the overhead-bound regime.
+> The Grid factor (CU saturation) is the *primary* signal distinguishing e.g. XBLOCK=256
+> (84% CU utilisation) from XBLOCK=1024 (21% CU utilisation) for medium-sized problems —
+> empirically the grid weight increase from 0.10 → 0.18 fixed an 18% speed gap in the
+> conv-block benchmark.  Launch was reduced from 0.65 → 0.57 to compensate.
+
 A kernel whose `overhead_frac=0.7, memory_frac=0.3, compute_frac=0.0` gets:
-`launch_weight = 0.7×0.65 + 0.3×0.10 = 0.485` — nearly half the total weight goes
-to the launch factor, correctly prioritising configs with fewer, larger blocks.
+`launch_weight = 0.7×0.57 + 0.3×0.10 = 0.429` — the largest single weight, correctly
+prioritising configs with well-amortised blocks; Grid gets `0.7×0.18 + 0.3×0.15 = 0.171`.
 
 The `launch_bound` boolean is set when `overhead_frac > 0.50`, which triggers the
 `LAUNCH-BOUND` regime label in verbose output and drives the occupancy scoring to use
@@ -516,35 +630,47 @@ BW_score  *= (0.65 + 0.35 × coalescing)
 
 #### Factor 2 — Launch overhead
 
-Gaussian centred at `optimal_elements_per_block` (hardware-derived from launch
-amortisation analysis):
+Two behaviours based on grid size:
+
+**Single-block kernels** (`num_blocks = 1`): EPB directly proxies overhead amortisation.
+Gaussian centred at `optimal_EPB` (hardware-derived):
 
 ```
 Launch_score = 0.75 + 0.25 × exp(−0.5 × ((EPB − optimal_EPB) / σ)²)
-               floor: 0.70 for EPB < 64 (overhead dominates)
+               σ = optimal_EPB / 2
+               floor: 0.70 for EPB < 64 (overhead completely dominates)
 ```
 
-> **Reading the equation:**
-> `EPB` (elements per block) = `total_elements / num_blocks`.  It measures how much
-> *useful work* each block does relative to its fixed dispatch cost.  The score peaks
-> at `optimal_EPB` (hardware-derived from launch amortisation analysis) and falls
-> symmetrically on both sides.
+**Multi-block kernels** (`num_blocks > 1`): the ~3 µs kernel dispatch cost is shared
+equally across ALL blocks, so it is already amortised over the whole problem regardless
+of block count.  Using the narrow EPB Gaussian would incorrectly reward large-XBLOCK
+configs (few, large blocks) over smaller ones that keep more CUs active.  Instead a very
+wide sigma makes the score near-flat across all reasonable EPB values:
+
+```
+Launch_score = 0.88 + 0.12 × exp(−0.5 × ((EPB − optimal_EPB) / (3 × optimal_EPB))²)
+               hard floor: 0.88 for EPB < 32 (sub-cache-line blocks)
+               range: [0.88, 1.00]
+```
+
+> **Reading the equations:**
+> `EPB` (elements per block) = `total_elements / num_blocks`.
 >
-> **When Launch score is HIGH** (close to 1.0): each block is doing a large amount of
-> work, so the fixed `K_launch` dispatch cost is well-amortised.  A config with
-> `XBLOCK=1024` and a 1M-element problem creates ~1000 blocks each handling 1024
-> elements — the 3 µs dispatch cost is a tiny fraction of the total.
+> For a **single-block** kernel the sole block carries the entire 3 µs dispatch cost; a
+> large EPB means the kernel does substantial work for that fixed overhead, scoring well.
+> EPB < 64 is hard-floored at 0.70 — overhead completely dominates.
 >
-> **When Launch score is LOW**: the blocks are too small or too numerous.  Classic
-> failure mode is a config like `XBLOCK=16, num_warps=1` on a 1M-element problem —
-> this creates 65,536 blocks, each doing only 16 elements of work.  The GPU spends
-> more time dispatching blocks than executing them.  EPB = 16 < 64, so the formula
-> hard-floors to 0.70 immediately.
+> For a **multi-block** kernel the 3 µs is spread across all blocks (e.g. 1000 blocks
+> → 0.003 µs overhead per block), so EPB is no longer a meaningful predictor.  The
+> wide-sigma formula (`σ = 3 × optimal_EPB`) keeps all configs in [0.88, 1.00] — only
+> pathological sub-cache-line blocks (EPB < 32) stay at the 0.88 floor.  Block-count
+> optimisation is fully delegated to the Grid score.  This change fixed an 18% speed
+> gap where the old narrow Gaussian incorrectly preferred XBLOCK=1024 (fewer blocks)
+> over XBLOCK=256 (more CUs active) for medium-sized convolution kernels on MI300X.
 >
-> **The large-grid penalty** is a secondary correction for pathological grids — even
-> when EPB looks acceptable, a grid vastly larger than 4× the number of CUs adds
-> Command Processor queue pressure (the CP must batch-dispatch in multiple rounds),
-> adding measurable latency that the base Gaussian doesn't capture.
+> **The large-grid penalty** applies to both cases: a grid vastly larger than 4× the
+> number of CUs causes the Command Processor to batch-dispatch in multiple rounds,
+> adding measurable scheduling latency.
 
 A large-grid scheduler penalty applies when `num_blocks > 4 × num_CUs`:
 
@@ -597,10 +723,12 @@ Problem-size-adaptive Gaussian; the optimal block count scales with problem size
 >
 > For the **tiny** band (< 2048 elements), the Gaussian is replaced by a discrete
 > lookup table because the element count is too small to fit a meaningful Gaussian:
-> 4 blocks = 1.0, 3–2 blocks = 0.93, 1 block = 0.85, >8 blocks = 0.70.  The peak at
-> 4 (not 1) reflects the empirical finding that AMD can dispatch 4 small blocks to 4
-> separate CUs with negligible extra overhead, delivering ~2–3% more throughput than a
-> single block by avoiding the single-CU resource contention bottleneck.
+> 4 blocks = 1.0, 3–2 blocks = 0.93, 1 block = 0.85, 5–8 blocks = 0.90, >8 blocks = 0.70.
+> The peak at 4 (not 1) reflects the empirical finding that AMD can dispatch 4 small
+> blocks to 4 separate CUs with negligible extra overhead, delivering ~2–3% more
+> throughput than a single block by avoiding single-CU resource contention.  Configs
+> with more than 8 blocks at < 2048 elements are penalised (0.70) because per-block
+> dispatch overhead then dominates any parallelism benefit.
 
 For tiny kernels the grid score peaks at exactly 4 blocks (score = 1.0); single-block
 configs are penalised to 0.85 because AMD can dispatch 4 blocks to 4 CUs with negligible
@@ -630,19 +758,55 @@ extra overhead while leaving 116 CUs idle with a single block.
 > each extra declared wavefront costs ~0.2 µs in launch overhead (SGPR/VGPR bank
 > allocation in the SPI), which for tiny kernels dwarfs any latency-hiding benefit.
 
-Three regimes, selected by saturation level and block count:
+Four regimes, selected by saturation level, block count, and blocks-per-CU:
 
-**Memory-bound / well-saturated (`saturation ≥ 0.25`):**  Sweet-spot model — `num_warps`
+**Well-saturated (`saturation ≥ 0.25`) or single-block:**  Sweet-spot model — `num_warps`
 in `[sweet_min, sweet_max]` (4–8 on AMD) gives `score=1.0`.  Derived from Little's Law:
-enough resident wavefronts must exist to hide ~300-cycle HBM latency given a 40-cycle
-issue gap ⇒ `ceil(300/40) = 8` wavefronts, but 4 suffices when L2 hit rate is high.
+`ceil(300/40) = 8` wavefronts needed to hide HBM latency; 4 suffices when L2 absorbs
+traffic.
 
-**Launch-bound, single-block (`saturation < 0.25, num_blocks=1`):**  All work on one CU;
-wavefront latency hiding still governs, so the same sweet-spot model applies.
+Within this regime, `num_warps` cases below and above the sweet-spot are handled as:
 
-**Launch-bound, multi-block (`saturation < 0.25, num_blocks > 1`):**  Each block runs on
-a separate CU; latency hiding is provided by grid spread rather than per-block warp count.
-The per-block score becomes a first-principles overhead ratio:
+| `num_warps` range | Score | Reason |
+|---|---|---|
+| `[4, 8]` (sweet spot) | 1.00 | Optimal latency hiding |
+| `[2, 12]` (near sweet) | 0.95 | Marginal deviation from ideal |
+| `= 1`, CU-level hiding OK (`wf/CU > sweet_max`) | 0.85–1.00 | Many blocks keep CUs busy; ILP further helps |
+| `= 1`, CU-level hiding insufficient (`wf/CU ≤ sweet_max`) | **0.82** | Too few wavefronts per CU; see below |
+| `> 12` (over-warped) | **0.88** | Extra wavefronts cause SPI overhead; see below |
+
+**CU-level latency hiding (`wf_per_cu` check):**  The key distinction for `num_warps=1`
+is whether the CU scheduler can switch between *blocks* to hide latency, or whether
+per-block warp count is the sole source of wavefronts:
+
+```
+wf_per_cu = num_blocks / num_CUs
+need_intra_block_warps = (wf_per_cu ≤ sweet_max)   # e.g. ≤ 8 on AMD
+```
+
+When `need_intra_block_warps=True` (e.g. 2048 blocks / 256 CUs = 8.0 wf/CU ≤ 8),
+the CU can only switch among ≤ 8 wavefronts while waiting for HBM.  Little's Law
+requires ~8 resident wavefronts, so `num_warps=1` is borderline — empirically 1.4–2.8×
+slower than `num_warps=8` on MI300X for the same block count.  The ILP bonus (extra
+loads per thread hiding per-thread latency) does NOT compensate: the bottleneck is the
+number of independent wavefronts the CU scheduler can choose from, not per-thread
+instruction parallelism.  Score is capped at **0.82**.
+
+When `need_intra_block_warps=False` (e.g. 16 384 blocks / 256 CUs = 64 wf/CU >> 8),
+the CU naturally switches between 64 blocks' wavefronts; per-block warp count becomes
+less critical.  The normal ILP correction applies: `num_warps=1` with ≥ 8 elements/
+thread scores 1.0 (compiler-pipelined loads hide latency), and 0.85 otherwise.
+
+**High-warp configs (`num_warps > 12`, e.g. `num_warps=16`):**  Score is **0.88**
+regardless of ILP.  Rationale: 16 wavefronts per block provides ample CU-level latency
+hiding (16 >> 8 needed) and is empirically faster than `num_warps=1` (0.82) for kernels
+with few blocks per CU.  The 0.88 ceiling (vs the sweet-spot 1.0) reflects that extra
+SPI initialisation cost and reduced VGPR budget per wavefront still impose a small
+penalty relative to the ideal 4–8 range.
+
+**Launch-bound, multi-block (`saturation < 0.25, num_blocks > 1`):**  Each block lands
+on a separate CU; latency hiding is provided by grid spread.  The per-block score is a
+first-principles overhead ratio penalising extra SPI warp init cost:
 
 ```
 T(nw) = K_launch + (nw − 1) × K_warp        K_launch=3.0 µs, K_warp=0.2 µs
@@ -650,17 +814,19 @@ score  = K_launch / T(nw) = 3.0 / (3.0 + (nw−1) × 0.2)
 ```
 
 > **Reading the multi-block equation:**
-> When each block lands on a *separate* CU, latency hiding is already handled across
-> CUs by the grid (many CUs work simultaneously).  Within a single block, declaring
-> more wavefronts only adds the SPI allocation cost of `(nw−1) × 0.2 µs` without
-> providing any additional latency-hiding benefit.  The ideal is therefore `nw=1`
-> (minimum overhead), and the score is the ratio of that minimum time to the actual
-> time for this config's `nw`.  At `nw=1` the ratio is `3.0/3.0 = 1.00`; at `nw=16`
-> it's `3.0/(3.0 + 15×0.2) = 3.0/6.0 = 0.50` — the kernel spends half its wall
-> time just initialising wavefronts.
+> When each block lands on a *separate* CU and the grid is small (`saturation < 0.25`),
+> all latency hiding comes from CU-to-CU parallelism, not intra-block wavefront
+> switching.  Extra warps per block add SPI allocation cost without hiding more latency.
+> Score: `nw=1 → 1.00`, `nw=4 → 0.83`, `nw=16 → 0.50`.
+>
+> This path applies only for *under-saturated* grids (total wavefronts < 25% of CU
+> capacity).  Kernels with enough blocks to be well-saturated use the sweet-spot model
+> above — with the `wf_per_cu` correction distinguishing CU-rich from CU-poor configs.
 
-This produces `score(nw=1)=1.00`, `score(nw=4)=0.83`, `score(nw=16)=0.50` — no tuned
-coefficients, only the same hardware constants used by the overhead model.
+An ILP correction within the launch-bound multi-block path is scaled by CU utilisation
+(`cu_util = num_blocks / num_CUs`) to avoid over-scoring configs where the GPU is mostly
+idle: `ilp_scale = min(1.0, cu_util / 0.25)`.  Full ILP benefit applies only at ≥ 25%
+CU utilisation.
 
 #### 2-D tile tie-breaker
 
@@ -692,8 +858,12 @@ on four criteria: *taste, presentation, texture, and originality*.
    a nice, contiguous pattern?  Jumpy access patterns waste cache-line fetches.
 
 2. **Launch overhead** — Does each block do enough work to justify the fixed cost of
-   launching it?  A config that creates 10,000 tiny blocks is slow because the GPU spends
-   most of its time just *starting* blocks rather than executing them.
+   launching it?  For **single-block** kernels, a config that does very little work per
+   block is slow because the GPU spends most of its time just *starting* blocks rather
+   than executing them.  For **multi-block** kernels, the ~3 µs dispatch cost is already
+   shared across all blocks and is a small fraction of total runtime — so the scoring
+   becomes nearly flat (all reasonable configs score 0.88–1.00) and the Grid factor takes
+   over as the primary block-count discriminator.
 
 3. **Grid granularity** — Does the grid size match the GPU's capacity?  Too few blocks
    leave most Compute Units idle.  Too many blocks create scheduling pressure.  The sweet
@@ -722,6 +892,26 @@ on four criteria: *taste, presentation, texture, and originality*.
      hiding.  For small, launch-dominated kernels the balance tips toward fewer warps —
      the latency-hiding benefit is marginal when the kernel only runs for a few
      microseconds anyway.
+
+   **Key subtlety — CU-level vs block-level wavefront switching:**
+   The scoring model uses `num_warps` (wavefronts *per block*), but what actually
+   matters for latency hiding is the total wavefronts each CU sees.  This comes from two
+   sources simultaneously:
+
+   - **Intra-block:** the `num_warps` declared in the config.  With `num_warps=8` and
+     1 block on a CU, the CU has 8 wavefronts to switch between.
+   - **Inter-block (CU-level switching):** if many blocks are dispatched, each CU may
+     hold *multiple* blocks at once.  With 4096 blocks on 256 CUs, each CU hosts ~16
+     blocks simultaneously — providing 16 independent wavefronts to switch between even
+     if every block only declares `num_warps=1`.
+
+   So `num_warps=1` is **not always bad**.  When there are many blocks (`blocks/CU >
+   sweet_max ≈ 8`), the CU already has enough wavefront targets from block-level
+   switching, and each thread's multiple loads (ILP) further hide per-load latency.
+   But when blocks are scarce (`blocks/CU ≤ 8`), the CU may only see 4–8 wavefronts
+   total — right at the threshold where every load causes a visible stall.  Empirically
+   on MI300X, `num_warps=1` with 8 blocks/CU is 1.4–2.8× slower than `num_warps=8`
+   for memory-bound streaming kernels.
 
 All four scores are multiplied together (weighted geometric mean), with the weights
 automatically adjusted based on the bottleneck analysis from Stage 3.  The result is a
@@ -755,25 +945,51 @@ allocation across the full kernel graph.  The system provides two mechanisms:
 
 #### Mechanism A — Pre-compile heuristic estimate (informational only)
 
-`_estimate_spill_risk(config_dict, problem_metadata)` in `triton_heuristics.py`
-estimates VGPR demand from first principles:
+`_estimate_spill_risk(config_dict, problem_metadata, kernel_metadata)` in
+`triton_heuristics.py` estimates VGPR demand from first principles:
 
 ```
-estimated_vgprs = 16                                  # base: loop vars, predicates, pid
-                + (num_inputs + num_outputs) × 8      # operand registers
-                + ops_per_element × 1.5               # compute temporaries
-                + 10  if YBLOCK > 0                   # 2-D stride/index overhead
-                + 8   if XBLOCK ≥ 512                 # loop-unroll live-value pressure
+# ── Step 1: hardware budget ───────────────────────────────────────────────
+threads_per_block = num_warps × warp_size
+raw_max           = 65536 // threads_per_block          # AMD CDNA2/3: 65 536 VGPRs/CU
+max_vgprs         = min(256, (raw_max // 8) × 8)        # round DOWN to 8-reg granule
+
+# ── Step 2: estimated demand (additive components) ────────────────────────
+base           = 16                         # loop-control vars, predicate regs, pid
+tensor_regs    = (num_inputs + num_outputs) × 8   # pointer + value + mask per tensor
+ops_regs       = n_fast × 1                # fast ops (add/mul/FMA) — high register reuse
+               + n_med  × 3               # medium ops (sqrt, abs, int div) — 1-2 temps each
+               + n_slow × 6               # slow ops (exp, log, sin, FP div) — ~5 temp regs
+dim_regs       = 12  if YBLOCK > 0        # 2-D: y-index, y-stride, y-offset, extra predicate
+               + 18  if ZBLOCK > 0        # 3-D: two more loop vars + strides + predicates
+unroll_depth   = XBLOCK × max(1,YBLOCK) × max(1,ZBLOCK) // warp_size
+unroll_regs    = min(unroll_depth, 16)    # capped at 16; compiler reuses beyond that
+pipeline_regs  = max(0, num_stages − 1) × 8  # software-pipeline buffers two load copies
+
+estimated_vgprs = base + tensor_regs + ops_regs + dim_regs + unroll_regs + pipeline_regs
+estimated_vgprs = round_up_to_multiple_of_8(estimated_vgprs)   # mirrors hardware allocator
 ```
 
-The estimate is intentionally conservative (tends to over-estimate by 10–20%) to avoid
-suppressing valid configs.  The ratio `estimated_vgprs / max_vgprs` is shown in the
-verbose scoring table as `low`, `MED`, or `HIGH` — purely informational, does not alter
-ranking:
+Key differences from a naïve estimate:
+- `ops_regs` weights the three instruction classes separately (1 / 3 / 6 cycles of
+  temporaries) rather than a flat multiplier.  This correctly gives a higher VGPR demand
+  to kernels heavy in `exp`/`log` than to kernels that only do FMA chains.
+- `unroll_regs` grows with the tile *volume* (`XBLOCK × YBLOCK × ZBLOCK`) not just
+  `XBLOCK`, because Triton unrolls all three loop axes.  Capped at 16 because the
+  compiler reuses registers across unrolled iterations once the live-set stabilises.
+- `pipeline_regs` accounts for software pipelining (`num_stages > 1`): each extra stage
+  effectively needs a duplicate set of load-buffer registers.
+- The final `estimated_vgprs` is rounded **up** to the next multiple of 8, mirroring the
+  hardware's 8-register granule allocator.  This produces the same "wasted" ceiling the
+  real hardware experiences.
+
+The estimate intentionally runs ~10–20% high (conservative) to avoid suppressing valid
+configs.  The ratio `estimated_vgprs / max_vgprs` is shown in the verbose scoring table
+as `low`, `MED`, or `HIGH` — purely informational, does not alter ranking:
 
 ```
-ratio > 1.0  → HIGH  (very likely to spill)
-ratio > 0.75 → MED   (at risk)
+ratio > 1.0  → HIGH  (very likely to spill after compile)
+ratio > 0.75 → MED   (at risk — worth monitoring)
 ratio ≤ 0.75 → low   (probably safe)
 ```
 
@@ -781,22 +997,44 @@ ratio ≤ 0.75 → low   (probably safe)
 
 When `TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER > 0`, the compile pool is expanded from
 `top_N` to `top_N + buffer` configs.  After `_make_launchers()` runs (which populates
-`launcher.n_spills` from the compiled binary metadata), a **pre-benchmark eviction pass**
-replaces any spilling top-N config with the highest-ranked non-spilling buffer config:
+`launcher.n_spills` from the compiled binary metadata), `autotune_to_one_config` runs a
+**pre-benchmark eviction pass** before any GPU timing occurs:
 
 ```python
-for i, hdict in enumerate(top_n_pool):
-    launcher = hdict_to_launcher[tuple(sorted(hdict.items()))]
-    if launcher.n_spills > spill_threshold:
-        top_n_pool[i] = next_non_spilling_buffer_config()
+spill_threshold = inductor_meta.get('spill_threshold',
+                                    32 if torch.version.hip else 16)
+
+# Build fast lookup: effective hdict → compiled launcher
+hdict_to_launcher = {
+    tuple(sorted(launcher_hdict(ln).items())): ln
+    for ln in self.launchers
+}
+
+# Pre-filter buffer pool to only non-spilling candidates (in score order)
+buffer_candidates = [
+    hdict for hdict in full_ranked[len(top_n_sel):]   # ranked N+1, N+2, …
+    if hdict_to_launcher[key(hdict)].n_spills <= spill_threshold
+]
+
+# Walk top-N in score order; swap out any that spill
+buf_idx = 0
+for i, hdict in enumerate(new_top_n):
+    if hdict_to_launcher[key(hdict)].n_spills > spill_threshold:
+        if buf_idx < len(buffer_candidates):
+            new_top_n[i] = buffer_candidates[buf_idx]
+            buf_idx += 1
+        # else: no buffer replacement available → bench() returns inf as fallback
 ```
 
-The spill threshold defaults to 32 for ROCm and 16 for CUDA (configurable via
-`inductor_meta['spill_threshold']`).  Evicted configs are never benchmarked — this avoids
-wasting GPU time on kernels that will return `inf` from `bench()` and cannot be selected.
+The spill threshold defaults to **32 for ROCm** and **16 for CUDA**
+(overridable via `inductor_meta['spill_threshold']`).  Evicted configs are never
+benchmarked — this avoids wasting GPU time on kernels that will return `inf` from
+`bench()` and cannot be selected.
 
 If all top-N configs spill even after eviction (buffer exhausted), `autotune_to_one_config`
-falls back to the fastest non-spilling config across all compiled configs.
+walks `_HEURISTICS_FULL_RANKED_HDICTS` (the full score-ordered list) and selects the
+fastest non-`inf` timing from the extended compile pool.  As a last resort, if *every*
+compiled config spills, it picks the one with the fewest spills (minimum `inf` timing).
 
 ---
 
@@ -836,19 +1074,61 @@ does **not** prune `self.configs` — all generated configs are passed to the Tr
 compiler and benchmarked.  However, the **winner is still selected from the heuristic
 top-N**, not from the global minimum:
 
-```
+```python
 # Real-bench mode: compile and time all configs
 self.configs = all_generated_configs          # no pruning
 # ...after benchmarking:
 timings = {cfg: bench(cfg) for cfg in all_configs}
 
-# Selection restricted to heuristic top-N
+# Selection restricted to heuristic top-N (stored in _TOP_N_CONFIGS_FOR_SELECTION)
 top_n_timings = {cfg: t for cfg, t in timings.items() if cfg in top_n_set}
 best = min(top_n_timings, key=top_n_timings.get)
 ```
 
 This means real-bench mode collects ground-truth timing for every config while still
 testing whether the heuristic selection would have chosen the right config.
+
+#### `bench()` — spill-skipped configs always recorded
+
+A critical implementation detail: when a compiled config exceeds the register-spill
+threshold (`launcher.n_spills > spill_threshold`), `bench()` short-circuits and returns
+`float("inf")` — but **before** returning it records the `inf` timing in
+`_HEURISTICS_VALIDATION_DATA`:
+
+```python
+if launcher.n_spills > spill_threshold:
+    if _heur_track:
+        _store_actual_timing(problem_key, config_dict, float("inf"))   # record FIRST
+    return float("inf")                                                # then exit
+```
+
+Without this fix, spill-skipped configs would be absent from `actual_timings`, and
+`_print_heuristics_validation_summary` would see an empty timing list for 2-D/3-D
+kernels whose large block products (`XBLOCK × YBLOCK`) push every top-N config over the
+VGPR limit — producing no summary output at all (the silent-failure bug for multi-block
+kernels seen in `tuning10_verbose.log`).
+
+#### Validation summary — rank labels and fallback handling
+
+`_print_heuristics_validation_summary` uses the following logic to determine what to
+show as the "heuristic pick":
+
+1. **Chosen from top-N pool (normal case):** Walk `actual_timings` in ascending order
+   and find the first config that is (a) in `_TOP_N_CONFIGS_FOR_SELECTION` and (b) has
+   a finite timing.  This is the config that actually runs at inference time.  Label:
+   `📊 HEURISTIC CHOSEN  (fastest from top-N selection pool)`.
+
+2. **Spill-skipped top predictions:** If the highest-scored predicted configs all have
+   `inf` timing (register spill), walk `predicted_sorted` to find the first config with
+   a finite benchmark result.  The summary label reflects the skip:
+   `📊 PREDICTED #3  (ranks 1–2 spill-skipped, using next available)`.
+
+3. **All predicted configs spill:** If *every* predicted config has `inf` timing, fall
+   back to the best finite timing across all benchmarked configs regardless of rank.
+
+The `actual_inf_count` (number of `inf` timings in `actual_timings`) is tracked and
+used to distinguish between "spilled" (expected for 2-D configs) and "compile-failed"
+(unexpected) configs in diagnostic output.
 
 `_print_heuristics_validation_summary` then emits a structured comparison report:
 

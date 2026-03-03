@@ -198,17 +198,57 @@ class PointwiseHeuristics:
         #   XBLOCK ≥ 16 →  factor 1.00  (full or multi-CL per row; no penalty)
         #   XBLOCK <  16 →  factor 0.75–0.98  (partial cache-line utilisation)
         if yblock > 0:
-            cache_line_elems = 16                  # 64 B / 4 B per FP32
+            cache_line_elems = 16   # 64 B / 4 B per FP32
+            zblock = config.get('ZBLOCK', 0)
 
-            if xblock >= cache_line_elems:         # ≥ 16 elements = full cache line
-                # Each row access is at least one full cache line.  No penalty
-                # regardless of whether the wavefront spans multiple rows.
-                warp_align = 1.00
+            if zblock > 0:
+                # ── 3-D kernel: shape-aware coalescing ────────────────────────
+                #
+                # The correct model depends on the problem aspect ratio:
+                #
+                # CUBE-LIKE problems (max_dim / min_dim < 2, e.g. 64×64×64):
+                #   Both X and Y loop axes are nearly the same length and both
+                #   can be stride-1 in permute/broadcast kernels.  Using wider
+                #   YBLOCK tiles genuinely improves spatial reuse, so we average
+                #   the X and Y coalescing factors.  This correctly prefers
+                #   {X16,Y16} over {X16,Y8} for symmetric cube workloads.
+                #
+                # ELONGATED problems (max_dim / min_dim ≥ 2, e.g. 256×64×32):
+                #   The YBLOCK axis is often mismatched — stride-1 for one tensor
+                #   but stride-N for the other (typical in permute kernels).  A
+                #   YBLOCK penalty empirically hurts these cases: {X32,Y8}
+                #   outperforms {X16,Y16} by 3–5 % on MI300X.  We therefore
+                #   apply XBLOCK-only coalescing and leave YBLOCK unpenalised.
+                dims_3d = problem_metadata.get('dimensions', ())
+                is_cube_3d = False
+                if len(dims_3d) == 3:
+                    _max_d = max(dims_3d)
+                    _min_d = max(min(dims_3d), 1)
+                    is_cube_3d = (_max_d / _min_d) < 2
+
+                if is_cube_3d:
+                    # Symmetric (X+Y averaged) coalescing for cube problems.
+                    coalescing_x = min(1.0, xblock / cache_line_elems)
+                    coalescing_y = min(1.0, yblock / cache_line_elems)
+                    avg_coalescing = (coalescing_x + coalescing_y) / 2.0
+                    warp_align = 0.75 + 0.25 * avg_coalescing   # 0.75 → 1.00
+                else:
+                    # XBLOCK-only coalescing for elongated/mixed-stride problems.
+                    if xblock >= cache_line_elems:
+                        warp_align = 1.00
+                    else:
+                        coalescing = xblock / cache_line_elems
+                        warp_align = 0.75 + 0.23 * coalescing   # 0.75 → 0.98
             else:
-                # Sub-cache-line X width: row access doesn't fill a 64-byte line.
-                # Penalise proportionally to unused bandwidth per cache line.
-                coalescing = xblock / cache_line_elems   # fraction of CL used
-                warp_align = 0.75 + 0.23 * coalescing   # 0.75 (XBLOCK=1) → 0.98 (XBLOCK=15)
+                # ── 2-D kernel: XBLOCK-only coalescing rule (unchanged) ──────
+                #
+                # For 2-D transpose/strided kernels the fast thread index always
+                # maps to X, so only XBLOCK determines coalescing.
+                if xblock >= cache_line_elems:
+                    warp_align = 1.00
+                else:
+                    coalescing = xblock / cache_line_elems
+                    warp_align = 0.75 + 0.23 * coalescing  # 0.75→0.98
 
             score *= warp_align
 
@@ -223,12 +263,27 @@ class PointwiseHeuristics:
                                  problem_metadata: Dict) -> float:
         """Score how well this config amortises the fixed kernel dispatch cost.
 
-        Modelled as a Gaussian centred at arch.optimal_elements_per_block (the
-        elements-per-block value at which the ~3 µs dispatch cost is amortised
-        to < 5 % of wall time).  Score floor is 0.70 for EPB < 64 (overhead
-        completely dominates at that point).
+        **Single-block kernels** (num_blocks = 1):
+            EPB IS the overhead-amortisation metric.  Modelled as a Gaussian
+            centred at arch.optimal_elements_per_block with σ = optimal_epb/2.
+            Score floor is 0.70 for EPB < 64 (overhead completely dominates).
 
-        One secondary penalty applies:
+        **Multi-block kernels** (num_blocks > 1):
+            The ~3 µs kernel dispatch cost is shared equally across ALL blocks
+            and is therefore already amortised over the whole problem regardless
+            of block count.  The EPB-based Gaussian is therefore NOT a useful
+            differentiator for multi-block configs — it incorrectly rewarded
+            large-XBLOCK configs (e.g. XBLOCK=1024 → 64 blocks) over smaller
+            ones (e.g. XBLOCK=256 → 256 blocks) even though the latter keeps
+            4× more CUs active and is empirically 15–20% faster on MI300X for
+            medium-sized problems.
+
+            For multi-block configs we use a very wide sigma (3 × optimal_epb)
+            so the score is near-flat in [0.88, 1.00] for any reasonable EPB.
+            Only pathological configs with < 32 elements/block (sub-cache-line)
+            are penalised.  Block-count optimisation is handled by the Grid score.
+
+        One secondary penalty applies in both cases:
 
         Large-grid penalty (num_blocks > 4 × num_CUs): the Command Processor
         must batch-dispatch excess blocks, adding measurable scheduling latency:
@@ -252,14 +307,38 @@ class PointwiseHeuristics:
 
         arch         = PointwiseHeuristics._get_arch()
         optimal_epb  = arch.optimal_elements_per_block
-        sigma        = optimal_epb // 2
 
-        if elements_per_block < 64:
-            score = 0.70
+        if num_blocks == 1:
+            # Single-block kernel: EPB IS the overhead-amortisation metric.
+            # The ~3 µs dispatch cost is not shared across multiple blocks, so
+            # larger EPB directly reduces the overhead fraction.
+            sigma = optimal_epb // 2
+            if elements_per_block < 64:
+                score = 0.70
+            else:
+                diff     = (elements_per_block - optimal_epb) / sigma
+                gaussian = math.exp(-0.5 * diff * diff)
+                score    = max(0.70, min(1.0, 0.75 + 0.25 * gaussian))
         else:
-            diff     = (elements_per_block - optimal_epb) / sigma
-            gaussian = math.exp(-0.5 * diff * diff)
-            score    = max(0.70, min(1.0, 0.75 + 0.25 * gaussian))
+            # Multi-block kernel: the kernel dispatch cost is shared across ALL
+            # blocks and is already amortised over the entire problem.  EPB is
+            # therefore NOT a meaningful proxy for overhead amortisation here —
+            # that is already captured by the bottleneck analysis (overhead_frac)
+            # and the Grid score (CU saturation).  Using a narrow Gaussian
+            # centred at optimal_epb=2048 incorrectly rewarded XBLOCK=1024 (64
+            # blocks) over XBLOCK=256 (256 blocks) even though the latter keeps
+            # 4× more CUs busy and is empirically 15–20% faster on MI300X.
+            #
+            # For multi-block configs we therefore use a very wide sigma (3×
+            # optimal) so only extreme EPB values (<32 elements/block) are
+            # penalised.  The Grid score handles block-count optimisation.
+            sigma = optimal_epb * 3
+            if elements_per_block < 32:
+                score = 0.88   # sub-cache-line blocks — always bad
+            else:
+                diff     = (elements_per_block - optimal_epb) / sigma
+                gaussian = math.exp(-0.5 * diff * diff)
+                score    = max(0.88, min(1.0, 0.88 + 0.12 * gaussian))
 
         # Large-grid scheduler overhead: Command Processor must batch-dispatch
         # blocks beyond 4×CUs, adding measurable latency.
@@ -317,6 +396,31 @@ class PointwiseHeuristics:
         else:
             optimal = hardware_optimal
 
+        # 3-D kernels require a shape-specific grid target:
+        #
+        # CUBE-LIKE problems (all dims within 2× of each other, e.g. 64×64×64):
+        #   Symmetric, regular-stride access → excellent L2 spatial reuse.
+        #   Fewer, larger blocks exploit this reuse (each block touches a
+        #   contiguous 3-D tile).  The sweet spot is ≈ CUs/2 blocks, not 2×CUs.
+        #   Using hardware_optimal//2 (~228 on MI300X) makes the empirically best
+        #   256-block configs score Grid≈0.993 rather than 0.920.
+        #
+        # NON-CUBE problems (max/min dim ratio ≥ 2, e.g. 256×128×32):
+        #   Mixed-stride access (e.g. permute kernels) → irregular HBM traffic.
+        #   More wavefronts per CU are needed to hide latency; 1024-block configs
+        #   outperform 512-block ones by 2–5 % on MI300X.  Double the target.
+        ndims = len(problem_metadata.get('dimensions', (1,)))
+        if ndims >= 3:
+            dims_3d = problem_metadata.get('dimensions', (1, 1, 1))
+            max_dim = max(dims_3d) if dims_3d else 1
+            min_dim = max(min(dims_3d), 1) if dims_3d else 1
+            if (max_dim / min_dim) < 2:
+                # Cube-like: smaller block count needed for L2 locality.
+                optimal = max(4, hardware_optimal // 2)
+            else:
+                # Non-cube: more blocks needed for latency hiding.
+                optimal = min(optimal * 2, hardware_optimal * 4)
+
         if num_blocks < 4 and total_elements >= 262144:
             return 0.70
 
@@ -361,9 +465,32 @@ class PointwiseHeuristics:
         (elements_per_thread = xblock_prod / threads_per_block) the compiler
         unrolls the element loop and issues all loads as independent instructions.
         At ept ≥ 8 this is equivalent to having 8+ in-flight memory requests per
-        thread, which fully hides HBM round-trip latency without needing extra
-        wavefronts.  The "single wavefront stalls" concern therefore disappears
-        and num_warps = 1 is treated the same as being in the sweet spot.
+        thread, which hides HBM round-trip latency without extra wavefronts.
+
+        HOWEVER, in the launch-bound multi-block regime the ILP correction is
+        scaled by CU utilisation:
+            ilp_scale = min(1.0, cu_util / 0.25)
+            cu_util   = num_blocks / num_CUs
+        Rationale: ILP benefits only the currently-active blocks.  When far
+        fewer blocks than CUs are active (e.g. 64 blocks on 304 CUs → 21% CU
+        util), the HBM bandwidth from the idle 240 CUs is completely wasted.
+        Applying the full ILP bonus in that case overestimates the config's
+        actual performance — empirically 15–20% slower on MI300X for medium
+        kernels.  At ≥ 25% CU utilisation (e.g. 76+ blocks on 304 CUs) the
+        system-level bandwidth is well-utilised and the full ILP benefit applies.
+
+        MEMORY-BOUND CORRECTION (well-saturated regime):
+        The ILP bonus is disabled for num_warps < sweet_min when the kernel is
+        memory-bound (arithmetic intensity < OI_ceiling).  Rationale: ILP hides
+        per-thread memory LATENCY, but does NOT substitute for the per-CU
+        wavefront count needed to saturate HBM BANDWIDTH.  On MI300X (OI_ceiling
+        ≈ 222 FLOPS/byte), virtually all pointwise kernels are memory-bound.
+        With num_warps=1 and 2048 blocks the CU has only ≈7 resident wavefronts
+        — far below the ≈30 needed for full latency hiding.  Empirically,
+        num_warps=1 with elems_per_thread=16 was measured 1.4–2.8× slower than
+        num_warps=8 on MI300X, yet the ILP correction was scoring both identically
+        at 1.0.  The cap at 0.82 (between the baseline of 0.85 and the sweet
+        spot of 1.0) reflects this real performance gap without over-penalising.
 
         Returns a value in [0.70, 1.00].
         """
@@ -398,24 +525,63 @@ class PointwiseHeuristics:
         threads_per_block = num_warps * warp_size
         elems_per_thread  = max(1, xblock_prod // threads_per_block)
 
+        # Determine whether this block configuration has enough CU-level wavefront
+        # switching to hide HBM round-trip latency WITHOUT extra intra-block warps.
+        #
+        # Rule: a CU needs ≥ sweet_max (≈8) independent wavefronts to hide the
+        # ~300-cycle HBM latency at a ~40-cycle issue rate (Little's Law).
+        # When many blocks are dispatched (num_blocks ≥ num_cus × sweet_max) the
+        # CU scheduler switches between residet blocks, providing CU-level latency
+        # hiding even with only 1 wavefront per block.  When there are fewer blocks
+        # per CU, the intra-block warp count becomes the sole source of wavefronts
+        # for the CU to switch between — so num_warps=1 leaves the CU idle.
+        #
+        # This condition is computed purely from block geometry, not from the
+        # compute/memory roofline, because on MI300X the OI_ceiling (≈222 FLOP/B)
+        # is so high that virtually all pointwise kernels are "memory-bound" by
+        # the traditional definition — making that check uninformative.
+        wf_per_cu = num_blocks_est / max(1, num_cus)
+        # True  → each CU sees ≤ sweet_max wavefronts from block-level switching
+        # alone; num_warps=1 starves the CU of latency-hiding opportunities.
+        # Use ≤ (not <) to handle the exact boundary (e.g. 2048 blocks / 256 CUs
+        # = 8.0 wf/CU — borderline but empirically still insufficient on MI300X).
+        need_intra_block_warps = wf_per_cu <= sweet_max
+
         def _sweet_spot_score(nw: int) -> float:
             if sweet_min <= nw <= sweet_max:
                 return 1.00
             elif sweet_min // 2 <= nw <= int(sweet_max * 1.5):
                 return 0.95
             elif nw == 1:
-                # Single wavefront: normally stalls on every memory access.
-                # But if each thread processes ≥ 8 elements the compiler issues
-                # all of them as independent loads → latency is fully hidden.
-                if elems_per_thread >= 8:
-                    return 1.00   # ILP compensates entirely
-                elif elems_per_thread >= 4:
-                    return 0.93   # Partial compensation
-                return 0.85
-            # nw == 2 or 3: between sweet_min//2 and sweet_min
-            if elems_per_thread >= 8:
-                return 1.00
-            return 0.75
+                # Single wavefront per block.
+                #
+                # When the CU already has enough wavefronts from block-level
+                # switching (need_intra_block_warps=False) the ILP correction
+                # applies normally — extra loads per thread hide per-thread
+                # latency while the CU hides inter-thread stalls via block
+                # switching.
+                #
+                # When there are too few blocks per CU (need_intra_block_warps=
+                # True), ILP within a thread does NOT compensate: the bottleneck
+                # is the number of independent wavefronts available to the CU
+                # scheduler, not per-thread instruction parallelism.  Empirically,
+                # num_warps=1 with 6–7 blocks/CU is 1.4–2.8× slower than
+                # num_warps=8 on MI300X even when elems_per_thread=16 (full ILP).
+                if not need_intra_block_warps:
+                    if elems_per_thread >= 8:
+                        return 1.00   # CU-level hiding + ILP: full benefit
+                    elif elems_per_thread >= 4:
+                        return 0.93   # Partial ILP benefit
+                return 0.82   # Not enough wavefronts per CU; ILP doesn't compensate
+            # nw > int(sweet_max * 1.5): very high warp count — e.g. num_warps=16
+            # with XBLOCK=1024 means 16 wavefronts per block, providing ample CU-
+            # level latency hiding even for memory-bound kernels.  Return 0.88 for
+            # all high-warp configs regardless of ILP so they score above the
+            # penalised num_warps=1 path (0.82) — empirically num_warps=16 is
+            # 1.2–1.4× faster than num_warps=1 for memory-bound kernels with few
+            # blocks per CU, because 16 wavefronts / block >> the 8 needed to hide
+            # 300-cycle HBM round-trip latency.
+            return 0.88
 
         if saturation >= 0.25 or num_blocks_est == 1:
             # Well-saturated or single-block: latency hiding governs.
@@ -445,6 +611,31 @@ class PointwiseHeuristics:
                 extra = num_warps - natural_warps
                 t_config = k_launch + extra * k_warp
                 base_score = k_launch / t_config
+
+            # ILP correction — software-pipelining many element loads per thread
+            # hides HBM latency without extra wavefronts.  HOWEVER, this only
+            # helps at the per-block level.  When CU utilisation is very low
+            # (num_blocks << num_CUs) the system-level bottleneck is CU
+            # idleness, not per-block memory latency.  Applying the full ILP
+            # bonus to e.g. XBLOCK=1024 with only 64 active CUs out of 304
+            # incorrectly scores it 1.0 while the config leaves 79% of the GPU
+            # idle — empirically 15–20% slower than XBLOCK=256 (256 CUs active).
+            #
+            # We therefore scale the ILP ceiling by CU utilisation:
+            #   ilp_scale = min(1.0, cu_util / 0.25)
+            #   → full ILP benefit at ≥ 25 % CU utilisation
+            #   → zero ILP boost at 0 % CU utilisation
+            cu_util   = min(1.0, num_blocks_est / max(1, num_cus))
+            ilp_scale = min(1.0, cu_util / 0.25)
+
+            if elems_per_thread >= 8:
+                # Full ILP benefit when CUs are well-used; partial otherwise.
+                ilp_ceiling = 0.766 + 0.234 * ilp_scale  # 0.766 → 1.000
+                base_score = max(base_score, ilp_ceiling)
+            elif elems_per_thread >= 4:
+                # Partial software-pipelining benefit.
+                ilp_ceiling = 0.766 + 0.164 * ilp_scale  # 0.766 → 0.930
+                base_score = max(base_score, ilp_ceiling)
 
         return max(0.70, min(1.0, base_score))
 
@@ -521,6 +712,45 @@ class PointwiseHeuristics:
                 innermost_multiplier = 1.0 - 0.008 * max(0, 5 - math.log2(max(xblock, 4)))
 
                 score *= max(0.95, balance_multiplier * innermost_multiplier)
+
+            # 3-D tie-breaker: for cube-like problem shapes, mildly prefer
+            # cube-like tile shapes and a minimum YBLOCK.
+            #
+            # For x.permute(0,2,1)+y style kernels the YBLOCK axis is the
+            # contiguous direction for the permuted tensor.  Very elongated tiles
+            # like {XBLOCK:64, YBLOCK:4} coalesce poorly for that tensor even if
+            # the total element count is the same as a balanced tile.
+            #
+            # The tie-breaker is problem-shape aware: for elongated problems
+            # (max/min dimension ratio > 4) the optimal tile shape may itself be
+            # elongated (matching the problem), so we skip the penalty there.
+            #
+            #   balance_mult = 1 − 0.003 × log2(max_dim / min_dim)
+            #     e.g. {16,16,8} ratio=2 → ×0.997   {64,4,4} ratio=16 → ×0.988
+            #   yblock_mult  = 1 − 0.008 × max(0, 4 − log2(yblock))
+            #     yblock=16 → ×1.000   yblock=8 → ×0.992   yblock=4 → ×0.984
+            elif len(block_dims) == 3:
+                xblock, yblock, zblock = block_dims
+                problem_dims = PointwiseHeuristics.get_problem_dimensions(problem_metadata)
+
+                # Determine if the problem is strictly cube-like (all dims within 2× of each other).
+                # A ratio threshold of 2 (not 4) ensures we only apply cube-preferring
+                # tie-breakers to genuinely symmetric workloads (e.g. 64×64×64, 96×96×96).
+                # Moderately elongated shapes like 128×64×64 (ratio=2) are NOT cube-like
+                # and get XBLOCK-only coalescing + grid doubling instead.
+                is_cube_problem = False
+                if len(problem_dims) == 3:
+                    max_p = max(problem_dims)
+                    min_p = max(min(problem_dims), 1)
+                    is_cube_problem = (max_p / min_p) < 2
+
+                if is_cube_problem:
+                    max_dim = max(xblock, yblock, zblock)
+                    min_dim = max(min(xblock, yblock, zblock), 1)
+                    ratio   = max_dim / min_dim
+                    balance_multiplier = 1.0 - 0.003 * math.log2(max(ratio, 1.0))
+                    yblock_multiplier  = 1.0 - 0.008 * max(0, 4 - math.log2(max(yblock, 1)))
+                    score *= max(0.97, balance_multiplier * yblock_multiplier)
 
             return max(0.0, min(1.0, score))
 

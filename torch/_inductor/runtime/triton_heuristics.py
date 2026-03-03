@@ -4291,8 +4291,22 @@ def _convert_to_pointwise_heuristics_metadata(size_hints, inductor_meta, triton_
     Returns:
         problem_metadata dict for PointwiseHeuristics
     """
-    # Extract dimensions from size_hints
-    dimensions = tuple(size_hints.values())
+    # Extract dimensions in (x, y, z) order — innermost first.
+    # size_hints is a dict built by Inductor's codegen with keys 'x', 'y', 'z'
+    # where 'x' is the innermost (XBLOCK) dimension.  The dict's insertion order
+    # is (z, y, x) because convert_tiling_to_3d creates the dict in that order,
+    # so tuple(size_hints.values()) would give (z, y, x) which is backwards.
+    # Always extract explicitly by key so xnumel maps to XBLOCK, not ZBLOCK.
+    x_dim = size_hints.get('x', 1)
+    y_dim = size_hints.get('y', None)
+    z_dim = size_hints.get('z', None)
+    if z_dim is not None and y_dim is not None:
+        dimensions = (x_dim, y_dim, z_dim)
+    elif y_dim is not None:
+        dimensions = (x_dim, y_dim)
+    else:
+        # 1-D: fall back to the only value present
+        dimensions = (x_dim,)
     total_elements = functools.reduce(operator.mul, dimensions, 1)
     
     # Estimate number of inputs/outputs from metadata
@@ -4441,7 +4455,19 @@ def pointwise(
     assert not inductor_meta.get("no_x_dim")
     
     if torch.version.hip:
-        print(f"[POINTWISE] Called for problem size: {tuple(size_hints.values())}", flush=True)
+        # Print in (x, y, z) = (innermost → outermost) order for readability.
+        # size_hints dict insertion order is (z, y, x) from Inductor's codegen,
+        # so tuple(values()) would show dimensions in the wrong order.
+        _x = size_hints.get('x', next(iter(size_hints.values()), 1))
+        _y = size_hints.get('y')
+        _z = size_hints.get('z')
+        if _z is not None:
+            _dims_str = f"({_x}, {_y}, {_z})"
+        elif _y is not None:
+            _dims_str = f"({_x}, {_y})"
+        else:
+            _dims_str = f"({_x},)"
+        print(f"[POINTWISE] Called for problem size: {_dims_str}", flush=True)
 
     numel = functools.reduce(operator.mul, size_hints.values())
     bs = max(256, min(numel // 128, 1024))
