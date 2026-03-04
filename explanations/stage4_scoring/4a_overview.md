@@ -10,6 +10,108 @@ sorted descending by this score and the top-N are retained.
 
 ---
 
+## The Four Factors — Why Each Exists
+
+### 4b — Bandwidth (Memory Bus Utilisation)
+
+**What it measures:** Does this config keep the HBM bus fully loaded?
+
+The single biggest lever for a pointwise kernel's throughput is how efficiently threads
+issue memory transactions.  On MI300X HBM delivers ~5.2 TB/s peak; leaving it idle even
+30% of the time costs 30% of peak throughput.
+
+The key variable is **threads per block** (`num_warps × 64`).  Too few threads → the bus
+sits idle between wavefronts.  Too many threads → threads compete for the same cache lines,
+causing serialisation.  The bandwidth score is a Gaussian centred on the empirically good
+thread count for the problem's element count:
+
+```
+BW_score = exp( −((threads − target_threads)² / (2σ²)) )
+```
+
+This factor is the highest-weighted for memory-bound kernels (the common case for
+pointwise) because getting the thread count wrong costs the most wall time.
+
+**Relevant for:** All kernels.  Weight is highest when Stage 3 identifies a memory-bound
+bottleneck.
+
+---
+
+### 4c — Launch Overhead (Work-Per-Block Efficiency)
+
+**What it measures:** Does each thread block do enough work to pay for the cost of
+launching it?
+
+Every block incurs a fixed startup cost: the SPI (Shader Processor Input) must allocate
+VGPRs, LDS, and wavefront slots — roughly 2–5 μs per kernel invocation on MI300X.
+If a block processes only 64 elements, that fixed cost dominates the useful work.
+
+The scoring uses two regimes:
+
+- **Single-block kernels** (tiny problems): score is a Gaussian over elements-per-block
+  (EPB), peaked at a target EPB that matches the overhead budget.
+- **Multi-block kernels**: overhead is paid **once per kernel**, not per block.  The score
+  is kept near-flat across a wide EPB range (wide-sigma Gaussian) so that it does not
+  incorrectly favour the largest possible XBLOCK.  Block-count optimisation is delegated
+  to the Grid score (4d), which does it more accurately.
+
+**Relevant for:** Small kernels where overhead_frac > 0.3 (see Stage 3a).  For large
+streaming kernels, weight is low and the score is near-1.0 for almost all configs.
+
+---
+
+### 4d — Grid Granularity (CU Saturation)
+
+**What it measures:** Does the number of blocks match the number of Compute Units?
+
+The GPU has `num_cus` CUs (256 on MI300X).  Peak throughput requires every CU to be
+busy.  The grid score penalises two failure modes:
+
+1. **Too few blocks** (< num_cus): some CUs sit completely idle.  A kernel with 128
+   blocks on 256 CUs wastes exactly 50% of the hardware.
+2. **Fractional blocks** (non-integer multiple of num_cus): the last "wave" of blocks
+   is smaller than the rest, causing some CUs to finish early and wait.  E.g. 257 blocks
+   on 256 CUs means one CU gets 2 blocks while 255 get 1 — the total time is determined
+   by the 2-block CU.
+
+For tiny kernels (≤ 8192 elements) a discrete lookup table is used instead of a
+continuous formula because the continuous model over-penalises the correct 1–4-block
+configs in that regime.
+
+**Relevant for:** All kernels.  Weight is highest in the overhead-bound regime, because
+for tiny kernels the grid size is the most consequential tuning knob.
+
+---
+
+### 4e — Occupancy (Wavefront Latency Hiding)
+
+**What it measures:** Are enough wavefronts resident per CU to hide HBM round-trip
+latency?
+
+HBM latency is ~300 cycles.  The GPU hides this by switching to a different wavefront
+while the first one waits for its load to return (Little's Law).  To hide latency fully,
+a CU needs ≥ 8 independent wavefronts resident simultaneously.
+
+The wavefront supply comes from two sources:
+
+- **Block-level switching:** if many blocks are dispatched (`num_blocks ≥ num_cus × 8`)
+  the CU scheduler can switch between different blocks, providing latency hiding even with
+  `num_warps=1` per block.
+- **Intra-block switching:** if blocks are scarce (`wf_per_cu ≤ 8`), the wavefronts
+  *within* each block (controlled by `num_warps`) become the only source of CU-level
+  switching.  In this regime `num_warps=1` leaves the CU starved.
+
+An ILP correction (elements-per-thread ≥ 8) applies when the compiler can software-
+pipeline loads across loop iterations, providing per-thread latency hiding that partially
+substitutes for extra wavefronts — but only when block-level switching is already
+adequate (`need_intra_block_warps = False`).
+
+**Relevant for:** All kernels, but the scoring formula switches regime based on
+`saturation = (num_blocks × num_warps) / (num_cus × 8)`.  Weight is highest in the
+memory-bound and compute-bound regimes.
+
+---
+
 ## Technical
 
 ### Parallelism
