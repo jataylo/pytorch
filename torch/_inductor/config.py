@@ -560,6 +560,26 @@ heuristics_spill_fallback_buffer: int = int(
     os.environ.get("TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER", "0")
 )
 
+# ── Heuristics XBLOCK diversity pass ─────────────────────────────────────────
+#
+# When enabled, the top-N selection pool enforces a per-XBLOCK cap so that a
+# single XBLOCK value cannot flood all N slots (which happens when one XBLOCK
+# hits the Grid score target exactly and outscores every other XBLOCK variant).
+#
+# Cap rules:
+#   XBLOCK ≤ 256  →  at most 2 configs in the primary pool
+#   XBLOCK > 256  →  at most 1 config in the primary pool
+#
+# Any configs that exceed their cap are placed in an "overflow" list that fills
+# remaining slots *after* the primary pool, so the returned list always has
+# exactly top-N entries when enough valid configs exist.
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_DIVERSITY
+# Default: "0" (disabled – opt-in while under evaluation)
+heuristics_diversity: bool = (
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_DIVERSITY", "0") == "1"
+)
+
 # ── Heuristics verbosity ─────────────────────────────────────────────────────
 #
 # Controls whether the pointwise heuristics system prints detailed diagnostic

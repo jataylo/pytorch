@@ -39,6 +39,7 @@ def extract_kernel_metadata(kernel_code: str) -> Dict:
         'fast_ops':          2,
         'medium_ops':        0,
         'slow_ops':          0,
+        'load_ops':          0,
         'has_broadcast':     False,
         'has_mask':          False,
     }
@@ -100,6 +101,10 @@ def extract_kernel_metadata(kernel_code: str) -> Dict:
         metadata['medium_ops'] = medium_ops
         metadata['slow_ops']   = slow_ops
 
+        # load_ops: number of tl.load call sites; used to derive
+        # instructions_per_load in estimate_memory_bandwidth().
+        metadata['load_ops'] = kernel_code.count('tl.load')
+
         # Weighted op count: 1 / 10 / 30 for fast / medium / slow.
         # This feeds ops_per_element in the compute-time estimate.
         total_weighted = fast_ops * 1 + medium_ops * 10 + slow_ops * 30
@@ -136,26 +141,3 @@ def extract_kernel_metadata(kernel_code: str) -> Dict:
     return metadata
 
 
-def get_instruction_mix_efficiency(metadata: Dict) -> float:
-    """Compute an efficiency scalar from the instruction-mix breakdown.
-
-    Fast ops execute at FMA throughput (~90% pipeline efficiency).
-    Medium ops (div/sqrt) introduce pipeline bubbles (~70%).
-    Slow transcendentals block the FMA pipeline while the SFU is busy (~60%).
-
-    Returns a value in [0.5, 0.9].
-    """
-    fast_ops   = metadata.get('fast_ops',   0)
-    medium_ops = metadata.get('medium_ops', 0)
-    slow_ops   = metadata.get('slow_ops',   0)
-
-    total = fast_ops + medium_ops + slow_ops
-    if total == 0:
-        return 0.7
-
-    efficiency = (
-        (fast_ops   / total) * 0.9 +
-        (medium_ops / total) * 0.7 +
-        (slow_ops   / total) * 0.6
-    )
-    return max(0.5, min(0.9, efficiency))

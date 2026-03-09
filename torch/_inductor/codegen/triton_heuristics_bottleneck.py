@@ -117,11 +117,15 @@ class BottleneckAnalysis:
             (the CP must batch-dispatch in multiple rounds)
           - Masking: +0.5 µs (extra predicate instructions increase CP complexity)
         """
+        # Per-tensor arg cost: each pointer requires one SGPR write at dispatch.
+        # Calibrated so a 5-tensor kernel adds ≈ 0.2 µs over the base cost.
+        K_ARG_US = 0.04
+
         total = BottleneckAnalysis.KERNEL_LAUNCH_US
 
         if problem_metadata:
             num_tensors  = problem_metadata.get('num_tensors', 3)
-            total       += (num_tensors - 3) * 0.1
+            total       += num_tensors * K_ARG_US
 
         if config:
             num_warps = config.get('num_warps', 4)
@@ -243,8 +247,7 @@ class BottleneckAnalysis:
         total_elements = threads_per_block * num_blocks
 
         if problem_metadata:
-            ops_per_element   = problem_metadata.get('ops_per_element',   2)
-            bytes_per_element = problem_metadata.get('bytes_per_element', 12.0)  # noqa: F841
+            ops_per_element = problem_metadata.get('ops_per_element', 2)
         else:
             ops_per_element = num_ops / max(total_elements, 1)
 
@@ -280,18 +283,11 @@ class BottleneckAnalysis:
         If kernel_code is provided it is parsed to refine metadata (tensor
         counts, instruction mix, masking) before the time estimates are made.
 
-        Roofline combination:
-            total_us = overhead_us + max(memory_us, compute_us)
+        Roofline: total_us = overhead_us + max(memory_us, compute_us).
+        Memory and compute overlap (independent pipelines); overhead does not.
 
-        Memory and compute overlap on the GPU (the memory controller and ALU
-        pipelines are independent); only the slower of the two is visible.
-        Overhead does not overlap — dispatch must complete before any wavefront
-        starts executing.
-
-        The three fractions are computed from the gross sum
-        (overhead + memory + compute), not from total_us.  This preserves
-        information about relative component weight even when memory and compute
-        strongly overlap, which is what get_adaptive_weights() needs.
+        Fractions are computed from the gross sum (overhead + memory + compute),
+        not total_us, so they sum to 1.0 regardless of memory/compute overlap.
 
         Returns a dict with keys:
             overhead_us, memory_us, compute_us, total_us,
@@ -301,7 +297,7 @@ class BottleneckAnalysis:
         """
         if kernel_code:
             try:
-                from torch._inductor.codegen.triton_heuristics_kernel_analysis import (
+                from torch._inductor.codegen.triton_heuristics_analysis import (
                     extract_kernel_metadata,
                 )
                 kernel_metadata  = extract_kernel_metadata(kernel_code)
@@ -378,8 +374,13 @@ class BottleneckAnalysis:
     @staticmethod
     def get_adaptive_weights(config: Dict,
                              problem_metadata: Dict,
-                             kernel_code: str = None) -> Dict[str, float]:
+                             kernel_code: str = None,
+                             analysis: Dict = None) -> Dict[str, float]:
         """Interpolate factor weights from the per-config bottleneck fractions.
+
+        Pass a pre-computed `analysis` dict (from analyze_bottleneck()) to
+        avoid running the bottleneck model twice when score_config() already
+        computed it.
 
         Rather than hard-switching between three static weight tables, we define
         pure-regime ideal weight vectors and blend them using the component
@@ -420,23 +421,18 @@ class BottleneckAnalysis:
 
         Returns a dict with keys 'bandwidth', 'launch', 'grid', 'occupancy'.
         """
-        analysis = BottleneckAnalysis.analyze_bottleneck(
-            config, problem_metadata, kernel_code
-        )
+        if analysis is None:
+            analysis = BottleneckAnalysis.analyze_bottleneck(
+                config, problem_metadata, kernel_code
+            )
         o_frac = analysis['overhead_frac']
         m_frac = analysis['memory_frac']
         c_frac = analysis['compute_frac']
 
         # Pure-regime weight vectors.
-        #
-        # overhead-bound: Grid raised from 0.10 → 0.18, Launch lowered from
-        #   0.65 → 0.57.  Rationale: for multi-block launch-bound kernels the
-        #   EPB-based Launch score is now near-flat (wide sigma), so it barely
-        #   discriminates configs.  The Grid score (CU saturation) is the primary
-        #   signal that distinguishes e.g. XBLOCK=256 (84% CU util) from
-        #   XBLOCK=1024 (21% CU util) for medium-sized problems.  Empirically,
-        #   the 65536-element conv-block case improved from 18% gap to <3% gap
-        #   across 204 benchmark cases where the old weights chose too-large XBLOCK.
+        # Grid has a higher weight in overhead-bound (0.18 vs 0.10 for memory)
+        # because the Launch score is near-flat for multi-block kernels (wide σ),
+        # making CU saturation (Grid) the primary discriminating signal.
         OVERHEAD_W = {'bandwidth': 0.10, 'launch': 0.57, 'grid': 0.18, 'occupancy': 0.15}
         MEMORY_W   = {'bandwidth': 0.55, 'launch': 0.10, 'grid': 0.15, 'occupancy': 0.20}
         COMPUTE_W  = {'bandwidth': 0.15, 'launch': 0.10, 'grid': 0.30, 'occupancy': 0.45}

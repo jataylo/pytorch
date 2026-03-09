@@ -33,11 +33,16 @@ class ArchitectureConfig:
     l2_cache_size:         int   # Total L2 in bytes
 
     # Derived optimal values
-    optimal_threads_bandwidth:  int   # Thread count for best HBM utilisation
+    optimal_threads_bandwidth:  int   # Thread count for best HBM utilisation (default ipl=2)
     optimal_blocks_grid:        int   # Block count for full GPU saturation
     occupancy_sweetspot_min:    int   # Min wavefronts/block for latency hiding
     occupancy_sweetspot_max:    int   # Max wavefronts/block before VGPR pressure
     optimal_elements_per_block: int   # Elements/block to amortise launch overhead
+
+    # Raw latency constants — exposed so callers can recompute optimal_threads
+    # with a kernel-specific instructions_per_load value (see TODO-1).
+    simd_units:        int    # SIMD units per CU (4 on AMD CDNA, 4 on NVIDIA)
+    effective_latency: float  # Blended L2+HBM round-trip in cycles
 
     @classmethod
     def from_device(cls, device: Optional[torch.device] = None) -> 'ArchitectureConfig':
@@ -163,6 +168,8 @@ class ArchitectureConfig:
             occupancy_sweetspot_min=occupancy_sweetspot_min,
             occupancy_sweetspot_max=occupancy_sweetspot_max,
             optimal_elements_per_block=optimal_elements_per_block,
+            simd_units=simd_units,
+            effective_latency=effective_latency,
         )
 
     @classmethod
@@ -181,6 +188,8 @@ class ArchitectureConfig:
             occupancy_sweetspot_min=4,
             occupancy_sweetspot_max=8,
             optimal_elements_per_block=1024,
+            simd_units=4,
+            effective_latency=275.0,
         )
 
     def __str__(self) -> str:

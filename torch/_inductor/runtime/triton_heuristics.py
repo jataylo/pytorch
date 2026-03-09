@@ -698,7 +698,7 @@ def _print_heuristics_validation_summary(problem_key):
 
 try:
     from torch._inductor.codegen.triton_heuristics_pointwise import PointwiseHeuristics
-    from torch._inductor.codegen.triton_heuristics_adaptive import BottleneckAnalysis
+    from torch._inductor.codegen.triton_heuristics_bottleneck import BottleneckAnalysis
     POINTWISE_HEURISTICS_AVAILABLE = True
 except ImportError:
     POINTWISE_HEURISTICS_AVAILABLE = False
@@ -1234,10 +1234,10 @@ class CachingAutotuner(KernelInterface):
         # ── 2.6  Print kernel + problem + device analysis block ───────────────
         if _verbose:
             try:
-                from torch._inductor.codegen.triton_heuristics_kernel_analysis import (
+                from torch._inductor.codegen.triton_heuristics_analysis import (
                     extract_kernel_metadata,
                 )
-                from torch._inductor.codegen.triton_heuristics_adaptive import (
+                from torch._inductor.codegen.triton_heuristics_bottleneck import (
                     BottleneckAnalysis,
                 )
 
@@ -1355,7 +1355,7 @@ class CachingAutotuner(KernelInterface):
         # during printing) and gives real parallelism on calls that release the
         # GIL (torch.cuda.get_device_properties in _get_device_constants).
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from torch._inductor.codegen.triton_heuristics_adaptive import (
+        from torch._inductor.codegen.triton_heuristics_bottleneck import (
             BottleneckAnalysis,
         )
 
@@ -1441,6 +1441,29 @@ class CachingAutotuner(KernelInterface):
 
         # Collapse to (score, triton_cfg, effective) for downstream use
         scored = [(_sc, _tc, _eff) for _sc, _tc, _eff, _d, _bn in _scored_raw]
+
+        # ── Optional XBLOCK diversity pass ────────────────────────────────
+        # Without this pass a single XBLOCK that hits the Grid score target
+        # exactly (Grid=1.000) scores high enough to flood all top-N slots
+        # with its different num_warps variants, so other XBLOCK values are
+        # never benchmarked.  The diversity pass enforces a per-XBLOCK cap:
+        #   XBLOCK ≤ 256 → at most 2 primary slots  (small-tile regime)
+        #   XBLOCK > 256 → at most 1 primary slot   (large-tile regime)
+        # Overflow configs fill any remaining slots so the list always has
+        # exactly top-N entries.
+        if inductor_config.heuristics_diversity:
+            _primary: list = []
+            _overflow: list = []
+            _xb_counts: dict = {}
+            for _entry in scored:
+                _xb = _entry[2].get('XBLOCK', 0)
+                _cap = 2 if _xb <= 256 else 1
+                if _xb_counts.get(_xb, 0) < _cap:
+                    _primary.append(_entry)
+                    _xb_counts[_xb] = _xb_counts.get(_xb, 0) + 1
+                else:
+                    _overflow.append(_entry)
+            scored = _primary + _overflow
 
         # ── How many configs form the selection pool? ──────────────────────
         # Controlled by TORCHINDUCTOR_HEURISTICS_TOP_N (default 5).
@@ -4407,8 +4430,12 @@ def _apply_pointwise_heuristics(size_hints, inductor_meta, triton_meta, triton_c
                 block_dims = PointwiseHeuristics.get_block_dimensions(cfg)
                 if len(block_dims) != len(problem_dims):
                     continue
-                threads = PointwiseHeuristics.prod(block_dims)
-                if threads < 16 or threads > 1024:
+                # Validate using actual hardware thread count, not tile size.
+                # prod(block_dims) == XBLOCK for 1-D kernels and can legally
+                # exceed 1024; the HW constraint is num_warps × warp_size ≤ 1024.
+                warp_size  = problem_metadata.get('warp_size', 64)
+                hw_threads = cfg.get('num_warps', 1) * warp_size
+                if hw_threads < 16 or hw_threads > 1024:
                     continue
                 if cfg.get('num_warps', 0) <= 0:
                     continue
@@ -4440,6 +4467,7 @@ def _apply_pointwise_heuristics(size_hints, inductor_meta, triton_meta, triton_c
             flush=True,
         )
         return None
+
 def pointwise(
     size_hints,
     triton_meta,

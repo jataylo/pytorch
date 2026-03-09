@@ -1,6 +1,6 @@
 # Heuristics TODO
 
-## TODO-1 — Replace hardcoded `instructions_per_load` with kernel instruction mix
+## TODO-1 — ✅ IMPLEMENTED — Replace hardcoded `instructions_per_load` with kernel instruction mix
 
 **File:** `torch/_inductor/codegen/triton_heuristics_hardware.py`
 
@@ -35,7 +35,7 @@ correctly prefer fewer warps; memory-thin kernels (low I) would correctly prefer
 
 ---
 
-## TODO-3 — Factor `num_stages` into the ILP correction in `estimate_occupancy_impact`
+## TODO-3 — ⏳ DEFERRED — Factor `num_stages` into the ILP correction in `estimate_occupancy_impact`
 
 **File:** `torch/_inductor/codegen/triton_heuristics_pointwise.py`
 
@@ -83,7 +83,7 @@ Becomes important if num_stages tuning is added for pointwise kernels.
 
 ---
 
-## TODO-2 — Replace `(n_args - 3) × K_arg` with `n_args × K_arg` in overhead calc
+## TODO-2 — ✅ IMPLEMENTED — Replace `(n_args - 3) × K_arg` with `n_args × K_arg` in overhead calc
 
 **File:** `torch/_inductor/codegen/triton_heuristics_adaptive.py`
 (or wherever `T_overhead` / kernel launch overhead is computed)
@@ -115,3 +115,35 @@ adaptive weight interpolation in Stage 3e.  Small kernels with many args would s
 slightly higher predicted overhead, shifting their weights toward the overhead-bound
 regime and increasing the Launch score's influence.
 
+---
+
+## TODO-4 — ✅ IMPLEMENTED — Use `launch_bound` flag to gate occupancy regime switch
+
+**File:** `torch/_inductor/codegen/triton_heuristics_pointwise.py`
+
+**Problem:**
+The occupancy regime switch (`saturation < 0.25` → natural_warps scoring) activated
+for any low-saturation kernel regardless of whether it was actually launch-bound.
+A memory-bound kernel with few blocks (e.g. a small 16 K-element kernel) would
+incorrectly enter the natural_warps regime and score `num_warps=1` highly, even though
+it still needs multiple wavefronts per CU to hide HBM latency.
+
+**Fix implemented:**
+```python
+# natural_warps regime only when ALL hold:
+#   • saturation < 0.25  (few total wavefronts active)
+#   • num_blocks > 1     (not single-block)
+#   • launch_bound is not False  (unknown or confirmed launch-bound)
+use_natural_warps = (
+    saturation < 0.25
+    and num_blocks_est > 1
+    and launch_bound is not False
+)
+```
+`launch_bound` (from `analyze_bottleneck()`) is passed into `estimate_occupancy_impact()`
+via the new `launch_bound: Optional[bool]` parameter.  `score_config()` runs the
+bottleneck analysis once and passes the result to both `get_adaptive_weights()` and
+`estimate_occupancy_impact()`, avoiding the double-call.
+
+**Impact:** Memory-bound kernels with few blocks now correctly score `num_warps=4–8`
+over `num_warps=1`, improving accuracy for small/medium problem sizes.
