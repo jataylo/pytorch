@@ -382,9 +382,22 @@ class PointwiseHeuristics:
                 return 0.70
 
         if total_elements < 16384:
-            optimal = max(4, hardware_optimal // 32)
+            # For small problems the GPU is heavily launch-bound and most CUs sit
+            # idle regardless of block count.  Fewer, larger blocks are better
+            # because they give each active CU more wavefronts per block to hide
+            # HBM latency.  A target of hw_opt//64 (≈8 blocks) makes configs
+            # with XBLOCK=512+8w hit the Gaussian peak instead of XBLOCK=256+4w,
+            # which empirically gives better throughput for 4 K–16 K element
+            # problems via higher warp count and mild ILP (elements per thread = 2).
+            optimal = max(4, hardware_optimal // 64)
         elif total_elements < 262144:
-            optimal = hardware_optimal // 2
+            # Adaptive target: aim for ~total_elements/512 blocks so each block
+            # handles ≥ 512 elements.  The former fixed value of
+            # hardware_optimal//2 (= 256) rewarded tiny 1-warp tiles
+            # (e.g. 128×128 → 256 blocks × 64 elements × 1 warp) because they
+            # hit the Grid peak, while empirically better configs with fewer,
+            # larger blocks (more warps, ILP) were scored below the peak.
+            optimal = max(hardware_optimal // 8, total_elements // 512)
         else:
             if ndims == 1:
                 # For large 1-D kernels scale the block-count target with
@@ -406,7 +419,20 @@ class PointwiseHeuristics:
                 optimal = min(total_elements // 512, hardware_optimal * 8)
                 optimal = max(optimal, hardware_optimal)
             else:
-                optimal = hardware_optimal
+                # For large 2-D / 3-D kernels use a problem-size-adaptive
+                # target that caps elements-per-thread (EPT) at roughly 32
+                # for an 8-warp block (512 threads × 32 EPT = 16 384 tile).
+                #
+                # With a fixed target of hardware_optimal (≈512 blocks):
+                #   4096² (16 M):  tile = 32 768 → EPT = 64   → register spills
+                #   8192² (67 M):  tile = 131 072 → EPT = 256  → severe spills
+                #
+                # Formula: aim for at least total_elements / 16 384 blocks so
+                # that a typical 8-warp tile stays at ≤ 32 EPT, while keeping
+                # the count above hardware_optimal for CU saturation.
+                max_tile_elems = 16384  # 32 EPT × 512 threads
+                optimal = max(hardware_optimal, total_elements // max_tile_elems)
+                optimal = min(optimal, hardware_optimal * 8)
 
         # 3-D: shape-specific grid target.
         #   Cube-like (max/min < 2): regular-stride access → good L2 reuse;
@@ -765,8 +791,8 @@ class PointwiseHeuristics:
 
         warp_candidates    = [1, 2, 4, 8]
         block_sizes_1d     = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-        block_sizes_2d     = [1, 2, 4, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-        block_sizes_3d     = [1, 2, 4, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        block_sizes_2d     = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        block_sizes_3d     = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
         configs: List[Dict] = []
 
@@ -788,17 +814,22 @@ class PointwiseHeuristics:
                 for yblock in block_sizes_2d:
                     if yblock > ynumel:
                         continue
-                    total_threads = xblock * yblock
-                    if not (64 <= total_threads <= max_threads):
+                    # tile_size is the number of *elements* processed by one block,
+                    # not the hardware thread count.  For 2-D kernels each thread can
+                    # handle multiple elements (ILP), so there is no upper bound on
+                    # tile_size coming from hardware.  The only constraint is:
+                    #   num_warps × warp_size  ≤  tile_size   (warp-coherence)
+                    # which is enforced in the inner loop below.
+                    tile_size = xblock * yblock
+                    if tile_size < warp_size:   # must hold at least 1 full warp
                         continue
                     for nw in warp_candidates:
-                        if nw > max_warps or nw * warp_size > total_threads:
+                        if nw > max_warps or nw * warp_size > tile_size:
                             continue
                         configs.append({'XBLOCK': xblock, 'YBLOCK': yblock, 'num_warps': nw})
 
         elif ndims == 3:
             xnumel, ynumel, znumel = problem_dims
-            max_threads_3d = min(max_threads, 1024)
             for xblock in block_sizes_3d:
                 if xblock > xnumel:
                     continue
@@ -808,11 +839,12 @@ class PointwiseHeuristics:
                     for zblock in block_sizes_3d:
                         if zblock > znumel:
                             continue
-                        total_threads = xblock * yblock * zblock
-                        if not (64 <= total_threads <= max_threads_3d):
+                        # Same rationale as 2-D: tile_size ≠ thread count.
+                        tile_size = xblock * yblock * zblock
+                        if tile_size < warp_size:
                             continue
                         for nw in warp_candidates:
-                            if nw > max_warps or nw * warp_size > total_threads:
+                            if nw > max_warps or nw * warp_size > tile_size:
                                 continue
                             configs.append({
                                 'XBLOCK': xblock, 'YBLOCK': yblock,
@@ -866,11 +898,12 @@ class PointwiseHeuristics:
                 num_blocks = PointwiseHeuristics.prod(grid_size)
 
                 for block_dim, problem_dim in zip(block_dims, problem_dims):
-                    # Allow blocks as small as 4 for 3-D problems or small dimensions.
-                    if ndims == 3 or problem_dim <= 32 or num_blocks <= 1024:
-                        min_for_dim = 4
-                    else:
-                        min_for_dim = PointwiseHeuristics.MIN_BLOCK_SIZE
+                    # MIN_BLOCK_SIZE=1 applies uniformly.  The warp-coherence
+                    # check below (hw_threads ≤ 1024 and tile ≥ hw_threads) is
+                    # the real safeguard against degenerate configs; forcing a
+                    # separate per-dim floor of 4 for 3-D kernels incorrectly
+                    # rejects valid configs such as ZBLOCK=2 when ZBLOCK ≤ Z/2.
+                    min_for_dim = PointwiseHeuristics.MIN_BLOCK_SIZE
                     if not (min_for_dim <= block_dim <= PointwiseHeuristics.MAX_BLOCK_SIZE):
                         invalid = True
                         break
@@ -899,7 +932,26 @@ class PointwiseHeuristics:
             except Exception:
                 continue
 
-        scored.sort(reverse=True, key=lambda x: x[0])
+        # Primary sort: score descending.  Secondary sort: XBLOCK descending as a
+        # tiebreaker for near-equal scores.
+        #
+        # Why rounding? When Grid is at its floor (0.75) for all configs — which
+        # happens for very large problems where every valid block count far exceeds
+        # the target — all XBLOCK values in a warp-group score identically on Grid,
+        # BW, Launch, and Occ.  However, the bottleneck analysis computes a
+        # different T_overhead per config (more blocks → more overhead), which
+        # shifts the exponents in the geometric mean by ~1e-7.  This tiny
+        # difference makes the sort pick the smallest XBLOCK (first generated)
+        # arbitrarily rather than the more ILP-efficient larger tile.
+        #
+        # Rounding to 4 decimal places collapses configs that differ by < 5e-5 into
+        # a single score bucket, and within a bucket the XBLOCK tiebreaker picks
+        # the largest tile — which empirically tends to win on large streaming
+        # workloads (higher elements-per-thread → better pipelining).
+        scored.sort(
+            reverse=True,
+            key=lambda x: (round(x[0], 4), x[1].get('XBLOCK', 0)),
+        )
 
         # Diversity pass: ensure the top-N pool covers a wide range of tile widths.
         #

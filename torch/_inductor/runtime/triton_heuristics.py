@@ -1387,7 +1387,13 @@ class CachingAutotuner(KernelInterface):
             log.warning("[HEURISTICS] No configs could be scored – keeping all configs")
             return
 
-        _scored_raw.sort(key=lambda x: x[0], reverse=True)
+        # Sort: score descending.  Secondary key: XBLOCK descending as a tiebreaker
+        # for near-equal scores (see prune_configs for the rounding rationale).
+        # Larger XBLOCK → more elements-per-thread → better ILP for large streaming.
+        _scored_raw.sort(
+            key=lambda x: (round(x[0], 4), x[1].kwargs.get('XBLOCK', 0)),
+            reverse=True,
+        )
 
         # ── 4. Print full scoring table (verbose only) ─────────────────────
         if _verbose:
