@@ -1021,6 +1021,7 @@ class CachingAutotuner(KernelInterface):
             not cached_config
             and not _autotune_cache_hit
             and POINTWISE_HEURISTICS_AVAILABLE
+            and _is_pointwise_heuristics_enabled()
             and bool(torch.version.hip)
             and heuristic_type == HeuristicType.POINTWISE
             and size_hints is not None
@@ -1452,9 +1453,25 @@ class CachingAutotuner(KernelInterface):
         # Without this pass a single XBLOCK that hits the Grid score target
         # exactly (Grid=1.000) scores high enough to flood all top-N slots
         # with its different num_warps variants, so other XBLOCK values are
-        # never benchmarked.  The diversity pass enforces a per-XBLOCK cap:
-        #   XBLOCK ≤ 256 → at most 2 primary slots  (small-tile regime)
-        #   XBLOCK > 256 → at most 1 primary slot   (large-tile regime)
+        # never benchmarked.  The diversity pass enforces a per-XBLOCK cap
+        # of 2 for all tile widths, allowing both the 4-warp and 8-warp
+        # variants to enter the top-N pool.
+        #
+        # Diversity cap: controls how many variants per XBLOCK enter the pool.
+        #
+        # XBLOCK ≤ 256 → cap = 2:
+        #   These small tiles support at most 4 warps (256/warp_size=4), so
+        #   num_warps=4 and num_warps=8 are genuinely distinct.  For compute-
+        #   heavy kernels (many fused ops) fewer threads per block leaves more
+        #   VGPRs per thread and the compiler avoids register spills; empirically
+        #   XBLOCK=256+4w often beats 512+8w for fusion-heavy workloads.
+        #
+        # XBLOCK > 256 → cap = 1:
+        #   Keeps the pool diverse across XBLOCK sizes.  For 2-D and 3-D
+        #   problems all top-N XBLOCK values are ≤ 256 by construction, so
+        #   this branch only matters for large 1-D problems where preserving
+        #   XBLOCK=256+4w (small tile + 4 warps) in the pool is the priority.
+        #
         # Overflow configs fill any remaining slots so the list always has
         # exactly top-N entries.
         if inductor_config.heuristics_diversity:
@@ -1470,6 +1487,31 @@ class CachingAutotuner(KernelInterface):
                 else:
                     _overflow.append(_entry)
             scored = _primary + _overflow
+
+        # Four-warp guarantee: if no num_warps=4 config reached the pool,
+        # inject the highest-scoring 4w config in place of the lowest scorer.
+        # Prevents 3-D kernels whose Y/Z shape variants fill all diversity-cap
+        # slots at 8w from completely evicting the compute-efficient 4w variant.
+        # Guard: only apply when top-N ≥ 3 so that N=1 still returns the
+        # highest-scoring config unconditionally.
+        if inductor_config.heuristics_diversity and inductor_config.heuristics_top_n_configs >= 3:
+            _top_n_preview = max(1, min(inductor_config.heuristics_top_n_configs, len(scored)))
+            _pool = scored[:_top_n_preview]
+            _pool_ids = {id(e[2]) for e in _pool}
+            _has_4w = any(e[2].get('num_warps', 8) == 4 for e in _pool)
+            if not _has_4w:
+                _best_4w = next(
+                    (e for e in scored if e[2].get('num_warps', 8) == 4 and id(e[2]) not in _pool_ids),
+                    None,
+                )
+                if _best_4w is not None:
+                    # Replace lowest scorer; restore descending order so scored[0]
+                    # remains the best config (needed for N=1 heuristics-only mode).
+                    _pool_sorted = sorted(_pool, key=lambda e: e[0])   # ascending
+                    _pool_sorted[0] = _best_4w
+                    _pool_sorted.sort(key=lambda e: e[0], reverse=True)  # descending
+                    _overflow_rest = [e for e in scored if id(e[2]) not in {id(x[2]) for x in _pool_sorted}]
+                    scored = _pool_sorted + _overflow_rest
 
         # ── How many configs form the selection pool? ──────────────────────
         # Controlled by TORCHINDUCTOR_HEURISTICS_TOP_N (default 5).

@@ -953,27 +953,29 @@ class PointwiseHeuristics:
             key=lambda x: (round(x[0], 4), x[1].get('XBLOCK', 0)),
         )
 
-        # Diversity pass: ensure the top-N pool covers a wide range of tile widths.
+        # Diversity pass: ensure the top-N pool covers a wide range of tile widths
+        # AND warp counts.
         #
-        # Problem: for large 1-D kernels with Grid=0.75 constant, configs with
-        # XBLOCK ≥ 512 can use num_warps=8 (hw_threads=512) and score slightly
-        # higher on BW than XBLOCK=256, which is capped at num_warps=4
-        # (hw_threads=256). Without a diversity cap, the four XBLOCK values
-        # {512, 1024, 2048, 4096} each take one primary slot (via the warp=8
-        # variant) and then a second slot (via warp=4), pushing XBLOCK=256 out of
-        # the top-5 entirely — even though XBLOCK=256 is empirically the fastest
-        # for many streaming kernels.
+        # Diversity cap rationale:
         #
-        # Hardware justification for the asymmetric cap:
-        #   XBLOCK ≤ 256  → cap=2: XBLOCK=256 is the smallest fully-coalesced
-        #     tile (256 floats = 1 KB, fills a cache-line burst).  It is also
-        #     the only tile width that cannot use num_warps=8 (limited to 4
-        #     warps), so it needs 2 slots to present both warp-count options.
-        #   XBLOCK > 256  → cap=1: one representative per larger tile width is
-        #     sufficient — the scoring already picks the optimal num_warps for
-        #     that width.  Limiting to 1 slot frees room for XBLOCK=256 and
-        #     ensures the benchmark pool spans all major tile widths:
-        #     {256, 512, 1024, 2048, 4096} for a typical top_n=5 selection.
+        # For XBLOCK ≤ 256:  cap = 2 (both 4-warp and 8-warp variants included)
+        #   XBLOCK=256 with warp_size=64 supports at most 4 warps (256/64=4),
+        #   so both num_warps=4 and num_warps=8 are distinct configs worth testing.
+        #   Fewer threads per block (4w=256 threads) means more VGPRs available
+        #   per thread; for compute-heavy kernels (many ops, fusion chains) the
+        #   compiler can keep more intermediate values in registers, eliminating
+        #   spills.  Empirically XBLOCK=256+4w is often optimal for kernels with
+        #   30+ ops per element (e.g. fused Linear+GELU+Dropout patterns).
+        #
+        # For XBLOCK > 256:  cap = 1 (only the best-scoring variant per XBLOCK)
+        #   This keeps the pool diverse in XBLOCK size rather than filling all
+        #   top-N slots with {512+8w, 512+4w, 1024+8w, 1024+4w, ...}.  When only
+        #   one variant per large XBLOCK is admitted, the pool covers more distinct
+        #   tile widths.  The scoring already picks the better warp count via the
+        #   BW and Occupancy factors.  For 2-D and 3-D problems all XBLOCK values
+        #   in the top-N are ≤ 256 by construction (the 2-D scoring favours small
+        #   X tiles for grid saturation), so this branch only matters for large
+        #   1-D problems where keeping XBLOCK=256+4w in the pool is valuable.
         #
         # Overflow configs fill any remaining slots so the pool always reaches
         # exactly top_n entries when enough valid configs exist.
@@ -992,6 +994,36 @@ class PointwiseHeuristics:
         selected = primary[:top_n]
         if len(selected) < top_n:
             selected.extend(overflow[:top_n - len(selected)])
+
+        # Four-warp guarantee: ensure at least one num_warps=4 config reaches the
+        # benchmark pool.  Without this, 3-D kernels with many YBLOCK×ZBLOCK shape
+        # variants can fill every diversity-cap slot with 8-warp configs, completely
+        # evicting the 4-warp variants.  Empirically, for compute-heavy fused
+        # kernels (many ops per element), the 4-warp variant often wins because
+        # fewer threads → more VGPRs per thread → the compiler avoids register
+        # spills.  Guaranteeing one slot costs at most one suboptimal benchmark
+        # invocation per problem shape; the runtime overhead is negligible.
+        #
+        # Guard: only apply when top_n ≥ 3.  For top_n=1 (get_optimal_config)
+        # we want the single highest-scoring config unconditionally.
+        #
+        # Implementation: if the selected pool contains no num_warps=4 config, find
+        # the highest-scoring 4-warp config not already selected and swap it in for
+        # the lowest-scored entry currently in the pool.
+        if top_n >= 3:
+            selected_ids = {id(cfg) for _, cfg in selected}
+            has_four_warp = any(cfg.get('num_warps', 8) == 4 for _, cfg in selected)
+            if not has_four_warp:
+                best_4w = next(
+                    ((s, cfg) for s, cfg in scored
+                     if cfg.get('num_warps', 8) == 4 and id(cfg) not in selected_ids),
+                    None,
+                )
+                if best_4w is not None:
+                    # Replace the lowest-scored entry with the best available 4w.
+                    selected.sort(key=lambda x: x[0])   # ascending → [0] is lowest
+                    selected[0] = best_4w
+                    selected.sort(key=lambda x: x[0], reverse=True)  # restore descending
 
         return [cfg for _, cfg in selected]
 
