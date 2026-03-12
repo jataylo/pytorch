@@ -41,6 +41,38 @@ def _is_pointwise_heuristics_enabled():
     return os.environ.get("TORCHINDUCTOR_POINTWISE_HEURISTICS", "1") == "1"
 
 
+def _is_waves_per_eu_enabled():
+    """Check if waves_per_eu config generation and scoring is enabled.
+
+    Controlled by TORCHINDUCTOR_POINTWISE_WAVES_PER_EU (default: 0 = disabled).
+    Only meaningful on AMD/ROCm builds; on CUDA this is always a no-op because
+    waves_per_eu variants are only generated when torch.version.hip is set.
+
+    Set to 1 to enable:
+        TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1
+    """
+    return os.environ.get("TORCHINDUCTOR_POINTWISE_WAVES_PER_EU", "0") == "1"
+
+
+def _is_reduction_heuristics_enabled():
+    """Check if AMD-aware reduction heuristics are enabled.
+
+    Controlled by TORCHINDUCTOR_REDUCTION_HEURISTICS (default: 0 = disabled).
+    Only meaningful on AMD/ROCm builds — on CUDA builds this is always a no-op
+    because the logic is gated on ``torch.version.hip``.
+
+    When enabled, ``_reduction_configs()`` and ``_persistent_reduction_configs()``
+    return a small set of AMD-optimised configs (instead of a single default)
+    so the CachingAutotuner can benchmark and cache the best one.  The overhead
+    is ~3-4× more first-run compilation per unique reduction kernel, with all
+    results cached forever after that.
+
+    Set to 1 to enable:
+        TORCHINDUCTOR_REDUCTION_HEURISTICS=1
+    """
+    return os.environ.get("TORCHINDUCTOR_REDUCTION_HEURISTICS", "0") == "1"
+
+
 # Global storage for heuristics validation data
 # Maps problem_key -> {problem_metadata, predicted_scores: [(score, config)], actual_timings: [(time, config)], top_n_configs: [configs]}
 _HEURISTICS_VALIDATION_DATA = {}
@@ -142,7 +174,14 @@ def _estimate_spill_risk(config_dict, problem_metadata, kernel_metadata=None):
 
     # ── Hardware VGPR budget ──────────────────────────────────────────────────
     total_vgprs = 65536                          # AMD CDNA2/CDNA3 per CU
-    raw_max     = total_vgprs // max(1, threads_per_block)
+    # waves_per_eu > 0 means N concurrent blocks share the CU register file,
+    # shrinking the per-thread VGPR budget by a factor of waves_per_eu:
+    #   budget = floor(65536 / (threads_per_block × waves_per_eu))
+    # Only active when TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1; otherwise falls
+    # back to the original formula (waves_per_eu treated as 0).
+    waves_per_eu = config_dict.get('waves_per_eu', 0) if _is_waves_per_eu_enabled() else 0
+    effective_threads = threads_per_block * max(1, waves_per_eu) if waves_per_eu > 0 else threads_per_block
+    raw_max     = total_vgprs // max(1, effective_threads)
     # Triton allocates in 8-reg granules; reflect the same rounding
     granule     = 8
     max_vgprs   = min(256, (raw_max // granule) * granule)
@@ -320,7 +359,15 @@ def _print_heuristics_validation_summary(problem_key):
         best_actual_ms, best_actual_cfg = actual_finite[0]
 
     # ── sort predicted scores (highest = best heuristic pick) ────────────
-    predicted_sorted = sorted(predicted, reverse=True, key=lambda x: x[0])
+    # Use the same tiebreaker as _apply_pointwise_heuristics: (round(score, 4),
+    # XBLOCK descending).  This ensures pred-rank #1 .. #N in the table are
+    # exactly the configs that ended up in top_n_heuristic / top_n_cfgs, so
+    # the ★ markers are consistent with the "Pred rank" column.
+    predicted_sorted = sorted(
+        predicted,
+        reverse=True,
+        key=lambda x: (round(x[0], 4), x[1].get('XBLOCK', 0)),
+    )
     if not predicted_sorted:
         return
 
@@ -1368,6 +1415,16 @@ class CachingAutotuner(KernelInterface):
                     if k in triton_cfg.kwargs
                 }
                 effective['num_warps'] = triton_cfg.num_warps
+                # AMD: waves_per_eu may be stored in cfg.kwargs (HIP-only kwarg).
+                # Include it so the scorer applies the correct VGPR pressure
+                # penalty / occupancy boost when waves_per_eu > 0.
+                # Only active when the feature env var is set — otherwise
+                # waves_per_eu never appears in kwargs so this is a no-op.
+                if _is_waves_per_eu_enabled():
+                    if 'waves_per_eu' in triton_cfg.kwargs:
+                        effective['waves_per_eu'] = triton_cfg.kwargs['waves_per_eu']
+                    elif hasattr(triton_cfg, 'waves_per_eu') and triton_cfg.waves_per_eu:
+                        effective['waves_per_eu'] = triton_cfg.waves_per_eu
                 sc = PointwiseHeuristics.score_config(effective, problem_metadata, kernel_code)
                 d  = PointwiseHeuristics.get_detailed_scores(effective, problem_metadata, kernel_code)
                 bn = BottleneckAnalysis.analyze_bottleneck(effective, problem_metadata, kernel_code)
@@ -1536,9 +1593,19 @@ class CachingAutotuner(KernelInterface):
 
         # ── 6. Apply mode logic ────────────────────────────────────────────
         if inductor_config.heuristics_real_bench:
-            # REAL_BENCH: benchmark ALL configs for full validation data.
-            # Winner is chosen only from the heuristic top-N (stored below).
-            # self.configs is left unchanged – every config gets compiled.
+            # REAL_BENCH: compile and benchmark the top-REAL_BENCH_LIMIT scored
+            # configs (default 10) rather than every candidate config.  Without
+            # this cap, enabling waves_per_eu triples the pool (22 → 66+), making
+            # benchmark runs prohibitively slow.  The winner is still chosen only
+            # from the heuristic top-N (≤ REAL_BENCH_LIMIT) selection pool.
+            #
+            # REAL_BENCH_LIMIT is intentionally larger than _top_n so the
+            # validation summary can show configs ranked just outside the selection
+            # pool — useful for diagnosing near-misses.
+            _REAL_BENCH_LIMIT = 10
+            _rb_n = max(_top_n, min(_REAL_BENCH_LIMIT, len(scored)))
+            self.configs = [tcfg for _, tcfg, _ in scored[:_rb_n]]
+
             _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_n_heuristic
 
             # When compilation runs in a worker subprocess, the module-level
@@ -1561,13 +1628,13 @@ class CachingAutotuner(KernelInterface):
                 )
 
             log.info(
-                "[HEURISTICS] REAL_BENCH mode: all %d configs will be benchmarked, "
+                "[HEURISTICS] REAL_BENCH mode: top-%d of %d configs will be benchmarked, "
                 "winner selected from top-%d predicted",
-                len(self.configs), _top_n,
+                _rb_n, len(scored), _top_n,
             )
             print(
-                f"[HEURISTICS] REAL_BENCH mode: benchmarking all {len(self.configs)} configs, "
-                f"selecting winner from heuristic top-{_top_n}",
+                f"[HEURISTICS] REAL_BENCH mode: benchmarking top-{_rb_n} of "
+                f"{len(scored)} scored configs, selecting winner from heuristic top-{_top_n}",
                 flush=True,
             )
         else:
@@ -1694,6 +1761,23 @@ class CachingAutotuner(KernelInterface):
                 compile_results.append(self._precompile_config(c))
             except (OutOfResources, PTXASError) as e:
                 exc = e
+            except Exception as e:
+                # Triton compilation errors (e.g. ``ValueError: numel exceeds
+                # triton maximum tensor numel``) surface here when a config
+                # with an oversized tile slips past the pre-generation filter.
+                # Log at debug level and skip — the remaining configs can still
+                # produce a valid launcher.
+                _msg = str(e)
+                if "numel" in _msg or "triton" in _msg.lower():
+                    log.debug(
+                        "Skipping config %s — Triton rejected it: %s",
+                        c, _msg,
+                    )
+                    if exc is None:
+                        exc = e
+                else:
+                    # Unexpected error: re-raise so we don't silently swallow bugs.
+                    raise
         if len(compile_results) == 0:
             raise NoTritonConfigsError(
                 f"No valid triton configs. {type(exc).__name__}: {exc}"
@@ -1990,6 +2074,8 @@ class CachingAutotuner(KernelInterface):
                     }
                     config_dict['num_warps'] = cfg.num_warps
                     config_dict = {k: v for k, v in config_dict.items() if v is not None}
+                    if _is_waves_per_eu_enabled() and cfg.kwargs.get('waves_per_eu'):
+                        config_dict['waves_per_eu'] = cfg.kwargs['waves_per_eu']
                     _store_actual_timing(problem_key, config_dict, float("inf"))
 
     def prepare_for_pickle(self) -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -2297,6 +2383,8 @@ class CachingAutotuner(KernelInterface):
             }
             _config_dict['num_warps'] = launcher.config.num_warps
             _config_dict = {k: v for k, v in _config_dict.items() if v is not None}
+            if _is_waves_per_eu_enabled() and launcher.config.kwargs.get('waves_per_eu'):
+                _config_dict['waves_per_eu'] = launcher.config.kwargs['waves_per_eu']
 
         if (
             not self.custom_kernel
@@ -2587,6 +2675,43 @@ class CachingAutotuner(KernelInterface):
         # This avoids wasting GPU bench time on configs that will return inf.
         from torch._inductor import config as inductor_config
         from torch._inductor.runtime.hints import HeuristicType
+
+        # ── Reduction verbose logging (main-process side) ─────────────────────
+        # _log_reduction_configs() is called from _reduction_configs() /
+        # _persistent_reduction_configs(), but those run in async compile worker
+        # subprocesses where print() output is invisible to the main terminal.
+        # Re-log here in autotune_to_one_config(), which always runs in the main
+        # process (it's called on the first real forward pass), so the user can
+        # see what configs the CachingAutotuner is benchmarking for reductions.
+        if (
+            inductor_config.heuristics_verbose
+            and self.heuristic_type in (
+                HeuristicType.REDUCTION,
+                HeuristicType.PERSISTENT_REDUCTION,
+            )
+        ):
+            try:
+                # self.configs is set to None in _make_launchers(), so
+                # reconstruct the config list from the compiled launchers.
+                _cfgs_from_launchers = [lnch.config for lnch in self.launchers]
+                _hint = (self.inductor_meta or {}).get("reduction_hint", None)
+                _hint_s = getattr(_hint, "name", str(_hint)) if _hint else "?"
+                if self.heuristic_type == HeuristicType.PERSISTENT_REDUCTION:
+                    _rlabel = f"PERSISTENT/{_hint_s}"
+                else:
+                    _rlabel = f"REDUCTION/{_hint_s}"
+                _log_reduction_configs(
+                    size_hints=self.size_hints or {},
+                    inductor_meta=self.inductor_meta or {},
+                    cfgs=_cfgs_from_launchers,
+                    path_label=_rlabel,
+                    amd_heuristics=(
+                        bool(torch.version.hip)
+                        and _is_reduction_heuristics_enabled()
+                    ),
+                )
+            except Exception:
+                pass  # never crash the forward pass for logging
 
         if (
             not inductor_config.heuristics_real_bench
@@ -3109,9 +3234,21 @@ class CachingAutotuner(KernelInterface):
                 and self.heuristic_type == HeuristicType.POINTWISE
                 and self.size_hints is not None
             )
+            # For reduction kernels, also call autotune_to_one_config when only
+            # 1 launcher exists and verbose is on — so the [REDUCTION] log fires
+            # in the main process (the log in _reduction_configs runs in the
+            # async compile subprocess and its stdout is never seen).
+            _verbose_reduction_single = (
+                inductor_config.heuristics_verbose
+                and self.heuristic_type in (
+                    HeuristicType.REDUCTION,
+                    HeuristicType.PERSISTENT_REDUCTION,
+                )
+                and len(self.launchers) == 1
+            )
             if len(self.launchers) > 1 or (
                 _real_bench_pointwise and len(self.launchers) == 1
-            ):
+            ) or _verbose_reduction_single:
                 self.autotune_to_one_config(*args, **kwargs)
 
         if not getattr(
@@ -4473,6 +4610,7 @@ def _apply_pointwise_heuristics(size_hints, inductor_meta, triton_meta, triton_c
         # and self.fn.arg_names are available.
         valid_configs = []
         problem_dims = PointwiseHeuristics.get_problem_dimensions(problem_metadata)
+        _max_tile = PointwiseHeuristics.TRITON_MAX_TILE_NUMEL
         for cfg in all_configs:
             try:
                 block_dims = PointwiseHeuristics.get_block_dimensions(cfg)
@@ -4484,6 +4622,14 @@ def _apply_pointwise_heuristics(size_hints, inductor_meta, triton_meta, triton_c
                 warp_size  = problem_metadata.get('warp_size', 64)
                 hw_threads = cfg.get('num_warps', 1) * warp_size
                 if hw_threads < 16 or hw_threads > 1024:
+                    continue
+                # Triton rejects tiles whose total element count exceeds 2^20.
+                # For 2-D/3-D configs tile_numel = XBLOCK × YBLOCK (× ZBLOCK).
+                # Filter proactively so we never hand bad configs to the compiler.
+                tile_numel = 1
+                for d in block_dims:
+                    tile_numel *= d
+                if tile_numel > _max_tile:
                     continue
                 if cfg.get('num_warps', 0) <= 0:
                     continue
@@ -4652,6 +4798,13 @@ def pointwise(
                         kwargs = {'XBLOCK': xblock, 'YBLOCK': yblock, 'ZBLOCK': zblock}
                     else:
                         continue
+                    # AMD: propagate waves_per_eu into kwargs only when the
+                    # feature is enabled.  _create_compile_meta extracts it
+                    # from cfg.kwargs (the "for k in (…,'waves_per_eu',…)" loop),
+                    # so it must live in kwargs, not as a top-level Config param.
+                    waves_per_eu = cfg.get('waves_per_eu', 0)
+                    if waves_per_eu and _is_waves_per_eu_enabled():
+                        kwargs['waves_per_eu'] = waves_per_eu
                     triton_configs.append(Config(kwargs, num_warps=num_warps, num_stages=1))
                 except Exception:
                     continue
@@ -4852,6 +5005,75 @@ triton_native_bmm_configs = _config_helper(bmm=True, persistent=False)
 triton_native_persistent_bmm_configs = _config_helper(bmm=True, persistent=True)
 
 
+def _log_reduction_configs(
+    size_hints: dict[str, int],
+    inductor_meta: dict[str, Any],
+    cfgs: list[Config],
+    path_label: str,
+    amd_heuristics: bool,
+) -> None:
+    """Print a [REDUCTION] verbose table when TORCHINDUCTOR_HEURISTICS_VERBOSE=1.
+
+    Shows the configs that will be passed to the CachingAutotuner for this
+    reduction kernel, mirroring the [HEURISTICS] scoring table on the pointwise
+    path so users can see what the reduction heuristics are doing.
+    """
+    from torch._inductor import config as inductor_config
+    if not inductor_config.heuristics_verbose:
+        return
+
+    import math
+    xnumel  = size_hints.get("x", 1)
+    rnumel  = inductor_meta.get("_rnumel_display",           # injected below
+                 max(size_hints.get(k, 1) for k in size_hints if k.startswith("r")))
+    hint    = inductor_meta.get("reduction_hint", "?")
+    hint_s  = getattr(hint, "name", str(hint))
+    amd_tag = " [AMD heuristics]" if amd_heuristics else ""
+    n_cus   = 256  # MI300X default; good enough for display
+
+    header = (
+        f"[REDUCTION] {path_label}{amd_tag} | "
+        f"x={xnumel} r={rnumel} | "
+        f"hint={hint_s} | "
+        f"{len(cfgs)} config(s) → CachingAutotuner benchmarks all, caches winner"
+    )
+    print(header, flush=True)
+
+    # Column header
+    print(
+        f"[REDUCTION]   {'XBLOCK':>8} {'R0_BLOCK':>9} {'nw':>4} {'wpe':>4} "
+        f"{'blocks':>7} {'CU%':>5}  note",
+        flush=True,
+    )
+    for i, c in enumerate(cfgs):
+        xb  = c.kwargs.get("XBLOCK",   1)
+        r0  = c.kwargs.get("R0_BLOCK",  "dyn")
+        nw  = c.num_warps
+        wpe = c.kwargs.get("waves_per_eu", 0)
+        if isinstance(xb, int) and xb > 0:
+            n_blk = math.ceil(xnumel / xb)
+            cu_pct = f"{100 * n_blk / n_cus:.0f}%"
+        else:
+            n_blk, cu_pct = "?", "?"
+        # Build a human-readable note
+        notes = []
+        if i == 0:
+            notes.append("baseline")
+        if wpe:
+            notes.append(f"waves_per_eu={wpe}")
+        if isinstance(r0, int) and isinstance(cfgs[0].kwargs.get("R0_BLOCK"), int) and r0 < cfgs[0].kwargs["R0_BLOCK"] and i > 0:
+            notes.append("low-reg")
+        if "outer_config_opt" in path_label.lower() or (i == 1 and "OUTER" in path_label and amd_heuristics):
+            notes.append("outer_config_opt")
+        note_s = ", ".join(notes)
+        print(
+            f"[REDUCTION]   {str(xb):>8} {str(r0):>9} {nw:>4} {wpe:>4} "
+            f"{str(n_blk):>7} {cu_pct:>5}  {note_s}",
+            flush=True,
+        )
+    print(flush=True)
+
+
 def _reduction_configs(
     *,
     size_hints: dict[str, int],
@@ -5019,20 +5241,159 @@ def _reduction_configs(
 
     result_configs = []
 
+    # ── AMD-aware reduction heuristics ────────────────────────────────────────
+    # Gated by TORCHINDUCTOR_REDUCTION_HEURISTICS=1.  When active we return a
+    # small, AMD-calibrated candidate set instead of a single default.  The
+    # CachingAutotuner compiles and benchmarks all candidates then caches the
+    # winner forever.  First-run overhead is ~3-4× a single compile (much less
+    # than max_autotune's 8+× exhaustive search).
+    #
+    # ── Hardware background (CDNA / AMD) ──────────────────────────────────────
+    # Wavefront width : 64 lanes (SIMD32 × 2 or SIMD64 depending on variant)
+    # Intra-warp reduction : AMD DPP (Data Parallel Primitives) instructions.
+    #   DPP is hardware-accelerated lane-to-lane communication (butterfly
+    #   tree), ~4 cycles per round, 6 rounds for a 64-lane wavefront.
+    #   Triton uses DPP automatically — we cannot configure it directly.
+    # Cross-warp reduction : LDS (Local Data Share / shared memory), ~100
+    #   cycles per round.  Rounds = log2(num_warps).
+    # Cost per loop iteration ≈ (6×4 + log2(nw)×100) cycles + HBM loads.
+    #
+    # ── INNER reductions (full reduction to scalar or very small x) ───────────
+    # Inductor reshapes the problem, e.g. mean([65536]) becomes x=8, r0_=8192.
+    # Grid = ceil(xnumel / XBLOCK).  The maximum block count is xnumel, achieved
+    # with XBLOCK=1 — contiguous_config already does this.
+    #
+    # Key insight: different R0_BLOCK values do NOT change block count — they
+    # only change the number of r-loop iterations per block.  Smaller R0_BLOCK
+    # → more iterations → more DPP+LDS overhead (worse for simple reductions).
+    # Larger R0_BLOCK → fewer iterations but more registers per thread.
+    #
+    # What actually helps for INNER on AMD:
+    #   • num_warps=16 : doubles HBM threads (better bandwidth), adds only 1
+    #     extra LDS round (~100 cycles vs 2× more concurrent loads).
+    #     Cost: 424 cyc/iter overhead vs 324 for nw=8 (+31%), but 2× bandwidth.
+    #     Net win when memory-latency-bound (most INNER reductions are).
+    #   • Smaller R0_BLOCK only for register-intensive reductions (var, std, Welford)
+    #     where accumulating too many elements per thread causes register spills.
+    #   • waves_per_eu=2 to increase occupancy on the (few) active CUs.
+    #
+    # ── OUTER reductions (partial reduce: many output elements) ───────────────
+    # Grid = ceil(xnumel / XBLOCK).  Here XBLOCK directly controls CU utilisation.
+    # Current AMD default: outer_config = make_config(64, 8) → XBLOCK=64.
+    # For xnumel=4096: 64 blocks = 25% CU utilisation.
+    # outer_config_opt() (explicitly disabled for AMD, TODO comment in code) is
+    # smarter: for x=4096 it picks XBLOCK=16 → 256 blocks = 100% CU util.
+    # Enabling outer_config_opt() as an additional candidate is the main win
+    # for OUTER reductions on AMD.
+    # ──────────────────────────────────────────────────────────────────────────
+    _amd_heuristics = (
+        torch.version.hip
+        and _is_reduction_heuristics_enabled()
+        and not max_autotune_enabled
+        and "y" not in size_hints  # 3-D tiling handled separately below
+    )
+
     # For 3d tiling, default to more autotuning only if max_autotune is enabled
     if "y" in size_hints and max_autotune_enabled:
         pass
     elif max_autotune_enabled:
         pass  # skip all these cases
+    elif _amd_heuristics and reduction_hint == ReductionHint.INNER:
+        # INNER: Inductor already splits the problem for multi-block execution
+        # (e.g. mean([65536]) → size_hints={'x': 8, 'r0_': 8192}).
+        # Maximum grid = xnumel, achieved with XBLOCK=1 — contiguous_config
+        # already does this.  R0_BLOCK changes per-block loop iterations, NOT
+        # block count.
+        #
+        # AMD-specific constraint: _num_warps() halves max_num_warps for AMD
+        # because AMD wavefronts are 64 lanes (2× CUDA's 32).  For r ≤ 8192,
+        # max_num_warps=16 on CUDA → 8 on AMD.  Requesting nw=16 is silently
+        # clamped to 8.  The baseline contiguous_config already achieves the
+        # maximum effective warp count (8 AMD wavefronts = 512 threads).
+        #
+        # Effective optimisation levers:
+        #   A) baseline  – contiguous_config: XBLOCK=1, R0_BLOCK=min(r,2048),
+        #                  nw=8 (auto-calculated to max).  Good for simple
+        #                  reductions (sum, mean): fewest r-loop iterations.
+        #   B) low-reg   – half R0_BLOCK for register-intensive reductions
+        #                  (var, std, Welford with 3+ fp32 accumulators).
+        #                  register_intensive=True in make_config also halves
+        #                  nw (→ 4 AMD wavefronts) to reduce register pressure.
+        #                  Trades more loop iterations for less spill risk.
+        #   C) wpe=2     – waves_per_eu=2: scheduler launches 2 wavefronts per
+        #                  SIMD unit, increasing CU occupancy and hiding the
+        #                  DPP+LDS latency within the (limited) active CUs.
+        amd_inner: list = [contiguous_config]                           # A
+
+        # Config B: smaller R0_BLOCK for register-intensive reductions (var/std)
+        # Only useful when register_intensive flag is set (≥ 10 load+reduction
+        # ops, set by _reduction_configs based on kernel analysis).
+        if register_intensive and rnumel > 1024:
+            r_half = max(256, min(rnumel, MAX_R0_BLOCK) // 2)
+            amd_inner.append(make_config(
+                1, r_half, num_warps=8,
+                register_intensive=register_intensive,
+            ))
+
+        # Config C: waves_per_eu to increase CU occupancy for all INNER kernels
+        if _is_waves_per_eu_enabled() and rnumel >= 512:
+            amd_inner.append(make_config(
+                1, min(rnumel, MAX_R0_BLOCK), num_warps=8, num_stages=1,
+                waves_per_eu=2, register_intensive=register_intensive,
+            ))
+
+        # Deduplicate (configs may collapse for tiny rnumel or if flags produce
+        # the same effective config after AMD's _num_warps clamping)
+        seen: set = set()
+        deduped: list = []
+        for c in amd_inner:
+            key = (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"),
+                   c.num_warps, c.kwargs.get("waves_per_eu", 0))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+        result = configs + deduped
+        _log_reduction_configs(size_hints, inductor_meta, result, "INNER", True)
+        return result
+
+    elif _amd_heuristics and reduction_hint == ReductionHint.OUTER:
+        # OUTER: CU utilisation is controlled by XBLOCK.  Current AMD default
+        # outer_config=make_config(64,8) is often too coarse (few blocks).
+        # outer_config_opt() (disabled for AMD via "if not torch.version.hip:")
+        # adapts XBLOCK to xnumel for full CU utilisation.  Enable it here as an
+        # additional candidate alongside the default for safety.
+        #
+        # outer_config_opt() is already defined in this scope — call it directly.
+        amd_outer: list = [outer_config, outer_config_opt()]
+        # Deduplicate in case they produce the same config
+        seen_outer: set = set()
+        deduped_outer: list = []
+        for c in amd_outer:
+            key = (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"), c.num_warps)
+            if key not in seen_outer:
+                seen_outer.add(key)
+                deduped_outer.append(c)
+        result_outer = configs + deduped_outer
+        _log_reduction_configs(size_hints, inductor_meta, result_outer, "OUTER", True)
+        return result_outer
+
     elif reduction_hint == ReductionHint.INNER:
-        return configs + [contiguous_config]
+        result_inner = configs + [contiguous_config]
+        _log_reduction_configs(size_hints, inductor_meta, result_inner, "INNER", False)
+        return result_inner
     elif reduction_hint == ReductionHint.OUTER:
-        return configs + [outer_config]
+        result_outer_d = configs + [outer_config]
+        _log_reduction_configs(size_hints, inductor_meta, result_outer_d, "OUTER", False)
+        return result_outer_d
     elif reduction_hint == ReductionHint.OUTER_TINY:
-        return configs + [tiny_config]
+        result_tiny = configs + [tiny_config]
+        _log_reduction_configs(size_hints, inductor_meta, result_tiny, "OUTER_TINY", False)
+        return result_tiny
     else:
         # Default case: return a single config when autotuning is not enabled
-        return configs + [contiguous_config]
+        result_default = configs + [contiguous_config]
+        _log_reduction_configs(size_hints, inductor_meta, result_default, "DEFAULT", False)
+        return result_default
 
     # We continue here under the following conditions:
     # - max_autotune_enabled is True
@@ -5056,6 +5417,7 @@ def _reduction_configs(
             ]
         )
 
+    _log_reduction_configs(size_hints, inductor_meta, result_configs, "MAX_AUTOTUNE", False)
     return result_configs
 
 
@@ -5408,9 +5770,45 @@ def _persistent_reduction_configs(
     ]
 
     # defer to more autotuning only when max_autotune is enabled
+    # ── AMD-aware persistent reduction heuristics ─────────────────────────────
+    # Gated by TORCHINDUCTOR_REDUCTION_HEURISTICS=1 (same env var as regular
+    # reductions).
+    #
+    # Persistent reductions keep all data in registers (no r-loop); the whole
+    # rnumel is loaded in one shot per block.  The config candidates above
+    # already use AMD's wider xblock_vals=[1,4,8,16,32,64,128,256] vs CUDA's
+    # [1,8,32,128].  However the default non-max_autotune path prunes to
+    # configs[:1] for INNER reductions, losing this benefit.
+    #
+    # For full scalar outputs (xnumel=1), XBLOCK is clamped to 1 by
+    # triton_config_reduction anyway, so all xblock_vals collapse to the same
+    # config and top-3 is effectively top-1.  The real benefit is for OUTER
+    # persistent reductions (xnumel > 1) where multiple XBLOCK candidates
+    # translate to different block counts.
+    #
+    # Strategy: keep top-3 distinct configs (by XBLOCK) for INNER when rnumel is
+    # small enough for persistent (rnumel <= 512) and xnumel > 1.
+    _amd_persistent_heuristics = (
+        torch.version.hip
+        and _is_reduction_heuristics_enabled()
+        and not max_autotune_enabled
+        and "y" not in size_hints  # 3-D tiling handled separately
+    )
+
     if "y" in size_hints and max_autotune_enabled:
         pass
     # TODO(jansel): we should be able to improve these heuristics
+    elif _amd_persistent_heuristics and reduction_hint == ReductionHint.INNER and rnumel >= 256:
+        # De-duplicate by XBLOCK (may collapse to 1 for scalar outputs)
+        seen_p: set = set()
+        deduped_p: list = []
+        for c in configs:
+            key = (c.kwargs.get("XBLOCK"), c.num_warps)
+            if key not in seen_p:
+                seen_p.add(key)
+                deduped_p.append(c)
+        # Keep top-3 distinct XBLOCK configs
+        configs = deduped_p[:3]
     elif not max_autotune_enabled:  # Do not filter configs when tuning
         if reduction_hint == ReductionHint.INNER and rnumel >= 256:
             if rnumel > 1024 or xnumel // 8 < 128 or inductor_meta.get("RSPLIT_SIZE"):
@@ -5471,8 +5869,13 @@ def _persistent_reduction_configs(
         # we don't need Rn_BLOCK for persistent reduction
         for prefix in size_hints:
             if prefix_is_reduction(prefix):
-                c.kwargs.pop(f"{prefix.upper()}BLOCK")
+                c.kwargs.pop(f"{prefix.upper()}BLOCK", None)
 
+    _log_reduction_configs(
+        size_hints, inductor_meta, configs,
+        "PERSISTENT",
+        _amd_persistent_heuristics,
+    )
     return configs
 
 

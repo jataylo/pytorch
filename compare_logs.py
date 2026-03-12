@@ -131,21 +131,24 @@ def parse_log(path: str) -> List[Record]:
 
             m = RE_CHOSEN.search(line)
             if m:
-                # Compact form: "XBLOCK=128 num_warps=2"
-                xblock_dict = m.group(1)   # e.g. "{'XBLOCK': 128}"
+                # Compact form: "XBLOCK=128 num_warps=2 [waves_per_eu=2]"
+                xblock_dict = m.group(1)   # e.g. "{'XBLOCK': 128, 'waves_per_eu': 2}"
                 num_warps   = m.group(2)
                 # Pull out XBLOCK value
                 xm = re.search(r"'XBLOCK':\s*(\d+)", xblock_dict)
                 xb = xm.group(1) if xm else "?"
-                # Also look for YBLOCK / ZBLOCK
-                ym = re.search(r"'YBLOCK':\s*(\d+)", xblock_dict)
-                zm = re.search(r"'ZBLOCK':\s*(\d+)", xblock_dict)
+                # Also look for YBLOCK / ZBLOCK / waves_per_eu
+                ym   = re.search(r"'YBLOCK':\s*(\d+)", xblock_dict)
+                zm   = re.search(r"'ZBLOCK':\s*(\d+)", xblock_dict)
+                wpem = re.search(r"'waves_per_eu':\s*(\d+)", xblock_dict)
                 parts = [f"XBLOCK={xb}"]
                 if ym:
                     parts.append(f"YBLOCK={ym.group(1)}")
                 if zm:
                     parts.append(f"ZBLOCK={zm.group(1)}")
                 parts.append(f"num_warps={num_warps}")
+                if wpem and wpem.group(1) != "0":
+                    parts.append(f"wpe={wpem.group(1)}")
                 pending_cfg = " ".join(parts)
                 continue
 
@@ -376,16 +379,29 @@ def print_summary(agg_a: Dict[Key, Record],
               f"{ca_o:.4f}  {cb_o:.4f}  {(cb_o-ca_o)/ca_o*100:+.1f}%  "
               f"{sa_o:.3f}x  {sb_o:.3f}x  {(sb_o-sa_o)/sa_o*100:+.1f}%")
 
+        # Compute per-op eager drift to decide which verdict method to use
+        # BvsA_impr = cmp_A/cmp_B  — valid only when eager drift is small (<40%)
+        # When drift is large the GPU thermal state dominates absolute compile times;
+        # use Δspd (within-run speedup ratio delta) as the primary verdict instead.
+        HIGH_DRIFT_THRESHOLD = 0.40  # 40% eager drift
+
+        # Detect overall drift level for the header note
+        overall_eager_drift = abs(eb_o - ea_o) / ea_o if ea_o > 0 else 0.0
+        high_drift_mode = overall_eager_drift > HIGH_DRIFT_THRESHOLD
+
         # Table 2: cross-baseline speedups
         # spd_AvsA = eA/cA  spd_BvsA = eA/cB  spd_AvB = eB/cA  spd_BvsB = eB/cB
-        # If spd_BvsA > spd_AvsA → B compile improved vs same baseline (not a true regression)
         print(f"\n  Cross-baseline speedups  (pin one baseline, swap compile to isolate real delta)")
         print(f"  spd_AvsA = eager_A/cmp_A   spd_BvsA = eager_A/cmp_B  (← B vs OLD baseline)")
         print(f"  spd_AvB  = eager_B/cmp_A   spd_BvsB = eager_B/cmp_B")
-        print(f"  'BvsA improvement' > 1.0 → B's compile is better, regression is baseline-only\n")
+        if high_drift_mode:
+            print(f"  ⚠  Overall eager drift {overall_eager_drift*100:+.0f}% — BvsA_impr is unreliable.")
+            print(f"     Verdict uses Δspd (within-run speedup ratio B÷A): positive = B improved.\n")
+        else:
+            print(f"  'BvsA improvement' > 1.0 → B's compile is better, regression is baseline-only\n")
         print(f"{'Op':<20}  {'spd_AvsA':>9}  {'spd_BvsA':>9}  {'spd_AvB':>9}  {'spd_BvsB':>9}  "
-              f"{'BvsA_impr':>11}  {'verdict':>24}")
-        print("-" * 100)
+              f"{'BvsA_impr':>11}  {'Δspd':>7}  {'verdict':>24}")
+        print("-" * 110)
         for op in all_ops:
             ea, eb, ca, cb, sa, sb = op_data[op]
             sAA = ea / ca if ca > 0 else float("nan")
@@ -393,16 +409,35 @@ def print_summary(agg_a: Dict[Key, Record],
             sAB = eb / ca if ca > 0 else float("nan")
             sBB = eb / cb if cb > 0 else float("nan")
             impr = sBA / sAA if (sAA > 0 and not math.isnan(sAA)) else float("nan")
-            if math.isnan(impr):
+            delta_spd = (sb - sa) / sa if (sa > 0 and not math.isnan(sa)) else float("nan")
+            # Per-op eager drift
+            op_eager_drift = abs(eb - ea) / ea if (ea > 0 and not math.isnan(ea)) else 0.0
+
+            # Choose verdict method: use Δspd when eager drift is high for this op
+            use_delta_spd = op_eager_drift > HIGH_DRIFT_THRESHOLD
+            if math.isnan(impr) or math.isnan(delta_spd):
                 verdict = "N/A"
-            elif impr >= 0.99:
-                verdict = "✓ baseline drift only"
-            elif impr >= 0.95:
-                verdict = "~ minor regression"
+            elif use_delta_spd:
+                # Verdict based on within-run speedup ratio delta
+                if delta_spd >= -0.02:
+                    verdict = "✓ baseline drift only"
+                elif delta_spd >= -0.08:
+                    verdict = "~ minor regression"
+                else:
+                    verdict = "✗ TRUE REGRESSION"
             else:
-                verdict = "✗ TRUE REGRESSION"
-            print(f"  {op:<18}  {_fmt(sAA):>9}  {_fmt(sBA):>9}  {_fmt(sAB):>9}  {_fmt(sBB):>9}  "
-                  f"{impr:>+11.3f}  {verdict:>24}")
+                # Original BvsA_impr verdict (valid when drift is small)
+                if impr >= 0.99:
+                    verdict = "✓ baseline drift only"
+                elif impr >= 0.95:
+                    verdict = "~ minor regression"
+                else:
+                    verdict = "✗ TRUE REGRESSION"
+
+            drift_flag = "⚠" if use_delta_spd else " "
+            delta_spd_str = f"{delta_spd*100:+.1f}%" if not math.isnan(delta_spd) else "  N/A"
+            print(f"  {op:<18}{drift_flag} {_fmt(sAA):>9}  {_fmt(sBA):>9}  {_fmt(sAB):>9}  {_fmt(sBB):>9}  "
+                  f"{impr:>+11.3f}  {delta_spd_str:>7}  {verdict:>24}")
 
         # Overall cross-baseline
         sAA_o = ea_o / ca_o if ca_o > 0 else float("nan")
@@ -410,28 +445,70 @@ def print_summary(agg_a: Dict[Key, Record],
         sAB_o = eb_o / ca_o if ca_o > 0 else float("nan")
         sBB_o = eb_o / cb_o if cb_o > 0 else float("nan")
         impr_o = sBA_o / sAA_o if sAA_o > 0 else float("nan")
-        print("-" * 100)
-        print(f"  {'OVERALL':<18}  {_fmt(sAA_o):>9}  {_fmt(sBA_o):>9}  {_fmt(sAB_o):>9}  "
-              f"{_fmt(sBB_o):>9}  {impr_o:>+11.3f}")
+        delta_spd_o = (sb_o - sa_o) / sa_o if sa_o > 0 else float("nan")
+        delta_spd_o_str = f"{delta_spd_o*100:+.1f}%" if not math.isnan(delta_spd_o) else "  N/A"
+        print("-" * 110)
+        print(f"  {'OVERALL':<19} {_fmt(sAA_o):>9}  {_fmt(sBA_o):>9}  {_fmt(sAB_o):>9}  "
+              f"{_fmt(sBB_o):>9}  {impr_o:>+11.3f}  {delta_spd_o_str:>7}")
 
-        # Top regressions / improvements by compile time
+        if high_drift_mode:
+            print(f"\n  ⚠  High thermal drift detected ({overall_eager_drift*100:.0f}% eager shift).")
+            print(f"     Δspd column is the reliable metric: it compares (compile/eager) ratio within each run.")
+            print(f"     Positive Δspd = B's heuristics found a proportionally faster config.")
+
+        # Top regressions / improvements by within-run speedup delta (drift-corrected)
         paired = [(key, agg_a[key], agg_b[key])
                   for key in set(agg_a) & set(agg_b)]
 
-        compile_diffs = sorted(
-            [(rb.compile_ms - ra.compile_ms, key[1], key[2], ra.compile_ms, rb.compile_ms)
-             for key, ra, rb in paired],
-            reverse=True
-        )
-        print(f"\nTop 10 compile-time regressions  (B slower than A):")
-        for diff, op, bench, ca, cb in compile_diffs[:10]:
-            pct = diff / ca * 100 if ca > 0 else 0
-            print(f"  {op:20} {bench:22}  A={ca:.4f}ms  B={cb:.4f}ms  ({pct:+.1f}%)")
+        # Compute per-shape speedup delta and absolute compile delta
+        speedup_diffs = []
+        compile_diffs = []
+        for key, ra, rb in paired:
+            spd_a = ra.eager_ms / ra.compile_ms if ra.compile_ms > 0 else float("nan")
+            spd_b = rb.eager_ms / rb.compile_ms if rb.compile_ms > 0 else float("nan")
+            if not (math.isnan(spd_a) or math.isnan(spd_b)):
+                d_spd = (spd_b - spd_a) / spd_a  # positive = B improved
+                speedup_diffs.append((d_spd, key[1], key[2],
+                                      ra.eager_ms, rb.eager_ms,
+                                      ra.compile_ms, rb.compile_ms,
+                                      spd_a, spd_b))
+            compile_diffs.append((rb.compile_ms - ra.compile_ms,
+                                  key[1], key[2], ra.compile_ms, rb.compile_ms,
+                                  ra.eager_ms, rb.eager_ms))
 
-        print(f"\nTop 10 compile-time improvements (B faster than A):")
-        for diff, op, bench, ca, cb in compile_diffs[-10:]:
-            pct = diff / ca * 100 if ca > 0 else 0
-            print(f"  {op:20} {bench:22}  A={ca:.4f}ms  B={cb:.4f}ms  ({pct:+.1f}%)")
+        # Sort speedup diffs: most-regressed first (most negative)
+        speedup_diffs.sort(key=lambda x: x[0])
+
+        print(f"\nTop 10 speedup regressions  (B has worse within-run speedup ratio):")
+        print(f"  {'Op':20} {'Benchmark':22}  {'spd_A':>7}  {'spd_B':>7}  {'Δspd':>8}  {'cmp_A':>9}  {'cmp_B':>9}  Δeager")
+        for d_spd, op, bench, ea, eb, ca, cb, sa, sb in speedup_diffs[:10]:
+            if d_spd >= 0:
+                break  # no regressions
+            eager_drift_pct = (eb - ea) / ea * 100 if ea > 0 else 0
+            print(f"  {op:20} {bench:22}  {sa:7.4f}  {sb:7.4f}  {d_spd*100:+7.1f}%  "
+                  f"{ca:.4f}ms  {cb:.4f}ms  ({eager_drift_pct:+.0f}% eager)")
+
+        print(f"\nTop 10 speedup improvements (B has better within-run speedup ratio):")
+        print(f"  {'Op':20} {'Benchmark':22}  {'spd_A':>7}  {'spd_B':>7}  {'Δspd':>8}  {'cmp_A':>9}  {'cmp_B':>9}  Δeager")
+        for d_spd, op, bench, ea, eb, ca, cb, sa, sb in reversed(speedup_diffs[-10:]):
+            if d_spd <= 0:
+                break
+            eager_drift_pct = (eb - ea) / ea * 100 if ea > 0 else 0
+            print(f"  {op:20} {bench:22}  {sa:7.4f}  {sb:7.4f}  {d_spd*100:+7.1f}%  "
+                  f"{ca:.4f}ms  {cb:.4f}ms  ({eager_drift_pct:+.0f}% eager)")
+
+        # Also show absolute compile-time table when drift is low (classic view)
+        if not high_drift_mode:
+            compile_diffs_sorted = sorted(compile_diffs, key=lambda x: x[0], reverse=True)
+            print(f"\nTop 10 compile-time regressions  (B slower than A, absolute):")
+            for diff, op, bench, ca, cb, ea, eb in compile_diffs_sorted[:10]:
+                pct = diff / ca * 100 if ca > 0 else 0
+                print(f"  {op:20} {bench:22}  A={ca:.4f}ms  B={cb:.4f}ms  ({pct:+.1f}%)")
+
+            print(f"\nTop 10 compile-time improvements (B faster than A, absolute):")
+            for diff, op, bench, ca, cb, ea, eb in compile_diffs_sorted[-10:]:
+                pct = diff / ca * 100 if ca > 0 else 0
+                print(f"  {op:20} {bench:22}  A={ca:.4f}ms  B={cb:.4f}ms  ({pct:+.1f}%)")
 
     else:
         # Single log: just per-op eager and compile geomeans

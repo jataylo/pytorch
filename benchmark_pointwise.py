@@ -91,9 +91,48 @@ class PointwiseBenchmark:
             ("3D_odd_batch", (7, 333, 333)),
         ]
     
+    def _time_fn_gpu_events(self, fn, inputs, n_iters: int) -> float:
+        """
+        Time a function using CUDA GPU events.
+
+        This measures pure GPU execution time and excludes Python dispatch
+        overhead, making it insensitive to HIP_LAUNCH_BLOCKING and consistent
+        with Triton's do_bench methodology.
+
+        Returns time in milliseconds.
+        """
+        if self.device != 'cuda':
+            # CPU fallback: wall clock
+            torch.cuda.synchronize() if hasattr(torch, 'cuda') else None
+            start = time.perf_counter()
+            for _ in range(n_iters):
+                fn(*inputs)
+            return (time.perf_counter() - start) / n_iters * 1000
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event   = torch.cuda.Event(enable_timing=True)
+
+        # Ensure all pending GPU work is done before we start recording
+        torch.cuda.synchronize()
+
+        start_event.record()
+        for _ in range(n_iters):
+            fn(*inputs)
+        end_event.record()
+
+        # Wait for GPU to finish
+        torch.cuda.synchronize()
+
+        return start_event.elapsed_time(end_event) / n_iters  # ms
+
     def benchmark_op(self, name: str, eager_fn, compile_fn, inputs: List[torch.Tensor]) -> Dict:
         """
         Benchmark a single operation.
+
+        Uses CUDA GPU events for timing so that Python dispatch overhead and
+        HIP_LAUNCH_BLOCKING synchronisation cost are NOT included in the
+        measured times.  This makes results consistent with Triton's internal
+        do_bench (used by REAL_BENCH autotuning).
 
         Returns:
             dict with timing results and speedup (includes wall_time_s for sub-problem timing)
@@ -103,37 +142,23 @@ class PointwiseBenchmark:
         # Warmup eager
         for _ in range(self.warmup_iters):
             _ = eager_fn(*inputs)
-            if self.device == 'cuda':
-                torch.cuda.synchronize()
-        
-        # Time eager
         if self.device == 'cuda':
             torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(self.bench_iters):
-            _ = eager_fn(*inputs)
-        if self.device == 'cuda':
-            torch.cuda.synchronize()
-        eager_time = (time.perf_counter() - start) / self.bench_iters * 1000  # ms
-        
+
+        # Time eager (GPU events only)
+        eager_time = self._time_fn_gpu_events(eager_fn, inputs, self.bench_iters)
+
         # Warmup compiled
         for _ in range(self.warmup_iters):
             _ = compile_fn(*inputs)
-            if self.device == 'cuda':
-                torch.cuda.synchronize()
-        
-        # Time compiled
         if self.device == 'cuda':
             torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(self.bench_iters):
-            _ = compile_fn(*inputs)
-        if self.device == 'cuda':
-            torch.cuda.synchronize()
-        compile_time = (time.perf_counter() - start) / self.bench_iters * 1000  # ms
-        
+
+        # Time compiled (GPU events only)
+        compile_time = self._time_fn_gpu_events(compile_fn, inputs, self.bench_iters)
+
         speedup = eager_time / compile_time if compile_time > 0 else 0.0
-        
+
         return {
             'name': name,
             'eager_ms': eager_time,
