@@ -77,6 +77,16 @@ def _is_reduction_heuristics_enabled():
 # Maps problem_key -> {problem_metadata, predicted_scores: [(score, config)], actual_timings: [(time, config)], top_n_configs: [configs]}
 _HEURISTICS_VALIDATION_DATA = {}
 
+# Reduction validation data — mirrors _HEURISTICS_VALIDATION_DATA for reduction
+# kernels.  Populated in _score_and_prune_reduction_configs(); consumed in
+# _print_reduction_validation_summary() after benchmarking.
+# Maps problem_key -> {
+#   'all_scored':        List[Tuple[float, dict]],   # (score, hdict) all candidates
+#   'top_n':             List[dict],                  # top-N hdicts (normalised)
+#   'problem_metadata':  dict,                        # from ReductionHeuristics
+# }
+_REDUCTION_VALIDATION_DATA: dict = {}
+
 # Global storage for top-N predicted configs per problem
 # Maps problem_key -> [list of top N configs to use for selection]
 _TOP_N_CONFIGS_FOR_SELECTION = {}
@@ -102,6 +112,31 @@ def _normalize_problem_key(size_hints):
         return str(tuple(size_hints))
     else:
         return str((size_hints,))
+
+
+def _normalize_reduction_problem_key(size_hints, inductor_meta=None) -> str:
+    """Reduction-specific problem key that avoids stale-data collisions.
+
+    Two reduction kernels with the same (x, r) shape but different config
+    generation parameters (e.g. register_intensive=True vs False) would
+    collide in _TOP_N_CONFIGS_FOR_SELECTION if only the shape is used.
+    The second kernel would find the first's stale top_n_hdicts and the
+    top-N config matching would fail for all launchers.
+
+    This function adds a short suffix capturing the key parameters that
+    determine *which configs are generated*, so different kernel types
+    get distinct dict entries.
+
+    Parameters added to the key
+    ---------------------------
+    ri   : 1 if register_intensive else 0
+           Affects max_r0_block (1024 vs 2048) and nw_cap (÷2).
+    """
+    base = _normalize_problem_key(size_hints)
+    if inductor_meta:
+        ri = 1 if inductor_meta.get("register_intensive") else 0
+        return f"{base}:ri{ri}"
+    return base
 
 
 def _store_heuristics_predictions(problem_key, problem_metadata, predicted_scores, kernel_code=None):
@@ -750,6 +785,13 @@ try:
 except ImportError:
     POINTWISE_HEURISTICS_AVAILABLE = False
     logging.warning("Pointwise heuristics not available, falling back to default configs")
+
+try:
+    from torch._inductor.codegen.triton_heuristics_reduction import ReductionHeuristics
+    REDUCTION_HEURISTICS_AVAILABLE = True
+except ImportError:
+    ReductionHeuristics = None  # type: ignore[assignment,misc]
+    REDUCTION_HEURISTICS_AVAILABLE = False
 from .hints import (
     _NUM_THREADS_PER_WARP,
     AutotuneHint,
@@ -1104,6 +1146,33 @@ class CachingAutotuner(KernelInterface):
                         f"[HEURISTICS] ⚠ Scoring skipped ({'; '.join(_why)})",
                         flush=True,
                     )
+
+        # ── Reduction scoring + top-N (AMD only, gated by env var) ──────────
+        # Mirrors _score_and_prune_heuristic_configs for REDUCTION kernels.
+        # Only runs when:
+        #   1. Running on an AMD ROCm build
+        #   2. TORCHINDUCTOR_REDUCTION_HEURISTICS=1
+        #   3. not max_autotune (autotuner benchmarks all configs anyway)
+        #   4. heuristic_type is REDUCTION or PERSISTENT_REDUCTION
+        #   5. size_hints is available
+        #   6. No cached best config (autotune cache hit skips re-scoring)
+        _should_score_reduction = (
+            bool(torch.version.hip)
+            and _is_reduction_heuristics_enabled()
+            and not (
+                (inductor_meta or {}).get("max_autotune")
+                or (inductor_meta or {}).get("max_autotune_pointwise")
+            )
+            and heuristic_type in (
+                HeuristicType.REDUCTION,
+                HeuristicType.PERSISTENT_REDUCTION,
+            )
+            and size_hints is not None
+            and not cached_config
+            and not _autotune_cache_hit
+        )
+        if _should_score_reduction:
+            self._score_and_prune_reduction_configs()
 
         self.heuristic_type = heuristic_type
         self.custom_kernel = custom_kernel
@@ -1593,17 +1662,14 @@ class CachingAutotuner(KernelInterface):
 
         # ── 6. Apply mode logic ────────────────────────────────────────────
         if inductor_config.heuristics_real_bench:
-            # REAL_BENCH: compile and benchmark the top-REAL_BENCH_LIMIT scored
-            # configs (default 10) rather than every candidate config.  Without
-            # this cap, enabling waves_per_eu triples the pool (22 → 66+), making
-            # benchmark runs prohibitively slow.  The winner is still chosen only
-            # from the heuristic top-N (≤ REAL_BENCH_LIMIT) selection pool.
+            # REAL_BENCH: compile and benchmark all generated candidates so the
+            # autotuner measures every config the heuristic produced.  The winner
+            # is still chosen only from the heuristic top-N selection pool.
             #
-            # REAL_BENCH_LIMIT is intentionally larger than _top_n so the
-            # validation summary can show configs ranked just outside the selection
-            # pool — useful for diagnosing near-misses.
-            _REAL_BENCH_LIMIT = 10
-            _rb_n = max(_top_n, min(_REAL_BENCH_LIMIT, len(scored)))
+            # heuristics_real_bench_limit (TORCHINDUCTOR_HEURISTICS_REAL_BENCH_LIMIT)
+            # caps the pool when set to a positive integer; 0 = unlimited (default).
+            _limit = inductor_config.heuristics_real_bench_limit
+            _rb_n = max(_top_n, len(scored) if _limit <= 0 else min(_limit, len(scored)))
             self.configs = [tcfg for _, tcfg, _ in scored[:_rb_n]]
 
             _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_n_heuristic
@@ -1627,14 +1693,15 @@ class CachingAutotuner(KernelInterface):
                     problem_key, _HEURISTICS_FULL_RANKED_HDICTS[problem_key]
                 )
 
+            _bench_desc = "all" if _rb_n == len(scored) else f"top-{_rb_n} of"
             log.info(
-                "[HEURISTICS] REAL_BENCH mode: top-%d of %d configs will be benchmarked, "
+                "[HEURISTICS] REAL_BENCH mode: benchmarking %s %d configs, "
                 "winner selected from top-%d predicted",
-                _rb_n, len(scored), _top_n,
+                _bench_desc, len(scored), _top_n,
             )
             print(
-                f"[HEURISTICS] REAL_BENCH mode: benchmarking top-{_rb_n} of "
-                f"{len(scored)} scored configs, selecting winner from heuristic top-{_top_n}",
+                f"[HEURISTICS] REAL_BENCH mode: benchmarking {_bench_desc} {len(scored)} "
+                f"scored configs, selecting winner from heuristic top-{_top_n}",
                 flush=True,
             )
         else:
@@ -1669,6 +1736,185 @@ class CachingAutotuner(KernelInterface):
                 f" (top-{_top_n} selection{_buf_note})",
                 flush=True,
             )
+
+    # -------------------------------------------------------------------------
+    # Reduction scoring + top-N (mirrors _score_and_prune_heuristic_configs)
+    # -------------------------------------------------------------------------
+
+    def _score_and_prune_reduction_configs(self) -> None:
+        """Score all reduction candidates and prune self.configs to the top-N.
+
+        Called from ``__init__`` for REDUCTION / PERSISTENT_REDUCTION kernels
+        when TORCHINDUCTOR_REDUCTION_HEURISTICS=1 and not max_autotune.
+
+        Behaviour mirrors the pointwise path:
+          REAL_BENCH=0  → self.configs is pruned in-place to top-N.
+          REAL_BENCH=1  → self.configs keeps top REAL_BENCH_LIMIT candidates;
+                          the heuristic top-N is stored in
+                          _TOP_N_CONFIGS_FOR_SELECTION for use by
+                          autotune_to_one_config.
+
+        A verbose scoring table is printed when HEURISTICS_VERBOSE=1.
+        """
+        if self.size_hints is None:
+            return
+        if not self.configs:
+            return
+
+        try:
+            from torch._inductor.codegen.triton_heuristics_reduction import (
+                ReductionHeuristics,
+            )
+        except ImportError:
+            return
+
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+
+        # Build problem_metadata
+        problem_metadata = ReductionHeuristics.problem_metadata_from_size_hints(
+            self.size_hints, self.inductor_meta
+        )
+        hint = problem_metadata["reduction_hint"]
+
+        _top_n_env = max(1, inductor_config.heuristics_top_n_configs)
+        top_n_configs, all_scored = ReductionHeuristics.prune_configs(
+            self.configs, problem_metadata, top_n=_top_n_env
+        )
+
+        if not top_n_configs:
+            return  # scoring failed; keep original configs
+
+        _verbose = inductor_config.heuristics_verbose
+
+        # ── Verbose scoring table ───────────────────────────────────────────
+        if _verbose and all_scored:
+            xnumel = problem_metadata["xnumel"]
+            rnumel = problem_metadata["rnumel"]
+            top_n_set = {
+                (c.kwargs.get("XBLOCK", 1), c.kwargs.get("R0_BLOCK", 1), c.num_warps)
+                for c in top_n_configs
+            }
+            print(
+                f"\n[REDUCTION] Scoring table – {len(all_scored)} configs | "
+                f"hint={hint} | x={xnumel} r={rnumel}",
+                flush=True,
+            )
+            print(
+                f"{'':>4}  {'XB':>5}  {'R0B':>6}  {'NW':>4}  "
+                f"{'r_eff':>7}  {'grid':>7}  {'sync/coa':>9}  {'warp':>7}  "
+                f"{'score':>7}  {'top-N':>6}",
+                flush=True,
+            )
+            print("-" * 80, flush=True)
+            for rank, (score, hdict) in enumerate(all_scored[:20], 1):
+                xb  = hdict.get("XBLOCK", 1)
+                r0  = hdict.get("R0_BLOCK", 1)
+                nw  = hdict.get("num_warps", 4)
+                wpe = hdict.get("waves_per_eu", 0)
+                ds  = ReductionHeuristics.get_detailed_scores(hdict, problem_metadata)
+                third_key = "sync_overhead" if hint == "INNER" else "outer_coalescing"
+                third_val = ds.get(third_key, ds.get("sync_overhead", 0.0))
+                in_top = "✓" if (xb, r0, nw) in top_n_set else ""
+                wpe_str = f"+wpe{wpe}" if wpe else ""
+                print(
+                    f"#{rank:>3}  {xb:>5}  {r0:>6}  {nw:>4}{wpe_str:>5}  "
+                    f"{ds.get('r_efficiency',0):.4f}  "
+                    f"{ds.get('grid_coverage',0):.4f}  "
+                    f"{third_val:.4f}    "
+                    f"{ds.get('warp_parallelism',0):.4f}  "
+                    f"{score:.4f}  {in_top}",
+                    flush=True,
+                )
+
+        # Use the reduction-specific key (includes register_intensive suffix)
+        # so different kernels with the same (x, r) shape but different config
+        # generation paths don't collide in _TOP_N_CONFIGS_FOR_SELECTION.
+        problem_key = _normalize_reduction_problem_key(self.size_hints, self.inductor_meta)
+        _rnumel = problem_metadata.get("rnumel", 1)
+
+        def _cfg_r0(c) -> int:
+            """Return the effective R0_BLOCK for a config.
+
+            Persistent reductions omit R0_BLOCK from kwargs (it is dynamic).
+            prune_configs() maps that to rnumel so that the scored hdict key
+            matches the actual problem width.  We must use the same mapping
+            here when building top_n_hdicts and filtering self.configs so that
+            lookup keys are consistent across all three places.
+            """
+            raw = c.kwargs.get("R0_BLOCK", None)
+            return raw if (isinstance(raw, int) and raw >= 1) else max(1, _rnumel)
+
+        # Normalise waves_per_eu: store 0 for absent/zero so that dict equality
+        # matches consistently with _launcher_to_cfg() below.
+        # num_stages is included so pipelined (ns=2) and non-pipelined (ns=1)
+        # variants of the same (xb, r0, nw, wpe) are treated as distinct configs.
+        top_n_hdicts = [
+            {
+                "XBLOCK": c.kwargs.get("XBLOCK", 1),
+                "R0_BLOCK": _cfg_r0(c),
+                "num_warps": c.num_warps,
+                "waves_per_eu": c.kwargs.get("waves_per_eu") or 0,
+                "num_stages": c.num_stages or 1,
+            }
+            for c in top_n_configs
+        ]
+
+        if inductor_config.heuristics_real_bench:
+            _limit = inductor_config.heuristics_real_bench_limit
+            _rb_n = max(_top_n_env, len(all_scored) if _limit <= 0 else min(_limit, len(all_scored)))
+            # Keep the top _rb_n candidates for benchmarking.
+            # Include waves_per_eu and num_stages in the key so pipelined /
+            # wpe variants of the same (XBLOCK, R0_BLOCK, nw) base don't
+            # inflate the set beyond _rb_n.
+            rb_hdicts = {
+                (
+                    s["XBLOCK"],
+                    s["R0_BLOCK"],
+                    s["num_warps"],
+                    s.get("waves_per_eu") or 0,
+                    s.get("num_stages") or 1,
+                )
+                for s in [h for _, h in all_scored[:_rb_n]]
+            }
+            self.configs = [
+                c for c in self.configs
+                if (
+                    c.kwargs.get("XBLOCK", 1),
+                    _cfg_r0(c),
+                    c.num_warps,
+                    c.kwargs.get("waves_per_eu") or 0,
+                    c.num_stages or 1,
+                ) in rb_hdicts
+            ]
+            _TOP_N_CONFIGS_FOR_SELECTION[problem_key] = top_n_hdicts
+            # Transfer dict for subprocess → main-process propagation
+            self._heuristics_subprocess_transfer = {
+                "top_n": (problem_key, top_n_hdicts),
+            }
+            if _verbose:
+                print(
+                    f"[REDUCTION] REAL_BENCH: benchmarking top-{len(self.configs)} "
+                    f"of {len(all_scored)} scored, selecting winner from "
+                    f"heuristic top-{len(top_n_configs)}",
+                    flush=True,
+                )
+        else:
+            self.configs = top_n_configs
+            if _verbose:
+                print(
+                    f"[REDUCTION] Heuristics-only: compiling top-{len(top_n_configs)} "
+                    f"of {len(all_scored)} scored configs",
+                    flush=True,
+                )
+
+        # Always store validation data so autotune_to_one_config can print the
+        # full pointwise-style validation summary (VERBOSE or REAL_BENCH mode).
+        _REDUCTION_VALIDATION_DATA[problem_key] = {
+            "all_scored": all_scored,   # List[(score, hdict)]
+            "top_n": top_n_hdicts,       # normalised top-N dicts
+            "problem_metadata": problem_metadata,
+        }
 
     def is_statically_launchable(self):
         """
@@ -1756,11 +2002,32 @@ class CachingAutotuner(KernelInterface):
 
         compile_results = []
         exc = None
-        for c in self.configs:
+        from torch._inductor import config as _ic
+        _compile_verbose = getattr(_ic, "heuristics_bench_verbose", False)
+        for _ci, c in enumerate(self.configs):
+            if _compile_verbose:
+                _kn = self.inductor_meta.get("kernel_name", "triton_kernel") if self.inductor_meta else "triton_kernel"
+                _sh = self.size_hints or {}
+                print(
+                    f"[COMPILE_VERBOSE] [{_ci+1}/{len(self.configs)}] compiling {_kn} "
+                    f"size={_sh} cfg={c} …",
+                    flush=True,
+                )
+            _t_compile = time.perf_counter()
             try:
                 compile_results.append(self._precompile_config(c))
+                if _compile_verbose:
+                    print(
+                        f"[COMPILE_VERBOSE]   done in {time.perf_counter()-_t_compile:.2f}s",
+                        flush=True,
+                    )
             except (OutOfResources, PTXASError) as e:
                 exc = e
+                if _compile_verbose:
+                    print(
+                        f"[COMPILE_VERBOSE]   FAILED ({type(e).__name__}) in {time.perf_counter()-_t_compile:.2f}s",
+                        flush=True,
+                    )
             except Exception as e:
                 # Triton compilation errors (e.g. ``ValueError: numel exceeds
                 # triton maximum tensor numel``) surface here when a config
@@ -1768,6 +2035,11 @@ class CachingAutotuner(KernelInterface):
                 # Log at debug level and skip — the remaining configs can still
                 # produce a valid launcher.
                 _msg = str(e)
+                if _compile_verbose:
+                    print(
+                        f"[COMPILE_VERBOSE]   ERROR ({type(e).__name__}: {_msg[:80]}) in {time.perf_counter()-_t_compile:.2f}s",
+                        flush=True,
+                    )
                 if "numel" in _msg or "triton" in _msg.lower():
                     log.debug(
                         "Skipping config %s — Triton rejected it: %s",
@@ -1788,7 +2060,44 @@ class CachingAutotuner(KernelInterface):
     def _dynamic_scale_rblock(self):
         # TODO(jansel): we should find a way to move this extra compile into the worker process
         # Currently it relies on _make_launchers(), which requires a cuda context, to populate nreg.
+        #
+        # ── Background: why this exists ──────────────────────────────────────────
+        # When a reduction kernel uses too many registers, the GPU can co-schedule
+        # fewer blocks per CU.  If there are more blocks than the GPU can hold
+        # simultaneously (total_block > max_blocks_per_cu × num_cus), the excess
+        # blocks must wait in a queue.  During that wait the CU has no other
+        # wavefronts to execute — stalls on memory latency go unmasked.
+        # Halving the largest R-block reduces per-thread register use, allowing
+        # more blocks to co-reside per CU and restoring latency hiding.
+        #
+        # ── AMD-specific behaviour ───────────────────────────────────────────────
+        # AMD MI300X has 131,072 VGPRs per CU (vs 65,536 on A100), so the
+        # full-occupancy per-thread budget is 131,072 / 2,048 = 64 VGPRs.
+        # Typical reduction kernels use 24–56 VGPRs, so the VGPR-triggered path
+        # (nreg > 64) rarely fires on AMD.
+        #
+        # The more common AMD bottleneck is grid underutilisation: INNER reductions
+        # have few output elements (e.g. x=8), so only 8 CUs are ever active
+        # regardless of VGPR usage.  The standard halving path does not help here
+        # (total_block ≤ max_blocks_per_cu × num_cus is always satisfied).
+        #
+        # AMD-specific supplement (gated on TORCHINDUCTOR_POINTWISE_WAVES_PER_EU):
+        #   • For any config whose total_block < num_cus (some CUs idle), inject a
+        #     waves_per_eu=2 variant.  This tells the scheduler to co-schedule 2
+        #     wavefronts per SIMD unit on active CUs, hiding memory latency without
+        #     any extra loop-iteration overhead.
+        #   • When the VGPR path does fire, also inject a waves_per_eu=2 variant
+        #     alongside the R-block halving — the autotuner picks whichever wins.
+        #   • When TORCHINDUCTOR_REDUCTION_HEURISTICS=1, our heuristics already
+        #     emit waves_per_eu=2 candidates, so this path is skipped to avoid
+        #     redundant compiles.
+        #
+        # CDNA3 VGPR granularity: VGPRs are allocated in 8-VGPR increments per
+        # work-item.  We round nreg up to the next multiple of 8 so that
+        # max_blocks_per_cu reflects the actual hardware allocation, not the
+        # reported logical count.
         device_prop = self.device_props
+        is_hip = bool(torch.version.hip)
         if (
             not self.deterministic_mode
             and self.inductor_meta.get("dynamic_scale_rblock", True)
@@ -1798,7 +2107,7 @@ class CachingAutotuner(KernelInterface):
             # Disable for Intel as Triton is not ready to return n_regs for a compiled_binary.
             and device_prop.type in ["cuda", "hip"]
             and device_prop.major
-            and (device_prop.major >= 8 or torch.version.hip)
+            and (device_prop.major >= 8 or is_hip)
             and device_prop.regs_per_multiprocessor is not None
         ):
             assert device_prop.regs_per_multiprocessor
@@ -1806,6 +2115,46 @@ class CachingAutotuner(KernelInterface):
             assert device_prop.multi_processor_count
             seen_config_hashes: OrderedSet[Hashable] | None = None
             warp_size = device_prop.warp_size or 32
+            regs_per_cu = device_prop.regs_per_multiprocessor
+            num_cus = device_prop.multi_processor_count
+
+            # AMD: waves_per_eu injection path — gated on env var.
+            # Skipped when AMD reduction heuristics are already active because
+            # ReductionHeuristics.inner_configs() emits wpe=2 variants directly,
+            # making a second compile here redundant.
+            amd_wpe_enabled = (
+                is_hip
+                and _is_waves_per_eu_enabled()
+                and not _is_reduction_heuristics_enabled()
+            )
+
+            def _ensure_seen_hashes():
+                nonlocal seen_config_hashes
+                if seen_config_hashes is None:
+                    seen_config_hashes = OrderedSet(
+                        triton_config_to_hashable(r.config)
+                        for r in self.compile_results
+                    )
+
+            def _reload_fn_if_needed():
+                if self.fn.fn is None:
+                    # We are in the parent process; the fn was dropped after
+                    # prepare_for_pickle().  Reload it before compiling.
+                    assert hasattr(self, "_reload_kernel") and callable(self._reload_kernel)
+                    self.fn = self._reload_kernel().fn
+
+            def _add_config(new_cfg, label):
+                """Add new_cfg to compile_results if not a duplicate."""
+                _ensure_seen_hashes()
+                h = triton_config_to_hashable(new_cfg)
+                if h in seen_config_hashes:
+                    return
+                seen_config_hashes.add(h)
+                log.debug("DSR %s: %s → %s", label, triton_config, new_cfg)
+                _reload_fn_if_needed()
+                self.compile_results.append(self._precompile_config(new_cfg))  # noqa: B909
+
+            # ── Main loop: VGPR-triggered R-block halving ─────────────────────
             for result in self.compile_results:
                 triton_config = result.config
                 compiled_binary = result.kernel
@@ -1820,81 +2169,69 @@ class CachingAutotuner(KernelInterface):
                 if nreg is None:
                     continue
 
-                # make sure rblocks are not too small
+                # Skip if R-blocks are already small (halving would be counterproductive).
                 if conditional_product(*rblocks) <= 64:
                     continue
 
-                # each SM of A100 has 65536 32-bit registers. To maximize
-                # the theoretical occupancy, we need run 2048 threads on each
-                # SM. So each thread should use no more than 65536 / 2048
-                # = 32 registers. In cases where occupancy matters, and each
-                # thread uses too many registers, reduce R0_BLOCK to reduce
-                # the register usage.
-                # For kernel https://gist.github.com/shunting314/e4cccc031fe30d378b9b23c08c238cbd
-                # from PLBartForCausalLM, latency improve from
-                # 7.795ms to 4.883ms.
+                # ── Full-occupancy VGPR budget check ─────────────────────────
+                # Full occupancy requires every thread to use ≤ regs_per_cu /
+                # max_threads_per_cu registers.
+                # A100: 65536 / 2048 = 32.  MI300X: 131072 / 2048 = 64.
                 #
-                if (
-                    nreg
-                    <= device_prop.regs_per_multiprocessor
-                    // device_prop.max_threads_per_multi_processor
-                ):
+                # AMD CDNA3 allocates VGPRs in 8-VGPR granules per work-item.
+                # Round nreg up to the true allocation boundary for accuracy.
+                if is_hip:
+                    nreg_alloc = ((nreg + 7) // 8) * 8  # CDNA3: 8-VGPR granule
+                else:
+                    nreg_alloc = nreg
+
+                full_occ_threshold = regs_per_cu // device_prop.max_threads_per_multi_processor
+                if nreg_alloc <= full_occ_threshold:
+                    # VGPR budget is fine; no R-block halving needed.
+                    # AMD: still check whether wpe=2 would help underutilised CUs.
+                    if amd_wpe_enabled and total_block < num_cus:
+                        if triton_config.kwargs.get("waves_per_eu", 0) != 2:
+                            wpe_cfg = copy.deepcopy(triton_config)
+                            wpe_cfg.kwargs["waves_per_eu"] = 2
+                            _add_config(wpe_cfg, "AMD wpe=2 (CU underutil)")
                     continue
 
-                nreg_per_warp = nreg * warp_size
+                # ── VGPR pressure detected — compute actual co-residency ──────
+                # nreg_alloc × warp_size = VGPRs consumed per wavefront.
+                # max_blocks_per_cu = how many blocks can co-reside on one CU.
+                nreg_per_warp = nreg_alloc * warp_size
                 nreg_per_block = nreg_per_warp * triton_config.num_warps
+                max_blocks_per_cu = max(regs_per_cu // nreg_per_block, 1)
 
-                # Previously we set max_blocks_per_sm to 'max_threads_per_multi_processo / (32 * num_warps)'
-                # The formula below is a tighter upper bound since we have the assumption that
-                #   nreg > device_prop.regs_per_multiprocessor // device_prop.max_threads_per_multi_processor
-                # due to the if condition above and:
-                #   regs_per_multiprocessor / nreg_per_block
-                #   = regs_per_multiprocessor / (nreg * 32 * num_warps)
-                #   < regs_per_multiprocessor / ((regs_per_multiprocessor / max_threads_per_multi_processor) * 32 * num_warps)
-                #   = max_threads_per_multi_processor / (32 * num_warps)
-                # Using a tighter upper bound can reveal more optimization opportunities.
-                max_blocks_per_sm = max(
-                    device_prop.regs_per_multiprocessor // nreg_per_block, 1
-                )
-
-                if total_block <= max_blocks_per_sm * device_prop.multi_processor_count:
-                    # no need to improve occupancy
+                if total_block <= max_blocks_per_cu * num_cus:
+                    # All blocks fit in one scheduling wave — no occupancy problem.
+                    # AMD: still consider wpe=2 if max_blocks_per_cu == 1 (single-
+                    # block co-residency means wavefronts from one block only).
+                    if amd_wpe_enabled and max_blocks_per_cu < 2:
+                        if triton_config.kwargs.get("waves_per_eu", 0) != 2:
+                            wpe_cfg = copy.deepcopy(triton_config)
+                            wpe_cfg.kwargs["waves_per_eu"] = 2
+                            _add_config(wpe_cfg, "AMD wpe=2 (single block/CU)")
                     continue
-                new_config = copy.deepcopy(triton_config)
 
-                # Reduce the largest Rn_BLOCK by a factor of 2.
+                # ── Intervention: halve the largest R-block ───────────────────
+                # Fewer elements per thread → fewer registers → more blocks/CU.
+                # For kernel see: https://gist.github.com/shunting314/e4cccc031fe30d378b9b23c08c238cbd
+                # (PLBartForCausalLM: 7.795ms → 4.883ms)
+                new_config = copy.deepcopy(triton_config)
                 largest_rkwarg: str = max(
                     reduction_kwargs, key=triton_config.kwargs.__getitem__
                 )
                 new_config.kwargs[largest_rkwarg] //= 2
+                _add_config(new_config, f"halve {largest_rkwarg}")
 
-                if seen_config_hashes is None:
-                    seen_config_hashes = OrderedSet(
-                        [
-                            triton_config_to_hashable(x.config)
-                            for x in self.compile_results
-                        ]
-                    )
-                new_config_hash = triton_config_to_hashable(new_config)
-                if new_config_hash in seen_config_hashes:
-                    continue
-                seen_config_hashes.add(new_config_hash)
-                log.debug(
-                    "Dynamically scale down %s from TritonConfig(%s) and get a new TritonConfig(%s)",
-                    largest_rkwarg,
-                    triton_config,
-                    new_config,
-                )
-                if self.fn.fn is None:
-                    """
-                    We are in the parent process, while this program was compiled in a worker
-                    and the fn was dropped in prepare_for_pickle().  We haven't loaded the module
-                    containing the real fn yet.
-                    """
-                    assert hasattr(self, "_reload_kernel")
-                    assert callable(self._reload_kernel)
-                    self.fn = self._reload_kernel().fn
-                self.compile_results.append(self._precompile_config(new_config))  # noqa: B909
+                # AMD: also try waves_per_eu=2 alongside the halved-R config.
+                # waves_per_eu has zero R-loop overhead penalty; the autotuner
+                # will pick whichever of the three (original, halved, wpe=2) wins.
+                if amd_wpe_enabled and triton_config.kwargs.get("waves_per_eu", 0) != 2:
+                    wpe_cfg = copy.deepcopy(triton_config)
+                    wpe_cfg.kwargs["waves_per_eu"] = 2
+                    _add_config(wpe_cfg, "AMD wpe=2 (high VGPR)")
 
             self._make_launchers()
 
@@ -2602,10 +2939,38 @@ class CachingAutotuner(KernelInterface):
             #     str(self.compile_id),
             # ),
         ):
-            timings = {
-                launcher: self.bench(launcher, *args, **kwargs)
-                for launcher in self.launchers
-            }
+            # ── DEBUG: per-config progress log ────────────────────────────────
+            # Enabled via TORCHINDUCTOR_HEURISTICS_BENCH_VERBOSE=1 to diagnose
+            # hangs during autotuning.  Each line is flushed immediately so we
+            # can see exactly which config stalls.
+            import os as _os
+            _bench_verbose = _os.environ.get("TORCHINDUCTOR_HEURISTICS_BENCH_VERBOSE", "0") == "1"
+            if _bench_verbose:
+                import time as _time
+                _kname = self.inductor_meta.get("kernel_name", self.fn.__name__ if hasattr(self.fn, "__name__") else "?")
+                _sh = getattr(self, "size_hints", None)
+                _sh_str = str(_sh) if _sh else "?"
+                print(
+                    f"[BENCH_VERBOSE] kernel={_kname}  size_hints={_sh_str}  "
+                    f"n_configs={len(self.launchers)}",
+                    flush=True,
+                )
+            timings = {}
+            for _lnch_i, launcher in enumerate(self.launchers):
+                if _bench_verbose:
+                    _cfg_str = str(launcher.config)
+                    _t_start = _time.perf_counter()
+                    print(
+                        f"[BENCH_VERBOSE]   [{_lnch_i+1}/{len(self.launchers)}] "
+                        f"benchmarking {_cfg_str} …",
+                        end="", flush=True,
+                    )
+                _t = self.bench(launcher, *args, **kwargs)
+                timings[launcher] = _t
+                if _bench_verbose:
+                    _elapsed = _time.perf_counter() - _t_start
+                    print(f"  → {_t*1000:.3f} µs  (wall {_elapsed:.2f}s)", flush=True)
+            # ── end DEBUG ──────────────────────────────────────────────────────
 
             for k, v in timings.items():
                 self.coordesc_tuner.cache_benchmark_result(k.config, v)
@@ -2685,6 +3050,7 @@ class CachingAutotuner(KernelInterface):
         # see what configs the CachingAutotuner is benchmarking for reductions.
         if (
             inductor_config.heuristics_verbose
+            and _is_reduction_heuristics_enabled()
             and self.heuristic_type in (
                 HeuristicType.REDUCTION,
                 HeuristicType.PERSISTENT_REDUCTION,
@@ -2786,34 +3152,93 @@ class CachingAutotuner(KernelInterface):
         timings = self.benchmark_all_configs(*args, **kwargs)
         benchmark_time_taken_ns = time.time_ns() - start_time
         
-        # Top-5 Selection Logic (Heuristics REAL_BENCH Mode)
+        # Top-N Selection Logic (Heuristics REAL_BENCH Mode)
         # -------------------------------------------------------
-        # Only applies to pointwise kernels with heuristics enabled.
+        # Applies to pointwise AND reduction kernels when heuristics are enabled.
         # Standard kernels and non-REAL_BENCH mode select from all configs.
         from torch._inductor import config as inductor_config
         from torch._inductor.runtime.hints import HeuristicType
-        
-        if (inductor_config.heuristics_real_bench and 
-            self.heuristic_type == HeuristicType.POINTWISE and 
-            self.size_hints is not None):
-            problem_key = _normalize_problem_key(self.size_hints)
+
+        _is_heuristic_type = self.heuristic_type in (
+            HeuristicType.POINTWISE,
+            HeuristicType.REDUCTION,
+            HeuristicType.PERSISTENT_REDUCTION,
+        )
+        # For reduction kernels check the reduction-specific env var.
+        _heuristic_real_bench = inductor_config.heuristics_real_bench
+        if self.heuristic_type in (
+            HeuristicType.REDUCTION,
+            HeuristicType.PERSISTENT_REDUCTION,
+        ):
+            _heuristic_real_bench = (
+                _heuristic_real_bench and _is_reduction_heuristics_enabled()
+            )
+
+        if (_heuristic_real_bench and _is_heuristic_type and
+                self.size_hints is not None):
+            # Use kernel-type-specific key so that reduction and pointwise
+            # kernels with the same (x, r) shape don't collide in the shared
+            # _TOP_N_CONFIGS_FOR_SELECTION dict.  For reductions we also embed
+            # register_intensive so that high-register-pressure kernels (with
+            # a halved max_r0_block) get distinct entries from regular ones.
+            if self.heuristic_type in (
+                HeuristicType.REDUCTION, HeuristicType.PERSISTENT_REDUCTION
+            ):
+                problem_key = _normalize_reduction_problem_key(
+                    self.size_hints, self.inductor_meta
+                )
+            else:
+                problem_key = _normalize_problem_key(self.size_hints)
             top_n_configs = _TOP_N_CONFIGS_FOR_SELECTION.get(problem_key, [])
-            
+
+            # Effective rnumel for persistent-reduction R0_BLOCK mapping.
+            # top_n_hdicts normalises absent R0_BLOCK → rnumel (not 1) so that
+            # persistent configs are not silently dropped by the filter.
+            _val_meta = _REDUCTION_VALIDATION_DATA.get(problem_key, {})
+            _atoc_rnumel = _val_meta.get("problem_metadata", {}).get("rnumel", 1)
+
             if top_n_configs:
-                # Filter timings to only include top N predicted configs
-                # Match launcher configs to top_n_configs by extracting config dict
+                # Filter timings to only include top N predicted configs.
+                # The dict structure must match exactly what _score_one_config /
+                # prune_configs stores in top_n_hdicts / top_n_heuristic:
+                #   POINTWISE: {XBLOCK, num_warps, [waves_per_eu], [YBLOCK], [ZBLOCK]}
+                #   REDUCTION:  {XBLOCK, R0_BLOCK, num_warps, waves_per_eu, num_stages}
+                _is_reduction_kernel = self.heuristic_type in (
+                    HeuristicType.REDUCTION, HeuristicType.PERSISTENT_REDUCTION
+                )
+                def _launcher_to_cfg(launcher):
+                    kw = launcher.config.kwargs
+                    if _is_reduction_kernel:
+                        # Persistent reductions omit R0_BLOCK; map to rnumel to
+                        # match _cfg_r0() in _score_and_prune_reduction_configs.
+                        r0_raw = kw.get('R0_BLOCK', None)
+                        r0_eff = r0_raw if (isinstance(r0_raw, int) and r0_raw >= 1) else max(1, _atoc_rnumel)
+                        return {
+                            'XBLOCK': kw.get('XBLOCK', 1),
+                            'R0_BLOCK': r0_eff,
+                            'waves_per_eu': kw.get('waves_per_eu') or 0,
+                            'num_warps': launcher.config.num_warps,
+                            'num_stages': launcher.config.num_stages or 1,
+                        }
+                    else:
+                        # POINTWISE: mirror _score_one_config's effective dict.
+                        # Only XBLOCK/Y/Z + num_warps + optional waves_per_eu.
+                        d = {
+                            'XBLOCK': kw.get('XBLOCK', 1),
+                            'num_warps': launcher.config.num_warps,
+                        }
+                        if kw.get('YBLOCK') is not None:
+                            d['YBLOCK'] = kw['YBLOCK']
+                        if kw.get('ZBLOCK') is not None:
+                            d['ZBLOCK'] = kw['ZBLOCK']
+                        wpe = kw.get('waves_per_eu') or 0
+                        if wpe:
+                            d['waves_per_eu'] = wpe
+                        return d
+
                 filtered_timings = {}
                 for launcher, timing in timings.items():
-                    # Extract config dict from launcher
-                    launcher_cfg = {
-                        'XBLOCK': launcher.config.kwargs.get('XBLOCK'),
-                        'YBLOCK': launcher.config.kwargs.get('YBLOCK'),
-                        'ZBLOCK': launcher.config.kwargs.get('ZBLOCK'),
-                        'num_warps': launcher.config.num_warps,
-                    }
-                    # Remove None values
-                    launcher_cfg = {k: v for k, v in launcher_cfg.items() if v is not None}
-                    
+                    launcher_cfg = _launcher_to_cfg(launcher)
                     # Check if this launcher's config is in top N
                     if launcher_cfg in top_n_configs:
                         filtered_timings[launcher] = timing
@@ -2836,13 +3261,7 @@ class CachingAutotuner(KernelInterface):
                             for launcher, timing in timings.items():
                                 if timing < float("inf"):
                                     # Check if this launcher matches the fallback hdict
-                                    launcher_cfg = {
-                                        'XBLOCK': launcher.config.kwargs.get('XBLOCK'),
-                                        'YBLOCK': launcher.config.kwargs.get('YBLOCK'),
-                                        'ZBLOCK': launcher.config.kwargs.get('ZBLOCK'),
-                                        'num_warps': launcher.config.num_warps,
-                                    }
-                                    launcher_cfg = {k: v for k, v in launcher_cfg.items() if v is not None}
+                                    launcher_cfg = _launcher_to_cfg(launcher)
                                     if launcher_cfg == _fb_hdict:
                                         fallback_launcher = launcher
                                         fallback_rank = _fb_rank
@@ -2878,15 +3297,107 @@ class CachingAutotuner(KernelInterface):
                         print(msg, flush=True)
                         log.info(msg)
                 else:
-                    # Fallback: use all timings if matching failed
+                    # filtered_timings is empty: config-key matching failed.
+                    # Most likely cause: stale top_n_hdicts in
+                    # _TOP_N_CONFIGS_FOR_SELECTION from an earlier kernel with
+                    # the same (x, r) shape but different config generation
+                    # (different register_intensive, different path, etc.).
+                    # This is harmless — we fall back to the globally fastest
+                    # benchmarked config, which is always correct.  With the
+                    # _normalize_reduction_problem_key fix this should be rare.
                     self.launchers = [builtins.min(timings, key=timings.get)]
+                    # Determine whether this looks like stale data (top_n was
+                    # stored for a different kernel type) or a genuine key bug.
+                    # For POINTWISE: check XBLOCK overlap (top-N dicts don't have R0_BLOCK).
+                    # For REDUCTION: check R0_BLOCK overlap.
+                    if _is_reduction_kernel:
+                        _top_n_keys = {d.get("R0_BLOCK") for d in top_n_configs}
+                        _lnch_keys  = {
+                            lnch.config.kwargs.get("R0_BLOCK")
+                            for lnch in timings
+                        }
+                    else:
+                        _top_n_keys = {d.get("XBLOCK") for d in top_n_configs}
+                        _lnch_keys  = {
+                            lnch.config.kwargs.get("XBLOCK")
+                            for lnch in timings
+                        }
+                    _stale = _top_n_keys.isdisjoint(_lnch_keys)
+                    if _stale:
+                        # Key sets are completely disjoint → definitely stale
+                        # data from a different kernel.  Log at DEBUG only.
+                        log.debug(
+                            "[HEURISTICS] top-N mismatch (stale data from "
+                            "earlier kernel with same shape): falling back to global best."
+                        )
+                    else:
+                        # Partial mismatch — might be a genuine key bug.
+                        _ktype = "REDUCTION" if _is_reduction_kernel else "POINTWISE"
+                        msg = (
+                            f"[HEURISTICS] ⚠ {_ktype} top-N config matching failed "
+                            f"({len(top_n_configs)} top-N dicts, {len(timings)} launchers) — "
+                            f"falling back to global best.  "
+                            f"Check waves_per_eu/XBLOCK/R0_BLOCK key normalisation."
+                        )
+                        print(msg, flush=True)
+                        log.warning(msg)
             else:
-                # No top N configs stored, use all timings
+                # No top-N configs stored for this problem; use all timings.
                 self.launchers = [builtins.min(timings, key=timings.get)]
         else:
             # Not using heuristics, select from all configs
             self.launchers = [builtins.min(timings, key=timings.get)]
-        
+
+        # ── Reduction validation summary (main-process, verbose / real_bench) ─────
+        # Full pointwise-style table: HEURISTIC CHOSEN, ACTUAL Best, ANALYSIS,
+        # benchmark ranking with pred-rank / score / ★, ACCURACY / COVERAGE.
+        # Shown when VERBOSE=1 OR REAL_BENCH=1 (real_bench forces all candidates
+        # to be benchmarked via _heuristics_skip_cache_read).
+        from torch._inductor import config as inductor_config
+        from torch._inductor.runtime.hints import HeuristicType
+        if (
+            (inductor_config.heuristics_verbose or inductor_config.heuristics_real_bench)
+            and _is_reduction_heuristics_enabled()
+            and self.heuristic_type in (
+                HeuristicType.REDUCTION,
+                HeuristicType.PERSISTENT_REDUCTION,
+            )
+            and self.size_hints is not None
+        ):
+            try:
+                _hint = (self.inductor_meta or {}).get("reduction_hint", None)
+                _hint_s = getattr(_hint, "name", str(_hint)) if _hint else "?"
+                _rlabel = (
+                    f"PERSISTENT/{_hint_s}"
+                    if self.heuristic_type == HeuristicType.PERSISTENT_REDUCTION
+                    else f"REDUCTION/{_hint_s}"
+                )
+                # Use the reduction-specific key (same as _score_and_prune_reduction_configs).
+                _pk = _normalize_reduction_problem_key(self.size_hints, self.inductor_meta)
+                # Retrieve top_n_hdicts stored by _score_and_prune_reduction_configs
+                # (may be absent when scoring ran in an async worker process).
+                _stored_top_n = (
+                    _REDUCTION_VALIDATION_DATA.get(_pk, {}).get("top_n")
+                    or _TOP_N_CONFIGS_FOR_SELECTION.get(_pk)
+                )
+                _print_reduction_validation_summary(
+                    problem_key=_pk,
+                    timings=timings,
+                    chosen_launcher=self.launchers[0],
+                    path_label=_rlabel,
+                    amd_heuristics=(
+                        bool(torch.version.hip) and _is_reduction_heuristics_enabled()
+                    ),
+                    size_hints=self.size_hints,
+                    inductor_meta=self.inductor_meta,
+                    # Pass ALL benchmarked launchers (timings.keys()), not just
+                    # self.launchers which is already reduced to [best] at this point.
+                    launchers=list(timings.keys()),
+                    top_n_hdicts=_stored_top_n,
+                )
+            except Exception:
+                pass  # never crash the forward pass for logging
+
         self.autotune_time_taken_ns = (
             self.precompile_time_taken_ns + benchmark_time_taken_ns
         )
@@ -3247,9 +3758,19 @@ class CachingAutotuner(KernelInterface):
                 and len(self.launchers) == 1
             )
             if len(self.launchers) > 1 or (
+                # Call autotune_to_one_config on the very first invocation when
+                # only 1 launcher survived precompile (OutOfResources knocked out
+                # the others) — needed so the REAL_BENCH validation table prints.
+                # The _autotune_complete flag prevents repeat calls on every
+                # subsequent warmup/timing iteration (which would re-run do_bench
+                # ~125ms per call, making the benchmark appear to hang).
                 _real_bench_pointwise and len(self.launchers) == 1
+                and not getattr(self, '_autotune_complete', False)
             ) or _verbose_reduction_single:
                 self.autotune_to_one_config(*args, **kwargs)
+                # Mark done so the _real_bench_pointwise single-launcher path
+                # does NOT fire again on subsequent iterations.
+                self._autotune_complete = True
 
         if not getattr(
             self.launchers[0].config, "found_by_coordesc", False
@@ -5005,6 +5526,574 @@ triton_native_bmm_configs = _config_helper(bmm=True, persistent=False)
 triton_native_persistent_bmm_configs = _config_helper(bmm=True, persistent=True)
 
 
+def _fmt_reduction_cfg(hdict: dict) -> str:
+    """Format a reduction hdict as a compact string (matches result table rows)."""
+    xb  = hdict.get("XBLOCK", 1)
+    r0  = hdict.get("R0_BLOCK", 1)
+    nw  = hdict.get("num_warps", 4)
+    wpe = hdict.get("waves_per_eu") or 0
+    ns  = hdict.get("num_stages") or 1
+    xb_s  = f" XBLOCK={xb}" if xb != 1 else ""
+    wpe_s = f" wpe={wpe}" if wpe else ""
+    ns_s  = f" ns={ns}" if ns > 1 else ""
+    return f"R0_BLOCK={r0} nw={nw}{xb_s}{wpe_s}{ns_s}"
+
+
+def _reduction_hdict_to_key(h: dict) -> tuple:
+    """Canonical 5-tuple from a hdict (same ordering as _reduction_launcher_key)."""
+    return (
+        h.get("XBLOCK", 1),
+        h.get("R0_BLOCK", 1),
+        h.get("num_warps", 4),
+        h.get("waves_per_eu") or 0,
+        h.get("num_stages") or 1,
+    )
+
+
+def _print_reduction_validation_summary(
+    problem_key: str,
+    timings: dict,          # {launcher: float ms}
+    chosen_launcher,
+    path_label: str,
+    amd_heuristics: bool,
+    size_hints=None,        # needed for lazy on-the-fly scoring fallback
+    inductor_meta=None,     # needed for lazy on-the-fly scoring fallback
+    launchers=None,         # needed for lazy on-the-fly scoring fallback
+    top_n_hdicts=None,      # pre-computed top-N from _score_and_prune_reduction_configs
+) -> None:
+    """Full pointwise-style validation table for reduction kernels.
+
+    Printed in VERBOSE or REAL_BENCH mode after autotune_to_one_config completes.
+    Shows:
+      • Problem header
+      • 📊 HEURISTIC CHOSEN – best config from top-N pool, score + factors
+      • 🏆 ACTUAL Best     – globally fastest benchmarked config
+      • 🔍 ANALYSIS        – factor comparison + root-cause
+      • 📊 Benchmark Results – all benchmarked configs with pred rank / score / ★
+      • 📈 ACCURACY / COVERAGE verdict
+    """
+    from torch._inductor import config as inductor_config
+    if not (inductor_config.heuristics_verbose or inductor_config.heuristics_real_bench):
+        return
+    if not _is_reduction_heuristics_enabled():
+        return
+
+    data = _REDUCTION_VALIDATION_DATA.get(problem_key)
+    if not data and REDUCTION_HEURISTICS_AVAILABLE and size_hints is not None and launchers:
+        # Lazy fallback: scoring ran in a worker process (async compilation) so
+        # _REDUCTION_VALIDATION_DATA is empty in the main process.  Re-score now
+        # using the benchmarked launchers' configs so we can still print the table.
+        try:
+            from torch._inductor import config as _ic
+            _top_n_env = max(1, _ic.heuristics_top_n_configs)
+            _pm = ReductionHeuristics.problem_metadata_from_size_hints(
+                size_hints, inductor_meta or {}
+            )
+            _cfgs = [lnch.config for lnch in launchers]
+            _top_n_cfgs, _all_scored = ReductionHeuristics.prune_configs(
+                _cfgs, _pm, top_n=_top_n_env
+            )
+            if _all_scored:
+                _top_n_h = top_n_hdicts or [
+                    {
+                        "XBLOCK": c.kwargs.get("XBLOCK", 1),
+                        "R0_BLOCK": c.kwargs.get("R0_BLOCK", max(1, _pm.get("rnumel", 1))),
+                        "num_warps": c.num_warps,
+                        "waves_per_eu": c.kwargs.get("waves_per_eu") or 0,
+                        "num_stages": c.num_stages or 1,
+                    }
+                    for c in _top_n_cfgs
+                ]
+                data = {
+                    "all_scored": _all_scored,
+                    "top_n": _top_n_h,
+                    "problem_metadata": _pm,
+                }
+                _REDUCTION_VALIDATION_DATA[problem_key] = data
+        except Exception:
+            pass
+    if not data:
+        return
+
+    all_scored:  list = data.get("all_scored", [])
+    top_n:       list = data.get("top_n", [])
+    prob_meta:   dict = data.get("problem_metadata", {})
+
+    if not all_scored:
+        return
+
+    # rnumel from problem_metadata — needed so _reduction_launcher_key handles
+    # persistent reductions (no explicit R0_BLOCK in kwargs) correctly.
+    _rnumel = prob_meta.get("rnumel", 1)
+
+    def _lkey(lnch):
+        return _reduction_launcher_key(lnch, rnumel=_rnumel)
+
+    # ── sort actual timings ───────────────────────────────────────────────
+    valid_timings = [(t, lnch) for lnch, t in timings.items() if t < float("inf")]
+    valid_timings.sort(key=lambda x: x[0])
+    if not valid_timings:
+        return
+
+    best_t, best_lnch = valid_timings[0]
+    best_key = _lkey(best_lnch)
+
+    # ── sort predicted scores (highest first) ─────────────────────────────
+    # tiebreak: R0_BLOCK descending (larger tile preferred)
+    predicted_sorted = sorted(
+        all_scored,
+        reverse=True,
+        key=lambda x: (round(x[0], 4), x[1].get("R0_BLOCK", 0)),
+    )
+
+    # Build fast lookup: 4-tuple → (rank, score, hdict)
+    score_by_key: dict[tuple, tuple] = {}
+    for rank, (score, hdict) in enumerate(predicted_sorted, 1):
+        k = _reduction_hdict_to_key(hdict)
+        if k not in score_by_key:
+            score_by_key[k] = (rank, score, hdict)
+
+    top_n_key_set = {_reduction_hdict_to_key(h) for h in top_n}
+
+    # ── find CHOSEN: best timing from top-N pool ──────────────────────────
+    chosen_t = chosen_lnch = None
+    for t, lnch in valid_timings:
+        if _lkey(lnch) in top_n_key_set:
+            chosen_t = t
+            chosen_lnch = lnch
+            break
+    if chosen_lnch is None:
+        # fallback: use the externally-chosen launcher
+        chosen_lnch = chosen_launcher
+        chosen_t    = timings.get(chosen_launcher, float("inf"))
+
+    chosen_key   = _lkey(chosen_lnch)
+    chosen_entry = score_by_key.get(chosen_key, (None, None, None))
+    chosen_rank, chosen_score, _  = chosen_entry
+
+    # ── find actual best's heuristic rank ────────────────────────────────
+    best_rank_entry = score_by_key.get(best_key, (None, None, None))
+    best_pred_rank, best_pred_score, _ = best_rank_entry
+
+    slowdown = chosen_t / best_t if best_t > 0 and chosen_t < float("inf") else 1.0
+
+    W = 90
+    amd_tag = " [AMD heuristics]" if amd_heuristics else ""
+    print("\n" + "═" * W, flush=True)
+    print(f"  [REDUCTION VALIDATION]{amd_tag}  Predicted vs Actual Performance", flush=True)
+    print("═" * W, flush=True)
+
+    xnumel = prob_meta.get("xnumel", 1)
+    rnumel = prob_meta.get("rnumel", 1)
+    hint   = prob_meta.get("reduction_hint", "?")
+    print(
+        f"  Problem    : {path_label} | x={xnumel} r={rnumel} | hint={hint}",
+        flush=True,
+    )
+    print(
+        f"  Configs    : {len(all_scored)} scored  |  {len(valid_timings)} benchmarked",
+        flush=True,
+    )
+    if top_n:
+        print(
+            f"  Selection  : winner chosen from heuristic top-{len(top_n)}  "
+            f"| validation uses all {len(valid_timings)} benchmarked configs",
+            flush=True,
+        )
+    print("─" * W, flush=True)
+
+    # ── helper: print one config block ────────────────────────────────────
+    def _print_red_block(label: str, lnch, t_ms: float, rank, score, indent="  "):
+        """Print a CHOSEN / ACTUAL-Best block with factor details."""
+        kw   = lnch.config.kwargs
+        r0_raw = kw.get("R0_BLOCK", None)
+        # Display string: show "dyn" for persistent reductions (no explicit tile).
+        r0_disp = r0_raw if r0_raw is not None else "dyn"
+        # Effective R0_BLOCK for scoring: map absent → rnumel so that
+        # get_detailed_scores receives a real integer (not the string "dyn").
+        r0_eff = r0_raw if (isinstance(r0_raw, int) and r0_raw >= 1) else max(1, _rnumel)
+        nw   = lnch.config.num_warps
+        xb   = kw.get("XBLOCK", 1)
+        wpe  = kw.get("waves_per_eu") or 0
+        ns   = lnch.config.num_stages or 1
+        xb_s  = f" XBLOCK={xb}" if xb != 1 else ""
+        wpe_s = f" wpe={wpe}" if wpe else ""
+        ns_s  = f" ns={ns}" if ns > 1 else ""
+        cfg_s = f"R0_BLOCK={r0_disp} nw={nw}{xb_s}{wpe_s}{ns_s}"
+        rank_s = f"#{rank}" if rank is not None else "NOT in scored set"
+        score_s = f"{score:.4f}" if score is not None else "—"
+        print(f"\n{indent}{label}", flush=True)
+        print(f"{indent}  Config  : {cfg_s}", flush=True)
+        print(f"{indent}  Score   : {score_s}  (rank {rank_s})", flush=True)
+        print(f"{indent}  Measured: {t_ms:.6f} ms", flush=True)
+        # Factor details from ReductionHeuristics.get_detailed_scores
+        if REDUCTION_HEURISTICS_AVAILABLE:
+            try:
+                hdict = {
+                    "XBLOCK": xb, "R0_BLOCK": r0_eff, "num_warps": nw, "waves_per_eu": wpe,
+                }
+                ds = ReductionHeuristics.get_detailed_scores(hdict, prob_meta)
+                # prob_meta["reduction_hint"] is already normalised to "INNER"/"OUTER"
+                # by problem_metadata_from_size_hints, so a plain equality check works.
+                is_inner = (hint == "INNER")
+                third_k = "sync_overhead" if is_inner else "outer_coalescing"
+                r_eff_v = ds.get("r_efficiency", 0)
+                grid_v  = ds.get("grid_coverage", 0)
+                third_v = ds.get(third_k, 0)
+                warp_v  = ds.get("warp_parallelism", 0)
+                print(
+                    f"{indent}  Factors : r_eff={r_eff_v:.3f}  grid={grid_v:.3f}  "
+                    f"{'sync' if is_inner else 'coal'}={third_v:.3f}  warp={warp_v:.3f}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+    _print_red_block(
+        f"📊 HEURISTIC CHOSEN  (fastest from top-{len(top_n)} selection pool)"
+        if top_n else "📊 HEURISTIC CHOSEN",
+        chosen_lnch, chosen_t, chosen_rank, chosen_score,
+    )
+    _print_red_block(
+        "🏆 ACTUAL Best  (fastest benchmarked)",
+        best_lnch, best_t,
+        best_pred_rank, best_pred_score,
+    )
+
+    # ── analysis ─────────────────────────────────────────────────────────
+    print(f"\n  🔍 ANALYSIS", flush=True)
+    print("  " + "─" * (W - 2), flush=True)
+
+    if slowdown < 1.01:
+        print(f"  ✅ Heuristics chose the optimal config  (slowdown: {slowdown:.3f}x)", flush=True)
+    else:
+        print(
+            f"  ⚠️  Heuristic chosen (rank #{chosen_rank}) is not the fastest overall.",
+            flush=True,
+        )
+        pct = 100.0 * (chosen_t - best_t) / best_t if best_t > 0 else 0.0
+        print(f"     Gap       : +{pct:.1f}%  ({slowdown:.3f}x vs global best)", flush=True)
+
+        # Factor comparison
+        if REDUCTION_HEURISTICS_AVAILABLE and chosen_key != best_key:
+            try:
+                hint_s = str(hint)
+                third_k = "sync_overhead" if "INNER" in hint_s else "outer_coalescing"
+                third_n = "Sync/DPP" if "INNER" in hint_s else "Coalescing"
+                ch_kw = chosen_lnch.config.kwargs
+                bk_kw = best_lnch.config.kwargs
+                ch_h  = {"XBLOCK": ch_kw.get("XBLOCK", 1), "R0_BLOCK": ch_kw.get("R0_BLOCK", 1),
+                          "num_warps": chosen_lnch.config.num_warps,
+                          "waves_per_eu": ch_kw.get("waves_per_eu") or 0}
+                bk_h  = {"XBLOCK": bk_kw.get("XBLOCK", 1), "R0_BLOCK": bk_kw.get("R0_BLOCK", 1),
+                          "num_warps": best_lnch.config.num_warps,
+                          "waves_per_eu": bk_kw.get("waves_per_eu") or 0}
+                ch_ds = ReductionHeuristics.get_detailed_scores(ch_h, prob_meta)
+                bk_ds = ReductionHeuristics.get_detailed_scores(bk_h, prob_meta)
+                factors = [
+                    ("r_efficiency", "R-Efficiency", 40),
+                    ("grid_coverage", "Grid",        25),
+                    (third_k,         third_n,       25),
+                    ("warp_parallelism", "Warp",     10),
+                ]
+                print(
+                    f"\n  📋 Factor comparison  (CHOSEN rank #{chosen_rank}  vs  ACTUAL Best rank #{best_pred_rank}):",
+                    flush=True,
+                )
+                print(
+                    f"     {'Factor':13s}  {'Chosen':>7}  {'Actual':>7}  {'Delta':>7}  {'Wt':>4}  Note",
+                    flush=True,
+                )
+                print(f"     {'-'*62}", flush=True)
+                weighted_diffs = []
+                for fk, fname, wt in factors:
+                    pv = ch_ds.get(fk, 0)
+                    av = bk_ds.get(fk, 0)
+                    d  = pv - av
+                    wd = abs(d) * (wt / 100.0)
+                    icon = "🔴" if abs(d) > 0.01 and d > 0 else ("🟢" if abs(d) > 0.01 else "  ")
+                    note = f"chosen {'HIGHER' if d>0 else 'LOWER'}" if abs(d) > 0.01 else "≈ same"
+                    print(
+                        f"     {icon}{fname:13s}  {pv:7.3f}  {av:7.3f}  {d:+7.3f}  {wt:3d}%  {note}",
+                        flush=True,
+                    )
+                    weighted_diffs.append((wd, fname, d, wt))
+                print(f"     {'-'*62}", flush=True)
+                weighted_diffs.sort(reverse=True)
+                wd0, fn0, d0, wt0 = weighted_diffs[0]
+                print(f"\n  💡 Root Cause:", flush=True)
+                if wd0 > 0.005:
+                    dir0 = "over-scored" if d0 > 0 else "under-scored"
+                    print(f"     {fn0} was {dir0} for chosen config (Δ={d0:+.3f}, wt={wt0}%)", flush=True)
+                    print(
+                        f"     Actual best ran {slowdown:.3f}x faster despite "
+                        f"{'lower' if d0>0 else 'higher'} {fn0}",
+                        flush=True,
+                    )
+                    adj = "too high" if d0 > 0 else "too low"
+                    print(f"     → {fn0} weight ({wt0}%) may be {adj}", flush=True)
+                else:
+                    print("     All factors very similar – gap is likely measurement noise.", flush=True)
+            except Exception:
+                pass
+
+    # ── benchmark ranking table ───────────────────────────────────────────
+    n_bk = len(valid_timings)
+    print(f"\n  📊 Benchmark Results (top 10 of {n_bk} benchmarked):", flush=True)
+    print(
+        f"     {'Rank':>4}  {'Time(ms)':>10}  {'Pred rank':>9}  {'Score':>7}  Config",
+        flush=True,
+    )
+    print(f"     {'-'*70}", flush=True)
+
+    for i, (t, lnch) in enumerate(valid_timings[:10], 1):
+        lkey = _lkey(lnch)
+        entry = score_by_key.get(lkey, (None, None, None))
+        pr, ps, _ = entry
+        pr_s  = f"#{pr}" if pr is not None else "—"
+        ps_s  = f"{ps:.4f}" if ps is not None else "—"
+        kw    = lnch.config.kwargs
+        r0    = kw.get("R0_BLOCK", "dyn")
+        nw    = lnch.config.num_warps
+        xb    = kw.get("XBLOCK", 1)
+        wpe   = kw.get("waves_per_eu") or 0
+        ns    = lnch.config.num_stages or 1
+        xb_s  = f" XBLOCK={xb}" if xb != 1 else ""
+        wpe_s = f" wpe={wpe}" if wpe else ""
+        ns_s  = f" ns={ns}" if ns > 1 else ""
+        cfg_s = f"R0_BLOCK={r0} nw={nw}{xb_s}{wpe_s}{ns_s}"
+        rel_s = "  ← best" if i == 1 else (f"  (×{t/best_t:.3f})" if best_t > 0 else "")
+        top_n_mark = " ★" if lkey in top_n_key_set else ""
+        print(
+            f"     #{i:3d}  {t:10.6f}  {pr_s:>9}  {ps_s:>7}  {cfg_s}{rel_s}{top_n_mark}",
+            flush=True,
+        )
+
+    print(f"     {'-'*70}", flush=True)
+    if top_n:
+        print(f"     ★ = was in heuristic top-{len(top_n)} selection pool", flush=True)
+
+    # ── ACCURACY / COVERAGE verdict ──────────────────────────────────────
+    if slowdown < 1.05:
+        gap_verdict = "✅ EXCELLENT  – within 5% of optimal"
+    elif slowdown < 1.15:
+        gap_verdict = "✓  GOOD       – within 15% of optimal"
+    elif slowdown < 1.30:
+        gap_verdict = "⚠  ACCEPTABLE – within 30% of optimal"
+    else:
+        gap_verdict = "❌ POOR       – >30% slower than optimal"
+
+    print(f"\n  📈 ACCURACY  : chosen vs best  = {slowdown:.3f}x", flush=True)
+    print(f"     {gap_verdict}", flush=True)
+
+    if top_n:
+        top10_keys = [_lkey(lnch) for _, lnch in valid_timings[:10]]
+        top2_keys  = top10_keys[:2]
+        hits10 = sum(1 for k in top10_keys if k in top_n_key_set)
+        k10 = len(top10_keys)
+        k2  = len(top2_keys)
+        hit_rate = hits10 / k10 if k10 > 0 else 0.0
+        cov_str  = f"{hits10}/{k10} actual top-{k10} configs were in heuristic top-{len(top_n)}"
+        top2_parts = []
+        for rank, k in enumerate(top2_keys, 1):
+            mark = "✓" if k in top_n_key_set else "✗"
+            top2_parts.append(f"#{rank}{mark}")
+        hits2    = sum(1 for k in top2_keys if k in top_n_key_set)
+        top2_str = f"{' '.join(top2_parts)}  ({hits2}/{k2} captured)"
+        if hits10 == 0:
+            cov_verdict = "❌ MISS       – top-N did not capture any actual top-10 config"
+        elif hit_rate >= 0.3:
+            cov_verdict = "✅ GOOD COV   – top-N captured ≥30% of actual top-10"
+        else:
+            cov_verdict = "⚠  LOW COV    – top-N captured <30% of actual top-10"
+        print(f"  📊 COVERAGE  : {cov_str}", flush=True)
+        print(f"     TOP-2      : {top2_str}", flush=True)
+        print(f"     {cov_verdict}", flush=True)
+
+    print("═" * W + "\n", flush=True)
+
+
+def _reduction_launcher_key(lnch, rnumel: int = 1) -> tuple:
+    """Canonical 5-tuple key for a launcher, matching top_n_hdicts normalisation.
+
+    For persistent reductions R0_BLOCK is absent from kwargs (dynamic tile).
+    Pass rnumel so the key matches what prune_configs() stores in the hdict
+    (which maps absent R0_BLOCK to rnumel, not 1).
+    num_stages distinguishes pipelined (ns=2) from non-pipelined (ns=1) configs.
+    """
+    kw = lnch.config.kwargs
+    r0_raw = kw.get("R0_BLOCK", None)
+    r0 = r0_raw if (isinstance(r0_raw, int) and r0_raw >= 1) else max(1, rnumel)
+    return (
+        kw.get("XBLOCK", 1),
+        r0,
+        lnch.config.num_warps,
+        kw.get("waves_per_eu") or 0,
+        lnch.config.num_stages or 1,
+    )
+
+
+def _print_reduction_result_summary(
+    size_hints: dict[str, int],
+    inductor_meta: dict[str, Any],
+    timings: dict,          # {launcher: float ms}
+    chosen_launcher,
+    path_label: str,
+    amd_heuristics: bool,
+    top_n_hdicts: list | None = None,   # heuristic top-N dicts (for ★ marking)
+) -> None:
+    """Print a [REDUCTION RESULT] table after the autotuner picks a winner.
+
+    Shows all benchmarked configs ranked by actual timing, annotates which ones
+    were in the heuristic top-N (★), and reports whether the global winner was
+    captured by the top-N set.
+
+    Format::
+
+        [REDUCTION RESULT] REDUCTION/INNER [AMD heuristics] | x=128 r=8192
+                           benchmarked=10  heuristic-top-N=5
+           Rank  Time(ms)    Δ%   Config                        TopN?
+           #  1  0.009000  +0.0%  R0_BLOCK=2048 nw=8 wpe=2      ★  ← CHOSEN
+           #  2  0.009000  +0.0%  R0_BLOCK=1024 nw=8 wpe=2      ★
+           ...
+        📈 ✅  top-5 captured global winner  (chosen gap vs global best: +0.0%)
+        📈 ⚠️  top-5 MISSED global winner (rank #3 in heuristic) — chosen is +2.1% slower
+    """
+    from torch._inductor import config as inductor_config
+    if not inductor_config.heuristics_verbose:
+        return
+    if not _is_reduction_heuristics_enabled():
+        return
+
+    xnumel = size_hints.get("x", 1)
+    rnumel = inductor_meta.get(
+        "_rnumel_display",
+        max((size_hints.get(k, 1) for k in size_hints if k.startswith("r")), default=1),
+    )
+    amd_tag = " [AMD heuristics]" if amd_heuristics else ""
+
+    # Build a fast lookup set of (xb, r0, nw, wpe, ns) for heuristic top-N entries.
+    top_n_set: set[tuple] = set()
+    if top_n_hdicts:
+        for h in top_n_hdicts:
+            top_n_set.add((
+                h.get("XBLOCK", 1),
+                h.get("R0_BLOCK", 1),
+                h.get("num_warps", 4),
+                h.get("waves_per_eu") or 0,
+                h.get("num_stages") or 1,
+            ))
+
+    # Sort launchers by timing (ascending); skip inf (failed compiles)
+    valid = [(t, lnch) for lnch, t in timings.items() if t < float("inf")]
+    valid.sort(key=lambda x: x[0])
+
+    if not valid:
+        print(f"[REDUCTION RESULT] {path_label}{amd_tag} — all configs failed", flush=True)
+        return
+
+    best_t = valid[0][0]
+    chosen_t = timings.get(chosen_launcher, float("inf"))
+    top_n_label = f"  heuristic-top-N={len(top_n_set)}" if top_n_set else ""
+
+    print(
+        f"[REDUCTION RESULT] {path_label}{amd_tag} | x={xnumel} r={rnumel} | "
+        f"benchmarked={len(valid)}{top_n_label}",
+        flush=True,
+    )
+    print(
+        f"[REDUCTION RESULT]   {'Rank':>5}  {'Time(ms)':>9}  {'Δ%':>6}  "
+        f"{'Config':<36}  {'TopN?':>5}",
+        flush=True,
+    )
+
+    for rank, (t, lnch) in enumerate(valid, 1):
+        c = lnch.config
+        xb  = c.kwargs.get("XBLOCK", 1)
+        r0  = c.kwargs.get("R0_BLOCK", "dyn")
+        nw  = c.num_warps
+        wpe = c.kwargs.get("waves_per_eu") or 0
+        ns  = c.num_stages or 1
+        delta_pct = 100.0 * (t - best_t) / best_t if best_t > 0 else 0.0
+        chosen_marker = "  ← CHOSEN" if lnch is chosen_launcher else ""
+        wpe_s = f" wpe={wpe}" if wpe else ""
+        xb_s  = f" XBLOCK={xb}" if xb != 1 else ""
+        ns_s  = f" ns={ns}" if ns > 1 else ""
+        key = (xb, r0 if isinstance(r0, int) else 1, nw, wpe, ns)
+        top_n_marker = "★" if (top_n_set and key in top_n_set) else ""
+        cfg_str = f"R0_BLOCK={r0} nw={nw}{xb_s}{wpe_s}{ns_s}"
+        print(
+            f"[REDUCTION RESULT]   #{rank:>4}  {t:>9.6f}  {delta_pct:>+6.1f}%  "
+            f"{cfg_str:<36}{top_n_marker:>5}{chosen_marker}",
+            flush=True,
+        )
+
+    # ── Verdict ──────────────────────────────────────────────────────────────
+    # The meaningful question is: did the heuristic top-N set capture the
+    # global winner?  That is independent of which config we actually chose
+    # (the chosen config is the best within top-N; if top-N contains the global
+    # winner, chosen == global winner and chosen_rank == 1).
+    chosen_rank = next(
+        (i + 1 for i, (_, lnch) in enumerate(valid) if lnch is chosen_launcher),
+        None,
+    )
+    global_winner_key = _reduction_launcher_key(valid[0][1])
+    global_captured = top_n_set and global_winner_key in top_n_set
+
+    if top_n_set:
+        if global_captured:
+            chosen_gap_s = (
+                f"+{100.0 * (chosen_t - best_t) / best_t:.1f}%"
+                if chosen_t < float("inf") and best_t > 0 else "?"
+            )
+            verdict = (
+                f"✅  top-{len(top_n_set)} captured global winner  "
+                f"(chosen gap vs global best: {chosen_gap_s})"
+            )
+        else:
+            # Find the global winner's rank in the heuristic scoring
+            gw_hrank = "?"
+            for hrank, h in enumerate(top_n_hdicts or [], 1):
+                hkey = (
+                    h.get("XBLOCK", 1),
+                    h.get("R0_BLOCK", 1),
+                    h.get("num_warps", 4),
+                    h.get("waves_per_eu") or 0,
+                )
+                if hkey == global_winner_key:
+                    gw_hrank = hrank
+                    break
+            chosen_delta_s = (
+                f"+{100.0 * (chosen_t - best_t) / best_t:.1f}%"
+                if chosen_t < float("inf") and best_t > 0 else "?"
+            )
+            verdict = (
+                f"⚠️   top-{len(top_n_set)} MISSED global winner  "
+                f"(global winner heuristic-rank={gw_hrank}) — "
+                f"chosen is {chosen_delta_s} slower than global best"
+            )
+    else:
+        # No top-N info → plain verdict
+        if chosen_rank == 1:
+            runner_up_delta = (
+                f"+{100.0 * (valid[1][0] - best_t) / best_t:.1f}%"
+                if len(valid) > 1 else "N/A"
+            )
+            verdict = f"chose BEST of {len(valid)} candidates  (runner-up gap: {runner_up_delta})"
+        else:
+            chosen_delta = (
+                f"+{100.0 * (chosen_t - best_t) / best_t:.1f}%"
+                if best_t > 0 else "?"
+            )
+            verdict = (
+                f"chose rank #{chosen_rank} ({chosen_delta} vs best)  "
+                f"of {len(valid)} candidates"
+            )
+
+    print(f"[REDUCTION RESULT] 📈 {verdict}", flush=True)
+    print(flush=True)
+
+
 def _log_reduction_configs(
     size_hints: dict[str, int],
     inductor_meta: dict[str, Any],
@@ -5020,6 +6109,8 @@ def _log_reduction_configs(
     """
     from torch._inductor import config as inductor_config
     if not inductor_config.heuristics_verbose:
+        return
+    if not _is_reduction_heuristics_enabled():
         return
 
     import math
@@ -5091,24 +6182,39 @@ def _reduction_configs(
         "max_autotune_pointwise"
     )
 
+    # ── REAL_BENCH: bypass autotune disk-cache read ──────────────────────────
+    # When TORCHINDUCTOR_HEURISTICS_REAL_BENCH=1 we want ALL reduction
+    # candidates to reach CachingAutotuner and be benchmarked, mirroring the
+    # behaviour of the pointwise() path.  Without this flag, a warm run
+    # (autotune cache hit) collapses self.configs to [best_config] before
+    # benchmarking, making the _print_reduction_result_summary useless.
+    # The cache WRITE at the end of the run is still active.
+    try:
+        from torch._inductor import config as _ic_rb
+        if _ic_rb.heuristics_real_bench and not max_autotune_enabled:
+            inductor_meta['_heuristics_skip_cache_read'] = True
+    except Exception:
+        pass
+
     register_intensive = False
     MAX_R0_BLOCK = 2048
     loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
         "num_reduction", 0
     )
-    if size_hints["x"] >= 1024 and loads_and_red >= 10:
+    if loads_and_red >= 10:
         # A heuristics to reduce R0_BLOCK if a kernel potentially need many registers.
         # Consider load and reduction since load need move data into registers and
         # reduction needs an accumulator.
-        #
-        # The magic numbers are a bit arbitrary.
         #
         # We cannot rely on dynamically scaling down R0_BLOCK later, since sometimes
         # triton makes it to use less registers with worse perf. Check:
         # https://github.com/pytorch/pytorch/issues/126463
         #
-        # The heuristic is a very simple one since registers can be reused. But
-        # hopefully it can be a good enough indicator.
+        # Previously gated on size_hints["x"] >= 1024, but profiling shows that
+        # small-x kernels (x=128) with many fused ops (gelu, std, transcendentals)
+        # also spill at r0/thread=32 — the x-size is irrelevant to register pressure.
+        # The AMD reduction heuristics additionally halve MAX_R0_PER_THREAD to 16
+        # when register_intensive=True, eliminating the observed inf configs.
         MAX_R0_BLOCK = 1024
         register_intensive = True
 
@@ -5290,7 +6396,10 @@ def _reduction_configs(
         torch.version.hip
         and _is_reduction_heuristics_enabled()
         and not max_autotune_enabled
-        and "y" not in size_hints  # 3-D tiling handled separately below
+        # 2-D / 3-D kernels: make_config routes through adapt_config_for_tiling
+        # which redistributes (xb × r0) across x, y, r using tiling_scores.
+        # We require tiling_scores to be present when y is in size_hints.
+        and ("y" not in size_hints or "tiling_scores" in inductor_meta)
     )
 
     # For 3d tiling, default to more autotuning only if max_autotune is enabled
@@ -5299,81 +6408,76 @@ def _reduction_configs(
     elif max_autotune_enabled:
         pass  # skip all these cases
     elif _amd_heuristics and reduction_hint == ReductionHint.INNER:
-        # INNER: Inductor already splits the problem for multi-block execution
-        # (e.g. mean([65536]) → size_hints={'x': 8, 'r0_': 8192}).
-        # Maximum grid = xnumel, achieved with XBLOCK=1 — contiguous_config
-        # already does this.  R0_BLOCK changes per-block loop iterations, NOT
-        # block count.
-        #
-        # AMD-specific constraint: _num_warps() halves max_num_warps for AMD
-        # because AMD wavefronts are 64 lanes (2× CUDA's 32).  For r ≤ 8192,
-        # max_num_warps=16 on CUDA → 8 on AMD.  Requesting nw=16 is silently
-        # clamped to 8.  The baseline contiguous_config already achieves the
-        # maximum effective warp count (8 AMD wavefronts = 512 threads).
-        #
-        # Effective optimisation levers:
-        #   A) baseline  – contiguous_config: XBLOCK=1, R0_BLOCK=min(r,2048),
-        #                  nw=8 (auto-calculated to max).  Good for simple
-        #                  reductions (sum, mean): fewest r-loop iterations.
-        #   B) low-reg   – half R0_BLOCK for register-intensive reductions
-        #                  (var, std, Welford with 3+ fp32 accumulators).
-        #                  register_intensive=True in make_config also halves
-        #                  nw (→ 4 AMD wavefronts) to reduce register pressure.
-        #                  Trades more loop iterations for less spill risk.
-        #   C) wpe=2     – waves_per_eu=2: scheduler launches 2 wavefronts per
-        #                  SIMD unit, increasing CU occupancy and hiding the
-        #                  DPP+LDS latency within the (limited) active CUs.
-        amd_inner: list = [contiguous_config]                           # A
+        # ── AMD INNER: delegate to ReductionHeuristics ────────────────────────
+        # Config generation logic lives in triton_heuristics_reduction.py.
+        # See that module's docstring for the full explanation of:
+        #   - XBLOCK / num_warps sweep grid
+        #   - R0_BLOCK tiers (r_full, r_half, r_large, r_xlarge, r_quarter)
+        #   - block-count and work-per-thread filters
+        #   - waves_per_eu variants
+        #   - deduplication
 
-        # Config B: smaller R0_BLOCK for register-intensive reductions (var/std)
-        # Only useful when register_intensive flag is set (≥ 10 load+reduction
-        # ops, set by _reduction_configs based on kernel analysis).
-        if register_intensive and rnumel > 1024:
-            r_half = max(256, min(rnumel, MAX_R0_BLOCK) // 2)
-            amd_inner.append(make_config(
-                1, r_half, num_warps=8,
-                register_intensive=register_intensive,
-            ))
+        def _make_cfg(xb, r0, *, num_warps, num_stages=1,
+                      waves_per_eu=None, register_intensive=False):
+            return make_config(xb, r0, num_warps=num_warps,
+                               num_stages=num_stages,
+                               waves_per_eu=waves_per_eu,
+                               register_intensive=register_intensive)
 
-        # Config C: waves_per_eu to increase CU occupancy for all INNER kernels
-        if _is_waves_per_eu_enabled() and rnumel >= 512:
-            amd_inner.append(make_config(
-                1, min(rnumel, MAX_R0_BLOCK), num_warps=8, num_stages=1,
-                waves_per_eu=2, register_intensive=register_intensive,
-            ))
-
-        # Deduplicate (configs may collapse for tiny rnumel or if flags produce
-        # the same effective config after AMD's _num_warps clamping)
+        amd_inner_extra = ReductionHeuristics.inner_configs(
+            xnumel=size_hints.get("x", 1),
+            rnumel=rnumel,
+            max_r0_block=MAX_R0_BLOCK,
+            register_intensive=register_intensive,
+            waves_per_eu_enabled=_is_waves_per_eu_enabled(),
+            make_config_fn=_make_cfg,
+        )
+        # Prepend the baseline contiguous_config so it is always included
+        result = configs + [contiguous_config] + amd_inner_extra
+        # Deduplicate.  For 2-D/3-D kernels adapt_config_for_tiling may map
+        # many (xb, r0) pairs with the same product to the same tiled config,
+        # so include YBLOCK and num_stages in the key.
         seen: set = set()
-        deduped: list = []
-        for c in amd_inner:
-            key = (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"),
-                   c.num_warps, c.kwargs.get("waves_per_eu", 0))
-            if key not in seen:
-                seen.add(key)
-                deduped.append(c)
-        result = configs + deduped
+        result = [
+            c for c in result
+            if (key := (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"),
+                        c.kwargs.get("YBLOCK"), c.num_warps,
+                        c.kwargs.get("waves_per_eu", 0), c.num_stages))
+            not in seen and not seen.add(key)
+        ]
         _log_reduction_configs(size_hints, inductor_meta, result, "INNER", True)
         return result
 
     elif _amd_heuristics and reduction_hint == ReductionHint.OUTER:
-        # OUTER: CU utilisation is controlled by XBLOCK.  Current AMD default
-        # outer_config=make_config(64,8) is often too coarse (few blocks).
-        # outer_config_opt() (disabled for AMD via "if not torch.version.hip:")
-        # adapts XBLOCK to xnumel for full CU utilisation.  Enable it here as an
-        # additional candidate alongside the default for safety.
-        #
-        # outer_config_opt() is already defined in this scope — call it directly.
-        amd_outer: list = [outer_config, outer_config_opt()]
-        # Deduplicate in case they produce the same config
-        seen_outer: set = set()
-        deduped_outer: list = []
-        for c in amd_outer:
-            key = (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"), c.num_warps)
-            if key not in seen_outer:
-                seen_outer.add(key)
-                deduped_outer.append(c)
-        result_outer = configs + deduped_outer
+        # ── AMD OUTER: delegate to ReductionHeuristics ────────────────────────
+        # See triton_heuristics_reduction.py: ReductionHeuristics.outer_configs()
+
+        def _make_cfg(xb, r0, *, num_warps, num_stages=1,
+                      waves_per_eu=None, register_intensive=False):
+            return make_config(xb, r0, num_warps=num_warps,
+                               num_stages=num_stages,
+                               waves_per_eu=waves_per_eu,
+                               register_intensive=register_intensive)
+
+        amd_outer_extra = ReductionHeuristics.outer_configs(
+            xnumel=size_hints.get("x", 1),
+            rnumel=rnumel,
+            register_intensive=register_intensive,
+            make_config_fn=_make_cfg,
+            waves_per_eu_enabled=_is_waves_per_eu_enabled(),
+        )
+        # Always include the standard outer configs as a baseline
+        result_outer = configs + [outer_config, outer_config_opt()] + amd_outer_extra
+        # Deduplicate. Include YBLOCK and waves_per_eu so wpe variants are
+        # treated as distinct configs (not merged with their wpe=0 counterparts).
+        seen_o: set = set()
+        result_outer = [
+            c for c in result_outer
+            if (key := (c.kwargs.get("R0_BLOCK"), c.kwargs.get("XBLOCK"),
+                        c.kwargs.get("YBLOCK"), c.num_warps,
+                        c.kwargs.get("waves_per_eu") or 0))
+            not in seen_o and not seen_o.add(key)
+        ]
         _log_reduction_configs(size_hints, inductor_meta, result_outer, "OUTER", True)
         return result_outer
 
@@ -5798,8 +6902,52 @@ def _persistent_reduction_configs(
     if "y" in size_hints and max_autotune_enabled:
         pass
     # TODO(jansel): we should be able to improve these heuristics
+    elif _amd_persistent_heuristics and reduction_hint == ReductionHint.INNER and rnumel >= 128 and rnumel < 256:
+        # ── AMD persistent INNER: tiny-r expansion (128 ≤ rnumel < 256) ────────
+        # For rnumel in [128, 256) the thread-work constraint limits useful nw:
+        #   nw=1 → warp_size=64 threads, rnumel/warp_size=2+ elements each (OK)
+        #   nw=2 → 128 threads, rnumel/128 = 1 element each (OK for rnumel≥128)
+        #   nw=4 → 256 threads, rnumel/256 < 1 (idle threads, skip)
+        # Expand the auto-computed base config to try nw=1 and nw=2 only.
+        _AMD_PERSIST_MAX_NW_TINY = 2  # cap for tiny rnumel
+        amd_wpe_tiny = _is_waves_per_eu_enabled()
+        seen_pt: set = set()
+        expanded_tiny: list = []
+        # Take the first (largest-XBLOCK) base config only; XBLOCK variants are
+        # seldom different from each other when xnumel=1 (scalar output).
+        base_cfg = configs[0] if configs else None
+        if base_cfg is not None:
+            xb = base_cfg.kwargs.get("XBLOCK", 1)
+            for nw in range(1, _AMD_PERSIST_MAX_NW_TINY + 1):
+                key = (xb, nw, 0)
+                if key in seen_pt:
+                    continue
+                seen_pt.add(key)
+                nc_copy = copy.deepcopy(base_cfg)
+                nc_copy.num_warps = nw
+                expanded_tiny.append(nc_copy)
+                if amd_wpe_tiny:
+                    key_w = (xb, nw, 2)
+                    if key_w not in seen_pt:
+                        seen_pt.add(key_w)
+                        wc = copy.deepcopy(base_cfg)
+                        wc.num_warps = nw
+                        wc.kwargs["waves_per_eu"] = 2
+                        expanded_tiny.append(wc)
+        configs = expanded_tiny if expanded_tiny else configs
     elif _amd_persistent_heuristics and reduction_hint == ReductionHint.INNER and rnumel >= 256:
-        # De-duplicate by XBLOCK (may collapse to 1 for scalar outputs)
+        # ── AMD persistent INNER: expand candidate set ─────────────────────
+        # Base configs vary only XBLOCK; the auto-computed num_warps is fixed.
+        # We expand each XBLOCK with additional num_warps values and optional
+        # waves_per_eu=2 variants so the heuristics / autotuner have real
+        # choices within the persistent tile.
+        #
+        # AMD register cap for persistent (register_intensive=True):
+        #   max_num_warps (before capping) = 16 for r<=8192.
+        #   After AMD halving (÷2): 8.  After reg_intensive halving (÷2): 4.
+        # So practical range on AMD persistent is {1, 2, 4}.
+        #
+        # De-duplicate by (XBLOCK, num_warps) then keep top-3 distinct XBLOCKs.
         seen_p: set = set()
         deduped_p: list = []
         for c in configs:
@@ -5807,8 +6955,61 @@ def _persistent_reduction_configs(
             if key not in seen_p:
                 seen_p.add(key)
                 deduped_p.append(c)
-        # Keep top-3 distinct XBLOCK configs
-        configs = deduped_p[:3]
+
+        # Select top-3 distinct XBLOCK base configs
+        base_xblocks_seen: set = set()
+        top3_base: list = []
+        for c in deduped_p:
+            xb = c.kwargs.get("XBLOCK", 1)
+            if xb not in base_xblocks_seen:
+                base_xblocks_seen.add(xb)
+                top3_base.append(c)
+            if len(top3_base) == 3:
+                break
+
+        # AMD persistent nw cap: 4 (register_intensive path)
+        _AMD_PERSIST_MAX_NW = 4
+
+        amd_wpe = _is_waves_per_eu_enabled()
+        expanded_seen: set = set()
+        expanded: list = []
+
+        for c in top3_base:
+            base_nw = c.num_warps
+            xb      = c.kwargs.get("XBLOCK", 1)
+
+            # Candidate num_warps: {nw/2, nw, nw*2} clamped to [1, _AMD_PERSIST_MAX_NW]
+            nw_variants = sorted({
+                max(1, base_nw // 2),
+                base_nw,
+                min(_AMD_PERSIST_MAX_NW, base_nw * 2),
+            })
+
+            for nw in nw_variants:
+                key_base = (xb, nw, 0)
+                if key_base in expanded_seen:
+                    continue
+                expanded_seen.add(key_base)
+                if nw == base_nw:
+                    expanded.append(c)   # keep original (already compiled)
+                else:
+                    nc = copy.deepcopy(c)
+                    nc.num_warps = nw
+                    expanded.append(nc)
+
+                # wpe=2 variant: useful when few blocks → CUs underutilised.
+                # Apply to all xb values (especially xb=1 where grid is largest
+                # for persistent but still < num_cus for many shapes).
+                if amd_wpe:
+                    key_wpe = (xb, nw, 2)
+                    if key_wpe not in expanded_seen:
+                        expanded_seen.add(key_wpe)
+                        wc = copy.deepcopy(c)
+                        wc.num_warps = nw
+                        wc.kwargs["waves_per_eu"] = 2
+                        expanded.append(wc)
+
+        configs = expanded
     elif not max_autotune_enabled:  # Do not filter configs when tuning
         if reduction_hint == ReductionHint.INNER and rnumel >= 256:
             if rnumel > 1024 or xnumel // 8 < 128 or inductor_meta.get("RSPLIT_SIZE"):

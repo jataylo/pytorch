@@ -518,16 +518,30 @@ heuristics_real_bench: bool = (
     os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "1") == "1"
 )
 
+# ── Heuristics real-bench candidate limit ────────────────────────────────────
+#
+# Maximum number of scored configs that REAL_BENCH mode will compile and
+# benchmark.  0 (the default) means unlimited — every generated candidate is
+# compiled and measured.  Set to a positive integer to cap compilation time
+# when the candidate pool is very large (e.g. with waves_per_eu enabled).
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_REAL_BENCH_LIMIT
+# Default: 0 (unlimited — benchmark all candidates)
+heuristics_real_bench_limit: int = int(
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH_LIMIT", "0")
+)
+
 # ── Heuristics top-N selection pool ──────────────────────────────────────────
 #
 # Number of top-scoring configs that form the "selection pool" for the
 # heuristic winner:
 #
 #   REAL_BENCH mode  (heuristics_real_bench=True):
-#     All candidate configs are compiled and benchmarked, but the final
-#     kernel is chosen only from the top-N predicted by the heuristic.
-#     Raising N gives the benchmark more candidates to pick from (safer);
-#     lowering N tests the heuristic more aggressively.
+#     All candidate configs are compiled and benchmarked (subject to
+#     heuristics_real_bench_limit), but the final kernel is chosen only from
+#     the top-N predicted by the heuristic.  Raising N gives the benchmark
+#     more candidates to pick from (safer); lowering N tests the heuristic
+#     more aggressively.
 #
 #   Heuristics-only mode  (heuristics_real_bench=False):
 #     Only the top-N configs are compiled at all.  Lower = faster compilation;

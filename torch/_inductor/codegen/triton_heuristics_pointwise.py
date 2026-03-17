@@ -409,7 +409,7 @@ class PointwiseHeuristics:
                 return 1.00
             elif num_blocks <= 8:
                 return 0.90
-            else:
+        else:
                 return 0.70
 
         # Compute-intensity scale: compute-heavy kernels need MORE blocks because
@@ -914,7 +914,24 @@ class PointwiseHeuristics:
     # to compile with ``ValueError("numel (...) exceeds triton maximum tensor
     # numel (1048576)")``.  Filter them out proactively.
     TRITON_MAX_TILE_NUMEL: int = 1048576   # 2^20
-    
+
+    # Hardware register-pressure limit for multi-dimensional tile kernels.
+    #
+    # On AMD MI300X each thread has 256 VGPRs (32-bit slots).  A 2-D/3-D
+    # pointwise kernel must hold `tile_size / threads_per_block` data elements
+    # simultaneously in registers while the inner loops are live.  Profiling of
+    # tuning66 shows that, without exception, every config with
+    #   elems_per_thread = tile_size / (num_warps × warp_size) ≥ 64
+    # produces `inf µs` (register spill / PTXASError / OutOfResources).
+    # No config at elems_per_thread ≤ 32 ever spills.  The range 33–63 is
+    # safe for simple kernels but complex fused ops (many transcendentals) can
+    # still spill there – we cap at 32 for conservatism and zero spill risk.
+    #
+    # Mathematically: 32 data elements × 2 VGPRs each = 64 VGPRs for data;
+    # leaving 192 VGPRs for address registers, accumulators, loop variables,
+    # and compiler temps – sufficient for even heavily-fused kernels.
+    MAX_ELEMS_PER_THREAD_MULTIDIM: int = 32  # reject if > this (avoids VGPR spills)
+
     @staticmethod
     def generate_all_candidate_configs(problem_metadata: Dict) -> List[Dict]:
         """Enumerate every legal (XBLOCK[×YBLOCK[×ZBLOCK]], num_warps) pair.
@@ -954,6 +971,26 @@ class PointwiseHeuristics:
                 for nw in warp_candidates:
                     if nw > max_warps or nw * warp_size > xblock:
                         continue
+                    # Register-pressure guard for 1-D kernels.
+                    #
+                    # The AMD AMDGPU LLVM backend fully unrolls inner loops with
+                    # ≤ 16 vectorized iterations (4-wide FP32 SIMD).  At ept > 32
+                    # (ept=64 → 16 iterations), 16 copies of the kernel body are
+                    # live simultaneously.  For kernels with many transcendental
+                    # ops (gelu, exp, tanh, …) or Welford accumulators, this
+                    # pushes VGPR usage past the 256-VGPR MI300X limit, causing
+                    # n_spills > 32 → bench() returns inf.
+                    #
+                    # Empirical evidence (tuning68):
+                    #   XBLOCK=4096, nw=1 (ept=64): always inf for complex kernels
+                    #   XBLOCK=4096, nw=2 (ept=32): always valid (≤ 8 loop iters)
+                    #
+                    # Performance cost of filtering: ≤ 4% for the 3 simple-kernel
+                    # cases where ept=64 was the empirical winner — the second-best
+                    # config at ept=32 is within measurement noise.
+                    elems_per_thread = xblock / (nw * warp_size)
+                    if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                        continue
                     configs.append({'XBLOCK': xblock, 'num_warps': nw})
         
         elif ndims == 2:
@@ -966,18 +1003,25 @@ class PointwiseHeuristics:
                         continue
                     # tile_size is the number of *elements* processed by one block,
                     # not the hardware thread count.  For 2-D kernels each thread can
-                    # handle multiple elements (ILP), so there is no upper bound on
-                    # tile_size coming from hardware.  The constraints are:
-                    #   num_warps × warp_size  ≤  tile_size   (warp-coherence)
-                    #   tile_size ≤ TRITON_MAX_TILE_NUMEL       (Triton compiler limit)
+                    # handle multiple elements (ILP).  Hard constraints:
+                    #   num_warps × warp_size  ≤  tile_size        (warp-coherence)
+                    #   tile_size ≤ TRITON_MAX_TILE_NUMEL           (Triton limit)
+                    #   tile_size / threads ≤ MAX_ELEMS_PER_THREAD  (VGPR budget)
                     tile_size = xblock * yblock
-                    if tile_size < warp_size:   # must hold at least 1 full warp
-                                continue
+                    if tile_size < warp_size:
+                        continue
                     if tile_size > PointwiseHeuristics.TRITON_MAX_TILE_NUMEL:
-                                continue
+                        continue
                     for nw in warp_candidates:
                         if nw > max_warps or nw * warp_size > tile_size:
-                                continue
+                            continue
+                        # Register-pressure guard: empirically, every 2-D config with
+                        # elems_per_thread ≥ 64 spills on AMD MI300X (100% inf rate).
+                        # Cap at MAX_ELEMS_PER_THREAD_MULTIDIM to pre-filter safely.
+                        threads_per_block = nw * warp_size
+                        elems_per_thread  = tile_size / threads_per_block
+                        if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                            continue
                         configs.append({'XBLOCK': xblock, 'YBLOCK': yblock, 'num_warps': nw})
         
         elif ndims == 3:
@@ -991,16 +1035,20 @@ class PointwiseHeuristics:
                     for zblock in block_sizes_3d:
                         if zblock > znumel:
                             continue
-                        # Same rationale as 2-D: tile_size ≠ thread count.
+                        # Same constraints as 2-D plus VGPR register-pressure guard.
                         tile_size = xblock * yblock * zblock
                         if tile_size < warp_size:
-                                    continue
+                            continue
                         if tile_size > PointwiseHeuristics.TRITON_MAX_TILE_NUMEL:
-                                    continue
+                            continue
                         for nw in warp_candidates:
                             if nw > max_warps or nw * warp_size > tile_size:
                                 continue
-                                configs.append({
+                            threads_per_block = nw * warp_size
+                            elems_per_thread  = tile_size / threads_per_block
+                            if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                                continue
+                            configs.append({
                                 'XBLOCK': xblock, 'YBLOCK': yblock,
                                 'ZBLOCK': zblock, 'num_warps': nw,
                             })
