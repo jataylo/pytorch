@@ -652,6 +652,7 @@ class ReductionHeuristics:
 
         ops_pe    = float(im.get("ops_per_element", 1))
         load_ops  = int(im.get("load_ops", 1))
+        slow_ops  = int(im.get("slow_ops", 0))
 
         return {
             # Core dimensions
@@ -665,6 +666,7 @@ class ReductionHeuristics:
             "warp_size":         ws,
             # Instruction mix / compute
             "ops_per_element":   ops_pe,
+            "slow_ops":          slow_ops,
             "load_ops":          load_ops,
             "element_size":      elem_size,
             # ── BottleneckAnalysis-compatible fields ──────────────────────
@@ -692,12 +694,25 @@ class ReductionHeuristics:
         register-intensive kernels to avoid spill).  Score uses a log-scale
         so partial tiles (e.g. r0=1024 vs r0=2048) are not severely penalised.
 
+        Above-optimal penalty for register-intensive / slow-op heavy kernels:
+        Exceeding optimal_r0 increases the r0-elements processed per thread,
+        which raises VGPR pressure:
+          • Welford std/var: 3 accumulators (mean, M2, count) per r0-element.
+            e.g. R0=8192, nw=8, x=4 → 16 r0/thread × 3 = 48 Welford VGPRs.
+          • Transcendental fusions (tanh+sin+cos+exp): each SFU op needs temp
+            registers; at high R0_BLOCK the unrolled loop holds many live temps.
+        In both cases higher R0_BLOCK is empirically slower even with n_spills=0
+        (sub-spill register pressure reduces occupancy / increases pipeline stalls).
+
+        Penalty scale: at excess=2 → −5%; excess=4 → −10%; excess=8 → −15%.
+
         Returns a value in [0.65, 1.00].
         """
-        r0_block        = config.get("R0_BLOCK", 1)
-        max_r0_block    = pm.get("max_r0_block", 2048)
-        rnumel          = pm.get("rnumel", 1)
+        r0_block           = config.get("R0_BLOCK", 1)
+        max_r0_block       = pm.get("max_r0_block", 2048)
+        rnumel             = pm.get("rnumel", 1)
         register_intensive = pm.get("register_intensive", False)
+        slow_ops           = pm.get("slow_ops", 0)
 
         optimal_r0 = max_r0_block // 2 if register_intensive else max_r0_block
         optimal_r0 = min(optimal_r0, rnumel)
@@ -707,7 +722,22 @@ class ReductionHeuristics:
 
         r_ratio = r0_block / optimal_r0
         if r_ratio >= 1.0:
-            score = 1.0
+            # Above optimal: for register-intensive (Welford) kernels or kernels
+            # with many transcendental ops (slow_ops ≥ 4), penalise excessive
+            # R0_BLOCK proportionally to log2(excess).  This prevents the sync
+            # factor (which rewards larger R0_BLOCK for fewer DPP passes) from
+            # always pushing the highest R0_BLOCK to rank #1 even when it causes
+            # meaningful VGPR-induced slowdowns empirically.
+            if register_intensive or slow_ops >= 4:
+                excess = r0_block / max(1, optimal_r0)
+                # penalty: −5% per doubling of excess above optimal
+                score = max(0.65, 1.0 - 0.05 * math.log2(max(1.0, excess)))
+            elif slow_ops >= 2:
+                excess = r0_block / max(1, optimal_r0)
+                # moderate penalty: −3% per doubling
+                score = max(0.70, 1.0 - 0.03 * math.log2(max(1.0, excess)))
+            else:
+                score = 1.0
         else:
             # Log-scale: log2(r0)/log2(optimal).  r0=optimal/2 → 1-1/log2(opt);
             # for optimal=2048 that's 1-1/11 ≈ 0.91.
@@ -1067,10 +1097,25 @@ class ReductionHeuristics:
             except Exception:
                 continue
 
-        # Sort descending by score; use R0_BLOCK as secondary tiebreaker
-        # (larger R0_BLOCK → fewer loop iterations → prefer when scores tie).
+        # Sort descending by score; tiebreakers (all reversed=True so descending):
+        #   1. score (primary)
+        #   2. R0_BLOCK: larger → fewer reduction iterations → prefer when tied
+        #   3. waves_per_eu: prefer wpe=2 over wpe=0 when score and R0_BLOCK tie.
+        #
+        # Rationale for wpe=2 preference: certain (R0_BLOCK, nw) combinations
+        # run 3–6× slower WITHOUT wpe=2 on AMD MI300X due to scheduler imbalance
+        # (e.g. R0_BLOCK=8192 nw=8 no-wpe → 104 µs; same config wpe=2 → 19 µs).
+        # The scoring formula gives wpe=0 and wpe=2 IDENTICAL scores (wpe is not
+        # modeled), so the tiebreaker decides which gets benchmarked in N=1 mode.
+        # For N=5 this has no effect: the diversity cap uses (XBLOCK, bool(wpe))
+        # buckets, so both wpe=0 and wpe=2 variants already appear in the top-N
+        # pool and the benchmark picks the empirically faster one.
         scored.sort(
-            key=lambda x: (round(x[0], 4), x[2].get("R0_BLOCK", 0)),
+            key=lambda x: (
+                round(x[0], 4),
+                x[2].get("R0_BLOCK", 0),
+                int(bool(x[2].get("waves_per_eu", 0))),  # wpe=2 → 1 > wpe=0 → 0
+            ),
             reverse=True,
         )
 

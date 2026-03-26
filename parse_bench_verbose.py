@@ -13,7 +13,7 @@ Output CSV columns (chosen mode):
     kernel_name, size_hints, chosen_us, config, n_spills
 
 If a kernel+size_hints combination appears multiple times (re-benchmarked),
-only the last chosen / overall fastest finite result is kept.
+the fastest result across all occurrences is kept (both modes).
 """
 
 import csv
@@ -201,13 +201,16 @@ def parse_log_chosen(path: Path) -> list[dict]:
             m = RE_CHOSEN_PW.search(line)
             if m and current_kernel is not None:
                 key = (current_kernel, current_hints)
-                chosen[key] = dict(
-                    kernel_name=current_kernel,
-                    size_hints=current_hints,
-                    chosen_us=float(m.group(4)) * 1000.0,
-                    config=parse_chosen_config(m.group(1), m.group(2)),
-                    n_spills=int(m.group(3)),
-                )
+                new_us = float(m.group(4)) * 1000.0
+                prev = chosen.get(key)
+                if prev is None or new_us < prev['chosen_us']:
+                    chosen[key] = dict(
+                        kernel_name=current_kernel,
+                        size_hints=current_hints,
+                        chosen_us=new_us,
+                        config=parse_chosen_config(m.group(1), m.group(2)),
+                        n_spills=int(m.group(3)),
+                    )
                 in_red_chosen = False
                 red_cfg = None
                 continue
@@ -230,13 +233,16 @@ def parse_log_chosen(path: Path) -> list[dict]:
                 mm = RE_CHOSEN_RED_TIME.search(line)
                 if mm and red_cfg is not None and current_kernel is not None:
                     key = (current_kernel, current_hints)
-                    chosen[key] = dict(
-                        kernel_name=current_kernel,
-                        size_hints=current_hints,
-                        chosen_us=float(mm.group(1)) * 1000.0,
-                        config=red_cfg,
-                        n_spills=0,
-                    )
+                    new_us = float(mm.group(1)) * 1000.0
+                    prev = chosen.get(key)
+                    if prev is None or new_us < prev['chosen_us']:
+                        chosen[key] = dict(
+                            kernel_name=current_kernel,
+                            size_hints=current_hints,
+                            chosen_us=new_us,
+                            config=red_cfg,
+                            n_spills=0,
+                        )
                     in_red_chosen = False
                     red_cfg = None
                     continue

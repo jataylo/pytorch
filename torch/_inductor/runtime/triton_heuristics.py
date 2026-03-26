@@ -1592,11 +1592,15 @@ class CachingAutotuner(KernelInterface):
         #   VGPRs per thread and the compiler avoids register spills; empirically
         #   XBLOCK=256+4w often beats 512+8w for fusion-heavy workloads.
         #
-        # XBLOCK > 256 → cap = 1:
-        #   Keeps the pool diverse across XBLOCK sizes.  For 2-D and 3-D
-        #   problems all top-N XBLOCK values are ≤ 256 by construction, so
-        #   this branch only matters for large 1-D problems where preserving
-        #   XBLOCK=256+4w (small tile + 4 warps) in the pool is the priority.
+        # For all XBLOCK sizes → cap = 2:
+        #   After the BW saturation fix (BW is flat at 0.97 for any nw≥4
+        #   when the grid has ≥2048 blocks or is a single block), the scoring
+        #   intentionally makes nw=4 and nw=8 equivalent — grid score and
+        #   XBLOCK size differentiate configs, but warp count is left to the
+        #   real bench.  Using cap=1 for XBLOCK>256 would prevent both nw=4
+        #   and nw=8 variants from being benchmarked, permanently hiding the
+        #   empirically faster variant.  cap=2 for all XBLOCK sizes ensures
+        #   both warp-count variants of the top XBLOCK widths enter the pool.
         #
         # Overflow configs fill any remaining slots so the list always has
         # exactly top-N entries.
@@ -1606,7 +1610,7 @@ class CachingAutotuner(KernelInterface):
             _xb_counts: dict = {}
             for _entry in scored:
                 _xb = _entry[2].get('XBLOCK', 0)
-                _cap = 2 if _xb <= 256 else 1
+                _cap = 2  # allow both nw=4 and nw=8 variants per XBLOCK
                 if _xb_counts.get(_xb, 0) < _cap:
                     _primary.append(_entry)
                     _xb_counts[_xb] = _xb_counts.get(_xb, 0) + 1
@@ -1638,6 +1642,85 @@ class CachingAutotuner(KernelInterface):
                     _pool_sorted.sort(key=lambda e: e[0], reverse=True)  # descending
                     _overflow_rest = [e for e in scored if id(e[2]) not in {id(x[2]) for x in _pool_sorted}]
                     scored = _pool_sorted + _overflow_rest
+
+        # Large-XBLOCK guarantee: for 1-D kernels with ≥16 K elements and
+        # top_n ≥ 5, inject the best XBLOCK≥4096 nw=4 config into the pool
+        # if none is already present.  Needed because memory-bound 1-D kernels
+        # (leaky_relu, mul_relu, add_0 at 8M+ elements) run 15%+ faster with
+        # XBLOCK=4096 nw=4 on AMD MI300X due to 128-bit vectorised loads.
+        if (inductor_config.heuristics_diversity
+                and inductor_config.heuristics_top_n_configs >= 5):
+            _ndims_for_lg = len(problem_metadata.get('dimensions', (1,)))
+            _tot_elems_lg = problem_metadata.get('total_elements', 0)
+            if _ndims_for_lg == 1 and _tot_elems_lg >= 16384:
+                _top_n_preview_lg = max(
+                    1, min(inductor_config.heuristics_top_n_configs, len(scored)))
+                _pool_lg = scored[:_top_n_preview_lg]
+                _pool_ids_lg = {id(e[2]) for e in _pool_lg}
+                # Check specifically for nw=4 at XBLOCK≥4096: empirically on
+                # MI300X nw=4 often outperforms nw=8 for large-XBLOCK 1-D kernels
+                # due to lower SPI init overhead and better VGPR headroom.
+                # If only nw=8 is in the pool (diversity cap let nw=8 through
+                # because it scored slightly higher), we still inject nw=4.
+                _has_large_xb_nw4 = any(
+                    e[2].get('XBLOCK', 0) >= 4096 and e[2].get('num_warps', 8) == 4
+                    for e in _pool_lg
+                )
+                if not _has_large_xb_nw4:
+                    _best_large = next(
+                        (e for e in scored
+                         if e[2].get('XBLOCK', 0) >= 4096
+                         and e[2].get('num_warps', 8) == 4
+                         and id(e[2]) not in _pool_ids_lg),
+                        None,
+                    )
+                    if _best_large is not None:
+                        _pool_sorted_lg = sorted(_pool_lg, key=lambda e: e[0])
+                        _pool_sorted_lg[0] = _best_large
+                        _pool_sorted_lg.sort(key=lambda e: e[0], reverse=True)
+                        _overflow_rest_lg = [
+                            e for e in scored
+                            if id(e[2]) not in {id(x[2]) for x in _pool_sorted_lg}
+                        ]
+                        scored = _pool_sorted_lg + _overflow_rest_lg
+
+        # Low-warp large-XBLOCK guarantee: for compute-heavy 1-D kernels (slow_ops ≥ 2),
+        # also inject the best XBLOCK≥4096 nw=2 config if none is already in the pool.
+        # Empirically, nw=2 provides 2× the VGPR budget vs nw=4 for SFU-heavy kernels
+        # (e.g. var_7 x=262K: nw=2 wins by 25% over nw=4 at the same XBLOCK=4096).
+        if (inductor_config.heuristics_diversity
+                and inductor_config.heuristics_top_n_configs >= 5):
+            _ndims_nw2 = len(problem_metadata.get('dimensions', (1,)))
+            _tot_elems_nw2 = problem_metadata.get('total_elements', 0)
+            _slow_ops_nw2  = problem_metadata.get('slow_ops', 0)
+            if _ndims_nw2 == 1 and _tot_elems_nw2 >= 16384 and _slow_ops_nw2 >= 2:
+                _top_n_nw2  = max(1, min(inductor_config.heuristics_top_n_configs, len(scored)))
+                _pool_nw2   = scored[:_top_n_nw2]
+                _ids_nw2    = {id(e[2]) for e in _pool_nw2}
+                _has_nw2    = any(
+                    e[2].get('XBLOCK', 0) >= 4096 and e[2].get('num_warps', 8) == 2
+                    for e in _pool_nw2
+                )
+                if not _has_nw2:
+                    _best_nw2 = next(
+                        (e for e in scored
+                         if e[2].get('XBLOCK', 0) >= 4096
+                         and e[2].get('num_warps', 8) == 2
+                         and id(e[2]) not in _ids_nw2),
+                        None,
+                    )
+                    if _best_nw2 is not None:
+                        _pool_sorted_nw2 = sorted(_pool_nw2, key=lambda e: e[0])
+                        # Protected injection: only replace if the guarantee config
+                        # scores ≥ the pool member it displaces.
+                        if _best_nw2[0] >= _pool_sorted_nw2[0][0]:
+                            _pool_sorted_nw2[0] = _best_nw2
+                        _pool_sorted_nw2.sort(key=lambda e: e[0], reverse=True)
+                        _overflow_rest_nw2 = [
+                            e for e in scored
+                            if id(e[2]) not in {id(x[2]) for x in _pool_sorted_nw2}
+                        ]
+                        scored = _pool_sorted_nw2 + _overflow_rest_nw2
 
         # ── How many configs form the selection pool? ──────────────────────
         # Controlled by TORCHINDUCTOR_HEURISTICS_TOP_N (default 5).
@@ -1771,9 +1854,33 @@ class CachingAutotuner(KernelInterface):
         from torch._inductor import config as inductor_config
         from torch._inductor.runtime.hints import HeuristicType
 
+        # Extract slow_ops from kernel source so the reduction scorer can
+        # penalise excessive R0_BLOCK for transcendental-heavy and Welford kernels.
+        _red_kernel_code = None
+        try:
+            if self.fn is not None and hasattr(self.fn, 'src') and self.fn.src:
+                _red_kernel_code = str(self.fn.src)
+        except Exception:
+            pass
+
+        _red_inductor_meta = self.inductor_meta
+        if _red_kernel_code and not self.inductor_meta.get('slow_ops'):
+            try:
+                from torch._inductor.codegen.triton_heuristics_analysis import (
+                    extract_kernel_metadata as _ekm,
+                )
+                _km = _ekm(_red_kernel_code)
+                if _km.get('slow_ops', 0) > 0 or _km.get('ops_per_element', 0) > 0:
+                    _red_inductor_meta = {**self.inductor_meta, **{
+                        k: _km[k] for k in ('slow_ops', 'ops_per_element')
+                        if k in _km
+                    }}
+            except Exception:
+                pass
+
         # Build problem_metadata
         problem_metadata = ReductionHeuristics.problem_metadata_from_size_hints(
-            self.size_hints, self.inductor_meta
+            self.size_hints, _red_inductor_meta
         )
         hint = problem_metadata["reduction_hint"]
 

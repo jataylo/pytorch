@@ -77,24 +77,42 @@ def extract_kernel_metadata(kernel_code: str) -> Dict:
         )
 
         medium_ops = (
-            kernel_code.count('tl.div')   +
-            kernel_code.count('tl.fdiv')  +
-            kernel_code.count('tl.sqrt')  +
-            kernel_code.count('tl.rsqrt') +
-            len(re.findall(r'\s/\s', kernel_code))
+            kernel_code.count('tl.div(')   +
+            kernel_code.count('tl.fdiv(')  +
+            kernel_code.count('tl.sqrt(')  +
+            kernel_code.count('tl.rsqrt(') +
+            len(re.findall(r'\s/\s', kernel_code)) +
+            kernel_code.count('libdevice.sqrt(')  +
+            kernel_code.count('libdevice.rsqrt(') +
+            kernel_code.count('tl.math.sqrt(')    +
+            kernel_code.count('tl.math.rsqrt(')
         )
 
         # Transcendentals route through the Special Function Unit (SFU) and cost
         # 16–64 cycles each versus 1 cycle for FMA, so they dominate compute time.
+        #
+        # PyTorch Inductor generates kernels using the libdevice namespace
+        # (e.g. libdevice.tanh, libdevice.erf) rather than the tl.* namespace.
+        # Both variants must be counted.  Use the open-paren suffix to avoid
+        # double-counting exp vs exp2 (since 'tl.exp' is a substring of 'tl.exp2').
         slow_ops = (
-            kernel_code.count('tl.exp')     +
-            kernel_code.count('tl.exp2')    +
-            kernel_code.count('tl.log')     +
-            kernel_code.count('tl.log2')    +
-            kernel_code.count('tl.sin')     +
-            kernel_code.count('tl.cos')     +
-            kernel_code.count('tl.tanh')    +
-            kernel_code.count('tl.sigmoid')
+            # tl.* namespace (Triton builtins)
+            kernel_code.count('tl.exp(')     + kernel_code.count('tl.exp2(')   +
+            kernel_code.count('tl.log(')     + kernel_code.count('tl.log2(')   +
+            kernel_code.count('tl.sin(')     + kernel_code.count('tl.cos(')    +
+            kernel_code.count('tl.tanh(')    + kernel_code.count('tl.sigmoid(') +
+            # libdevice.* namespace (Inductor codegen — tl.extra.libdevice or
+            # from triton.language.extra.libdevice import * style)
+            kernel_code.count('libdevice.exp(')   + kernel_code.count('libdevice.exp2(')  +
+            kernel_code.count('libdevice.log(')   + kernel_code.count('libdevice.log2(')  +
+            kernel_code.count('libdevice.sin(')   + kernel_code.count('libdevice.cos(')   +
+            kernel_code.count('libdevice.tanh(')    + kernel_code.count('libdevice.erf(')      +
+            kernel_code.count('libdevice.erfc(')   + kernel_code.count('libdevice.pow(')      +
+            kernel_code.count('libdevice.sigmoid(') + kernel_code.count('libdevice.atan2(')   +
+            # tl.math.* namespace (another Triton dialect variant)
+            kernel_code.count('tl.math.exp(')  + kernel_code.count('tl.math.log(')  +
+            kernel_code.count('tl.math.sin(')  + kernel_code.count('tl.math.cos(')  +
+            kernel_code.count('tl.math.tanh(') + kernel_code.count('tl.math.erf(')
         )
 
         metadata['fast_ops']   = fast_ops
