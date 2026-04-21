@@ -1116,6 +1116,74 @@ static void registerCudaDeviceProperties(PyObject* module) {
       .def_readonly("pci_device_id", &cudaDeviceProp::pciDeviceID)
       .def_readonly("pci_domain_id", &cudaDeviceProp::pciDomainID)
       .def_readonly("L2_cache_size", &cudaDeviceProp::l2CacheSize)
+      // Computed properties for performance modeling
+      .def_property_readonly(
+          "memory_bandwidth_gb_s",
+          [](const cudaDeviceProp& prop) {
+            // Bandwidth (GB/s) = (mem_clk_khz * bus_width_bits / 8) * 2 (DDR) / 1e6
+#if USE_ROCM
+            int mem_clk_khz = 0;
+            int bus_width = 0;
+            if (cudaDeviceGetAttribute(
+                    &mem_clk_khz,
+                    cudaDevAttrMemoryClockRate,
+                    c10::cuda::current_device()) == cudaSuccess &&
+                cudaDeviceGetAttribute(
+                    &bus_width,
+                    cudaDevAttrGlobalMemoryBusWidth,
+                    c10::cuda::current_device()) == cudaSuccess) {
+              return (static_cast<double>(mem_clk_khz) *
+                      static_cast<double>(bus_width) / 8.0) *
+                  2.0 / 1e6;
+            }
+            return 0.0;
+#else
+            if (prop.memoryClockRate > 0 && prop.memoryBusWidth > 0) {
+              return (static_cast<double>(prop.memoryClockRate) *
+                      static_cast<double>(prop.memoryBusWidth) / 8.0) *
+                  2.0 / 1e6;
+            }
+            return 0.0;
+#endif
+          })
+      .def_property_readonly(
+          "compute_throughput_tflops",
+          [](const cudaDeviceProp& prop) {
+            // Peak FP32 throughput estimate
+#if USE_ROCM
+            // AMD CDNA: 64 FP32 lanes * 2 (FMA) per CU per clock
+            int clock_rate_khz = 0;
+            if (cudaDeviceGetAttribute(
+                    &clock_rate_khz,
+                    cudaDevAttrClockRate,
+                    c10::cuda::current_device()) == cudaSuccess) {
+              double clock_rate_mhz = clock_rate_khz / 1000.0;
+              double ops_per_cu_per_clock = 64.0 * 2.0;
+              return (prop.multiProcessorCount * ops_per_cu_per_clock *
+                      clock_rate_mhz) /
+                  1e6;
+            }
+            return 0.0;
+#else
+            int clock_rate_khz = 0;
+            if (cudaDeviceGetAttribute(
+                    &clock_rate_khz,
+                    cudaDevAttrClockRate,
+                    c10::cuda::current_device()) == cudaSuccess) {
+              double clock_rate_mhz = clock_rate_khz / 1000.0;
+              int cuda_cores_per_sm = 128; // Hopper/default
+              if (prop.major == 7)
+                cuda_cores_per_sm = 64; // Volta/Turing
+              else if (prop.major == 8)
+                cuda_cores_per_sm = 64; // Ampere
+              double ops_per_sm_per_clock = cuda_cores_per_sm * 2.0; // FMA
+              return (prop.multiProcessorCount * ops_per_sm_per_clock *
+                      clock_rate_mhz) /
+                  1e6;
+            }
+            return 0.0;
+#endif
+          })
       .def("__repr__", [](const cudaDeviceProp& prop) {
         std::ostringstream stream;
         stream << "_CudaDeviceProperties(name='" << prop.name
