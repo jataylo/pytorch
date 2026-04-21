@@ -94,6 +94,19 @@ def pre_fork_setup():
     if HAS_TRITON:
         triton_key()
 
+    # Pre-initialise the pointwise heuristics architecture config so forked
+    # worker processes inherit a populated _arch_config and never need to call
+    # torch.cuda.get_device_properties() themselves.  Calling that API in a
+    # forked subprocess (after the CUDA/HIP runtime is already active in the
+    # parent) raises "Cannot re-initialize CUDA in forked subprocess".
+    try:
+        from torch._inductor.codegen.triton_heuristics_pointwise import (
+            PointwiseHeuristics,
+        )
+        PointwiseHeuristics._get_arch()
+    except Exception:
+        pass  # Non-critical: workers fall back to conservative defaults
+
 
 def caching_device_properties():
     for _, device_interface in get_registered_device_interfaces():

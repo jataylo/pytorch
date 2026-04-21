@@ -496,7 +496,7 @@ class EnterDeviceContextManagerLine(WrapperLine):
             if V.graph.aot_mode:
                 # In AOT mode, we have a stream provided as a param. A stream is
                 # associated with a device, so we never expect the device to change.
-                # CUDAStreamGuard sets the stream and the device.
+                # HIPStreamGuardMasqueradingAsCUDA sets the stream and the device.
                 if self.last_seen_device_guard_index is None:
                     code.writeline(
                         f"{V.graph.device_ops.cpp_aoti_stream_guard()} stream_guard(stream, this->device_idx_);"
