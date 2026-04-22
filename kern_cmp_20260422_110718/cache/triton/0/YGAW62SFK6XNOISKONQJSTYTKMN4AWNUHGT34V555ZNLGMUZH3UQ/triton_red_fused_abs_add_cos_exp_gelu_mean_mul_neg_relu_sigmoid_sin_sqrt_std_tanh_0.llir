@@ -1,0 +1,1615 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+target triple = "amdgcn-amd-amdhsa"
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare !dbg !6 float @llvm.exp2.f32(float) #0
+
+; Function Attrs: nofree norecurse nounwind memory(argmem: readwrite)
+define amdgpu_kernel void @triton_red_fused_abs_add_cos_exp_gelu_mean_mul_neg_relu_sigmoid_sin_sqrt_std_tanh_0(ptr addrspace(1) inreg readonly captures(none) %0, ptr addrspace(1) inreg readonly captures(none) %1, ptr addrspace(1) inreg readonly captures(none) %2, ptr addrspace(1) inreg readonly captures(none) %3, ptr addrspace(1) inreg writeonly captures(none) %4, ptr addrspace(1) inreg writeonly captures(none) %5, ptr addrspace(1) inreg writeonly captures(none) %6, ptr addrspace(1) inreg writeonly captures(none) %7, ptr addrspace(1) inreg writeonly captures(none) %8, i32 inreg %9, i32 inreg %10, ptr addrspace(1) inreg readnone captures(none) %11, ptr addrspace(1) inreg readnone captures(none) %12) local_unnamed_addr #1 !dbg !10 {
+  %14 = tail call i32 @llvm.amdgcn.workitem.id.x(), !dbg !17
+  %15 = tail call i32 @llvm.amdgcn.readfirstlane.i32(i32 %14), !dbg !17
+  %16 = lshr i32 %15, 6, !dbg !17
+  %17 = and i32 %16, 3, !dbg !17
+  %18 = tail call i32 @llvm.amdgcn.workgroup.id.x(), !dbg !18
+  %19 = shl i32 %18, 3, !dbg !18
+  %20 = lshr i32 %14, 3, !dbg !19
+  %21 = and i32 %20, 7, !dbg !19
+  %22 = and i32 %14, 7, !dbg !19
+  %23 = or disjoint i32 %21, %19, !dbg !20
+  %24 = or disjoint i32 %19, %22, !dbg !20
+  %25 = icmp slt i32 %23, 8, !dbg !21
+  %26 = icmp slt i32 %24, 8, !dbg !21
+  %27 = shl i32 %23, 13, !dbg !22
+  %28 = or disjoint i32 %27, %22, !dbg !23
+  br i1 %25, label %29, label %33, !dbg !24
+
+29:                                               ; preds = %13
+  %30 = sext i32 %28 to i64
+  %31 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %30
+  %32 = load <1 x float>, ptr addrspace(1) %31, align 4, !dbg !24
+  br label %33, !dbg !24
+
+33:                                               ; preds = %29, %13
+  %34 = phi <1 x float> [ %32, %29 ], [ zeroinitializer, %13 ], !dbg !24
+  %35 = extractelement <1 x float> %34, i64 0, !dbg !24
+  br i1 %25, label %36, label %40, !dbg !25
+
+36:                                               ; preds = %33
+  %37 = sext i32 %28 to i64
+  %38 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %37
+  %39 = load <1 x float>, ptr addrspace(1) %38, align 4, !dbg !25
+  br label %40, !dbg !25
+
+40:                                               ; preds = %36, %33
+  %41 = phi <1 x float> [ %39, %36 ], [ zeroinitializer, %33 ], !dbg !25
+  %42 = extractelement <1 x float> %41, i64 0, !dbg !25
+  br i1 %25, label %43, label %47, !dbg !26
+
+43:                                               ; preds = %40
+  %44 = sext i32 %28 to i64
+  %45 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %44
+  %46 = load <1 x float>, ptr addrspace(1) %45, align 4, !dbg !26
+  br label %47, !dbg !26
+
+47:                                               ; preds = %43, %40
+  %48 = phi <1 x float> [ %46, %43 ], [ zeroinitializer, %40 ], !dbg !26
+  %49 = extractelement <1 x float> %48, i64 0, !dbg !26
+  br i1 %25, label %50, label %.peel.begin, !dbg !27
+
+50:                                               ; preds = %47
+  %51 = sext i32 %28 to i64
+  %52 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %51
+  %53 = load <1 x float>, ptr addrspace(1) %52, align 4, !dbg !27
+  br label %.peel.begin, !dbg !27
+
+.peel.begin:                                      ; preds = %50, %47
+  %54 = phi <1 x float> [ %53, %50 ], [ zeroinitializer, %47 ], !dbg !27
+  %55 = extractelement <1 x float> %54, i64 0, !dbg !27
+  %56 = icmp eq i32 %17, 0
+  %57 = and i1 %25, %56
+  %58 = or disjoint i32 %22, %27, !dbg !23
+  %59 = or disjoint i32 %58, 8, !dbg !23
+  br i1 %25, label %60, label %64, !dbg !24
+
+60:                                               ; preds = %.peel.begin
+  %61 = sext i32 %59 to i64
+  %62 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %61
+  %63 = load <1 x float>, ptr addrspace(1) %62, align 4, !dbg !24
+  br label %64, !dbg !24
+
+64:                                               ; preds = %60, %.peel.begin
+  %65 = phi <1 x float> [ %63, %60 ], [ zeroinitializer, %.peel.begin ], !dbg !24
+  %66 = extractelement <1 x float> %65, i64 0, !dbg !24
+  br i1 %25, label %67, label %71, !dbg !25
+
+67:                                               ; preds = %64
+  %68 = sext i32 %59 to i64
+  %69 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %68
+  %70 = load <1 x float>, ptr addrspace(1) %69, align 4, !dbg !25
+  br label %71, !dbg !25
+
+71:                                               ; preds = %67, %64
+  %72 = phi <1 x float> [ %70, %67 ], [ zeroinitializer, %64 ], !dbg !25
+  %73 = extractelement <1 x float> %72, i64 0, !dbg !25
+  br i1 %25, label %74, label %78, !dbg !26
+
+74:                                               ; preds = %71
+  %75 = sext i32 %59 to i64
+  %76 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %75
+  %77 = load <1 x float>, ptr addrspace(1) %76, align 4, !dbg !26
+  br label %78, !dbg !26
+
+78:                                               ; preds = %74, %71
+  %79 = phi <1 x float> [ %77, %74 ], [ zeroinitializer, %71 ], !dbg !26
+  %80 = extractelement <1 x float> %79, i64 0, !dbg !26
+  br i1 %25, label %81, label %85, !dbg !27
+
+81:                                               ; preds = %78
+  %82 = sext i32 %59 to i64
+  %83 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %82
+  %84 = load <1 x float>, ptr addrspace(1) %83, align 4, !dbg !27
+  br label %85, !dbg !27
+
+85:                                               ; preds = %81, %78
+  %86 = phi <1 x float> [ %84, %81 ], [ zeroinitializer, %78 ], !dbg !27
+  %87 = extractelement <1 x float> %86, i64 0, !dbg !27
+  %88 = tail call float @llvm.maximum.f32(float %35, float 0.000000e+00), !dbg !28
+  %89 = fsub float 0.000000e+00, %42, !dbg !29
+  %90 = fmul float %89, 0x3FF7154760000000, !dbg !34
+  %91 = tail call float @llvm.exp2.f32(float %90), !dbg !34
+  %92 = fadd float %91, 1.000000e+00, !dbg !35
+  %93 = fdiv float 1.000000e+00, %92, !dbg !36
+  %94 = fmul float %88, %93, !dbg !37
+  %95 = tail call float @llvm.fabs.f32(float %49), !dbg !38
+  %96 = fcmp olt float %95, 6.250000e-01, !dbg !38
+  br i1 %96, label %103, label %97, !dbg !38
+
+97:                                               ; preds = %85
+  %98 = fmul float %95, 2.000000e+00, !dbg !38
+  %99 = tail call noundef float @llvm.exp.f32(float %98), !dbg !38
+  %100 = fadd float %99, 1.000000e+00, !dbg !38
+  %101 = tail call float @llvm.amdgcn.rcp.f32(float %100), !dbg !38
+  %102 = tail call noundef float @llvm.fmuladd.f32(float %101, float -2.000000e+00, float 1.000000e+00), !dbg !38
+  br label %__ocml_tanh_f32.exit.peel, !dbg !38
+
+103:                                              ; preds = %85
+  %foldExtExtBinop = fmul nnan <1 x float> %48, %48, !dbg !38
+  %104 = extractelement <1 x float> %foldExtExtBinop, i64 0, !dbg !38
+  %105 = tail call nnan float @llvm.fmuladd.f32(float %104, float 0xBF7758E7A0000000, float 0x3F95211920000000), !dbg !38
+  %106 = tail call noundef float @llvm.fmuladd.f32(float %104, float %105, float 0xBFAB8389C0000000), !dbg !38
+  %107 = tail call noundef float @llvm.fmuladd.f32(float %104, float %106, float 0x3FC1107040000000), !dbg !38
+  %108 = tail call noundef float @llvm.fmuladd.f32(float %104, float %107, float 0xBFD5555320000000), !dbg !38
+  %109 = fmul float %95, %108, !dbg !38
+  %110 = tail call noundef float @llvm.fmuladd.f32(float %104, float %109, float %95), !dbg !38
+  br label %__ocml_tanh_f32.exit.peel, !dbg !38
+
+__ocml_tanh_f32.exit.peel:                        ; preds = %103, %97
+  %111 = phi float [ %110, %103 ], [ %102, %97 ], !dbg !38
+  %112 = tail call noundef float @llvm.copysign.f32(float %111, float %49), !dbg !38
+  %113 = fmul float %55, 5.000000e-01, !dbg !39
+  %114 = fmul float %55, 0x3FE6A09E60000000, !dbg !40
+  %115 = tail call float @llvm.fabs.f32(float %114), !dbg !41
+  %116 = fcmp olt float %115, 1.000000e+00, !dbg !41
+  br i1 %116, label %128, label %117, !dbg !41
+
+117:                                              ; preds = %__ocml_tanh_f32.exit.peel
+  %118 = tail call noundef float @llvm.fmuladd.f32(float %115, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !41
+  %119 = tail call noundef float @llvm.fmuladd.f32(float %115, float %118, float 0x3F6F9A6D20000000), !dbg !41
+  %120 = tail call noundef float @llvm.fmuladd.f32(float %115, float %119, float 0xBF98C31640000000), !dbg !41
+  %121 = tail call noundef float @llvm.fmuladd.f32(float %115, float %120, float 0x3FBB4E9C80000000), !dbg !41
+  %122 = tail call noundef float @llvm.fmuladd.f32(float %115, float %121, float 0x3FE4515FA0000000), !dbg !41
+  %123 = tail call noundef float @llvm.fmuladd.f32(float %115, float %122, float 0x3FC078E500000000), !dbg !41
+  %124 = tail call float @llvm.fma.f32(float %115, float %123, float %115), !dbg !41
+  %125 = fneg float %124, !dbg !41
+  %126 = tail call noundef float @llvm.exp.f32(float %125), !dbg !41
+  %127 = fsub float 1.000000e+00, %126, !dbg !41
+  br label %__ocml_erf_f32.exit.peel, !dbg !41
+
+128:                                              ; preds = %__ocml_tanh_f32.exit.peel
+  %129 = fmul nnan float %114, %114, !dbg !41
+  %130 = tail call noundef float @llvm.fmuladd.f32(float %129, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !41
+  %131 = tail call noundef float @llvm.fmuladd.f32(float %129, float %130, float 0xBF9B593700000000), !dbg !41
+  %132 = tail call noundef float @llvm.fmuladd.f32(float %129, float %131, float 0x3FBCE077C0000000), !dbg !41
+  %133 = tail call noundef float @llvm.fmuladd.f32(float %129, float %132, float 0xBFD8126600000000), !dbg !41
+  %134 = tail call noundef float @llvm.fmuladd.f32(float %129, float %133, float 0x3FC06EBA00000000), !dbg !41
+  %135 = tail call float @llvm.fma.f32(float %115, float %134, float %115), !dbg !41
+  br label %__ocml_erf_f32.exit.peel, !dbg !41
+
+__ocml_erf_f32.exit.peel:                         ; preds = %128, %117
+  %136 = phi float [ %135, %128 ], [ %127, %117 ], !dbg !41
+  %137 = tail call noundef float @llvm.copysign.f32(float %136, float %114), !dbg !41
+  %138 = fadd float %137, 1.000000e+00, !dbg !42
+  %139 = fmul float %113, %138, !dbg !43
+  %140 = fmul float %112, %139, !dbg !44
+  %141 = fadd float %94, %140, !dbg !45
+  %142 = tail call float @llvm.fabs.f32(float %141), !dbg !46
+  %143 = fadd float %142, 0x3EB0C6F7A0000000, !dbg !47
+  %144 = tail call float @llvm.sqrt.f32(float %143), !dbg !48
+  %145 = fadd float %142, %144, !dbg !49
+  %146 = tail call float @llvm.fabs.f32(float %145), !dbg !50
+  %147 = fcmp olt float %146, 1.310720e+05, !dbg !50
+  br i1 %147, label %251, label %148, !dbg !50
+
+148:                                              ; preds = %__ocml_erf_f32.exit.peel
+  %149 = bitcast float %146 to i32, !dbg !50
+  %150 = lshr i32 %149, 23, !dbg !50
+  %151 = add nsw i32 %150, -120, !dbg !50
+  %152 = icmp ugt i32 %151, 63, !dbg !50
+  %153 = select i1 %152, i32 -64, i32 0, !dbg !50
+  %154 = add nsw i32 %153, %151, !dbg !50
+  %155 = icmp ugt i32 %154, 31, !dbg !50
+  %156 = select i1 %155, i32 -32, i32 0, !dbg !50
+  %157 = add nsw i32 %156, %154, !dbg !50
+  %158 = icmp ugt i32 %157, 31, !dbg !50
+  %159 = select i1 %158, i32 -32, i32 0, !dbg !50
+  %160 = add nsw i32 %159, %157, !dbg !50
+  %161 = icmp eq i32 %160, 0, !dbg !50
+  %162 = and i32 %149, 8388607, !dbg !50
+  %163 = or disjoint i32 %162, 8388608, !dbg !50
+  %164 = zext nneg i32 %163 to i64, !dbg !50
+  %165 = mul nuw nsw i64 %164, 4266746795, !dbg !50
+  %166 = lshr i64 %165, 32, !dbg !50
+  %167 = mul nuw nsw i64 %164, 1011060801, !dbg !50
+  %168 = add nuw nsw i64 %166, %167, !dbg !50
+  %169 = lshr i64 %168, 32, !dbg !50
+  %170 = mul nuw nsw i64 %164, 3680671129, !dbg !50
+  %171 = add nuw nsw i64 %169, %170, !dbg !50
+  %172 = lshr i64 %171, 32, !dbg !50
+  %173 = mul nuw nsw i64 %164, 4113882560, !dbg !50
+  %174 = add nuw nsw i64 %172, %173, !dbg !50
+  %175 = trunc i64 %174 to i32, !dbg !50
+  %176 = lshr i64 %174, 32, !dbg !50
+  %177 = mul nuw nsw i64 %164, 4230436817, !dbg !50
+  %178 = add nuw nsw i64 %176, %177, !dbg !50
+  %179 = lshr i64 %178, 32, !dbg !50
+  %180 = mul nuw nsw i64 %164, 1313084713, !dbg !50
+  %181 = add nuw nsw i64 %179, %180, !dbg !50
+  %182 = trunc i64 %181 to i32, !dbg !50
+  %183 = select i1 %152, i32 %175, i32 %182, !dbg !50
+  %184 = trunc i64 %178 to i32, !dbg !50
+  %185 = lshr i64 %181, 32, !dbg !50
+  %186 = mul nuw nsw i64 %164, 2734261102, !dbg !50
+  %187 = add nuw nsw i64 %185, %186, !dbg !50
+  %188 = trunc i64 %187 to i32, !dbg !50
+  %189 = select i1 %152, i32 %184, i32 %188, !dbg !50
+  %190 = select i1 %155, i32 %183, i32 %189, !dbg !50
+  %191 = lshr i64 %187, 32, !dbg !50
+  %192 = trunc nuw nsw i64 %191 to i32, !dbg !50
+  %193 = select i1 %152, i32 %182, i32 %192, !dbg !50
+  %194 = select i1 %155, i32 %189, i32 %193, !dbg !50
+  %195 = select i1 %158, i32 %190, i32 %194, !dbg !50
+  %196 = trunc i64 %171 to i32, !dbg !50
+  %197 = select i1 %152, i32 %196, i32 %184, !dbg !50
+  %198 = select i1 %155, i32 %197, i32 %183, !dbg !50
+  %199 = select i1 %158, i32 %198, i32 %190, !dbg !50
+  %200 = sub nsw i32 32, %160, !dbg !50
+  %201 = tail call i32 @llvm.fshr.i32(i32 %195, i32 %199, i32 %200), !dbg !50
+  %202 = select i1 %161, i32 %195, i32 %201, !dbg !50
+  %203 = trunc i64 %168 to i32, !dbg !50
+  %204 = select i1 %152, i32 %203, i32 %175, !dbg !50
+  %205 = select i1 %155, i32 %204, i32 %197, !dbg !50
+  %206 = select i1 %158, i32 %205, i32 %198, !dbg !50
+  %207 = tail call i32 @llvm.fshr.i32(i32 %199, i32 %206, i32 %200), !dbg !50
+  %208 = select i1 %161, i32 %199, i32 %207, !dbg !50
+  %209 = tail call i32 @llvm.fshl.i32(i32 %202, i32 %208, i32 2), !dbg !50
+  %210 = lshr i32 %202, 29, !dbg !50
+  %211 = and i32 %210, 1, !dbg !50
+  %212 = sub nsw i32 0, %211, !dbg !50
+  %213 = xor i32 %209, %212, !dbg !50
+  %214 = trunc i64 %165 to i32, !dbg !50
+  %215 = select i1 %152, i32 %214, i32 %196, !dbg !50
+  %216 = select i1 %155, i32 %215, i32 %204, !dbg !50
+  %217 = select i1 %158, i32 %216, i32 %205, !dbg !50
+  %218 = tail call i32 @llvm.fshr.i32(i32 %206, i32 %217, i32 %200), !dbg !50
+  %219 = select i1 %161, i32 %206, i32 %218, !dbg !50
+  %220 = tail call i32 @llvm.fshl.i32(i32 %208, i32 %219, i32 2), !dbg !50
+  %221 = xor i32 %220, %212, !dbg !50
+  %222 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %213, i1 false), !dbg !50
+  %223 = sub nsw i32 31, %222, !dbg !50
+  %224 = tail call i32 @llvm.fshr.i32(i32 %213, i32 %221, i32 %223), !dbg !50
+  %225 = tail call i32 @llvm.fshl.i32(i32 %219, i32 %217, i32 2), !dbg !50
+  %226 = xor i32 %225, %212, !dbg !50
+  %227 = tail call i32 @llvm.fshr.i32(i32 %221, i32 %226, i32 %223), !dbg !50
+  %228 = tail call i32 @llvm.fshl.i32(i32 %224, i32 %227, i32 23), !dbg !50
+  %229 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %228, i1 false), !dbg !50
+  %230 = xor i32 %229, -1, !dbg !50
+  %231 = tail call i32 @llvm.fshr.i32(i32 %228, i32 %227, i32 %230), !dbg !50
+  %232 = lshr i32 %231, 9, !dbg !50
+  %.neg1.i.i.i.peel = xor i32 %222, -1, !dbg !50
+  %233 = add nuw nsw i32 %222, 1, !dbg !50
+  %.neg2.i.i.i.peel = sub nuw nsw i32 %.neg1.i.i.i.peel, %229, !dbg !50
+  %.neg3.i.i.i.peel = shl nsw i32 %.neg2.i.i.i.peel, 23, !dbg !50
+  %234 = shl i32 %210, 31, !dbg !50
+  %235 = or disjoint i32 %234, 864026624, !dbg !50
+  %236 = add i32 %235, %.neg3.i.i.i.peel, !dbg !50
+  %237 = or disjoint i32 %236, %232, !dbg !50
+  %238 = bitcast i32 %237 to float, !dbg !50
+  %239 = tail call i32 @llvm.fshl.i32(i32 %233, i32 %224, i32 23), !dbg !50
+  %240 = or disjoint i32 %239, %234, !dbg !50
+  %241 = xor i32 %240, 1065353216, !dbg !50
+  %242 = bitcast i32 %241 to float, !dbg !50
+  %243 = fmul float %242, 0x3FF921FB40000000, !dbg !50
+  %244 = fneg float %243, !dbg !50
+  %245 = tail call float @llvm.fma.f32(float %242, float 0x3FF921FB40000000, float %244), !dbg !50
+  %246 = tail call float @llvm.fma.f32(float %242, float 0x3E74442D00000000, float %245), !dbg !50
+  %247 = tail call float @llvm.fma.f32(float %238, float 0x3FF921FB40000000, float %246), !dbg !50
+  %248 = fadd float %243, %247, !dbg !50
+  %249 = lshr i32 %202, 30, !dbg !50
+  %250 = add nuw nsw i32 %211, %249, !dbg !50
+  br label %__ocml_sin_f32.exit.peel, !dbg !50
+
+251:                                              ; preds = %__ocml_erf_f32.exit.peel
+  %252 = fmul nnan float %145, 0x3FE45F3060000000, !dbg !50
+  %253 = tail call float @llvm.rint.f32(float %252), !dbg !50
+  %254 = tail call float @llvm.fma.f32(float %253, float 0xBFF921FB40000000, float %146), !dbg !50
+  %255 = tail call float @llvm.fma.f32(float %253, float 0xBE74442D00000000, float %254), !dbg !50
+  %256 = tail call float @llvm.fma.f32(float %253, float 0xBCF8469880000000, float %255), !dbg !50
+  %257 = fptosi float %253 to i32, !dbg !50
+  %.pre.i.peel = bitcast float %146 to i32, !dbg !50
+  br label %__ocml_sin_f32.exit.peel, !dbg !50
+
+__ocml_sin_f32.exit.peel:                         ; preds = %251, %148
+  %.pre-phi.i.peel = phi i32 [ %.pre.i.peel, %251 ], [ %149, %148 ], !dbg !50
+  %.pn3.in.i.i.peel = phi float [ %256, %251 ], [ %248, %148 ], !dbg !50
+  %.pn1.in.i.i.peel = phi i32 [ %257, %251 ], [ %250, %148 ], !dbg !50
+  %258 = fmul float %.pn3.in.i.i.peel, %.pn3.in.i.i.peel, !dbg !50
+  %259 = tail call noundef float @llvm.fmuladd.f32(float %258, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !50
+  %260 = tail call noundef float @llvm.fmuladd.f32(float %258, float %259, float 0xBFC55553A0000000), !dbg !50
+  %261 = fmul float %258, %260, !dbg !50
+  %262 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i.peel, float %261, float %.pn3.in.i.i.peel), !dbg !50
+  %263 = tail call noundef float @llvm.fmuladd.f32(float %258, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !50
+  %264 = tail call noundef float @llvm.fmuladd.f32(float %258, float %263, float 0x3FA5557EE0000000), !dbg !50
+  %265 = tail call noundef float @llvm.fmuladd.f32(float %258, float %264, float 0xBFE0000080000000), !dbg !50
+  %266 = tail call noundef float @llvm.fmuladd.f32(float %258, float %265, float 1.000000e+00), !dbg !50
+  %267 = and i32 %.pn1.in.i.i.peel, 1, !dbg !50
+  %268 = icmp eq i32 %267, 0, !dbg !50
+  %.v.i.peel = select i1 %268, float %262, float %266, !dbg !50
+  %269 = bitcast float %.v.i.peel to i32, !dbg !50
+  %.pn1.i.i.peel = shl i32 %.pn1.in.i.i.peel, 30, !dbg !50
+  %270 = and i32 %.pn1.i.i.peel, -2147483648, !dbg !50
+  %271 = bitcast float %145 to i32, !dbg !50
+  %272 = xor i32 %.pre-phi.i.peel, %271, !dbg !50
+  %273 = xor i32 %272, %270, !dbg !50
+  %274 = xor i32 %273, %269, !dbg !50
+  %275 = bitcast i32 %274 to float, !dbg !50
+  %276 = fcmp one float %146, 0x7FF0000000000000, !dbg !50
+  %277 = select i1 %276, float %275, float 0x7FF8000000000000, !dbg !50
+  %278 = fcmp olt float %142, 1.310720e+05, !dbg !51
+  br i1 %278, label %382, label %279, !dbg !51
+
+279:                                              ; preds = %__ocml_sin_f32.exit.peel
+  %280 = bitcast float %142 to i32, !dbg !51
+  %281 = lshr i32 %280, 23, !dbg !51
+  %282 = add nsw i32 %281, -120, !dbg !51
+  %283 = icmp ugt i32 %282, 63, !dbg !51
+  %284 = select i1 %283, i32 -64, i32 0, !dbg !51
+  %285 = add nsw i32 %284, %282, !dbg !51
+  %286 = icmp ugt i32 %285, 31, !dbg !51
+  %287 = select i1 %286, i32 -32, i32 0, !dbg !51
+  %288 = add nsw i32 %287, %285, !dbg !51
+  %289 = icmp ugt i32 %288, 31, !dbg !51
+  %290 = select i1 %289, i32 -32, i32 0, !dbg !51
+  %291 = add nsw i32 %290, %288, !dbg !51
+  %292 = icmp eq i32 %291, 0, !dbg !51
+  %293 = and i32 %280, 8388607, !dbg !51
+  %294 = or disjoint i32 %293, 8388608, !dbg !51
+  %295 = zext nneg i32 %294 to i64, !dbg !51
+  %296 = mul nuw nsw i64 %295, 4266746795, !dbg !51
+  %297 = lshr i64 %296, 32, !dbg !51
+  %298 = mul nuw nsw i64 %295, 1011060801, !dbg !51
+  %299 = add nuw nsw i64 %297, %298, !dbg !51
+  %300 = lshr i64 %299, 32, !dbg !51
+  %301 = mul nuw nsw i64 %295, 3680671129, !dbg !51
+  %302 = add nuw nsw i64 %300, %301, !dbg !51
+  %303 = lshr i64 %302, 32, !dbg !51
+  %304 = mul nuw nsw i64 %295, 4113882560, !dbg !51
+  %305 = add nuw nsw i64 %303, %304, !dbg !51
+  %306 = trunc i64 %305 to i32, !dbg !51
+  %307 = lshr i64 %305, 32, !dbg !51
+  %308 = mul nuw nsw i64 %295, 4230436817, !dbg !51
+  %309 = add nuw nsw i64 %307, %308, !dbg !51
+  %310 = lshr i64 %309, 32, !dbg !51
+  %311 = mul nuw nsw i64 %295, 1313084713, !dbg !51
+  %312 = add nuw nsw i64 %310, %311, !dbg !51
+  %313 = trunc i64 %312 to i32, !dbg !51
+  %314 = select i1 %283, i32 %306, i32 %313, !dbg !51
+  %315 = trunc i64 %309 to i32, !dbg !51
+  %316 = lshr i64 %312, 32, !dbg !51
+  %317 = mul nuw nsw i64 %295, 2734261102, !dbg !51
+  %318 = add nuw nsw i64 %316, %317, !dbg !51
+  %319 = trunc i64 %318 to i32, !dbg !51
+  %320 = select i1 %283, i32 %315, i32 %319, !dbg !51
+  %321 = select i1 %286, i32 %314, i32 %320, !dbg !51
+  %322 = lshr i64 %318, 32, !dbg !51
+  %323 = trunc nuw nsw i64 %322 to i32, !dbg !51
+  %324 = select i1 %283, i32 %313, i32 %323, !dbg !51
+  %325 = select i1 %286, i32 %320, i32 %324, !dbg !51
+  %326 = select i1 %289, i32 %321, i32 %325, !dbg !51
+  %327 = trunc i64 %302 to i32, !dbg !51
+  %328 = select i1 %283, i32 %327, i32 %315, !dbg !51
+  %329 = select i1 %286, i32 %328, i32 %314, !dbg !51
+  %330 = select i1 %289, i32 %329, i32 %321, !dbg !51
+  %331 = sub nsw i32 32, %291, !dbg !51
+  %332 = tail call i32 @llvm.fshr.i32(i32 %326, i32 %330, i32 %331), !dbg !51
+  %333 = select i1 %292, i32 %326, i32 %332, !dbg !51
+  %334 = trunc i64 %299 to i32, !dbg !51
+  %335 = select i1 %283, i32 %334, i32 %306, !dbg !51
+  %336 = select i1 %286, i32 %335, i32 %328, !dbg !51
+  %337 = select i1 %289, i32 %336, i32 %329, !dbg !51
+  %338 = tail call i32 @llvm.fshr.i32(i32 %330, i32 %337, i32 %331), !dbg !51
+  %339 = select i1 %292, i32 %330, i32 %338, !dbg !51
+  %340 = tail call i32 @llvm.fshl.i32(i32 %333, i32 %339, i32 2), !dbg !51
+  %341 = lshr i32 %333, 29, !dbg !51
+  %342 = and i32 %341, 1, !dbg !51
+  %343 = sub nsw i32 0, %342, !dbg !51
+  %344 = xor i32 %340, %343, !dbg !51
+  %345 = trunc i64 %296 to i32, !dbg !51
+  %346 = select i1 %283, i32 %345, i32 %327, !dbg !51
+  %347 = select i1 %286, i32 %346, i32 %335, !dbg !51
+  %348 = select i1 %289, i32 %347, i32 %336, !dbg !51
+  %349 = tail call i32 @llvm.fshr.i32(i32 %337, i32 %348, i32 %331), !dbg !51
+  %350 = select i1 %292, i32 %337, i32 %349, !dbg !51
+  %351 = tail call i32 @llvm.fshl.i32(i32 %339, i32 %350, i32 2), !dbg !51
+  %352 = xor i32 %351, %343, !dbg !51
+  %353 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %344, i1 false), !dbg !51
+  %354 = sub nsw i32 31, %353, !dbg !51
+  %355 = tail call i32 @llvm.fshr.i32(i32 %344, i32 %352, i32 %354), !dbg !51
+  %356 = tail call i32 @llvm.fshl.i32(i32 %350, i32 %348, i32 2), !dbg !51
+  %357 = xor i32 %356, %343, !dbg !51
+  %358 = tail call i32 @llvm.fshr.i32(i32 %352, i32 %357, i32 %354), !dbg !51
+  %359 = tail call i32 @llvm.fshl.i32(i32 %355, i32 %358, i32 23), !dbg !51
+  %360 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %359, i1 false), !dbg !51
+  %361 = xor i32 %360, -1, !dbg !51
+  %362 = tail call i32 @llvm.fshr.i32(i32 %359, i32 %358, i32 %361), !dbg !51
+  %363 = lshr i32 %362, 9, !dbg !51
+  %.neg1.i.i.i10.peel = xor i32 %353, -1, !dbg !51
+  %364 = add nuw nsw i32 %353, 1, !dbg !51
+  %.neg2.i.i.i11.peel = sub nuw nsw i32 %.neg1.i.i.i10.peel, %360, !dbg !51
+  %.neg3.i.i.i12.peel = shl nsw i32 %.neg2.i.i.i11.peel, 23, !dbg !51
+  %365 = shl i32 %341, 31, !dbg !51
+  %366 = or disjoint i32 %365, 864026624, !dbg !51
+  %367 = add i32 %366, %.neg3.i.i.i12.peel, !dbg !51
+  %368 = or disjoint i32 %367, %363, !dbg !51
+  %369 = bitcast i32 %368 to float, !dbg !51
+  %370 = tail call i32 @llvm.fshl.i32(i32 %364, i32 %355, i32 23), !dbg !51
+  %371 = or disjoint i32 %370, %365, !dbg !51
+  %372 = xor i32 %371, 1065353216, !dbg !51
+  %373 = bitcast i32 %372 to float, !dbg !51
+  %374 = fmul float %373, 0x3FF921FB40000000, !dbg !51
+  %375 = fneg float %374, !dbg !51
+  %376 = tail call float @llvm.fma.f32(float %373, float 0x3FF921FB40000000, float %375), !dbg !51
+  %377 = tail call float @llvm.fma.f32(float %373, float 0x3E74442D00000000, float %376), !dbg !51
+  %378 = tail call float @llvm.fma.f32(float %369, float 0x3FF921FB40000000, float %377), !dbg !51
+  %379 = fadd float %374, %378, !dbg !51
+  %380 = lshr i32 %333, 30, !dbg !51
+  %381 = add nuw nsw i32 %342, %380, !dbg !51
+  br label %__ocml_cos_f32.exit.peel, !dbg !51
+
+382:                                              ; preds = %__ocml_sin_f32.exit.peel
+  %383 = fmul nnan float %142, 0x3FE45F3060000000, !dbg !51
+  %384 = tail call float @llvm.rint.f32(float %383), !dbg !51
+  %385 = tail call float @llvm.fma.f32(float %384, float 0xBFF921FB40000000, float %142), !dbg !51
+  %386 = tail call float @llvm.fma.f32(float %384, float 0xBE74442D00000000, float %385), !dbg !51
+  %387 = tail call float @llvm.fma.f32(float %384, float 0xBCF8469880000000, float %386), !dbg !51
+  %388 = fptosi float %384 to i32, !dbg !51
+  br label %__ocml_cos_f32.exit.peel, !dbg !51
+
+__ocml_cos_f32.exit.peel:                         ; preds = %382, %279
+  %.pn3.in.i.i13.peel = phi float [ %387, %382 ], [ %379, %279 ], !dbg !51
+  %.pn1.in.i.i14.peel = phi i32 [ %388, %382 ], [ %381, %279 ], !dbg !51
+  %389 = fmul float %.pn3.in.i.i13.peel, %.pn3.in.i.i13.peel, !dbg !51
+  %390 = tail call noundef float @llvm.fmuladd.f32(float %389, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !51
+  %391 = tail call noundef float @llvm.fmuladd.f32(float %389, float %390, float 0xBFC55553A0000000), !dbg !51
+  %392 = fmul float %389, %391, !dbg !51
+  %393 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i13.peel, float %392, float %.pn3.in.i.i13.peel), !dbg !51
+  %394 = tail call noundef float @llvm.fmuladd.f32(float %389, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !51
+  %395 = tail call noundef float @llvm.fmuladd.f32(float %389, float %394, float 0x3FA5557EE0000000), !dbg !51
+  %396 = tail call noundef float @llvm.fmuladd.f32(float %389, float %395, float 0xBFE0000080000000), !dbg !51
+  %397 = tail call noundef float @llvm.fmuladd.f32(float %389, float %396, float 1.000000e+00), !dbg !51
+  %398 = fneg float %393, !dbg !51
+  %399 = and i32 %.pn1.in.i.i14.peel, 1, !dbg !51
+  %400 = icmp eq i32 %399, 0, !dbg !51
+  %.v.i15.peel = select i1 %400, float %397, float %398, !dbg !51
+  %401 = bitcast float %.v.i15.peel to i32, !dbg !51
+  %.pn1.i.i16.peel = shl i32 %.pn1.in.i.i14.peel, 30, !dbg !51
+  %402 = and i32 %.pn1.i.i16.peel, -2147483648, !dbg !51
+  %403 = xor i32 %402, %401, !dbg !51
+  %404 = bitcast i32 %403 to float, !dbg !51
+  %405 = fcmp one float %142, 0x7FF0000000000000, !dbg !51
+  %406 = select i1 %405, float %404, float 0x7FF8000000000000, !dbg !51
+  %407 = fmul float %277, %406, !dbg !52
+  %408 = tail call float @llvm.fabs.f32(float %407), !dbg !53
+  %409 = fsub float 0.000000e+00, %408, !dbg !54
+  %410 = tail call noundef float @llvm.exp.f32(float %409), !dbg !55
+  %411 = fadd float %407, %410, !dbg !56
+  %412 = select i1 %25, float %411, float 0.000000e+00, !dbg !57
+  %413 = select i1 %25, float 1.000000e+00, float 0.000000e+00, !dbg !58
+  br i1 %57, label %414, label %.peel.next.preheader, !dbg !59
+
+414:                                              ; preds = %__ocml_cos_f32.exit.peel
+  %415 = sext i32 %28 to i64
+  %416 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %415
+  %417 = insertelement <1 x float> poison, float %411, i64 0
+  store <1 x float> %417, ptr addrspace(1) %416, align 4, !dbg !59
+  br label %.peel.next.preheader, !dbg !59
+
+.peel.next.preheader:                             ; preds = %__ocml_cos_f32.exit.peel, %414
+  br label %.peel.next, !dbg !24
+
+.peel.next:                                       ; preds = %.peel.next.preheader, %794
+  %.pn644 = phi i32 [ %425, %794 ], [ %59, %.peel.next.preheader ]
+  %.pn443 = phi float [ %453, %794 ], [ %87, %.peel.next.preheader ]
+  %.pn342 = phi float [ %446, %794 ], [ %80, %.peel.next.preheader ]
+  %.pn241 = phi float [ %439, %794 ], [ %73, %.peel.next.preheader ]
+  %.pn140 = phi float [ %432, %794 ], [ %66, %.peel.next.preheader ]
+  %418 = phi float [ %789, %794 ], [ %413, %.peel.next.preheader ]
+  %419 = phi float [ %788, %794 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %420 = phi float [ %787, %794 ], [ %412, %.peel.next.preheader ]
+  %421 = phi float [ %779, %794 ], [ %412, %.peel.next.preheader ]
+  %422 = phi i32 [ %423, %794 ], [ 8, %.peel.next.preheader ]
+  %423 = add nuw nsw i32 %422, 8, !dbg !60
+  %424 = or disjoint i32 %423, %22, !dbg !61
+  %425 = add i32 %424, %27, !dbg !23
+  br i1 %25, label %426, label %430, !dbg !24
+
+426:                                              ; preds = %.peel.next
+  %427 = sext i32 %425 to i64
+  %428 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %427
+  %429 = load <1 x float>, ptr addrspace(1) %428, align 4, !dbg !24
+  br label %430, !dbg !24
+
+430:                                              ; preds = %426, %.peel.next
+  %431 = phi <1 x float> [ %429, %426 ], [ zeroinitializer, %.peel.next ], !dbg !24
+  %432 = extractelement <1 x float> %431, i64 0, !dbg !24
+  br i1 %25, label %433, label %437, !dbg !25
+
+433:                                              ; preds = %430
+  %434 = sext i32 %425 to i64
+  %435 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %434
+  %436 = load <1 x float>, ptr addrspace(1) %435, align 4, !dbg !25
+  br label %437, !dbg !25
+
+437:                                              ; preds = %433, %430
+  %438 = phi <1 x float> [ %436, %433 ], [ zeroinitializer, %430 ], !dbg !25
+  %439 = extractelement <1 x float> %438, i64 0, !dbg !25
+  br i1 %25, label %440, label %444, !dbg !26
+
+440:                                              ; preds = %437
+  %441 = sext i32 %425 to i64
+  %442 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %441
+  %443 = load <1 x float>, ptr addrspace(1) %442, align 4, !dbg !26
+  br label %444, !dbg !26
+
+444:                                              ; preds = %440, %437
+  %445 = phi <1 x float> [ %443, %440 ], [ zeroinitializer, %437 ], !dbg !26
+  %446 = extractelement <1 x float> %445, i64 0, !dbg !26
+  br i1 %25, label %447, label %451, !dbg !27
+
+447:                                              ; preds = %444
+  %448 = sext i32 %425 to i64
+  %449 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %448
+  %450 = load <1 x float>, ptr addrspace(1) %449, align 4, !dbg !27
+  br label %451, !dbg !27
+
+451:                                              ; preds = %447, %444
+  %452 = phi <1 x float> [ %450, %447 ], [ zeroinitializer, %444 ], !dbg !27
+  %453 = extractelement <1 x float> %452, i64 0, !dbg !27
+  %454 = tail call float @llvm.maximum.f32(float %.pn140, float 0.000000e+00), !dbg !28
+  %455 = fsub float 0.000000e+00, %.pn241, !dbg !29
+  %456 = fmul float %455, 0x3FF7154760000000, !dbg !34
+  %457 = tail call float @llvm.exp2.f32(float %456), !dbg !34
+  %458 = fadd float %457, 1.000000e+00, !dbg !35
+  %459 = fdiv float 1.000000e+00, %458, !dbg !36
+  %460 = fmul float %454, %459, !dbg !37
+  %461 = tail call float @llvm.fabs.f32(float %.pn342), !dbg !38
+  %462 = fcmp olt float %461, 6.250000e-01, !dbg !38
+  br i1 %462, label %463, label %471, !dbg !38
+
+463:                                              ; preds = %451
+  %464 = fmul nnan float %.pn342, %.pn342, !dbg !38
+  %465 = tail call nnan float @llvm.fmuladd.f32(float %464, float 0xBF7758E7A0000000, float 0x3F95211920000000), !dbg !38
+  %466 = tail call noundef float @llvm.fmuladd.f32(float %464, float %465, float 0xBFAB8389C0000000), !dbg !38
+  %467 = tail call noundef float @llvm.fmuladd.f32(float %464, float %466, float 0x3FC1107040000000), !dbg !38
+  %468 = tail call noundef float @llvm.fmuladd.f32(float %464, float %467, float 0xBFD5555320000000), !dbg !38
+  %469 = fmul float %461, %468, !dbg !38
+  %470 = tail call noundef float @llvm.fmuladd.f32(float %464, float %469, float %461), !dbg !38
+  br label %__ocml_tanh_f32.exit, !dbg !38
+
+471:                                              ; preds = %451
+  %472 = fmul float %461, 2.000000e+00, !dbg !38
+  %473 = tail call noundef float @llvm.exp.f32(float %472), !dbg !38
+  %474 = fadd float %473, 1.000000e+00, !dbg !38
+  %475 = tail call float @llvm.amdgcn.rcp.f32(float %474), !dbg !38
+  %476 = tail call noundef float @llvm.fmuladd.f32(float %475, float -2.000000e+00, float 1.000000e+00), !dbg !38
+  br label %__ocml_tanh_f32.exit, !dbg !38
+
+__ocml_tanh_f32.exit:                             ; preds = %463, %471
+  %477 = phi float [ %470, %463 ], [ %476, %471 ], !dbg !38
+  %478 = tail call noundef float @llvm.copysign.f32(float %477, float %.pn342), !dbg !38
+  %479 = fmul float %.pn443, 5.000000e-01, !dbg !39
+  %480 = fmul float %.pn443, 0x3FE6A09E60000000, !dbg !40
+  %481 = tail call float @llvm.fabs.f32(float %480), !dbg !41
+  %482 = fcmp olt float %481, 1.000000e+00, !dbg !41
+  br i1 %482, label %483, label %491, !dbg !41
+
+483:                                              ; preds = %__ocml_tanh_f32.exit
+  %484 = fmul nnan float %480, %480, !dbg !41
+  %485 = tail call noundef float @llvm.fmuladd.f32(float %484, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !41
+  %486 = tail call noundef float @llvm.fmuladd.f32(float %484, float %485, float 0xBF9B593700000000), !dbg !41
+  %487 = tail call noundef float @llvm.fmuladd.f32(float %484, float %486, float 0x3FBCE077C0000000), !dbg !41
+  %488 = tail call noundef float @llvm.fmuladd.f32(float %484, float %487, float 0xBFD8126600000000), !dbg !41
+  %489 = tail call noundef float @llvm.fmuladd.f32(float %484, float %488, float 0x3FC06EBA00000000), !dbg !41
+  %490 = tail call float @llvm.fma.f32(float %481, float %489, float %481), !dbg !41
+  br label %__ocml_erf_f32.exit, !dbg !41
+
+491:                                              ; preds = %__ocml_tanh_f32.exit
+  %492 = tail call noundef float @llvm.fmuladd.f32(float %481, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !41
+  %493 = tail call noundef float @llvm.fmuladd.f32(float %481, float %492, float 0x3F6F9A6D20000000), !dbg !41
+  %494 = tail call noundef float @llvm.fmuladd.f32(float %481, float %493, float 0xBF98C31640000000), !dbg !41
+  %495 = tail call noundef float @llvm.fmuladd.f32(float %481, float %494, float 0x3FBB4E9C80000000), !dbg !41
+  %496 = tail call noundef float @llvm.fmuladd.f32(float %481, float %495, float 0x3FE4515FA0000000), !dbg !41
+  %497 = tail call noundef float @llvm.fmuladd.f32(float %481, float %496, float 0x3FC078E500000000), !dbg !41
+  %498 = tail call float @llvm.fma.f32(float %481, float %497, float %481), !dbg !41
+  %499 = fneg float %498, !dbg !41
+  %500 = tail call noundef float @llvm.exp.f32(float %499), !dbg !41
+  %501 = fsub float 1.000000e+00, %500, !dbg !41
+  br label %__ocml_erf_f32.exit, !dbg !41
+
+__ocml_erf_f32.exit:                              ; preds = %483, %491
+  %502 = phi float [ %490, %483 ], [ %501, %491 ], !dbg !41
+  %503 = tail call noundef float @llvm.copysign.f32(float %502, float %480), !dbg !41
+  %504 = fadd float %503, 1.000000e+00, !dbg !42
+  %505 = fmul float %479, %504, !dbg !43
+  %506 = fmul float %478, %505, !dbg !44
+  %507 = fadd float %460, %506, !dbg !45
+  %508 = tail call float @llvm.fabs.f32(float %507), !dbg !46
+  %509 = fadd float %508, 0x3EB0C6F7A0000000, !dbg !47
+  %510 = tail call float @llvm.sqrt.f32(float %509), !dbg !48
+  %511 = fadd float %508, %510, !dbg !49
+  %512 = tail call float @llvm.fabs.f32(float %511), !dbg !50
+  %513 = fcmp olt float %512, 1.310720e+05, !dbg !50
+  br i1 %513, label %514, label %521, !dbg !50
+
+514:                                              ; preds = %__ocml_erf_f32.exit
+  %515 = fmul nnan float %511, 0x3FE45F3060000000, !dbg !50
+  %516 = tail call float @llvm.rint.f32(float %515), !dbg !50
+  %517 = tail call float @llvm.fma.f32(float %516, float 0xBFF921FB40000000, float %512), !dbg !50
+  %518 = tail call float @llvm.fma.f32(float %516, float 0xBE74442D00000000, float %517), !dbg !50
+  %519 = tail call float @llvm.fma.f32(float %516, float 0xBCF8469880000000, float %518), !dbg !50
+  %520 = fptosi float %516 to i32, !dbg !50
+  %.pre.i = bitcast float %512 to i32, !dbg !50
+  br label %__ocml_sin_f32.exit, !dbg !50
+
+521:                                              ; preds = %__ocml_erf_f32.exit
+  %522 = bitcast float %512 to i32, !dbg !50
+  %523 = lshr i32 %522, 23, !dbg !50
+  %524 = add nsw i32 %523, -120, !dbg !50
+  %525 = icmp ugt i32 %524, 63, !dbg !50
+  %526 = select i1 %525, i32 -64, i32 0, !dbg !50
+  %527 = add nsw i32 %526, %524, !dbg !50
+  %528 = icmp ugt i32 %527, 31, !dbg !50
+  %529 = select i1 %528, i32 -32, i32 0, !dbg !50
+  %530 = add nsw i32 %529, %527, !dbg !50
+  %531 = icmp ugt i32 %530, 31, !dbg !50
+  %532 = select i1 %531, i32 -32, i32 0, !dbg !50
+  %533 = add nsw i32 %532, %530, !dbg !50
+  %534 = icmp eq i32 %533, 0, !dbg !50
+  %535 = and i32 %522, 8388607, !dbg !50
+  %536 = or disjoint i32 %535, 8388608, !dbg !50
+  %537 = zext nneg i32 %536 to i64, !dbg !50
+  %538 = mul nuw nsw i64 %537, 4266746795, !dbg !50
+  %539 = lshr i64 %538, 32, !dbg !50
+  %540 = mul nuw nsw i64 %537, 1011060801, !dbg !50
+  %541 = add nuw nsw i64 %539, %540, !dbg !50
+  %542 = lshr i64 %541, 32, !dbg !50
+  %543 = mul nuw nsw i64 %537, 3680671129, !dbg !50
+  %544 = add nuw nsw i64 %542, %543, !dbg !50
+  %545 = lshr i64 %544, 32, !dbg !50
+  %546 = mul nuw nsw i64 %537, 4113882560, !dbg !50
+  %547 = add nuw nsw i64 %545, %546, !dbg !50
+  %548 = trunc i64 %547 to i32, !dbg !50
+  %549 = lshr i64 %547, 32, !dbg !50
+  %550 = mul nuw nsw i64 %537, 4230436817, !dbg !50
+  %551 = add nuw nsw i64 %549, %550, !dbg !50
+  %552 = lshr i64 %551, 32, !dbg !50
+  %553 = mul nuw nsw i64 %537, 1313084713, !dbg !50
+  %554 = add nuw nsw i64 %552, %553, !dbg !50
+  %555 = trunc i64 %554 to i32, !dbg !50
+  %556 = select i1 %525, i32 %548, i32 %555, !dbg !50
+  %557 = trunc i64 %551 to i32, !dbg !50
+  %558 = lshr i64 %554, 32, !dbg !50
+  %559 = mul nuw nsw i64 %537, 2734261102, !dbg !50
+  %560 = add nuw nsw i64 %558, %559, !dbg !50
+  %561 = trunc i64 %560 to i32, !dbg !50
+  %562 = select i1 %525, i32 %557, i32 %561, !dbg !50
+  %563 = select i1 %528, i32 %556, i32 %562, !dbg !50
+  %564 = lshr i64 %560, 32, !dbg !50
+  %565 = trunc nuw nsw i64 %564 to i32, !dbg !50
+  %566 = select i1 %525, i32 %555, i32 %565, !dbg !50
+  %567 = select i1 %528, i32 %562, i32 %566, !dbg !50
+  %568 = select i1 %531, i32 %563, i32 %567, !dbg !50
+  %569 = trunc i64 %544 to i32, !dbg !50
+  %570 = select i1 %525, i32 %569, i32 %557, !dbg !50
+  %571 = select i1 %528, i32 %570, i32 %556, !dbg !50
+  %572 = select i1 %531, i32 %571, i32 %563, !dbg !50
+  %573 = sub nsw i32 32, %533, !dbg !50
+  %574 = tail call i32 @llvm.fshr.i32(i32 %568, i32 %572, i32 %573), !dbg !50
+  %575 = select i1 %534, i32 %568, i32 %574, !dbg !50
+  %576 = trunc i64 %541 to i32, !dbg !50
+  %577 = select i1 %525, i32 %576, i32 %548, !dbg !50
+  %578 = select i1 %528, i32 %577, i32 %570, !dbg !50
+  %579 = select i1 %531, i32 %578, i32 %571, !dbg !50
+  %580 = tail call i32 @llvm.fshr.i32(i32 %572, i32 %579, i32 %573), !dbg !50
+  %581 = select i1 %534, i32 %572, i32 %580, !dbg !50
+  %582 = tail call i32 @llvm.fshl.i32(i32 %575, i32 %581, i32 2), !dbg !50
+  %583 = lshr i32 %575, 29, !dbg !50
+  %584 = and i32 %583, 1, !dbg !50
+  %585 = sub nsw i32 0, %584, !dbg !50
+  %586 = xor i32 %582, %585, !dbg !50
+  %587 = trunc i64 %538 to i32, !dbg !50
+  %588 = select i1 %525, i32 %587, i32 %569, !dbg !50
+  %589 = select i1 %528, i32 %588, i32 %577, !dbg !50
+  %590 = select i1 %531, i32 %589, i32 %578, !dbg !50
+  %591 = tail call i32 @llvm.fshr.i32(i32 %579, i32 %590, i32 %573), !dbg !50
+  %592 = select i1 %534, i32 %579, i32 %591, !dbg !50
+  %593 = tail call i32 @llvm.fshl.i32(i32 %581, i32 %592, i32 2), !dbg !50
+  %594 = xor i32 %593, %585, !dbg !50
+  %595 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %586, i1 false), !dbg !50
+  %596 = sub nsw i32 31, %595, !dbg !50
+  %597 = tail call i32 @llvm.fshr.i32(i32 %586, i32 %594, i32 %596), !dbg !50
+  %598 = tail call i32 @llvm.fshl.i32(i32 %592, i32 %590, i32 2), !dbg !50
+  %599 = xor i32 %598, %585, !dbg !50
+  %600 = tail call i32 @llvm.fshr.i32(i32 %594, i32 %599, i32 %596), !dbg !50
+  %601 = tail call i32 @llvm.fshl.i32(i32 %597, i32 %600, i32 23), !dbg !50
+  %602 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %601, i1 false), !dbg !50
+  %603 = xor i32 %602, -1, !dbg !50
+  %604 = tail call i32 @llvm.fshr.i32(i32 %601, i32 %600, i32 %603), !dbg !50
+  %605 = lshr i32 %604, 9, !dbg !50
+  %.neg1.i.i.i = xor i32 %595, -1, !dbg !50
+  %606 = add nuw nsw i32 %595, 1, !dbg !50
+  %.neg2.i.i.i = sub nuw nsw i32 %.neg1.i.i.i, %602, !dbg !50
+  %.neg3.i.i.i = shl nsw i32 %.neg2.i.i.i, 23, !dbg !50
+  %607 = shl i32 %583, 31, !dbg !50
+  %608 = or disjoint i32 %607, 864026624, !dbg !50
+  %609 = add i32 %608, %.neg3.i.i.i, !dbg !50
+  %610 = or disjoint i32 %609, %605, !dbg !50
+  %611 = bitcast i32 %610 to float, !dbg !50
+  %612 = tail call i32 @llvm.fshl.i32(i32 %606, i32 %597, i32 23), !dbg !50
+  %613 = or disjoint i32 %612, %607, !dbg !50
+  %614 = xor i32 %613, 1065353216, !dbg !50
+  %615 = bitcast i32 %614 to float, !dbg !50
+  %616 = fmul float %615, 0x3FF921FB40000000, !dbg !50
+  %617 = fneg float %616, !dbg !50
+  %618 = tail call float @llvm.fma.f32(float %615, float 0x3FF921FB40000000, float %617), !dbg !50
+  %619 = tail call float @llvm.fma.f32(float %615, float 0x3E74442D00000000, float %618), !dbg !50
+  %620 = tail call float @llvm.fma.f32(float %611, float 0x3FF921FB40000000, float %619), !dbg !50
+  %621 = fadd float %616, %620, !dbg !50
+  %622 = lshr i32 %575, 30, !dbg !50
+  %623 = add nuw nsw i32 %584, %622, !dbg !50
+  br label %__ocml_sin_f32.exit, !dbg !50
+
+__ocml_sin_f32.exit:                              ; preds = %514, %521
+  %.pre-phi.i = phi i32 [ %.pre.i, %514 ], [ %522, %521 ], !dbg !50
+  %.pn3.in.i.i = phi float [ %519, %514 ], [ %621, %521 ], !dbg !50
+  %.pn1.in.i.i = phi i32 [ %520, %514 ], [ %623, %521 ], !dbg !50
+  %624 = fmul float %.pn3.in.i.i, %.pn3.in.i.i, !dbg !50
+  %625 = tail call noundef float @llvm.fmuladd.f32(float %624, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !50
+  %626 = tail call noundef float @llvm.fmuladd.f32(float %624, float %625, float 0xBFC55553A0000000), !dbg !50
+  %627 = fmul float %624, %626, !dbg !50
+  %628 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i, float %627, float %.pn3.in.i.i), !dbg !50
+  %629 = tail call noundef float @llvm.fmuladd.f32(float %624, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !50
+  %630 = tail call noundef float @llvm.fmuladd.f32(float %624, float %629, float 0x3FA5557EE0000000), !dbg !50
+  %631 = tail call noundef float @llvm.fmuladd.f32(float %624, float %630, float 0xBFE0000080000000), !dbg !50
+  %632 = tail call noundef float @llvm.fmuladd.f32(float %624, float %631, float 1.000000e+00), !dbg !50
+  %633 = and i32 %.pn1.in.i.i, 1, !dbg !50
+  %634 = icmp eq i32 %633, 0, !dbg !50
+  %.v.i = select i1 %634, float %628, float %632, !dbg !50
+  %635 = bitcast float %.v.i to i32, !dbg !50
+  %.pn1.i.i = shl i32 %.pn1.in.i.i, 30, !dbg !50
+  %636 = and i32 %.pn1.i.i, -2147483648, !dbg !50
+  %637 = bitcast float %511 to i32, !dbg !50
+  %638 = xor i32 %.pre-phi.i, %637, !dbg !50
+  %639 = xor i32 %638, %636, !dbg !50
+  %640 = xor i32 %639, %635, !dbg !50
+  %641 = bitcast i32 %640 to float, !dbg !50
+  %642 = fcmp one float %512, 0x7FF0000000000000, !dbg !50
+  %643 = select i1 %642, float %641, float 0x7FF8000000000000, !dbg !50
+  %644 = fcmp olt float %508, 1.310720e+05, !dbg !51
+  br i1 %644, label %645, label %652, !dbg !51
+
+645:                                              ; preds = %__ocml_sin_f32.exit
+  %646 = fmul nnan float %508, 0x3FE45F3060000000, !dbg !51
+  %647 = tail call float @llvm.rint.f32(float %646), !dbg !51
+  %648 = tail call float @llvm.fma.f32(float %647, float 0xBFF921FB40000000, float %508), !dbg !51
+  %649 = tail call float @llvm.fma.f32(float %647, float 0xBE74442D00000000, float %648), !dbg !51
+  %650 = tail call float @llvm.fma.f32(float %647, float 0xBCF8469880000000, float %649), !dbg !51
+  %651 = fptosi float %647 to i32, !dbg !51
+  br label %__ocml_cos_f32.exit, !dbg !51
+
+652:                                              ; preds = %__ocml_sin_f32.exit
+  %653 = bitcast float %508 to i32, !dbg !51
+  %654 = lshr i32 %653, 23, !dbg !51
+  %655 = add nsw i32 %654, -120, !dbg !51
+  %656 = icmp ugt i32 %655, 63, !dbg !51
+  %657 = select i1 %656, i32 -64, i32 0, !dbg !51
+  %658 = add nsw i32 %657, %655, !dbg !51
+  %659 = icmp ugt i32 %658, 31, !dbg !51
+  %660 = select i1 %659, i32 -32, i32 0, !dbg !51
+  %661 = add nsw i32 %660, %658, !dbg !51
+  %662 = icmp ugt i32 %661, 31, !dbg !51
+  %663 = select i1 %662, i32 -32, i32 0, !dbg !51
+  %664 = add nsw i32 %663, %661, !dbg !51
+  %665 = icmp eq i32 %664, 0, !dbg !51
+  %666 = and i32 %653, 8388607, !dbg !51
+  %667 = or disjoint i32 %666, 8388608, !dbg !51
+  %668 = zext nneg i32 %667 to i64, !dbg !51
+  %669 = mul nuw nsw i64 %668, 4266746795, !dbg !51
+  %670 = lshr i64 %669, 32, !dbg !51
+  %671 = mul nuw nsw i64 %668, 1011060801, !dbg !51
+  %672 = add nuw nsw i64 %670, %671, !dbg !51
+  %673 = lshr i64 %672, 32, !dbg !51
+  %674 = mul nuw nsw i64 %668, 3680671129, !dbg !51
+  %675 = add nuw nsw i64 %673, %674, !dbg !51
+  %676 = lshr i64 %675, 32, !dbg !51
+  %677 = mul nuw nsw i64 %668, 4113882560, !dbg !51
+  %678 = add nuw nsw i64 %676, %677, !dbg !51
+  %679 = trunc i64 %678 to i32, !dbg !51
+  %680 = lshr i64 %678, 32, !dbg !51
+  %681 = mul nuw nsw i64 %668, 4230436817, !dbg !51
+  %682 = add nuw nsw i64 %680, %681, !dbg !51
+  %683 = lshr i64 %682, 32, !dbg !51
+  %684 = mul nuw nsw i64 %668, 1313084713, !dbg !51
+  %685 = add nuw nsw i64 %683, %684, !dbg !51
+  %686 = trunc i64 %685 to i32, !dbg !51
+  %687 = select i1 %656, i32 %679, i32 %686, !dbg !51
+  %688 = trunc i64 %682 to i32, !dbg !51
+  %689 = lshr i64 %685, 32, !dbg !51
+  %690 = mul nuw nsw i64 %668, 2734261102, !dbg !51
+  %691 = add nuw nsw i64 %689, %690, !dbg !51
+  %692 = trunc i64 %691 to i32, !dbg !51
+  %693 = select i1 %656, i32 %688, i32 %692, !dbg !51
+  %694 = select i1 %659, i32 %687, i32 %693, !dbg !51
+  %695 = lshr i64 %691, 32, !dbg !51
+  %696 = trunc nuw nsw i64 %695 to i32, !dbg !51
+  %697 = select i1 %656, i32 %686, i32 %696, !dbg !51
+  %698 = select i1 %659, i32 %693, i32 %697, !dbg !51
+  %699 = select i1 %662, i32 %694, i32 %698, !dbg !51
+  %700 = trunc i64 %675 to i32, !dbg !51
+  %701 = select i1 %656, i32 %700, i32 %688, !dbg !51
+  %702 = select i1 %659, i32 %701, i32 %687, !dbg !51
+  %703 = select i1 %662, i32 %702, i32 %694, !dbg !51
+  %704 = sub nsw i32 32, %664, !dbg !51
+  %705 = tail call i32 @llvm.fshr.i32(i32 %699, i32 %703, i32 %704), !dbg !51
+  %706 = select i1 %665, i32 %699, i32 %705, !dbg !51
+  %707 = trunc i64 %672 to i32, !dbg !51
+  %708 = select i1 %656, i32 %707, i32 %679, !dbg !51
+  %709 = select i1 %659, i32 %708, i32 %701, !dbg !51
+  %710 = select i1 %662, i32 %709, i32 %702, !dbg !51
+  %711 = tail call i32 @llvm.fshr.i32(i32 %703, i32 %710, i32 %704), !dbg !51
+  %712 = select i1 %665, i32 %703, i32 %711, !dbg !51
+  %713 = tail call i32 @llvm.fshl.i32(i32 %706, i32 %712, i32 2), !dbg !51
+  %714 = lshr i32 %706, 29, !dbg !51
+  %715 = and i32 %714, 1, !dbg !51
+  %716 = sub nsw i32 0, %715, !dbg !51
+  %717 = xor i32 %713, %716, !dbg !51
+  %718 = trunc i64 %669 to i32, !dbg !51
+  %719 = select i1 %656, i32 %718, i32 %700, !dbg !51
+  %720 = select i1 %659, i32 %719, i32 %708, !dbg !51
+  %721 = select i1 %662, i32 %720, i32 %709, !dbg !51
+  %722 = tail call i32 @llvm.fshr.i32(i32 %710, i32 %721, i32 %704), !dbg !51
+  %723 = select i1 %665, i32 %710, i32 %722, !dbg !51
+  %724 = tail call i32 @llvm.fshl.i32(i32 %712, i32 %723, i32 2), !dbg !51
+  %725 = xor i32 %724, %716, !dbg !51
+  %726 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %717, i1 false), !dbg !51
+  %727 = sub nsw i32 31, %726, !dbg !51
+  %728 = tail call i32 @llvm.fshr.i32(i32 %717, i32 %725, i32 %727), !dbg !51
+  %729 = tail call i32 @llvm.fshl.i32(i32 %723, i32 %721, i32 2), !dbg !51
+  %730 = xor i32 %729, %716, !dbg !51
+  %731 = tail call i32 @llvm.fshr.i32(i32 %725, i32 %730, i32 %727), !dbg !51
+  %732 = tail call i32 @llvm.fshl.i32(i32 %728, i32 %731, i32 23), !dbg !51
+  %733 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %732, i1 false), !dbg !51
+  %734 = xor i32 %733, -1, !dbg !51
+  %735 = tail call i32 @llvm.fshr.i32(i32 %732, i32 %731, i32 %734), !dbg !51
+  %736 = lshr i32 %735, 9, !dbg !51
+  %.neg1.i.i.i10 = xor i32 %726, -1, !dbg !51
+  %737 = add nuw nsw i32 %726, 1, !dbg !51
+  %.neg2.i.i.i11 = sub nuw nsw i32 %.neg1.i.i.i10, %733, !dbg !51
+  %.neg3.i.i.i12 = shl nsw i32 %.neg2.i.i.i11, 23, !dbg !51
+  %738 = shl i32 %714, 31, !dbg !51
+  %739 = or disjoint i32 %738, 864026624, !dbg !51
+  %740 = add i32 %739, %.neg3.i.i.i12, !dbg !51
+  %741 = or disjoint i32 %740, %736, !dbg !51
+  %742 = bitcast i32 %741 to float, !dbg !51
+  %743 = tail call i32 @llvm.fshl.i32(i32 %737, i32 %728, i32 23), !dbg !51
+  %744 = or disjoint i32 %743, %738, !dbg !51
+  %745 = xor i32 %744, 1065353216, !dbg !51
+  %746 = bitcast i32 %745 to float, !dbg !51
+  %747 = fmul float %746, 0x3FF921FB40000000, !dbg !51
+  %748 = fneg float %747, !dbg !51
+  %749 = tail call float @llvm.fma.f32(float %746, float 0x3FF921FB40000000, float %748), !dbg !51
+  %750 = tail call float @llvm.fma.f32(float %746, float 0x3E74442D00000000, float %749), !dbg !51
+  %751 = tail call float @llvm.fma.f32(float %742, float 0x3FF921FB40000000, float %750), !dbg !51
+  %752 = fadd float %747, %751, !dbg !51
+  %753 = lshr i32 %706, 30, !dbg !51
+  %754 = add nuw nsw i32 %715, %753, !dbg !51
+  br label %__ocml_cos_f32.exit, !dbg !51
+
+__ocml_cos_f32.exit:                              ; preds = %645, %652
+  %.pn3.in.i.i13 = phi float [ %650, %645 ], [ %752, %652 ], !dbg !51
+  %.pn1.in.i.i14 = phi i32 [ %651, %645 ], [ %754, %652 ], !dbg !51
+  %755 = fmul float %.pn3.in.i.i13, %.pn3.in.i.i13, !dbg !51
+  %756 = tail call noundef float @llvm.fmuladd.f32(float %755, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !51
+  %757 = tail call noundef float @llvm.fmuladd.f32(float %755, float %756, float 0xBFC55553A0000000), !dbg !51
+  %758 = fmul float %755, %757, !dbg !51
+  %759 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i13, float %758, float %.pn3.in.i.i13), !dbg !51
+  %760 = tail call noundef float @llvm.fmuladd.f32(float %755, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !51
+  %761 = tail call noundef float @llvm.fmuladd.f32(float %755, float %760, float 0x3FA5557EE0000000), !dbg !51
+  %762 = tail call noundef float @llvm.fmuladd.f32(float %755, float %761, float 0xBFE0000080000000), !dbg !51
+  %763 = tail call noundef float @llvm.fmuladd.f32(float %755, float %762, float 1.000000e+00), !dbg !51
+  %764 = fneg float %759, !dbg !51
+  %765 = and i32 %.pn1.in.i.i14, 1, !dbg !51
+  %766 = icmp eq i32 %765, 0, !dbg !51
+  %.v.i15 = select i1 %766, float %763, float %764, !dbg !51
+  %767 = bitcast float %.v.i15 to i32, !dbg !51
+  %.pn1.i.i16 = shl i32 %.pn1.in.i.i14, 30, !dbg !51
+  %768 = and i32 %.pn1.i.i16, -2147483648, !dbg !51
+  %769 = xor i32 %768, %767, !dbg !51
+  %770 = bitcast i32 %769 to float, !dbg !51
+  %771 = fcmp one float %508, 0x7FF0000000000000, !dbg !51
+  %772 = select i1 %771, float %770, float 0x7FF8000000000000, !dbg !51
+  %773 = fmul float %643, %772, !dbg !52
+  %774 = tail call float @llvm.fabs.f32(float %773), !dbg !53
+  %775 = fsub float 0.000000e+00, %774, !dbg !54
+  %776 = tail call noundef float @llvm.exp.f32(float %775), !dbg !55
+  %777 = fadd float %773, %776, !dbg !56
+  %778 = fadd float %421, %777, !dbg !62
+  %779 = select i1 %25, float %778, float %421, !dbg !57
+  %780 = fsub float %777, %420, !dbg !63
+  %781 = fadd float %418, 1.000000e+00, !dbg !67
+  %782 = fdiv float %780, %781, !dbg !68
+  %783 = fadd float %420, %782, !dbg !69
+  %784 = fsub float %777, %783, !dbg !70
+  %785 = fmul float %780, %784, !dbg !71
+  %786 = fadd float %419, %785, !dbg !72
+  %787 = select i1 %25, float %783, float %420, !dbg !73
+  %788 = select i1 %25, float %786, float %419, !dbg !74
+  %789 = select i1 %25, float %781, float %418, !dbg !58
+  br i1 %57, label %790, label %794, !dbg !59
+
+790:                                              ; preds = %__ocml_cos_f32.exit
+  %791 = sext i32 %.pn644 to i64
+  %792 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %791
+  %793 = insertelement <1 x float> poison, float %777, i64 0
+  store <1 x float> %793, ptr addrspace(1) %792, align 4, !dbg !59
+  br label %794, !dbg !59
+
+794:                                              ; preds = %790, %__ocml_cos_f32.exit
+  %795 = icmp samesign ult i32 %422, 8176, !dbg !60
+  br i1 %795, label %.peel.next, label %.loopexit, !dbg !60, !llvm.loop !75
+
+.loopexit:                                        ; preds = %794
+  %796 = tail call float @llvm.maximum.f32(float %432, float 0.000000e+00), !dbg !28
+  %797 = fsub float 0.000000e+00, %439, !dbg !29
+  %798 = fmul float %797, 0x3FF7154760000000, !dbg !34
+  %799 = tail call float @llvm.exp2.f32(float %798), !dbg !34
+  %800 = fadd float %799, 1.000000e+00, !dbg !35
+  %801 = fdiv float 1.000000e+00, %800, !dbg !36
+  %802 = fmul float %796, %801, !dbg !37
+  %803 = tail call float @llvm.fabs.f32(float %446), !dbg !38
+  %804 = fcmp olt float %803, 6.250000e-01, !dbg !38
+  br i1 %804, label %805, label %813, !dbg !38
+
+805:                                              ; preds = %.loopexit
+  %foldExtExtBinop106 = fmul nnan <1 x float> %445, %445, !dbg !38
+  %806 = extractelement <1 x float> %foldExtExtBinop106, i64 0, !dbg !38
+  %807 = tail call nnan float @llvm.fmuladd.f32(float %806, float 0xBF7758E7A0000000, float 0x3F95211920000000), !dbg !38
+  %808 = tail call noundef float @llvm.fmuladd.f32(float %806, float %807, float 0xBFAB8389C0000000), !dbg !38
+  %809 = tail call noundef float @llvm.fmuladd.f32(float %806, float %808, float 0x3FC1107040000000), !dbg !38
+  %810 = tail call noundef float @llvm.fmuladd.f32(float %806, float %809, float 0xBFD5555320000000), !dbg !38
+  %811 = fmul float %803, %810, !dbg !38
+  %812 = tail call noundef float @llvm.fmuladd.f32(float %806, float %811, float %803), !dbg !38
+  br label %__ocml_tanh_f32.exit17, !dbg !38
+
+813:                                              ; preds = %.loopexit
+  %814 = fmul float %803, 2.000000e+00, !dbg !38
+  %815 = tail call noundef float @llvm.exp.f32(float %814), !dbg !38
+  %816 = fadd float %815, 1.000000e+00, !dbg !38
+  %817 = tail call float @llvm.amdgcn.rcp.f32(float %816), !dbg !38
+  %818 = tail call noundef float @llvm.fmuladd.f32(float %817, float -2.000000e+00, float 1.000000e+00), !dbg !38
+  br label %__ocml_tanh_f32.exit17, !dbg !38
+
+__ocml_tanh_f32.exit17:                           ; preds = %805, %813
+  %819 = phi float [ %812, %805 ], [ %818, %813 ], !dbg !38
+  %820 = tail call noundef float @llvm.copysign.f32(float %819, float %446), !dbg !38
+  %821 = fmul float %453, 5.000000e-01, !dbg !39
+  %822 = fmul float %453, 0x3FE6A09E60000000, !dbg !40
+  %823 = tail call float @llvm.fabs.f32(float %822), !dbg !41
+  %824 = fcmp olt float %823, 1.000000e+00, !dbg !41
+  br i1 %824, label %825, label %833, !dbg !41
+
+825:                                              ; preds = %__ocml_tanh_f32.exit17
+  %826 = fmul nnan float %822, %822, !dbg !41
+  %827 = tail call noundef float @llvm.fmuladd.f32(float %826, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !41
+  %828 = tail call noundef float @llvm.fmuladd.f32(float %826, float %827, float 0xBF9B593700000000), !dbg !41
+  %829 = tail call noundef float @llvm.fmuladd.f32(float %826, float %828, float 0x3FBCE077C0000000), !dbg !41
+  %830 = tail call noundef float @llvm.fmuladd.f32(float %826, float %829, float 0xBFD8126600000000), !dbg !41
+  %831 = tail call noundef float @llvm.fmuladd.f32(float %826, float %830, float 0x3FC06EBA00000000), !dbg !41
+  %832 = tail call float @llvm.fma.f32(float %823, float %831, float %823), !dbg !41
+  br label %__ocml_erf_f32.exit18, !dbg !41
+
+833:                                              ; preds = %__ocml_tanh_f32.exit17
+  %834 = tail call noundef float @llvm.fmuladd.f32(float %823, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !41
+  %835 = tail call noundef float @llvm.fmuladd.f32(float %823, float %834, float 0x3F6F9A6D20000000), !dbg !41
+  %836 = tail call noundef float @llvm.fmuladd.f32(float %823, float %835, float 0xBF98C31640000000), !dbg !41
+  %837 = tail call noundef float @llvm.fmuladd.f32(float %823, float %836, float 0x3FBB4E9C80000000), !dbg !41
+  %838 = tail call noundef float @llvm.fmuladd.f32(float %823, float %837, float 0x3FE4515FA0000000), !dbg !41
+  %839 = tail call noundef float @llvm.fmuladd.f32(float %823, float %838, float 0x3FC078E500000000), !dbg !41
+  %840 = tail call float @llvm.fma.f32(float %823, float %839, float %823), !dbg !41
+  %841 = fneg float %840, !dbg !41
+  %842 = tail call noundef float @llvm.exp.f32(float %841), !dbg !41
+  %843 = fsub float 1.000000e+00, %842, !dbg !41
+  br label %__ocml_erf_f32.exit18, !dbg !41
+
+__ocml_erf_f32.exit18:                            ; preds = %825, %833
+  %844 = phi float [ %832, %825 ], [ %843, %833 ], !dbg !41
+  %845 = tail call noundef float @llvm.copysign.f32(float %844, float %822), !dbg !41
+  %846 = fadd float %845, 1.000000e+00, !dbg !42
+  %847 = fmul float %821, %846, !dbg !43
+  %848 = fmul float %820, %847, !dbg !44
+  %849 = fadd float %802, %848, !dbg !45
+  %850 = tail call float @llvm.fabs.f32(float %849), !dbg !46
+  %851 = fadd float %850, 0x3EB0C6F7A0000000, !dbg !47
+  %852 = tail call float @llvm.sqrt.f32(float %851), !dbg !48
+  %853 = fadd float %850, %852, !dbg !49
+  %854 = tail call float @llvm.fabs.f32(float %853), !dbg !50
+  %855 = fcmp olt float %854, 1.310720e+05, !dbg !50
+  br i1 %855, label %856, label %863, !dbg !50
+
+856:                                              ; preds = %__ocml_erf_f32.exit18
+  %857 = fmul nnan float %853, 0x3FE45F3060000000, !dbg !50
+  %858 = tail call float @llvm.rint.f32(float %857), !dbg !50
+  %859 = tail call float @llvm.fma.f32(float %858, float 0xBFF921FB40000000, float %854), !dbg !50
+  %860 = tail call float @llvm.fma.f32(float %858, float 0xBE74442D00000000, float %859), !dbg !50
+  %861 = tail call float @llvm.fma.f32(float %858, float 0xBCF8469880000000, float %860), !dbg !50
+  %862 = fptosi float %858 to i32, !dbg !50
+  %.pre.i27 = bitcast float %854 to i32, !dbg !50
+  br label %__ocml_sin_f32.exit28, !dbg !50
+
+863:                                              ; preds = %__ocml_erf_f32.exit18
+  %864 = bitcast float %854 to i32, !dbg !50
+  %865 = lshr i32 %864, 23, !dbg !50
+  %866 = add nsw i32 %865, -120, !dbg !50
+  %867 = icmp ugt i32 %866, 63, !dbg !50
+  %868 = select i1 %867, i32 -64, i32 0, !dbg !50
+  %869 = add nsw i32 %868, %866, !dbg !50
+  %870 = icmp ugt i32 %869, 31, !dbg !50
+  %871 = select i1 %870, i32 -32, i32 0, !dbg !50
+  %872 = add nsw i32 %871, %869, !dbg !50
+  %873 = icmp ugt i32 %872, 31, !dbg !50
+  %874 = select i1 %873, i32 -32, i32 0, !dbg !50
+  %875 = add nsw i32 %874, %872, !dbg !50
+  %876 = icmp eq i32 %875, 0, !dbg !50
+  %877 = and i32 %864, 8388607, !dbg !50
+  %878 = or disjoint i32 %877, 8388608, !dbg !50
+  %879 = zext nneg i32 %878 to i64, !dbg !50
+  %880 = mul nuw nsw i64 %879, 4266746795, !dbg !50
+  %881 = lshr i64 %880, 32, !dbg !50
+  %882 = mul nuw nsw i64 %879, 1011060801, !dbg !50
+  %883 = add nuw nsw i64 %881, %882, !dbg !50
+  %884 = lshr i64 %883, 32, !dbg !50
+  %885 = mul nuw nsw i64 %879, 3680671129, !dbg !50
+  %886 = add nuw nsw i64 %884, %885, !dbg !50
+  %887 = lshr i64 %886, 32, !dbg !50
+  %888 = mul nuw nsw i64 %879, 4113882560, !dbg !50
+  %889 = add nuw nsw i64 %887, %888, !dbg !50
+  %890 = trunc i64 %889 to i32, !dbg !50
+  %891 = lshr i64 %889, 32, !dbg !50
+  %892 = mul nuw nsw i64 %879, 4230436817, !dbg !50
+  %893 = add nuw nsw i64 %891, %892, !dbg !50
+  %894 = lshr i64 %893, 32, !dbg !50
+  %895 = mul nuw nsw i64 %879, 1313084713, !dbg !50
+  %896 = add nuw nsw i64 %894, %895, !dbg !50
+  %897 = trunc i64 %896 to i32, !dbg !50
+  %898 = select i1 %867, i32 %890, i32 %897, !dbg !50
+  %899 = trunc i64 %893 to i32, !dbg !50
+  %900 = lshr i64 %896, 32, !dbg !50
+  %901 = mul nuw nsw i64 %879, 2734261102, !dbg !50
+  %902 = add nuw nsw i64 %900, %901, !dbg !50
+  %903 = trunc i64 %902 to i32, !dbg !50
+  %904 = select i1 %867, i32 %899, i32 %903, !dbg !50
+  %905 = select i1 %870, i32 %898, i32 %904, !dbg !50
+  %906 = lshr i64 %902, 32, !dbg !50
+  %907 = trunc nuw nsw i64 %906 to i32, !dbg !50
+  %908 = select i1 %867, i32 %897, i32 %907, !dbg !50
+  %909 = select i1 %870, i32 %904, i32 %908, !dbg !50
+  %910 = select i1 %873, i32 %905, i32 %909, !dbg !50
+  %911 = trunc i64 %886 to i32, !dbg !50
+  %912 = select i1 %867, i32 %911, i32 %899, !dbg !50
+  %913 = select i1 %870, i32 %912, i32 %898, !dbg !50
+  %914 = select i1 %873, i32 %913, i32 %905, !dbg !50
+  %915 = sub nsw i32 32, %875, !dbg !50
+  %916 = tail call i32 @llvm.fshr.i32(i32 %910, i32 %914, i32 %915), !dbg !50
+  %917 = select i1 %876, i32 %910, i32 %916, !dbg !50
+  %918 = trunc i64 %883 to i32, !dbg !50
+  %919 = select i1 %867, i32 %918, i32 %890, !dbg !50
+  %920 = select i1 %870, i32 %919, i32 %912, !dbg !50
+  %921 = select i1 %873, i32 %920, i32 %913, !dbg !50
+  %922 = tail call i32 @llvm.fshr.i32(i32 %914, i32 %921, i32 %915), !dbg !50
+  %923 = select i1 %876, i32 %914, i32 %922, !dbg !50
+  %924 = tail call i32 @llvm.fshl.i32(i32 %917, i32 %923, i32 2), !dbg !50
+  %925 = lshr i32 %917, 29, !dbg !50
+  %926 = and i32 %925, 1, !dbg !50
+  %927 = sub nsw i32 0, %926, !dbg !50
+  %928 = xor i32 %924, %927, !dbg !50
+  %929 = trunc i64 %880 to i32, !dbg !50
+  %930 = select i1 %867, i32 %929, i32 %911, !dbg !50
+  %931 = select i1 %870, i32 %930, i32 %919, !dbg !50
+  %932 = select i1 %873, i32 %931, i32 %920, !dbg !50
+  %933 = tail call i32 @llvm.fshr.i32(i32 %921, i32 %932, i32 %915), !dbg !50
+  %934 = select i1 %876, i32 %921, i32 %933, !dbg !50
+  %935 = tail call i32 @llvm.fshl.i32(i32 %923, i32 %934, i32 2), !dbg !50
+  %936 = xor i32 %935, %927, !dbg !50
+  %937 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %928, i1 false), !dbg !50
+  %938 = sub nsw i32 31, %937, !dbg !50
+  %939 = tail call i32 @llvm.fshr.i32(i32 %928, i32 %936, i32 %938), !dbg !50
+  %940 = tail call i32 @llvm.fshl.i32(i32 %934, i32 %932, i32 2), !dbg !50
+  %941 = xor i32 %940, %927, !dbg !50
+  %942 = tail call i32 @llvm.fshr.i32(i32 %936, i32 %941, i32 %938), !dbg !50
+  %943 = tail call i32 @llvm.fshl.i32(i32 %939, i32 %942, i32 23), !dbg !50
+  %944 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %943, i1 false), !dbg !50
+  %945 = xor i32 %944, -1, !dbg !50
+  %946 = tail call i32 @llvm.fshr.i32(i32 %943, i32 %942, i32 %945), !dbg !50
+  %947 = lshr i32 %946, 9, !dbg !50
+  %.neg1.i.i.i19 = xor i32 %937, -1, !dbg !50
+  %948 = add nuw nsw i32 %937, 1, !dbg !50
+  %.neg2.i.i.i20 = sub nuw nsw i32 %.neg1.i.i.i19, %944, !dbg !50
+  %.neg3.i.i.i21 = shl nsw i32 %.neg2.i.i.i20, 23, !dbg !50
+  %949 = shl i32 %925, 31, !dbg !50
+  %950 = or disjoint i32 %949, 864026624, !dbg !50
+  %951 = add i32 %950, %.neg3.i.i.i21, !dbg !50
+  %952 = or disjoint i32 %951, %947, !dbg !50
+  %953 = bitcast i32 %952 to float, !dbg !50
+  %954 = tail call i32 @llvm.fshl.i32(i32 %948, i32 %939, i32 23), !dbg !50
+  %955 = or disjoint i32 %954, %949, !dbg !50
+  %956 = xor i32 %955, 1065353216, !dbg !50
+  %957 = bitcast i32 %956 to float, !dbg !50
+  %958 = fmul float %957, 0x3FF921FB40000000, !dbg !50
+  %959 = fneg float %958, !dbg !50
+  %960 = tail call float @llvm.fma.f32(float %957, float 0x3FF921FB40000000, float %959), !dbg !50
+  %961 = tail call float @llvm.fma.f32(float %957, float 0x3E74442D00000000, float %960), !dbg !50
+  %962 = tail call float @llvm.fma.f32(float %953, float 0x3FF921FB40000000, float %961), !dbg !50
+  %963 = fadd float %958, %962, !dbg !50
+  %964 = lshr i32 %917, 30, !dbg !50
+  %965 = add nuw nsw i32 %926, %964, !dbg !50
+  br label %__ocml_sin_f32.exit28, !dbg !50
+
+__ocml_sin_f32.exit28:                            ; preds = %856, %863
+  %.pre-phi.i22 = phi i32 [ %.pre.i27, %856 ], [ %864, %863 ], !dbg !50
+  %.pn3.in.i.i23 = phi float [ %861, %856 ], [ %963, %863 ], !dbg !50
+  %.pn1.in.i.i24 = phi i32 [ %862, %856 ], [ %965, %863 ], !dbg !50
+  %966 = fmul float %.pn3.in.i.i23, %.pn3.in.i.i23, !dbg !50
+  %967 = tail call noundef float @llvm.fmuladd.f32(float %966, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !50
+  %968 = tail call noundef float @llvm.fmuladd.f32(float %966, float %967, float 0xBFC55553A0000000), !dbg !50
+  %969 = fmul float %966, %968, !dbg !50
+  %970 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i23, float %969, float %.pn3.in.i.i23), !dbg !50
+  %971 = tail call noundef float @llvm.fmuladd.f32(float %966, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !50
+  %972 = tail call noundef float @llvm.fmuladd.f32(float %966, float %971, float 0x3FA5557EE0000000), !dbg !50
+  %973 = tail call noundef float @llvm.fmuladd.f32(float %966, float %972, float 0xBFE0000080000000), !dbg !50
+  %974 = tail call noundef float @llvm.fmuladd.f32(float %966, float %973, float 1.000000e+00), !dbg !50
+  %975 = and i32 %.pn1.in.i.i24, 1, !dbg !50
+  %976 = icmp eq i32 %975, 0, !dbg !50
+  %.v.i25 = select i1 %976, float %970, float %974, !dbg !50
+  %977 = bitcast float %.v.i25 to i32, !dbg !50
+  %.pn1.i.i26 = shl i32 %.pn1.in.i.i24, 30, !dbg !50
+  %978 = and i32 %.pn1.i.i26, -2147483648, !dbg !50
+  %979 = bitcast float %853 to i32, !dbg !50
+  %980 = xor i32 %.pre-phi.i22, %979, !dbg !50
+  %981 = xor i32 %980, %978, !dbg !50
+  %982 = xor i32 %981, %977, !dbg !50
+  %983 = bitcast i32 %982 to float, !dbg !50
+  %984 = fcmp one float %854, 0x7FF0000000000000, !dbg !50
+  %985 = select i1 %984, float %983, float 0x7FF8000000000000, !dbg !50
+  %986 = fcmp olt float %850, 1.310720e+05, !dbg !51
+  br i1 %986, label %987, label %994, !dbg !51
+
+987:                                              ; preds = %__ocml_sin_f32.exit28
+  %988 = fmul nnan float %850, 0x3FE45F3060000000, !dbg !51
+  %989 = tail call float @llvm.rint.f32(float %988), !dbg !51
+  %990 = tail call float @llvm.fma.f32(float %989, float 0xBFF921FB40000000, float %850), !dbg !51
+  %991 = tail call float @llvm.fma.f32(float %989, float 0xBE74442D00000000, float %990), !dbg !51
+  %992 = tail call float @llvm.fma.f32(float %989, float 0xBCF8469880000000, float %991), !dbg !51
+  %993 = fptosi float %989 to i32, !dbg !51
+  br label %__ocml_cos_f32.exit36, !dbg !51
+
+994:                                              ; preds = %__ocml_sin_f32.exit28
+  %995 = bitcast float %850 to i32, !dbg !51
+  %996 = lshr i32 %995, 23, !dbg !51
+  %997 = add nsw i32 %996, -120, !dbg !51
+  %998 = icmp ugt i32 %997, 63, !dbg !51
+  %999 = select i1 %998, i32 -64, i32 0, !dbg !51
+  %1000 = add nsw i32 %999, %997, !dbg !51
+  %1001 = icmp ugt i32 %1000, 31, !dbg !51
+  %1002 = select i1 %1001, i32 -32, i32 0, !dbg !51
+  %1003 = add nsw i32 %1002, %1000, !dbg !51
+  %1004 = icmp ugt i32 %1003, 31, !dbg !51
+  %1005 = select i1 %1004, i32 -32, i32 0, !dbg !51
+  %1006 = add nsw i32 %1005, %1003, !dbg !51
+  %1007 = icmp eq i32 %1006, 0, !dbg !51
+  %1008 = and i32 %995, 8388607, !dbg !51
+  %1009 = or disjoint i32 %1008, 8388608, !dbg !51
+  %1010 = zext nneg i32 %1009 to i64, !dbg !51
+  %1011 = mul nuw nsw i64 %1010, 4266746795, !dbg !51
+  %1012 = lshr i64 %1011, 32, !dbg !51
+  %1013 = mul nuw nsw i64 %1010, 1011060801, !dbg !51
+  %1014 = add nuw nsw i64 %1012, %1013, !dbg !51
+  %1015 = lshr i64 %1014, 32, !dbg !51
+  %1016 = mul nuw nsw i64 %1010, 3680671129, !dbg !51
+  %1017 = add nuw nsw i64 %1015, %1016, !dbg !51
+  %1018 = lshr i64 %1017, 32, !dbg !51
+  %1019 = mul nuw nsw i64 %1010, 4113882560, !dbg !51
+  %1020 = add nuw nsw i64 %1018, %1019, !dbg !51
+  %1021 = trunc i64 %1020 to i32, !dbg !51
+  %1022 = lshr i64 %1020, 32, !dbg !51
+  %1023 = mul nuw nsw i64 %1010, 4230436817, !dbg !51
+  %1024 = add nuw nsw i64 %1022, %1023, !dbg !51
+  %1025 = lshr i64 %1024, 32, !dbg !51
+  %1026 = mul nuw nsw i64 %1010, 1313084713, !dbg !51
+  %1027 = add nuw nsw i64 %1025, %1026, !dbg !51
+  %1028 = trunc i64 %1027 to i32, !dbg !51
+  %1029 = select i1 %998, i32 %1021, i32 %1028, !dbg !51
+  %1030 = trunc i64 %1024 to i32, !dbg !51
+  %1031 = lshr i64 %1027, 32, !dbg !51
+  %1032 = mul nuw nsw i64 %1010, 2734261102, !dbg !51
+  %1033 = add nuw nsw i64 %1031, %1032, !dbg !51
+  %1034 = trunc i64 %1033 to i32, !dbg !51
+  %1035 = select i1 %998, i32 %1030, i32 %1034, !dbg !51
+  %1036 = select i1 %1001, i32 %1029, i32 %1035, !dbg !51
+  %1037 = lshr i64 %1033, 32, !dbg !51
+  %1038 = trunc nuw nsw i64 %1037 to i32, !dbg !51
+  %1039 = select i1 %998, i32 %1028, i32 %1038, !dbg !51
+  %1040 = select i1 %1001, i32 %1035, i32 %1039, !dbg !51
+  %1041 = select i1 %1004, i32 %1036, i32 %1040, !dbg !51
+  %1042 = trunc i64 %1017 to i32, !dbg !51
+  %1043 = select i1 %998, i32 %1042, i32 %1030, !dbg !51
+  %1044 = select i1 %1001, i32 %1043, i32 %1029, !dbg !51
+  %1045 = select i1 %1004, i32 %1044, i32 %1036, !dbg !51
+  %1046 = sub nsw i32 32, %1006, !dbg !51
+  %1047 = tail call i32 @llvm.fshr.i32(i32 %1041, i32 %1045, i32 %1046), !dbg !51
+  %1048 = select i1 %1007, i32 %1041, i32 %1047, !dbg !51
+  %1049 = trunc i64 %1014 to i32, !dbg !51
+  %1050 = select i1 %998, i32 %1049, i32 %1021, !dbg !51
+  %1051 = select i1 %1001, i32 %1050, i32 %1043, !dbg !51
+  %1052 = select i1 %1004, i32 %1051, i32 %1044, !dbg !51
+  %1053 = tail call i32 @llvm.fshr.i32(i32 %1045, i32 %1052, i32 %1046), !dbg !51
+  %1054 = select i1 %1007, i32 %1045, i32 %1053, !dbg !51
+  %1055 = tail call i32 @llvm.fshl.i32(i32 %1048, i32 %1054, i32 2), !dbg !51
+  %1056 = lshr i32 %1048, 29, !dbg !51
+  %1057 = and i32 %1056, 1, !dbg !51
+  %1058 = sub nsw i32 0, %1057, !dbg !51
+  %1059 = xor i32 %1055, %1058, !dbg !51
+  %1060 = trunc i64 %1011 to i32, !dbg !51
+  %1061 = select i1 %998, i32 %1060, i32 %1042, !dbg !51
+  %1062 = select i1 %1001, i32 %1061, i32 %1050, !dbg !51
+  %1063 = select i1 %1004, i32 %1062, i32 %1051, !dbg !51
+  %1064 = tail call i32 @llvm.fshr.i32(i32 %1052, i32 %1063, i32 %1046), !dbg !51
+  %1065 = select i1 %1007, i32 %1052, i32 %1064, !dbg !51
+  %1066 = tail call i32 @llvm.fshl.i32(i32 %1054, i32 %1065, i32 2), !dbg !51
+  %1067 = xor i32 %1066, %1058, !dbg !51
+  %1068 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %1059, i1 false), !dbg !51
+  %1069 = sub nsw i32 31, %1068, !dbg !51
+  %1070 = tail call i32 @llvm.fshr.i32(i32 %1059, i32 %1067, i32 %1069), !dbg !51
+  %1071 = tail call i32 @llvm.fshl.i32(i32 %1065, i32 %1063, i32 2), !dbg !51
+  %1072 = xor i32 %1071, %1058, !dbg !51
+  %1073 = tail call i32 @llvm.fshr.i32(i32 %1067, i32 %1072, i32 %1069), !dbg !51
+  %1074 = tail call i32 @llvm.fshl.i32(i32 %1070, i32 %1073, i32 23), !dbg !51
+  %1075 = tail call range(i32 0, 33) i32 @llvm.ctlz.i32(i32 %1074, i1 false), !dbg !51
+  %1076 = xor i32 %1075, -1, !dbg !51
+  %1077 = tail call i32 @llvm.fshr.i32(i32 %1074, i32 %1073, i32 %1076), !dbg !51
+  %1078 = lshr i32 %1077, 9, !dbg !51
+  %.neg1.i.i.i29 = xor i32 %1068, -1, !dbg !51
+  %1079 = add nuw nsw i32 %1068, 1, !dbg !51
+  %.neg2.i.i.i30 = sub nuw nsw i32 %.neg1.i.i.i29, %1075, !dbg !51
+  %.neg3.i.i.i31 = shl nsw i32 %.neg2.i.i.i30, 23, !dbg !51
+  %1080 = shl i32 %1056, 31, !dbg !51
+  %1081 = or disjoint i32 %1080, 864026624, !dbg !51
+  %1082 = add i32 %1081, %.neg3.i.i.i31, !dbg !51
+  %1083 = or disjoint i32 %1082, %1078, !dbg !51
+  %1084 = bitcast i32 %1083 to float, !dbg !51
+  %1085 = tail call i32 @llvm.fshl.i32(i32 %1079, i32 %1070, i32 23), !dbg !51
+  %1086 = or disjoint i32 %1085, %1080, !dbg !51
+  %1087 = xor i32 %1086, 1065353216, !dbg !51
+  %1088 = bitcast i32 %1087 to float, !dbg !51
+  %1089 = fmul float %1088, 0x3FF921FB40000000, !dbg !51
+  %1090 = fneg float %1089, !dbg !51
+  %1091 = tail call float @llvm.fma.f32(float %1088, float 0x3FF921FB40000000, float %1090), !dbg !51
+  %1092 = tail call float @llvm.fma.f32(float %1088, float 0x3E74442D00000000, float %1091), !dbg !51
+  %1093 = tail call float @llvm.fma.f32(float %1084, float 0x3FF921FB40000000, float %1092), !dbg !51
+  %1094 = fadd float %1089, %1093, !dbg !51
+  %1095 = lshr i32 %1048, 30, !dbg !51
+  %1096 = add nuw nsw i32 %1057, %1095, !dbg !51
+  br label %__ocml_cos_f32.exit36, !dbg !51
+
+__ocml_cos_f32.exit36:                            ; preds = %987, %994
+  %.pn3.in.i.i32 = phi float [ %992, %987 ], [ %1094, %994 ], !dbg !51
+  %.pn1.in.i.i33 = phi i32 [ %993, %987 ], [ %1096, %994 ], !dbg !51
+  %1097 = fmul float %.pn3.in.i.i32, %.pn3.in.i.i32, !dbg !51
+  %1098 = tail call noundef float @llvm.fmuladd.f32(float %1097, float 0xBF29833040000000, float 0x3F81103880000000), !dbg !51
+  %1099 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1098, float 0xBFC55553A0000000), !dbg !51
+  %1100 = fmul float %1097, %1099, !dbg !51
+  %1101 = tail call noundef float @llvm.fmuladd.f32(float %.pn3.in.i.i32, float %1100, float %.pn3.in.i.i32), !dbg !51
+  %1102 = tail call noundef float @llvm.fmuladd.f32(float %1097, float 0x3EFAEA6680000000, float 0xBF56C9E760000000), !dbg !51
+  %1103 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1102, float 0x3FA5557EE0000000), !dbg !51
+  %1104 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1103, float 0xBFE0000080000000), !dbg !51
+  %1105 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1104, float 1.000000e+00), !dbg !51
+  %1106 = fneg float %1101, !dbg !51
+  %1107 = and i32 %.pn1.in.i.i33, 1, !dbg !51
+  %1108 = icmp eq i32 %1107, 0, !dbg !51
+  %.v.i34 = select i1 %1108, float %1105, float %1106, !dbg !51
+  %1109 = bitcast float %.v.i34 to i32, !dbg !51
+  %.pn1.i.i35 = shl i32 %.pn1.in.i.i33, 30, !dbg !51
+  %1110 = and i32 %.pn1.i.i35, -2147483648, !dbg !51
+  %1111 = xor i32 %1110, %1109, !dbg !51
+  %1112 = bitcast i32 %1111 to float, !dbg !51
+  %1113 = fcmp one float %850, 0x7FF0000000000000, !dbg !51
+  %1114 = select i1 %1113, float %1112, float 0x7FF8000000000000, !dbg !51
+  %1115 = fmul float %985, %1114, !dbg !52
+  %1116 = tail call float @llvm.fabs.f32(float %1115), !dbg !53
+  %1117 = fsub float 0.000000e+00, %1116, !dbg !54
+  %1118 = tail call noundef float @llvm.exp.f32(float %1117), !dbg !55
+  %1119 = fadd float %1115, %1118, !dbg !56
+  %1120 = fadd float %778, %1119, !dbg !62
+  %1121 = select i1 %25, float %1120, float %421, !dbg !57
+  %1122 = fsub float %1119, %787, !dbg !63
+  %1123 = fadd float %789, 1.000000e+00, !dbg !67
+  %1124 = fdiv float %1122, %1123, !dbg !68
+  %1125 = fadd float %787, %1124, !dbg !69
+  %1126 = fsub float %1119, %1125, !dbg !70
+  %1127 = fmul float %1122, %1126, !dbg !71
+  %1128 = fadd float %786, %1127, !dbg !72
+  %1129 = select i1 %25, float %1125, float %420, !dbg !73
+  %1130 = select i1 %25, float %1128, float %419, !dbg !74
+  %1131 = select i1 %25, float %1123, float %418, !dbg !58
+  br i1 %57, label %1132, label %1136, !dbg !59
+
+1132:                                             ; preds = %__ocml_cos_f32.exit36
+  %1133 = sext i32 %425 to i64
+  %1134 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %1133
+  %1135 = insertelement <1 x float> poison, float %1119, i64 0
+  store <1 x float> %1135, ptr addrspace(1) %1134, align 4, !dbg !59
+  br label %1136, !dbg !59
+
+1136:                                             ; preds = %1132, %__ocml_cos_f32.exit36
+  %1137 = bitcast float %1121 to i32, !dbg !77
+  %1138 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1137, i32 %1137, i32 276, i32 15, i32 10, i1 false), !dbg !77
+  %1139 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1138, i32 %1137, i32 260, i32 15, i32 5, i1 false), !dbg !77
+  %1140 = bitcast i32 %1139 to float, !dbg !77
+  %1141 = fadd float %1121, %1140, !dbg !79
+  %1142 = bitcast float %1141 to i32, !dbg !77
+  %1143 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1142, i32 %1142, i32 78, i32 15, i32 15, i1 false), !dbg !77
+  %1144 = bitcast i32 %1143 to float, !dbg !77
+  %1145 = fadd float %1141, %1144, !dbg !79
+  %1146 = bitcast float %1145 to i32, !dbg !77
+  %1147 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1146, i32 %1146, i32 177, i32 15, i32 15, i1 false), !dbg !77
+  %1148 = bitcast i32 %1147 to float, !dbg !77
+  %1149 = fadd float %1145, %1148, !dbg !79
+  %1150 = shl nuw nsw i32 %14, 5, !dbg !80
+  %1151 = and i32 %1150, 224, !dbg !80
+  %1152 = and i32 %14, 56, !dbg !80
+  %1153 = lshr exact i32 %1152, 1, !dbg !80
+  %1154 = or disjoint i32 %1151, %1153, !dbg !80
+  %1155 = bitcast float %1149 to i32, !dbg !80
+  %1156 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1154, i32 %1155), !dbg !80
+  %1157 = bitcast float %1129 to i32, !dbg !81
+  %1158 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1157, i32 %1157, i32 276, i32 15, i32 10, i1 false), !dbg !81
+  %1159 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1158, i32 %1157, i32 260, i32 15, i32 5, i1 false), !dbg !81
+  %1160 = bitcast i32 %1159 to float, !dbg !81
+  %1161 = bitcast float %1130 to i32, !dbg !81
+  %1162 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1161, i32 %1161, i32 276, i32 15, i32 10, i1 false), !dbg !81
+  %1163 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1162, i32 %1161, i32 260, i32 15, i32 5, i1 false), !dbg !81
+  %1164 = bitcast i32 %1163 to float, !dbg !81
+  %1165 = bitcast float %1131 to i32, !dbg !81
+  %1166 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1165, i32 %1165, i32 276, i32 15, i32 10, i1 false), !dbg !81
+  %1167 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1166, i32 %1165, i32 260, i32 15, i32 5, i1 false), !dbg !81
+  %1168 = bitcast i32 %1167 to float, !dbg !81
+  %1169 = fsub float %1160, %1129, !dbg !83
+  %1170 = fadd float %1131, %1168, !dbg !84
+  %1171 = fcmp oeq float %1170, 0.000000e+00, !dbg !85
+  %1172 = fdiv float %1168, %1170, !dbg !86
+  %1173 = select i1 %1171, float 0.000000e+00, float %1172, !dbg !87
+  %1174 = fmul float %1169, %1173, !dbg !88
+  %1175 = fadd float %1129, %1174, !dbg !89
+  %1176 = fadd float %1130, %1164, !dbg !90
+  %1177 = fmul float %1169, %1169, !dbg !91
+  %1178 = fmul float %1131, %1177, !dbg !91
+  %1179 = fmul float %1178, %1173, !dbg !91
+  %1180 = fadd float %1176, %1179, !dbg !90
+  %1181 = bitcast float %1175 to i32, !dbg !81
+  %1182 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1181, i32 %1181, i32 78, i32 15, i32 15, i1 false), !dbg !81
+  %1183 = bitcast i32 %1182 to float, !dbg !81
+  %1184 = bitcast float %1180 to i32, !dbg !81
+  %1185 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1184, i32 %1184, i32 78, i32 15, i32 15, i1 false), !dbg !81
+  %1186 = bitcast i32 %1185 to float, !dbg !81
+  %1187 = bitcast float %1170 to i32, !dbg !81
+  %1188 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1187, i32 %1187, i32 78, i32 15, i32 15, i1 false), !dbg !81
+  %1189 = bitcast i32 %1188 to float, !dbg !81
+  %1190 = fsub float %1183, %1175, !dbg !83
+  %1191 = fadd float %1170, %1189, !dbg !84
+  %1192 = fcmp oeq float %1191, 0.000000e+00, !dbg !85
+  %1193 = fdiv float %1189, %1191, !dbg !86
+  %1194 = select i1 %1192, float 0.000000e+00, float %1193, !dbg !87
+  %1195 = fmul float %1190, %1194, !dbg !88
+  %1196 = fadd float %1175, %1195, !dbg !89
+  %1197 = fadd float %1180, %1186, !dbg !90
+  %1198 = fmul float %1190, %1190, !dbg !91
+  %1199 = fmul float %1170, %1198, !dbg !91
+  %1200 = fmul float %1194, %1199, !dbg !91
+  %1201 = fadd float %1197, %1200, !dbg !90
+  %1202 = bitcast float %1196 to i32, !dbg !81
+  %1203 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1202, i32 %1202, i32 177, i32 15, i32 15, i1 false), !dbg !81
+  %1204 = bitcast i32 %1203 to float, !dbg !81
+  %1205 = bitcast float %1201 to i32, !dbg !81
+  %1206 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1205, i32 %1205, i32 177, i32 15, i32 15, i1 false), !dbg !81
+  %1207 = bitcast i32 %1206 to float, !dbg !81
+  %1208 = bitcast float %1191 to i32, !dbg !81
+  %1209 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1208, i32 %1208, i32 177, i32 15, i32 15, i1 false), !dbg !81
+  %1210 = bitcast i32 %1209 to float, !dbg !81
+  %1211 = fsub float %1204, %1196, !dbg !83
+  %1212 = fadd float %1191, %1210, !dbg !84
+  %1213 = fcmp oeq float %1212, 0.000000e+00, !dbg !85
+  %1214 = fdiv float %1210, %1212, !dbg !86
+  %1215 = select i1 %1213, float 0.000000e+00, float %1214, !dbg !87
+  %1216 = fmul float %1211, %1215, !dbg !88
+  %1217 = fadd float %1196, %1216, !dbg !89
+  %1218 = fadd float %1201, %1207, !dbg !90
+  %1219 = fmul float %1211, %1211, !dbg !91
+  %1220 = fmul float %1191, %1219, !dbg !91
+  %1221 = fmul float %1215, %1220, !dbg !91
+  %1222 = fadd float %1218, %1221, !dbg !90
+  %1223 = bitcast float %1217 to i32, !dbg !92
+  %1224 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1154, i32 %1223), !dbg !92
+  %1225 = bitcast float %1222 to i32, !dbg !93
+  %1226 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1154, i32 %1225), !dbg !93
+  %1227 = bitcast float %1212 to i32, !dbg !94
+  %1228 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1154, i32 %1227), !dbg !94
+  %1229 = or disjoint i32 %17, %1152, !dbg !95
+  %1230 = icmp eq i32 %1229, 0, !dbg !95
+  %1231 = and i1 %26, %1230, !dbg !95
+  br i1 %1231, label %.critedge, label %.critedge9, !dbg !95
+
+.critedge:                                        ; preds = %1136
+  %1232 = sext i32 %24 to i64
+  %1233 = getelementptr [4 x i8], ptr addrspace(1) %8, i64 %1232
+  %1234 = getelementptr [4 x i8], ptr addrspace(1) %7, i64 %1232
+  %1235 = getelementptr [4 x i8], ptr addrspace(1) %6, i64 %1232
+  %1236 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %1232
+  store i32 %1156, ptr addrspace(1) %1236, align 4, !dbg !95
+  store i32 %1224, ptr addrspace(1) %1235, align 4, !dbg !96
+  store i32 %1226, ptr addrspace(1) %1234, align 4, !dbg !97
+  store i32 %1228, ptr addrspace(1) %1233, align 4, !dbg !17
+  br label %.critedge9, !dbg !17
+
+.critedge9:                                       ; preds = %1136, %.critedge
+  ret void, !dbg !98
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.amdgcn.workitem.id.x() #2
+
+; Function Attrs: convergent mustprogress nocallback nocreateundeforpoison nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.readfirstlane.i32(i32) #3
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.x() #2
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.maximum.f32(float, float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fabs.f32(float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.sqrt.f32(float) #0
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32 immarg, i32 immarg, i32 immarg, i1 immarg) #4
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.ds.bpermute(i32, i32) #4
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.exp.f32(float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fmuladd.f32(float, float, float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.fshr.i32(i32, i32, i32) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.fshl.i32(i32, i32, i32) #0
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i32 @llvm.ctlz.i32(i32, i1 immarg) #2
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.rint.f32(float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.copysign.f32(float, float) #0
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.amdgcn.rcp.f32(float) #0
+
+attributes #0 = { mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #1 = { nofree norecurse nounwind memory(argmem: readwrite) "amdgpu-agpr-alloc"="0" "amdgpu-cluster-dims"="1,1,1" "amdgpu-flat-work-group-size"="1,256" "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-waves-per-eu"="1, 1" "denormal-fp-math-f32"="ieee" "uniform-work-group-size" }
+attributes #2 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #3 = { convergent mustprogress nocallback nocreateundeforpoison nofree nounwind willreturn memory(none) }
+attributes #4 = { convergent mustprogress nocallback nofree nounwind willreturn memory(none) }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3, !4, !5}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "czgjbydsicoypjoa3uvf4ckezp2el5bjfb2x3eb5taocujm55flx.py", directory: "/dockerx/meta-tuning/pytorch/kern_cmp_20260422_110718/cache/zg")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"amdhsa_code_object_version", i32 500}
+!4 = !{i32 1, !"wchar_size", i32 4}
+!5 = !{i32 8, !"PIC Level", i32 0}
+!6 = !DISubprogram(name: "llvm.exp2.f32", linkageName: "llvm.exp2.f32", scope: !1, file: !1, line: 49, type: !7, scopeLine: 49, spFlags: DISPFlagOptimized)
+!7 = !DISubroutineType(cc: DW_CC_normal, types: !8)
+!8 = !{!9, !9}
+!9 = !DIBasicType(name: "float", size: 32, encoding: DW_ATE_float)
+!10 = distinct !DISubprogram(name: "triton_red_fused_abs_add_cos_exp_gelu_mean_mul_neg_relu_sigmoid_sin_sqrt_std_tanh_0", linkageName: "triton_red_fused_abs_add_cos_exp_gelu_mean_mul_neg_relu_sigmoid_sin_sqrt_std_tanh_0", scope: !1, file: !1, line: 22, type: !11, scopeLine: 22, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!11 = !DISubroutineType(cc: DW_CC_normal, types: !12)
+!12 = !{null, !13, !13, !13, !13, !13, !13, !13, !13, !13, !14, !14, !15, !15}
+!13 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !9, size: 64, dwarfAddressSpace: 1)
+!14 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!15 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !16, size: 64, dwarfAddressSpace: 1)
+!16 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!17 = !DILocation(line: 92, column: 5, scope: !10)
+!18 = !DILocation(line: 27, column: 15, scope: !10)
+!19 = !DILocation(line: 28, column: 24, scope: !10)
+!20 = !DILocation(line: 28, column: 14, scope: !10)
+!21 = !DILocation(line: 29, column: 13, scope: !10)
+!22 = !DILocation(line: 43, column: 42, scope: !10)
+!23 = !DILocation(line: 43, column: 35, scope: !10)
+!24 = !DILocation(line: 43, column: 16, scope: !10)
+!25 = !DILocation(line: 44, column: 16, scope: !10)
+!26 = !DILocation(line: 45, column: 16, scope: !10)
+!27 = !DILocation(line: 46, column: 16, scope: !10)
+!28 = !DILocation(line: 48, column: 16, scope: !10)
+!29 = !DILocation(line: 50, column: 30, scope: !30, inlinedAt: !32)
+!30 = distinct !DILexicalBlockFile(scope: !10, file: !31, discriminator: 0)
+!31 = !DIFile(filename: "standard.py", directory: "/opt/conda/envs/py_3.10/lib/python3.10/site-packages/triton/language")
+!32 = !DILocation(line: 49, column: 16, scope: !33)
+!33 = distinct !DILexicalBlockFile(scope: !10, file: !1, discriminator: 0)
+!34 = !DILocation(line: 50, column: 21, scope: !30, inlinedAt: !32)
+!35 = !DILocation(line: 50, column: 17, scope: !30, inlinedAt: !32)
+!36 = !DILocation(line: 50, column: 12, scope: !30, inlinedAt: !32)
+!37 = !DILocation(line: 50, column: 16, scope: !10)
+!38 = !DILocation(line: 51, column: 16, scope: !10)
+!39 = !DILocation(line: 53, column: 17, scope: !10)
+!40 = !DILocation(line: 55, column: 17, scope: !10)
+!41 = !DILocation(line: 56, column: 17, scope: !10)
+!42 = !DILocation(line: 58, column: 17, scope: !10)
+!43 = !DILocation(line: 59, column: 17, scope: !10)
+!44 = !DILocation(line: 60, column: 17, scope: !10)
+!45 = !DILocation(line: 61, column: 17, scope: !10)
+!46 = !DILocation(line: 62, column: 17, scope: !10)
+!47 = !DILocation(line: 64, column: 17, scope: !10)
+!48 = !DILocation(line: 65, column: 17, scope: !10)
+!49 = !DILocation(line: 66, column: 17, scope: !10)
+!50 = !DILocation(line: 67, column: 17, scope: !10)
+!51 = !DILocation(line: 68, column: 17, scope: !10)
+!52 = !DILocation(line: 69, column: 17, scope: !10)
+!53 = !DILocation(line: 70, column: 17, scope: !10)
+!54 = !DILocation(line: 71, column: 17, scope: !10)
+!55 = !DILocation(line: 72, column: 17, scope: !10)
+!56 = !DILocation(line: 73, column: 17, scope: !10)
+!57 = !DILocation(line: 76, column: 18, scope: !10)
+!58 = !DILocation(line: 82, column: 24, scope: !10)
+!59 = !DILocation(line: 83, column: 9, scope: !10)
+!60 = !DILocation(line: 37, column: 5, scope: !10)
+!61 = !DILocation(line: 38, column: 20, scope: !10)
+!62 = !DILocation(line: 75, column: 17, scope: !10)
+!63 = !DILocation(line: 222, column: 17, scope: !64, inlinedAt: !66)
+!64 = distinct !DILexicalBlockFile(scope: !10, file: !65, discriminator: 0)
+!65 = !DIFile(filename: "triton_helpers.py", directory: "/dockerx/meta-tuning/pytorch/torch/_inductor/runtime")
+!66 = !DILocation(line: 77, column: 61, scope: !33)
+!67 = !DILocation(line: 223, column: 22, scope: !64, inlinedAt: !66)
+!68 = !DILocation(line: 224, column: 27, scope: !64, inlinedAt: !66)
+!69 = !DILocation(line: 224, column: 20, scope: !64, inlinedAt: !66)
+!70 = !DILocation(line: 225, column: 32, scope: !64, inlinedAt: !66)
+!71 = !DILocation(line: 225, column: 23, scope: !64, inlinedAt: !66)
+!72 = !DILocation(line: 225, column: 18, scope: !64, inlinedAt: !66)
+!73 = !DILocation(line: 80, column: 22, scope: !10)
+!74 = !DILocation(line: 81, column: 20, scope: !10)
+!75 = distinct !{!75, !76}
+!76 = !{!"llvm.loop.peeled.count", i32 1}
+!77 = !DILocation(line: 293, column: 12, scope: !30, inlinedAt: !78)
+!78 = !DILocation(line: 84, column: 13, scope: !33)
+!79 = !DILocation(line: 263, column: 12, scope: !30, inlinedAt: !77)
+!80 = !DILocation(line: 84, column: 13, scope: !10)
+!81 = !DILocation(line: 243, column: 12, scope: !64, inlinedAt: !82)
+!82 = !DILocation(line: 85, column: 27, scope: !33)
+!83 = !DILocation(line: 231, column: 13, scope: !64, inlinedAt: !81)
+!84 = !DILocation(line: 232, column: 18, scope: !64, inlinedAt: !81)
+!85 = !DILocation(line: 233, column: 26, scope: !64, inlinedAt: !81)
+!86 = !DILocation(line: 233, column: 50, scope: !64, inlinedAt: !81)
+!87 = !DILocation(line: 233, column: 17, scope: !64, inlinedAt: !81)
+!88 = !DILocation(line: 235, column: 18, scope: !64, inlinedAt: !81)
+!89 = !DILocation(line: 235, column: 9, scope: !64, inlinedAt: !81)
+!90 = !DILocation(line: 236, column: 9, scope: !64, inlinedAt: !81)
+!91 = !DILocation(line: 236, column: 23, scope: !64, inlinedAt: !81)
+!92 = !DILocation(line: 86, column: 13, scope: !10)
+!93 = !DILocation(line: 87, column: 13, scope: !10)
+!94 = !DILocation(line: 88, column: 13, scope: !10)
+!95 = !DILocation(line: 89, column: 5, scope: !10)
+!96 = !DILocation(line: 90, column: 5, scope: !10)
+!97 = !DILocation(line: 91, column: 5, scope: !10)
+!98 = !DILocation(line: 22, column: 1, scope: !10)

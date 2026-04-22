@@ -3394,7 +3394,48 @@ class CachingAutotuner(KernelInterface):
                         print(msg, flush=True)
                         log.warning(msg)
                     else:
-                        self.launchers = [builtins.min(filtered_timings, key=filtered_timings.get)]
+                        _winner = builtins.min(filtered_timings, key=filtered_timings.get)
+                        _winner_t = filtered_timings[_winner]
+
+                        # YBLOCK-stability veto (2D pointwise kernels only):
+                        # If the real-bench winner has YBLOCK=1 AND a YBLOCK≥4
+                        # config is available in the pool with timing ≤ 30% slower,
+                        # prefer the YBLOCK≥4 config.
+                        #
+                        # Rationale: torch.compile's dynamic-shape caching reuses a
+                        # compiled kernel across all shapes of the same kernel fn.
+                        # At a small launch-bound shape (e.g. 32 K elements) all
+                        # configs measure ~20 µs due to kernel-launch noise, so
+                        # YBLOCK=1 can appear marginally fastest.  At large shapes
+                        # (16 M elements with permuted / non-contiguous access),
+                        # YBLOCK=1 destroys Y-direction cache locality → 3–7× slower.
+                        # The YBLOCK-floor penalty in the scoring model (−20 % for
+                        # YBLOCK=1) prevents these configs from entering top-N; this
+                        # veto is a belt-and-suspenders fallback for edge cases where
+                        # the scoring does not fully suppress YBLOCK=1.
+                        if (not _is_reduction_kernel
+                                and _winner.config.kwargs.get('YBLOCK') == 1
+                                and _winner_t < float("inf")):
+                            _y4_candidates = [
+                                (t, lnch)
+                                for lnch, t in filtered_timings.items()
+                                if lnch.config.kwargs.get('YBLOCK', 0) >= 4
+                                and t < float("inf")
+                            ]
+                            if _y4_candidates:
+                                _y4_t, _y4_lnch = min(_y4_candidates, key=lambda x: x[0])
+                                if _y4_t <= _winner_t * 1.30:
+                                    _winner = _y4_lnch
+                                    _y4_yb  = _y4_lnch.config.kwargs.get('YBLOCK')
+                                    _veto_msg = (
+                                        f"[HEURISTICS] YBLOCK-stability veto: using YBLOCK={_y4_yb} "
+                                        f"({_y4_t:.6f}ms) over YBLOCK=1 ({_winner_t:.6f}ms) "
+                                        f"for better large-shape generalization"
+                                    )
+                                    print(_veto_msg, flush=True)
+                                    log.info(_veto_msg)
+
+                        self.launchers = [_winner]
 
                         # Log that we're restricting selection
                         msg = (
@@ -3508,6 +3549,76 @@ class CachingAutotuner(KernelInterface):
         self.autotune_time_taken_ns = (
             self.precompile_time_taken_ns + benchmark_time_taken_ns
         )
+
+        # ── Per-kernel timing instrumentation ─────────────────────────────────
+        # Writes a JSONL record when _INDUCTOR_KERNEL_LOG_FILE is set.
+        # Each record captures the selected winner AND the global best across
+        # all benchmarked configs, enabling post-run comparison between modes.
+        #
+        # Usage:
+        #   _INDUCTOR_KERNEL_LOG_FILE=/tmp/run.jsonl \
+        #   _BENCH_MODE_LABEL=autotune \
+        #   python benchmark_pointwise.py
+        #
+        # The kernel_id (kernel_name + size_hints) is stable across runs for
+        # the same model, allowing records from different mode runs to be
+        # joined by kernel_id in the analysis script.
+        _klog_file = os.environ.get("_INDUCTOR_KERNEL_LOG_FILE", "")
+        if _klog_file and timings:
+            try:
+                import json as _json
+
+                def _cfg_dict(lnch):
+                    kw = lnch.config.kwargs
+                    d = {k: kw[k] for k in ("XBLOCK", "YBLOCK", "ZBLOCK", "R0_BLOCK") if kw.get(k) is not None}
+                    d["num_warps"] = lnch.config.num_warps
+                    wpe = kw.get("waves_per_eu") or 0
+                    if wpe:
+                        d["waves_per_eu"] = wpe
+                    ns = getattr(lnch.config, "num_stages", None)
+                    if ns and ns > 1:
+                        d["num_stages"] = ns
+                    return d
+
+                _chosen   = self.launchers[0]
+                _chosen_t = timings.get(_chosen, float("inf"))
+                _gbest    = builtins.min(timings, key=timings.get)
+                _gbest_t  = timings[_gbest]
+
+                # Top-20 timings sorted fastest-first (skip inf)
+                _sorted_t = sorted(
+                    ((t, l) for l, t in timings.items() if t != float("inf")),
+                )
+                _top_timings = [
+                    {"config": _cfg_dict(l), "time_ms": t}
+                    for t, l in _sorted_t[:20]
+                ]
+
+                _record = {
+                    "kernel_name":    self.fn.__name__,
+                    "size_hints":     dict(self.size_hints) if self.size_hints else {},
+                    "heuristic_type": (self.heuristic_type.name
+                                       if hasattr(self.heuristic_type, "name")
+                                       else str(self.heuristic_type)),
+                    "mode_label":     os.environ.get("_BENCH_MODE_LABEL", "unknown"),
+                    # kernel_file is the path to the .py file that contains the Triton
+                    # kernel definition + the standalone benchmark harness
+                    # (generated when TORCHINDUCTOR_BENCHMARK_KERNEL=1).
+                    # Running `python <kernel_file>` with the same TORCHINDUCTOR_CACHE_DIR
+                    # gives a thermal-stable, application-noise-free timing for the
+                    # already-selected winner config (loaded from the autotune disk cache).
+                    "kernel_file":    self.filename if self.filename else None,
+                    "winner_config":  _cfg_dict(_chosen),
+                    "winner_time_ms": _chosen_t if _chosen_t != float("inf") else None,
+                    "global_best_config":  _cfg_dict(_gbest),
+                    "global_best_time_ms": _gbest_t if _gbest_t != float("inf") else None,
+                    "n_configs":      len(timings),
+                    "top_timings":    _top_timings,
+                }
+                with open(_klog_file, "a") as _kf:
+                    _kf.write(_json.dumps(_record) + "\n")
+            except Exception:
+                pass  # never crash autotune for logging
 
         # log the best config
         launcher = self.launchers[0]

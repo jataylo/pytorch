@@ -941,6 +941,22 @@ class PointwiseHeuristics:
                 # Partial software-pipelining benefit.
                 ilp_ceiling = 0.766 + 0.164 * ilp_scale  # 0.766 → 0.930
                 base_score = max(base_score, ilp_ceiling)
+            elif elems_per_thread >= 2:
+                # Two elements per thread: the compiler issues two independent
+                # loads per thread (one-level unroll), hiding most of the
+                # first HBM round-trip without the full EPT≥4 pipeline.  For
+                # tiny LAUNCH-BOUND kernels (few blocks, ≤25% CU util) the
+                # Ohd_µs time-model already captures the launch-overhead
+                # benefit of using fewer warps; applying the full under-natural
+                # penalty (0.875 for num_warps = natural/2) then double-counts
+                # that cost.  Grant a partial ILP ceiling to counteract this:
+                #   0.766 + 0.259 * ilp_scale  → 0.766 at 0% util, 1.025→1.0 at 100%
+                # At our typical case (32 blocks / 256 CUs → ilp_scale = 0.5)
+                # the ceiling is 0.766 + 0.130 = 0.896, which lifts the
+                # under-natural score (0.875) just enough to signal that EPT=2
+                # is nearly as good as the natural warp count for this regime.
+                ilp_ceiling = min(1.0, 0.766 + 0.259 * ilp_scale)  # 0.766 → 1.0
+                base_score = max(base_score, ilp_ceiling)
 
         # ── AMD-only: waves_per_eu correction (only when feature is enabled) ──
         # waves_per_eu > 0 means the LLVM backend plans for N concurrent
@@ -1112,8 +1128,8 @@ class PointwiseHeuristics:
                 (occupancy   ** occ_exp)
             ) ** (1.0 / total_exp)
 
-            # 2-D tie-breaker: mildly penalise extreme tile-shape asymmetry
-            # and sub-cache-line XBLOCK.
+            # 2-D tie-breaker: penalise extreme tile-shape asymmetry,
+            # sub-cache-line XBLOCK, and critically — YBLOCK=1.
             #
             # balance_multiplier: penalises tiles with very high aspect ratio
             # (XBLOCK >> YBLOCK, e.g. 4096×4 or 4096×1).  Empirical data
@@ -1129,6 +1145,21 @@ class PointwiseHeuristics:
             #
             # innermost_multiplier: penalises XBLOCK < 32 (sub-cache-line X
             # loads waste bandwidth).
+            #
+            # yblock_floor_mult: YBLOCK < 4 is the dominant cause of 3–7×
+            # performance collapse on non-contiguous 2D kernels (permuted
+            # tensors, 3D layouts flattened to 2D).  The compiled kernel is
+            # often reused across multiple tensor shapes via torch.compile's
+            # dynamic-shape caching; a config chosen at a small launch-bound
+            # shape (where all configs measure ~20 µs regardless of YBLOCK)
+            # generalises poorly to large shapes where YBLOCK=1 destroys
+            # Y-direction cache locality.  The balance_multiplier alone
+            # (−4 % at ratio=256) is insufficient.  A dedicated floor penalty
+            # of −20 % at YBLOCK=1 and −10 % at YBLOCK=2 pushes these configs
+            # out of the top-N pool so they are never selected by real-bench:
+            #   YBLOCK ≥ 4: 0 % penalty
+            #   YBLOCK = 2: −10 %
+            #   YBLOCK = 1: −20 %
             #
             # Skip entirely for single-block configs (tile covers whole problem,
             # shape has no effect on memory access patterns).
@@ -1151,7 +1182,10 @@ class PointwiseHeuristics:
                 _cl_elems           = _2d_arch.cacheline_bytes // 4
                 _cl_log2            = math.log2(max(_cl_elems, 4))
                 innermost_multiplier = 1.0 - 0.05 * max(0, _cl_log2 - math.log2(max(xblock, 4)))
-                score *= max(0.90, balance_multiplier * innermost_multiplier)
+                # YBLOCK-floor penalty: graduated penalty for YBLOCK < 4.
+                # log2(1)=0 → -20%, log2(2)=1 → -10%, log2(4)=2 → 0%.
+                yblock_floor_mult   = 1.0 - 0.10 * max(0.0, 2.0 - math.log2(max(yblock, 1)))
+                score *= max(0.75, balance_multiplier * innermost_multiplier * yblock_floor_mult)
 
             # 3-D tie-breaker: for cube-like problems mildly prefer balanced
             # tile shapes and a minimum YBLOCK (elongated tiles coalesce poorly
@@ -1685,6 +1719,34 @@ class PointwiseHeuristics:
                     selected.sort(key=lambda x: x[0])   # ascending → [0] is lowest
                     selected[0] = best_4w
                     selected.sort(key=lambda x: x[0], reverse=True)  # restore descending
+
+        # YBLOCK≥4 guarantee — for 2-D kernels ensure the pool always contains
+        # at least one config with YBLOCK ≥ 4.
+        #
+        # Rationale: the YBLOCK-floor scoring penalty (−20 % for YBLOCK=1,
+        # −10 % for YBLOCK=2) strongly discourages low-YBLOCK configs in the
+        # primary pool.  However, with the diversity cap at 2 per (XBLOCK,YBLOCK)
+        # tile and a small top_n (e.g. top_n=3), it is possible for all slots to
+        # be filled by high-scoring YBLOCK=2 configs before any YBLOCK≥4 config
+        # is admitted.  This guarantee ensures that even in such edge cases a
+        # balanced tile is always reachable by the real-bench.
+        #
+        # Applied to 2-D problems at top_n ≥ 3 only; at top_n=1 we take the
+        # highest-scoring config unconditionally (which the scoring model already
+        # biases toward YBLOCK≥4 via the floor penalty).
+        if top_n >= 3 and ndims == 2:
+            _sel_ids_y4 = {id(cfg) for _, cfg in selected}
+            _has_y4 = any(cfg.get('YBLOCK', 0) >= 4 for _, cfg in selected)
+            if not _has_y4:
+                _best_y4 = next(
+                    ((s, cfg) for s, cfg in scored
+                     if cfg.get('YBLOCK', 0) >= 4 and id(cfg) not in _sel_ids_y4),
+                    None,
+                )
+                if _best_y4 is not None:
+                    selected.sort(key=lambda x: x[0])   # ascending → [0] is lowest
+                    selected[0] = _best_y4
+                    selected.sort(key=lambda x: x[0], reverse=True)
 
         # Large-XBLOCK guarantee — for 1-D kernels with total_elements ≥ 16384,
         # ensure the pool contains at least one config with XBLOCK=4096 nw=4.

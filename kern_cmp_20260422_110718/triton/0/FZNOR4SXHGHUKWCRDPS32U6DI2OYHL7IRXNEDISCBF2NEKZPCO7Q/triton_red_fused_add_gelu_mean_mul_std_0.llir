@@ -1,0 +1,1947 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+target triple = "amdgcn-amd-amdhsa"
+
+; Function Attrs: nofree norecurse nounwind memory(argmem: readwrite)
+define amdgpu_kernel void @triton_red_fused_add_gelu_mean_mul_std_0(ptr addrspace(1) inreg readonly captures(none) %0, ptr addrspace(1) inreg readonly captures(none) %1, ptr addrspace(1) inreg readonly captures(none) %2, ptr addrspace(1) inreg readonly captures(none) %3, ptr addrspace(1) inreg readonly captures(none) %4, ptr addrspace(1) inreg writeonly captures(none) %5, ptr addrspace(1) inreg writeonly captures(none) %6, ptr addrspace(1) inreg writeonly captures(none) %7, ptr addrspace(1) inreg writeonly captures(none) %8, ptr addrspace(1) inreg writeonly captures(none) %9, i32 inreg %10, i32 inreg %11, ptr addrspace(1) inreg readnone captures(none) %12, ptr addrspace(1) inreg readnone captures(none) %13) local_unnamed_addr #0 !dbg !6 {
+  %15 = tail call i32 @llvm.amdgcn.workgroup.id.x(), !dbg !14
+  %16 = shl i32 %15, 6, !dbg !14
+  %17 = tail call i32 @llvm.amdgcn.workitem.id.x(), !dbg !15
+  %18 = and i32 %17, 63, !dbg !15
+  %19 = lshr i32 %17, 1, !dbg !15
+  %20 = and i32 %19, 31, !dbg !15
+  %21 = or disjoint i32 %20, %16, !dbg !16
+  %22 = or disjoint i32 %16, %18, !dbg !16
+  %23 = icmp slt i32 %21, 128, !dbg !17
+  %24 = icmp slt i32 %22, 128, !dbg !17
+  %25 = and i32 %17, 1, !dbg !18
+  %26 = icmp eq i32 %25, 0, !dbg !18
+  %27 = shl nuw nsw i32 %25, 2, !dbg !18
+  %28 = shl i32 %21, 13, !dbg !19
+  %29 = or disjoint i32 %28, 262144, !dbg !19
+  %30 = or disjoint i32 %28, %27, !dbg !20
+  %31 = or disjoint i32 %29, %27, !dbg !20
+  %32 = sext i32 %31 to i64, !dbg !21
+  %33 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %32, !dbg !21
+  br i1 %23, label %34, label %38, !dbg !22
+
+34:                                               ; preds = %14
+  %35 = sext i32 %30 to i64
+  %36 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %35
+  %37 = load <4 x float>, ptr addrspace(1) %36, align 16, !dbg !22
+  br label %38, !dbg !22
+
+38:                                               ; preds = %34, %14
+  %39 = phi <4 x float> [ %37, %34 ], [ zeroinitializer, %14 ], !dbg !22
+  br i1 %23, label %40, label %42, !dbg !22
+
+40:                                               ; preds = %38
+  %41 = load <4 x float>, ptr addrspace(1) %33, align 16, !dbg !22
+  br label %42, !dbg !22
+
+42:                                               ; preds = %40, %38
+  %43 = phi <4 x float> [ %41, %40 ], [ zeroinitializer, %38 ], !dbg !22
+  %44 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %32, !dbg !23
+  br i1 %23, label %45, label %49, !dbg !24
+
+45:                                               ; preds = %42
+  %46 = sext i32 %30 to i64
+  %47 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %46
+  %48 = load <4 x float>, ptr addrspace(1) %47, align 16, !dbg !24
+  br label %49, !dbg !24
+
+49:                                               ; preds = %45, %42
+  %50 = phi <4 x float> [ %48, %45 ], [ zeroinitializer, %42 ], !dbg !24
+  br i1 %23, label %51, label %53, !dbg !24
+
+51:                                               ; preds = %49
+  %52 = load <4 x float>, ptr addrspace(1) %44, align 16, !dbg !24
+  br label %53, !dbg !24
+
+53:                                               ; preds = %51, %49
+  %54 = phi <4 x float> [ %52, %51 ], [ zeroinitializer, %49 ], !dbg !24
+  %55 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %32, !dbg !25
+  br i1 %23, label %56, label %60, !dbg !26
+
+56:                                               ; preds = %53
+  %57 = sext i32 %30 to i64
+  %58 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %57
+  %59 = load <4 x float>, ptr addrspace(1) %58, align 16, !dbg !26
+  br label %60, !dbg !26
+
+60:                                               ; preds = %56, %53
+  %61 = phi <4 x float> [ %59, %56 ], [ zeroinitializer, %53 ], !dbg !26
+  br i1 %23, label %62, label %64, !dbg !26
+
+62:                                               ; preds = %60
+  %63 = load <4 x float>, ptr addrspace(1) %55, align 16, !dbg !26
+  br label %64, !dbg !26
+
+64:                                               ; preds = %62, %60
+  %65 = phi <4 x float> [ %63, %62 ], [ zeroinitializer, %60 ], !dbg !26
+  %66 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %32, !dbg !27
+  br i1 %23, label %67, label %71, !dbg !28
+
+67:                                               ; preds = %64
+  %68 = sext i32 %30 to i64
+  %69 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %68
+  %70 = load <4 x float>, ptr addrspace(1) %69, align 16, !dbg !28
+  br label %71, !dbg !28
+
+71:                                               ; preds = %67, %64
+  %72 = phi <4 x float> [ %70, %67 ], [ zeroinitializer, %64 ], !dbg !28
+  br i1 %23, label %73, label %75, !dbg !28
+
+73:                                               ; preds = %71
+  %74 = load <4 x float>, ptr addrspace(1) %66, align 16, !dbg !28
+  br label %75, !dbg !28
+
+75:                                               ; preds = %73, %71
+  %76 = phi <4 x float> [ %74, %73 ], [ zeroinitializer, %71 ], !dbg !28
+  %77 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %32, !dbg !29
+  br i1 %23, label %78, label %82, !dbg !30
+
+78:                                               ; preds = %75
+  %79 = sext i32 %30 to i64
+  %80 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %79
+  %81 = load <4 x float>, ptr addrspace(1) %80, align 16, !dbg !30
+  br label %82, !dbg !30
+
+82:                                               ; preds = %78, %75
+  %83 = phi <4 x float> [ %81, %78 ], [ zeroinitializer, %75 ], !dbg !30
+  br i1 %23, label %84, label %.peel.begin, !dbg !30
+
+84:                                               ; preds = %82
+  %85 = load <4 x float>, ptr addrspace(1) %77, align 16, !dbg !30
+  br label %.peel.begin, !dbg !30
+
+.peel.begin:                                      ; preds = %84, %82
+  %86 = phi <4 x float> [ %85, %84 ], [ zeroinitializer, %82 ], !dbg !30
+  %87 = or disjoint i32 %27, 8, !dbg !31
+  %88 = or disjoint i32 %87, %28, !dbg !20
+  %89 = or disjoint i32 %87, %29, !dbg !20
+  %90 = sext i32 %89 to i64, !dbg !21
+  %91 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %90, !dbg !21
+  br i1 %23, label %92, label %96, !dbg !22
+
+92:                                               ; preds = %.peel.begin
+  %93 = sext i32 %88 to i64
+  %94 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %93
+  %95 = load <4 x float>, ptr addrspace(1) %94, align 16, !dbg !22
+  br label %96, !dbg !22
+
+96:                                               ; preds = %92, %.peel.begin
+  %97 = phi <4 x float> [ %95, %92 ], [ zeroinitializer, %.peel.begin ], !dbg !22
+  br i1 %23, label %98, label %100, !dbg !22
+
+98:                                               ; preds = %96
+  %99 = load <4 x float>, ptr addrspace(1) %91, align 16, !dbg !22
+  br label %100, !dbg !22
+
+100:                                              ; preds = %98, %96
+  %101 = phi <4 x float> [ %99, %98 ], [ zeroinitializer, %96 ], !dbg !22
+  %102 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %90, !dbg !23
+  br i1 %23, label %103, label %107, !dbg !24
+
+103:                                              ; preds = %100
+  %104 = sext i32 %88 to i64
+  %105 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %104
+  %106 = load <4 x float>, ptr addrspace(1) %105, align 16, !dbg !24
+  br label %107, !dbg !24
+
+107:                                              ; preds = %103, %100
+  %108 = phi <4 x float> [ %106, %103 ], [ zeroinitializer, %100 ], !dbg !24
+  br i1 %23, label %109, label %111, !dbg !24
+
+109:                                              ; preds = %107
+  %110 = load <4 x float>, ptr addrspace(1) %102, align 16, !dbg !24
+  br label %111, !dbg !24
+
+111:                                              ; preds = %109, %107
+  %112 = phi <4 x float> [ %110, %109 ], [ zeroinitializer, %107 ], !dbg !24
+  %113 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %90, !dbg !25
+  br i1 %23, label %114, label %118, !dbg !26
+
+114:                                              ; preds = %111
+  %115 = sext i32 %88 to i64
+  %116 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %115
+  %117 = load <4 x float>, ptr addrspace(1) %116, align 16, !dbg !26
+  br label %118, !dbg !26
+
+118:                                              ; preds = %114, %111
+  %119 = phi <4 x float> [ %117, %114 ], [ zeroinitializer, %111 ], !dbg !26
+  br i1 %23, label %120, label %122, !dbg !26
+
+120:                                              ; preds = %118
+  %121 = load <4 x float>, ptr addrspace(1) %113, align 16, !dbg !26
+  br label %122, !dbg !26
+
+122:                                              ; preds = %120, %118
+  %123 = phi <4 x float> [ %121, %120 ], [ zeroinitializer, %118 ], !dbg !26
+  %124 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %90, !dbg !27
+  br i1 %23, label %125, label %129, !dbg !28
+
+125:                                              ; preds = %122
+  %126 = sext i32 %88 to i64
+  %127 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %126
+  %128 = load <4 x float>, ptr addrspace(1) %127, align 16, !dbg !28
+  br label %129, !dbg !28
+
+129:                                              ; preds = %125, %122
+  %130 = phi <4 x float> [ %128, %125 ], [ zeroinitializer, %122 ], !dbg !28
+  br i1 %23, label %131, label %133, !dbg !28
+
+131:                                              ; preds = %129
+  %132 = load <4 x float>, ptr addrspace(1) %124, align 16, !dbg !28
+  br label %133, !dbg !28
+
+133:                                              ; preds = %131, %129
+  %134 = phi <4 x float> [ %132, %131 ], [ zeroinitializer, %129 ], !dbg !28
+  %135 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %90, !dbg !29
+  br i1 %23, label %136, label %140, !dbg !30
+
+136:                                              ; preds = %133
+  %137 = sext i32 %88 to i64
+  %138 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %137
+  %139 = load <4 x float>, ptr addrspace(1) %138, align 16, !dbg !30
+  br label %140, !dbg !30
+
+140:                                              ; preds = %136, %133
+  %141 = phi <4 x float> [ %139, %136 ], [ zeroinitializer, %133 ], !dbg !30
+  br i1 %23, label %142, label %144, !dbg !30
+
+142:                                              ; preds = %140
+  %143 = load <4 x float>, ptr addrspace(1) %135, align 16, !dbg !30
+  br label %144, !dbg !30
+
+144:                                              ; preds = %142, %140
+  %145 = phi <4 x float> [ %143, %142 ], [ zeroinitializer, %140 ], !dbg !30
+  %146 = shufflevector <4 x float> %39, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !32
+  %147 = fmul <4 x float> %39, %50, !dbg !32
+  %148 = shufflevector <4 x float> %39, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !32
+  %149 = fmul <4 x float> %39, %50, !dbg !32
+  %150 = shufflevector <4 x float> %43, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !32
+  %151 = fmul <4 x float> %43, %54, !dbg !32
+  %152 = shufflevector <4 x float> %43, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !32
+  %153 = fmul <4 x float> %43, %54, !dbg !32
+  %154 = fadd <4 x float> %147, %61, !dbg !33
+  %155 = shufflevector <4 x float> %154, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !33
+  %156 = fadd <4 x float> %149, %61, !dbg !33
+  %157 = shufflevector <4 x float> %156, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !33
+  %158 = fadd <4 x float> %151, %65, !dbg !33
+  %159 = shufflevector <4 x float> %158, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !33
+  %160 = fadd <4 x float> %153, %65, !dbg !33
+  %161 = shufflevector <4 x float> %160, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !33
+  %162 = fmul <2 x float> %155, splat (float 5.000000e-01), !dbg !34
+  %163 = fmul <2 x float> %157, splat (float 5.000000e-01), !dbg !34
+  %164 = fmul <2 x float> %159, splat (float 5.000000e-01), !dbg !34
+  %165 = fmul <2 x float> %161, splat (float 5.000000e-01), !dbg !34
+  %166 = extractelement <4 x float> %154, i64 0, !dbg !35
+  %167 = fmul float %166, 0x3FE6A09E60000000, !dbg !35
+  %168 = extractelement <4 x float> %154, i64 1, !dbg !35
+  %169 = fmul float %168, 0x3FE6A09E60000000, !dbg !35
+  %170 = extractelement <4 x float> %156, i64 2, !dbg !35
+  %171 = fmul float %170, 0x3FE6A09E60000000, !dbg !35
+  %172 = extractelement <4 x float> %156, i64 3, !dbg !35
+  %173 = fmul float %172, 0x3FE6A09E60000000, !dbg !35
+  %174 = extractelement <4 x float> %158, i64 0, !dbg !35
+  %175 = fmul float %174, 0x3FE6A09E60000000, !dbg !35
+  %176 = extractelement <4 x float> %158, i64 1, !dbg !35
+  %177 = fmul float %176, 0x3FE6A09E60000000, !dbg !35
+  %178 = extractelement <4 x float> %160, i64 2, !dbg !35
+  %179 = fmul float %178, 0x3FE6A09E60000000, !dbg !35
+  %180 = extractelement <4 x float> %160, i64 3, !dbg !35
+  %181 = fmul float %180, 0x3FE6A09E60000000, !dbg !35
+  %182 = tail call float @llvm.fabs.f32(float %167), !dbg !36
+  %183 = fcmp olt float %182, 1.000000e+00, !dbg !36
+  br i1 %183, label %195, label %184, !dbg !36
+
+184:                                              ; preds = %144
+  %185 = tail call noundef float @llvm.fmuladd.f32(float %182, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %186 = tail call noundef float @llvm.fmuladd.f32(float %182, float %185, float 0x3F6F9A6D20000000), !dbg !36
+  %187 = tail call noundef float @llvm.fmuladd.f32(float %182, float %186, float 0xBF98C31640000000), !dbg !36
+  %188 = tail call noundef float @llvm.fmuladd.f32(float %182, float %187, float 0x3FBB4E9C80000000), !dbg !36
+  %189 = tail call noundef float @llvm.fmuladd.f32(float %182, float %188, float 0x3FE4515FA0000000), !dbg !36
+  %190 = tail call noundef float @llvm.fmuladd.f32(float %182, float %189, float 0x3FC078E500000000), !dbg !36
+  %191 = tail call float @llvm.fma.f32(float %182, float %190, float %182), !dbg !36
+  %192 = fneg float %191, !dbg !36
+  %193 = tail call noundef float @llvm.exp.f32(float %192), !dbg !36
+  %194 = fsub float 1.000000e+00, %193, !dbg !36
+  br label %__ocml_erf_f32.exit.peel, !dbg !36
+
+195:                                              ; preds = %144
+  %196 = fmul nnan float %167, %167, !dbg !36
+  %197 = tail call noundef float @llvm.fmuladd.f32(float %196, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %198 = tail call noundef float @llvm.fmuladd.f32(float %196, float %197, float 0xBF9B593700000000), !dbg !36
+  %199 = tail call noundef float @llvm.fmuladd.f32(float %196, float %198, float 0x3FBCE077C0000000), !dbg !36
+  %200 = tail call noundef float @llvm.fmuladd.f32(float %196, float %199, float 0xBFD8126600000000), !dbg !36
+  %201 = tail call noundef float @llvm.fmuladd.f32(float %196, float %200, float 0x3FC06EBA00000000), !dbg !36
+  %202 = tail call float @llvm.fma.f32(float %182, float %201, float %182), !dbg !36
+  br label %__ocml_erf_f32.exit.peel, !dbg !36
+
+__ocml_erf_f32.exit.peel:                         ; preds = %195, %184
+  %203 = phi float [ %202, %195 ], [ %194, %184 ], !dbg !36
+  %204 = tail call noundef float @llvm.copysign.f32(float %203, float %167), !dbg !36
+  %205 = tail call float @llvm.fabs.f32(float %169), !dbg !36
+  %206 = fcmp olt float %205, 1.000000e+00, !dbg !36
+  br i1 %206, label %218, label %207, !dbg !36
+
+207:                                              ; preds = %__ocml_erf_f32.exit.peel
+  %208 = tail call noundef float @llvm.fmuladd.f32(float %205, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %209 = tail call noundef float @llvm.fmuladd.f32(float %205, float %208, float 0x3F6F9A6D20000000), !dbg !36
+  %210 = tail call noundef float @llvm.fmuladd.f32(float %205, float %209, float 0xBF98C31640000000), !dbg !36
+  %211 = tail call noundef float @llvm.fmuladd.f32(float %205, float %210, float 0x3FBB4E9C80000000), !dbg !36
+  %212 = tail call noundef float @llvm.fmuladd.f32(float %205, float %211, float 0x3FE4515FA0000000), !dbg !36
+  %213 = tail call noundef float @llvm.fmuladd.f32(float %205, float %212, float 0x3FC078E500000000), !dbg !36
+  %214 = tail call float @llvm.fma.f32(float %205, float %213, float %205), !dbg !36
+  %215 = fneg float %214, !dbg !36
+  %216 = tail call noundef float @llvm.exp.f32(float %215), !dbg !36
+  %217 = fsub float 1.000000e+00, %216, !dbg !36
+  br label %__ocml_erf_f32.exit139.peel, !dbg !36
+
+218:                                              ; preds = %__ocml_erf_f32.exit.peel
+  %219 = fmul nnan float %169, %169, !dbg !36
+  %220 = tail call noundef float @llvm.fmuladd.f32(float %219, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %221 = tail call noundef float @llvm.fmuladd.f32(float %219, float %220, float 0xBF9B593700000000), !dbg !36
+  %222 = tail call noundef float @llvm.fmuladd.f32(float %219, float %221, float 0x3FBCE077C0000000), !dbg !36
+  %223 = tail call noundef float @llvm.fmuladd.f32(float %219, float %222, float 0xBFD8126600000000), !dbg !36
+  %224 = tail call noundef float @llvm.fmuladd.f32(float %219, float %223, float 0x3FC06EBA00000000), !dbg !36
+  %225 = tail call float @llvm.fma.f32(float %205, float %224, float %205), !dbg !36
+  br label %__ocml_erf_f32.exit139.peel, !dbg !36
+
+__ocml_erf_f32.exit139.peel:                      ; preds = %218, %207
+  %226 = phi float [ %225, %218 ], [ %217, %207 ], !dbg !36
+  %227 = tail call noundef float @llvm.copysign.f32(float %226, float %169), !dbg !36
+  %228 = tail call float @llvm.fabs.f32(float %171), !dbg !36
+  %229 = fcmp olt float %228, 1.000000e+00, !dbg !36
+  br i1 %229, label %241, label %230, !dbg !36
+
+230:                                              ; preds = %__ocml_erf_f32.exit139.peel
+  %231 = tail call noundef float @llvm.fmuladd.f32(float %228, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %232 = tail call noundef float @llvm.fmuladd.f32(float %228, float %231, float 0x3F6F9A6D20000000), !dbg !36
+  %233 = tail call noundef float @llvm.fmuladd.f32(float %228, float %232, float 0xBF98C31640000000), !dbg !36
+  %234 = tail call noundef float @llvm.fmuladd.f32(float %228, float %233, float 0x3FBB4E9C80000000), !dbg !36
+  %235 = tail call noundef float @llvm.fmuladd.f32(float %228, float %234, float 0x3FE4515FA0000000), !dbg !36
+  %236 = tail call noundef float @llvm.fmuladd.f32(float %228, float %235, float 0x3FC078E500000000), !dbg !36
+  %237 = tail call float @llvm.fma.f32(float %228, float %236, float %228), !dbg !36
+  %238 = fneg float %237, !dbg !36
+  %239 = tail call noundef float @llvm.exp.f32(float %238), !dbg !36
+  %240 = fsub float 1.000000e+00, %239, !dbg !36
+  br label %__ocml_erf_f32.exit140.peel, !dbg !36
+
+241:                                              ; preds = %__ocml_erf_f32.exit139.peel
+  %242 = fmul nnan float %171, %171, !dbg !36
+  %243 = tail call noundef float @llvm.fmuladd.f32(float %242, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %244 = tail call noundef float @llvm.fmuladd.f32(float %242, float %243, float 0xBF9B593700000000), !dbg !36
+  %245 = tail call noundef float @llvm.fmuladd.f32(float %242, float %244, float 0x3FBCE077C0000000), !dbg !36
+  %246 = tail call noundef float @llvm.fmuladd.f32(float %242, float %245, float 0xBFD8126600000000), !dbg !36
+  %247 = tail call noundef float @llvm.fmuladd.f32(float %242, float %246, float 0x3FC06EBA00000000), !dbg !36
+  %248 = tail call float @llvm.fma.f32(float %228, float %247, float %228), !dbg !36
+  br label %__ocml_erf_f32.exit140.peel, !dbg !36
+
+__ocml_erf_f32.exit140.peel:                      ; preds = %241, %230
+  %249 = phi float [ %248, %241 ], [ %240, %230 ], !dbg !36
+  %250 = tail call noundef float @llvm.copysign.f32(float %249, float %171), !dbg !36
+  %251 = tail call float @llvm.fabs.f32(float %173), !dbg !36
+  %252 = fcmp olt float %251, 1.000000e+00, !dbg !36
+  br i1 %252, label %264, label %253, !dbg !36
+
+253:                                              ; preds = %__ocml_erf_f32.exit140.peel
+  %254 = tail call noundef float @llvm.fmuladd.f32(float %251, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %255 = tail call noundef float @llvm.fmuladd.f32(float %251, float %254, float 0x3F6F9A6D20000000), !dbg !36
+  %256 = tail call noundef float @llvm.fmuladd.f32(float %251, float %255, float 0xBF98C31640000000), !dbg !36
+  %257 = tail call noundef float @llvm.fmuladd.f32(float %251, float %256, float 0x3FBB4E9C80000000), !dbg !36
+  %258 = tail call noundef float @llvm.fmuladd.f32(float %251, float %257, float 0x3FE4515FA0000000), !dbg !36
+  %259 = tail call noundef float @llvm.fmuladd.f32(float %251, float %258, float 0x3FC078E500000000), !dbg !36
+  %260 = tail call float @llvm.fma.f32(float %251, float %259, float %251), !dbg !36
+  %261 = fneg float %260, !dbg !36
+  %262 = tail call noundef float @llvm.exp.f32(float %261), !dbg !36
+  %263 = fsub float 1.000000e+00, %262, !dbg !36
+  br label %__ocml_erf_f32.exit141.peel, !dbg !36
+
+264:                                              ; preds = %__ocml_erf_f32.exit140.peel
+  %265 = fmul nnan float %173, %173, !dbg !36
+  %266 = tail call noundef float @llvm.fmuladd.f32(float %265, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %267 = tail call noundef float @llvm.fmuladd.f32(float %265, float %266, float 0xBF9B593700000000), !dbg !36
+  %268 = tail call noundef float @llvm.fmuladd.f32(float %265, float %267, float 0x3FBCE077C0000000), !dbg !36
+  %269 = tail call noundef float @llvm.fmuladd.f32(float %265, float %268, float 0xBFD8126600000000), !dbg !36
+  %270 = tail call noundef float @llvm.fmuladd.f32(float %265, float %269, float 0x3FC06EBA00000000), !dbg !36
+  %271 = tail call float @llvm.fma.f32(float %251, float %270, float %251), !dbg !36
+  br label %__ocml_erf_f32.exit141.peel, !dbg !36
+
+__ocml_erf_f32.exit141.peel:                      ; preds = %264, %253
+  %272 = phi float [ %271, %264 ], [ %263, %253 ], !dbg !36
+  %273 = tail call noundef float @llvm.copysign.f32(float %272, float %173), !dbg !36
+  %274 = tail call float @llvm.fabs.f32(float %175), !dbg !36
+  %275 = fcmp olt float %274, 1.000000e+00, !dbg !36
+  br i1 %275, label %287, label %276, !dbg !36
+
+276:                                              ; preds = %__ocml_erf_f32.exit141.peel
+  %277 = tail call noundef float @llvm.fmuladd.f32(float %274, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %278 = tail call noundef float @llvm.fmuladd.f32(float %274, float %277, float 0x3F6F9A6D20000000), !dbg !36
+  %279 = tail call noundef float @llvm.fmuladd.f32(float %274, float %278, float 0xBF98C31640000000), !dbg !36
+  %280 = tail call noundef float @llvm.fmuladd.f32(float %274, float %279, float 0x3FBB4E9C80000000), !dbg !36
+  %281 = tail call noundef float @llvm.fmuladd.f32(float %274, float %280, float 0x3FE4515FA0000000), !dbg !36
+  %282 = tail call noundef float @llvm.fmuladd.f32(float %274, float %281, float 0x3FC078E500000000), !dbg !36
+  %283 = tail call float @llvm.fma.f32(float %274, float %282, float %274), !dbg !36
+  %284 = fneg float %283, !dbg !36
+  %285 = tail call noundef float @llvm.exp.f32(float %284), !dbg !36
+  %286 = fsub float 1.000000e+00, %285, !dbg !36
+  br label %__ocml_erf_f32.exit142.peel, !dbg !36
+
+287:                                              ; preds = %__ocml_erf_f32.exit141.peel
+  %288 = fmul nnan float %175, %175, !dbg !36
+  %289 = tail call noundef float @llvm.fmuladd.f32(float %288, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %290 = tail call noundef float @llvm.fmuladd.f32(float %288, float %289, float 0xBF9B593700000000), !dbg !36
+  %291 = tail call noundef float @llvm.fmuladd.f32(float %288, float %290, float 0x3FBCE077C0000000), !dbg !36
+  %292 = tail call noundef float @llvm.fmuladd.f32(float %288, float %291, float 0xBFD8126600000000), !dbg !36
+  %293 = tail call noundef float @llvm.fmuladd.f32(float %288, float %292, float 0x3FC06EBA00000000), !dbg !36
+  %294 = tail call float @llvm.fma.f32(float %274, float %293, float %274), !dbg !36
+  br label %__ocml_erf_f32.exit142.peel, !dbg !36
+
+__ocml_erf_f32.exit142.peel:                      ; preds = %287, %276
+  %295 = phi float [ %294, %287 ], [ %286, %276 ], !dbg !36
+  %296 = tail call noundef float @llvm.copysign.f32(float %295, float %175), !dbg !36
+  %297 = tail call float @llvm.fabs.f32(float %177), !dbg !36
+  %298 = fcmp olt float %297, 1.000000e+00, !dbg !36
+  br i1 %298, label %310, label %299, !dbg !36
+
+299:                                              ; preds = %__ocml_erf_f32.exit142.peel
+  %300 = tail call noundef float @llvm.fmuladd.f32(float %297, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %301 = tail call noundef float @llvm.fmuladd.f32(float %297, float %300, float 0x3F6F9A6D20000000), !dbg !36
+  %302 = tail call noundef float @llvm.fmuladd.f32(float %297, float %301, float 0xBF98C31640000000), !dbg !36
+  %303 = tail call noundef float @llvm.fmuladd.f32(float %297, float %302, float 0x3FBB4E9C80000000), !dbg !36
+  %304 = tail call noundef float @llvm.fmuladd.f32(float %297, float %303, float 0x3FE4515FA0000000), !dbg !36
+  %305 = tail call noundef float @llvm.fmuladd.f32(float %297, float %304, float 0x3FC078E500000000), !dbg !36
+  %306 = tail call float @llvm.fma.f32(float %297, float %305, float %297), !dbg !36
+  %307 = fneg float %306, !dbg !36
+  %308 = tail call noundef float @llvm.exp.f32(float %307), !dbg !36
+  %309 = fsub float 1.000000e+00, %308, !dbg !36
+  br label %__ocml_erf_f32.exit143.peel, !dbg !36
+
+310:                                              ; preds = %__ocml_erf_f32.exit142.peel
+  %311 = fmul nnan float %177, %177, !dbg !36
+  %312 = tail call noundef float @llvm.fmuladd.f32(float %311, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %313 = tail call noundef float @llvm.fmuladd.f32(float %311, float %312, float 0xBF9B593700000000), !dbg !36
+  %314 = tail call noundef float @llvm.fmuladd.f32(float %311, float %313, float 0x3FBCE077C0000000), !dbg !36
+  %315 = tail call noundef float @llvm.fmuladd.f32(float %311, float %314, float 0xBFD8126600000000), !dbg !36
+  %316 = tail call noundef float @llvm.fmuladd.f32(float %311, float %315, float 0x3FC06EBA00000000), !dbg !36
+  %317 = tail call float @llvm.fma.f32(float %297, float %316, float %297), !dbg !36
+  br label %__ocml_erf_f32.exit143.peel, !dbg !36
+
+__ocml_erf_f32.exit143.peel:                      ; preds = %310, %299
+  %318 = phi float [ %317, %310 ], [ %309, %299 ], !dbg !36
+  %319 = tail call noundef float @llvm.copysign.f32(float %318, float %177), !dbg !36
+  %320 = tail call float @llvm.fabs.f32(float %179), !dbg !36
+  %321 = fcmp olt float %320, 1.000000e+00, !dbg !36
+  br i1 %321, label %333, label %322, !dbg !36
+
+322:                                              ; preds = %__ocml_erf_f32.exit143.peel
+  %323 = tail call noundef float @llvm.fmuladd.f32(float %320, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %324 = tail call noundef float @llvm.fmuladd.f32(float %320, float %323, float 0x3F6F9A6D20000000), !dbg !36
+  %325 = tail call noundef float @llvm.fmuladd.f32(float %320, float %324, float 0xBF98C31640000000), !dbg !36
+  %326 = tail call noundef float @llvm.fmuladd.f32(float %320, float %325, float 0x3FBB4E9C80000000), !dbg !36
+  %327 = tail call noundef float @llvm.fmuladd.f32(float %320, float %326, float 0x3FE4515FA0000000), !dbg !36
+  %328 = tail call noundef float @llvm.fmuladd.f32(float %320, float %327, float 0x3FC078E500000000), !dbg !36
+  %329 = tail call float @llvm.fma.f32(float %320, float %328, float %320), !dbg !36
+  %330 = fneg float %329, !dbg !36
+  %331 = tail call noundef float @llvm.exp.f32(float %330), !dbg !36
+  %332 = fsub float 1.000000e+00, %331, !dbg !36
+  br label %__ocml_erf_f32.exit144.peel, !dbg !36
+
+333:                                              ; preds = %__ocml_erf_f32.exit143.peel
+  %334 = fmul nnan float %179, %179, !dbg !36
+  %335 = tail call noundef float @llvm.fmuladd.f32(float %334, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %336 = tail call noundef float @llvm.fmuladd.f32(float %334, float %335, float 0xBF9B593700000000), !dbg !36
+  %337 = tail call noundef float @llvm.fmuladd.f32(float %334, float %336, float 0x3FBCE077C0000000), !dbg !36
+  %338 = tail call noundef float @llvm.fmuladd.f32(float %334, float %337, float 0xBFD8126600000000), !dbg !36
+  %339 = tail call noundef float @llvm.fmuladd.f32(float %334, float %338, float 0x3FC06EBA00000000), !dbg !36
+  %340 = tail call float @llvm.fma.f32(float %320, float %339, float %320), !dbg !36
+  br label %__ocml_erf_f32.exit144.peel, !dbg !36
+
+__ocml_erf_f32.exit144.peel:                      ; preds = %333, %322
+  %341 = phi float [ %340, %333 ], [ %332, %322 ], !dbg !36
+  %342 = tail call noundef float @llvm.copysign.f32(float %341, float %179), !dbg !36
+  %343 = tail call float @llvm.fabs.f32(float %181), !dbg !36
+  %344 = fcmp olt float %343, 1.000000e+00, !dbg !36
+  br i1 %344, label %356, label %345, !dbg !36
+
+345:                                              ; preds = %__ocml_erf_f32.exit144.peel
+  %346 = tail call noundef float @llvm.fmuladd.f32(float %343, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %347 = tail call noundef float @llvm.fmuladd.f32(float %343, float %346, float 0x3F6F9A6D20000000), !dbg !36
+  %348 = tail call noundef float @llvm.fmuladd.f32(float %343, float %347, float 0xBF98C31640000000), !dbg !36
+  %349 = tail call noundef float @llvm.fmuladd.f32(float %343, float %348, float 0x3FBB4E9C80000000), !dbg !36
+  %350 = tail call noundef float @llvm.fmuladd.f32(float %343, float %349, float 0x3FE4515FA0000000), !dbg !36
+  %351 = tail call noundef float @llvm.fmuladd.f32(float %343, float %350, float 0x3FC078E500000000), !dbg !36
+  %352 = tail call float @llvm.fma.f32(float %343, float %351, float %343), !dbg !36
+  %353 = fneg float %352, !dbg !36
+  %354 = tail call noundef float @llvm.exp.f32(float %353), !dbg !36
+  %355 = fsub float 1.000000e+00, %354, !dbg !36
+  br label %__ocml_erf_f32.exit145.peel, !dbg !36
+
+356:                                              ; preds = %__ocml_erf_f32.exit144.peel
+  %357 = fmul nnan float %181, %181, !dbg !36
+  %358 = tail call noundef float @llvm.fmuladd.f32(float %357, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %359 = tail call noundef float @llvm.fmuladd.f32(float %357, float %358, float 0xBF9B593700000000), !dbg !36
+  %360 = tail call noundef float @llvm.fmuladd.f32(float %357, float %359, float 0x3FBCE077C0000000), !dbg !36
+  %361 = tail call noundef float @llvm.fmuladd.f32(float %357, float %360, float 0xBFD8126600000000), !dbg !36
+  %362 = tail call noundef float @llvm.fmuladd.f32(float %357, float %361, float 0x3FC06EBA00000000), !dbg !36
+  %363 = tail call float @llvm.fma.f32(float %343, float %362, float %343), !dbg !36
+  br label %__ocml_erf_f32.exit145.peel, !dbg !36
+
+__ocml_erf_f32.exit145.peel:                      ; preds = %356, %345
+  %364 = phi float [ %363, %356 ], [ %355, %345 ], !dbg !36
+  %365 = tail call noundef float @llvm.copysign.f32(float %364, float %181), !dbg !36
+  %366 = insertelement <2 x float> poison, float %204, i64 0, !dbg !37
+  %367 = insertelement <2 x float> %366, float %227, i64 1, !dbg !37
+  %368 = fadd <2 x float> %367, splat (float 1.000000e+00), !dbg !37
+  %369 = insertelement <2 x float> poison, float %250, i64 0, !dbg !37
+  %370 = insertelement <2 x float> %369, float %273, i64 1, !dbg !37
+  %371 = fadd <2 x float> %370, splat (float 1.000000e+00), !dbg !37
+  %372 = insertelement <2 x float> poison, float %296, i64 0, !dbg !37
+  %373 = insertelement <2 x float> %372, float %319, i64 1, !dbg !37
+  %374 = fadd <2 x float> %373, splat (float 1.000000e+00), !dbg !37
+  %375 = fmul <2 x float> %162, %368, !dbg !38
+  %376 = shufflevector <4 x float> %72, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !39
+  %377 = fmul <2 x float> %376, %375, !dbg !39
+  %378 = shufflevector <4 x float> %83, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !40
+  %379 = fadd <2 x float> %378, %377, !dbg !40
+  %380 = fadd <2 x float> %146, %379, !dbg !41
+  %381 = fadd <2 x float> %380, zeroinitializer, !dbg !42
+  %382 = fmul <2 x float> %163, %371, !dbg !38
+  %383 = shufflevector <4 x float> %72, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !39
+  %384 = fmul <2 x float> %383, %382, !dbg !39
+  %385 = shufflevector <4 x float> %83, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !40
+  %386 = fadd <2 x float> %385, %384, !dbg !40
+  %387 = fadd <2 x float> %148, %386, !dbg !41
+  %388 = fadd <2 x float> %387, zeroinitializer, !dbg !42
+  %389 = fmul <2 x float> %164, %374, !dbg !38
+  %390 = shufflevector <4 x float> %76, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !39
+  %391 = fmul <2 x float> %390, %389, !dbg !39
+  %392 = shufflevector <4 x float> %86, <4 x float> poison, <2 x i32> <i32 0, i32 1>, !dbg !40
+  %393 = fadd <2 x float> %392, %391, !dbg !40
+  %394 = fadd <2 x float> %150, %393, !dbg !41
+  %395 = fadd <2 x float> %394, zeroinitializer, !dbg !42
+  %396 = insertelement <2 x float> poison, float %342, i64 0, !dbg !37
+  %397 = insertelement <2 x float> %396, float %365, i64 1, !dbg !37
+  %398 = fadd <2 x float> %397, splat (float 1.000000e+00), !dbg !37
+  %399 = fmul <2 x float> %165, %398, !dbg !38
+  %400 = shufflevector <4 x float> %76, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !39
+  %401 = fmul <2 x float> %400, %399, !dbg !39
+  %402 = shufflevector <4 x float> %86, <4 x float> poison, <2 x i32> <i32 2, i32 3>, !dbg !40
+  %403 = fadd <2 x float> %402, %401, !dbg !40
+  %404 = fadd <2 x float> %152, %403, !dbg !41
+  %405 = fadd <2 x float> %404, zeroinitializer, !dbg !42
+  %406 = insertelement <2 x i1> poison, i1 %23, i64 0, !dbg !43
+  %407 = shufflevector <2 x i1> %406, <2 x i1> poison, <2 x i32> zeroinitializer, !dbg !43
+  %408 = select <2 x i1> %407, <2 x float> %381, <2 x float> zeroinitializer, !dbg !43
+  %409 = select <2 x i1> %407, <2 x float> %388, <2 x float> zeroinitializer, !dbg !43
+  %410 = select <2 x i1> %407, <2 x float> %395, <2 x float> zeroinitializer, !dbg !43
+  %411 = select <2 x i1> %407, <2 x float> %405, <2 x float> zeroinitializer, !dbg !43
+  %412 = extractelement <2 x float> %380, i64 0, !dbg !44
+  %413 = extractelement <2 x float> %380, i64 1, !dbg !44
+  %414 = select i1 %23, float %413, float 0.000000e+00, !dbg !44
+  %415 = extractelement <2 x float> %387, i64 0, !dbg !44
+  %416 = select i1 %23, float %415, float 0.000000e+00, !dbg !44
+  %417 = extractelement <2 x float> %387, i64 1, !dbg !44
+  %418 = select i1 %23, float %417, float 0.000000e+00, !dbg !44
+  %419 = extractelement <2 x float> %394, i64 0, !dbg !44
+  %420 = select i1 %23, float %419, float 0.000000e+00, !dbg !44
+  %421 = extractelement <2 x float> %394, i64 1, !dbg !44
+  %422 = select i1 %23, float %421, float 0.000000e+00, !dbg !44
+  %423 = extractelement <2 x float> %404, i64 0, !dbg !44
+  %424 = select i1 %23, float %423, float 0.000000e+00, !dbg !44
+  %425 = extractelement <2 x float> %404, i64 1, !dbg !44
+  %426 = select i1 %23, float %425, float 0.000000e+00, !dbg !44
+  %427 = select i1 %23, float %412, float 0.000000e+00, !dbg !44
+  %428 = select i1 %23, float 1.000000e+00, float 0.000000e+00, !dbg !45
+  %429 = shufflevector <4 x float> %101, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %430 = shufflevector <4 x float> %145, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %431 = shufflevector <4 x float> %134, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %432 = shufflevector <4 x float> %112, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %433 = shufflevector <4 x float> %123, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %434 = shufflevector <4 x float> %101, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %435 = shufflevector <4 x float> %145, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %436 = shufflevector <4 x float> %134, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %437 = shufflevector <4 x float> %112, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %438 = shufflevector <4 x float> %123, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %439 = shufflevector <4 x float> %97, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %440 = shufflevector <4 x float> %141, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %441 = shufflevector <4 x float> %130, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %442 = shufflevector <4 x float> %108, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %443 = shufflevector <4 x float> %119, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %444 = shufflevector <4 x float> %97, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %445 = shufflevector <4 x float> %141, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %446 = shufflevector <4 x float> %130, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %447 = shufflevector <4 x float> %108, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %448 = shufflevector <4 x float> %119, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %449 = insertelement <2 x float> poison, float %428, i64 0
+  %450 = shufflevector <2 x float> %449, <2 x float> poison, <2 x i32> zeroinitializer
+  %451 = insertelement <2 x float> %449, float %427, i64 1
+  %452 = insertelement <2 x float> poison, float %414, i64 0
+  %453 = insertelement <2 x float> %452, float %416, i64 1
+  %454 = insertelement <2 x float> poison, float %418, i64 0
+  %455 = insertelement <2 x float> %454, float %420, i64 1
+  %456 = insertelement <2 x float> poison, float %422, i64 0
+  %457 = insertelement <2 x float> %456, float %424, i64 1
+  br i1 %23, label %458, label %.peel.next.preheader, !dbg !46
+
+458:                                              ; preds = %__ocml_erf_f32.exit145.peel
+  %459 = shufflevector <2 x float> %394, <2 x float> %404, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %460 = sext i32 %30 to i64
+  %461 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %460
+  %462 = shufflevector <2 x float> %380, <2 x float> %387, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %463 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %32, !dbg !47
+  store <4 x float> %462, ptr addrspace(1) %461, align 16, !dbg !46
+  store <4 x float> %459, ptr addrspace(1) %463, align 16, !dbg !46
+  br label %.peel.next.preheader, !dbg !46
+
+.peel.next.preheader:                             ; preds = %__ocml_erf_f32.exit145.peel, %458
+  br label %.peel.next, !dbg !22
+
+.peel.next:                                       ; preds = %.peel.next.preheader, %.critedge136
+  %.pn108198 = phi i32 [ %506, %.critedge136 ], [ %89, %.peel.next.preheader ]
+  %.pn116197 = phi i32 [ %505, %.critedge136 ], [ %88, %.peel.next.preheader ]
+  %.pn412 = phi float [ %870, %.critedge136 ], [ %428, %.peel.next.preheader ]
+  %.pn408 = phi float [ %871, %.critedge136 ], [ %428, %.peel.next.preheader ]
+  %.pn404 = phi float [ %873, %.critedge136 ], [ %428, %.peel.next.preheader ]
+  %464 = phi float [ %862, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %465 = phi float [ %863, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %466 = phi float [ %864, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %467 = phi float [ %865, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %468 = phi float [ %866, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %469 = phi float [ %867, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %470 = phi float [ %868, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %471 = phi float [ %869, %.critedge136 ], [ 0.000000e+00, %.peel.next.preheader ]
+  %.pn414 = phi float [ %861, %.critedge136 ], [ %426, %.peel.next.preheader ]
+  %472 = phi i32 [ %503, %.critedge136 ], [ 8, %.peel.next.preheader ]
+  %473 = phi <2 x float> [ %810, %.critedge136 ], [ %411, %.peel.next.preheader ]
+  %474 = phi <2 x float> [ %884, %.critedge136 ], [ %429, %.peel.next.preheader ]
+  %475 = phi <2 x float> [ %885, %.critedge136 ], [ %430, %.peel.next.preheader ]
+  %476 = phi <2 x float> [ %886, %.critedge136 ], [ %431, %.peel.next.preheader ]
+  %477 = phi <2 x float> [ %887, %.critedge136 ], [ %432, %.peel.next.preheader ]
+  %478 = phi <2 x float> [ %888, %.critedge136 ], [ %433, %.peel.next.preheader ]
+  %479 = phi <2 x float> [ %809, %.critedge136 ], [ %410, %.peel.next.preheader ]
+  %480 = phi <2 x float> [ %889, %.critedge136 ], [ %434, %.peel.next.preheader ]
+  %481 = phi <2 x float> [ %890, %.critedge136 ], [ %435, %.peel.next.preheader ]
+  %482 = phi <2 x float> [ %891, %.critedge136 ], [ %436, %.peel.next.preheader ]
+  %483 = phi <2 x float> [ %892, %.critedge136 ], [ %437, %.peel.next.preheader ]
+  %484 = phi <2 x float> [ %893, %.critedge136 ], [ %438, %.peel.next.preheader ]
+  %485 = phi <2 x float> [ %808, %.critedge136 ], [ %409, %.peel.next.preheader ]
+  %486 = phi <2 x float> [ %894, %.critedge136 ], [ %439, %.peel.next.preheader ]
+  %487 = phi <2 x float> [ %895, %.critedge136 ], [ %440, %.peel.next.preheader ]
+  %488 = phi <2 x float> [ %896, %.critedge136 ], [ %441, %.peel.next.preheader ]
+  %489 = phi <2 x float> [ %897, %.critedge136 ], [ %442, %.peel.next.preheader ]
+  %490 = phi <2 x float> [ %898, %.critedge136 ], [ %443, %.peel.next.preheader ]
+  %491 = phi <2 x float> [ %807, %.critedge136 ], [ %408, %.peel.next.preheader ]
+  %492 = phi <2 x float> [ %899, %.critedge136 ], [ %444, %.peel.next.preheader ]
+  %493 = phi <2 x float> [ %900, %.critedge136 ], [ %445, %.peel.next.preheader ]
+  %494 = phi <2 x float> [ %901, %.critedge136 ], [ %446, %.peel.next.preheader ]
+  %495 = phi <2 x float> [ %902, %.critedge136 ], [ %447, %.peel.next.preheader ]
+  %496 = phi <2 x float> [ %903, %.critedge136 ], [ %448, %.peel.next.preheader ]
+  %497 = phi <2 x float> [ %875, %.critedge136 ], [ %450, %.peel.next.preheader ]
+  %498 = phi <2 x float> [ %872, %.critedge136 ], [ %450, %.peel.next.preheader ]
+  %499 = phi <2 x float> [ %874, %.critedge136 ], [ %451, %.peel.next.preheader ]
+  %500 = phi <2 x float> [ %858, %.critedge136 ], [ %453, %.peel.next.preheader ]
+  %501 = phi <2 x float> [ %859, %.critedge136 ], [ %455, %.peel.next.preheader ]
+  %502 = phi <2 x float> [ %860, %.critedge136 ], [ %457, %.peel.next.preheader ]
+  %503 = add nuw nsw i32 %472, 8, !dbg !48
+  %504 = or disjoint i32 %503, %27, !dbg !31
+  %505 = add nuw nsw i32 %504, %28, !dbg !20
+  %506 = add i32 %504, %29, !dbg !20
+  %507 = sext i32 %506 to i64, !dbg !21
+  %508 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %507, !dbg !21
+  br i1 %23, label %509, label %513, !dbg !22
+
+509:                                              ; preds = %.peel.next
+  %510 = sext i32 %505 to i64
+  %511 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %510
+  %512 = load <4 x float>, ptr addrspace(1) %511, align 16, !dbg !22
+  br label %513, !dbg !22
+
+513:                                              ; preds = %509, %.peel.next
+  %514 = phi <4 x float> [ %512, %509 ], [ zeroinitializer, %.peel.next ], !dbg !22
+  br i1 %23, label %515, label %517, !dbg !22
+
+515:                                              ; preds = %513
+  %516 = load <4 x float>, ptr addrspace(1) %508, align 16, !dbg !22
+  br label %517, !dbg !22
+
+517:                                              ; preds = %515, %513
+  %518 = phi <4 x float> [ %516, %515 ], [ zeroinitializer, %513 ], !dbg !22
+  %519 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %507, !dbg !23
+  br i1 %23, label %520, label %524, !dbg !24
+
+520:                                              ; preds = %517
+  %521 = sext i32 %505 to i64
+  %522 = getelementptr [4 x i8], ptr addrspace(1) %1, i64 %521
+  %523 = load <4 x float>, ptr addrspace(1) %522, align 16, !dbg !24
+  br label %524, !dbg !24
+
+524:                                              ; preds = %520, %517
+  %525 = phi <4 x float> [ %523, %520 ], [ zeroinitializer, %517 ], !dbg !24
+  br i1 %23, label %526, label %528, !dbg !24
+
+526:                                              ; preds = %524
+  %527 = load <4 x float>, ptr addrspace(1) %519, align 16, !dbg !24
+  br label %528, !dbg !24
+
+528:                                              ; preds = %526, %524
+  %529 = phi <4 x float> [ %527, %526 ], [ zeroinitializer, %524 ], !dbg !24
+  %530 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %507, !dbg !25
+  br i1 %23, label %531, label %535, !dbg !26
+
+531:                                              ; preds = %528
+  %532 = sext i32 %505 to i64
+  %533 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %532
+  %534 = load <4 x float>, ptr addrspace(1) %533, align 16, !dbg !26
+  br label %535, !dbg !26
+
+535:                                              ; preds = %531, %528
+  %536 = phi <4 x float> [ %534, %531 ], [ zeroinitializer, %528 ], !dbg !26
+  br i1 %23, label %537, label %539, !dbg !26
+
+537:                                              ; preds = %535
+  %538 = load <4 x float>, ptr addrspace(1) %530, align 16, !dbg !26
+  br label %539, !dbg !26
+
+539:                                              ; preds = %537, %535
+  %540 = phi <4 x float> [ %538, %537 ], [ zeroinitializer, %535 ], !dbg !26
+  %541 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %507, !dbg !27
+  br i1 %23, label %542, label %546, !dbg !28
+
+542:                                              ; preds = %539
+  %543 = sext i32 %505 to i64
+  %544 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %543
+  %545 = load <4 x float>, ptr addrspace(1) %544, align 16, !dbg !28
+  br label %546, !dbg !28
+
+546:                                              ; preds = %542, %539
+  %547 = phi <4 x float> [ %545, %542 ], [ zeroinitializer, %539 ], !dbg !28
+  br i1 %23, label %548, label %550, !dbg !28
+
+548:                                              ; preds = %546
+  %549 = load <4 x float>, ptr addrspace(1) %541, align 16, !dbg !28
+  br label %550, !dbg !28
+
+550:                                              ; preds = %548, %546
+  %551 = phi <4 x float> [ %549, %548 ], [ zeroinitializer, %546 ], !dbg !28
+  %552 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %507, !dbg !29
+  br i1 %23, label %553, label %557, !dbg !30
+
+553:                                              ; preds = %550
+  %554 = sext i32 %505 to i64
+  %555 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %554
+  %556 = load <4 x float>, ptr addrspace(1) %555, align 16, !dbg !30
+  br label %557, !dbg !30
+
+557:                                              ; preds = %553, %550
+  %558 = phi <4 x float> [ %556, %553 ], [ zeroinitializer, %550 ], !dbg !30
+  br i1 %23, label %559, label %561, !dbg !30
+
+559:                                              ; preds = %557
+  %560 = load <4 x float>, ptr addrspace(1) %552, align 16, !dbg !30
+  br label %561, !dbg !30
+
+561:                                              ; preds = %559, %557
+  %562 = phi <4 x float> [ %560, %559 ], [ zeroinitializer, %557 ], !dbg !30
+  %563 = fmul <2 x float> %492, %495, !dbg !32
+  %564 = fmul <2 x float> %486, %489, !dbg !32
+  %565 = fmul <2 x float> %480, %483, !dbg !32
+  %566 = fmul <2 x float> %474, %477, !dbg !32
+  %567 = fadd <2 x float> %563, %496, !dbg !33
+  %568 = fadd <2 x float> %564, %490, !dbg !33
+  %569 = fadd <2 x float> %565, %484, !dbg !33
+  %570 = fadd <2 x float> %566, %478, !dbg !33
+  %571 = fmul <2 x float> %567, splat (float 5.000000e-01), !dbg !34
+  %572 = fmul <2 x float> %568, splat (float 5.000000e-01), !dbg !34
+  %573 = fmul <2 x float> %569, splat (float 5.000000e-01), !dbg !34
+  %574 = fmul <2 x float> %570, splat (float 5.000000e-01), !dbg !34
+  %575 = extractelement <2 x float> %567, i64 0, !dbg !35
+  %576 = fmul float %575, 0x3FE6A09E60000000, !dbg !35
+  %577 = extractelement <2 x float> %567, i64 1, !dbg !35
+  %578 = fmul float %577, 0x3FE6A09E60000000, !dbg !35
+  %579 = extractelement <2 x float> %568, i64 0, !dbg !35
+  %580 = fmul float %579, 0x3FE6A09E60000000, !dbg !35
+  %581 = extractelement <2 x float> %568, i64 1, !dbg !35
+  %582 = fmul float %581, 0x3FE6A09E60000000, !dbg !35
+  %583 = extractelement <2 x float> %569, i64 0, !dbg !35
+  %584 = fmul float %583, 0x3FE6A09E60000000, !dbg !35
+  %585 = extractelement <2 x float> %569, i64 1, !dbg !35
+  %586 = fmul float %585, 0x3FE6A09E60000000, !dbg !35
+  %587 = extractelement <2 x float> %570, i64 0, !dbg !35
+  %588 = fmul float %587, 0x3FE6A09E60000000, !dbg !35
+  %589 = extractelement <2 x float> %570, i64 1, !dbg !35
+  %590 = fmul float %589, 0x3FE6A09E60000000, !dbg !35
+  %591 = tail call float @llvm.fabs.f32(float %576), !dbg !36
+  %592 = fcmp olt float %591, 1.000000e+00, !dbg !36
+  br i1 %592, label %593, label %601, !dbg !36
+
+593:                                              ; preds = %561
+  %594 = fmul nnan float %576, %576, !dbg !36
+  %595 = tail call noundef float @llvm.fmuladd.f32(float %594, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %596 = tail call noundef float @llvm.fmuladd.f32(float %594, float %595, float 0xBF9B593700000000), !dbg !36
+  %597 = tail call noundef float @llvm.fmuladd.f32(float %594, float %596, float 0x3FBCE077C0000000), !dbg !36
+  %598 = tail call noundef float @llvm.fmuladd.f32(float %594, float %597, float 0xBFD8126600000000), !dbg !36
+  %599 = tail call noundef float @llvm.fmuladd.f32(float %594, float %598, float 0x3FC06EBA00000000), !dbg !36
+  %600 = tail call float @llvm.fma.f32(float %591, float %599, float %591), !dbg !36
+  br label %__ocml_erf_f32.exit, !dbg !36
+
+601:                                              ; preds = %561
+  %602 = tail call noundef float @llvm.fmuladd.f32(float %591, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %603 = tail call noundef float @llvm.fmuladd.f32(float %591, float %602, float 0x3F6F9A6D20000000), !dbg !36
+  %604 = tail call noundef float @llvm.fmuladd.f32(float %591, float %603, float 0xBF98C31640000000), !dbg !36
+  %605 = tail call noundef float @llvm.fmuladd.f32(float %591, float %604, float 0x3FBB4E9C80000000), !dbg !36
+  %606 = tail call noundef float @llvm.fmuladd.f32(float %591, float %605, float 0x3FE4515FA0000000), !dbg !36
+  %607 = tail call noundef float @llvm.fmuladd.f32(float %591, float %606, float 0x3FC078E500000000), !dbg !36
+  %608 = tail call float @llvm.fma.f32(float %591, float %607, float %591), !dbg !36
+  %609 = fneg float %608, !dbg !36
+  %610 = tail call noundef float @llvm.exp.f32(float %609), !dbg !36
+  %611 = fsub float 1.000000e+00, %610, !dbg !36
+  br label %__ocml_erf_f32.exit, !dbg !36
+
+__ocml_erf_f32.exit:                              ; preds = %593, %601
+  %612 = phi float [ %600, %593 ], [ %611, %601 ], !dbg !36
+  %613 = tail call noundef float @llvm.copysign.f32(float %612, float %576), !dbg !36
+  %614 = tail call float @llvm.fabs.f32(float %578), !dbg !36
+  %615 = fcmp olt float %614, 1.000000e+00, !dbg !36
+  br i1 %615, label %616, label %624, !dbg !36
+
+616:                                              ; preds = %__ocml_erf_f32.exit
+  %617 = fmul nnan float %578, %578, !dbg !36
+  %618 = tail call noundef float @llvm.fmuladd.f32(float %617, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %619 = tail call noundef float @llvm.fmuladd.f32(float %617, float %618, float 0xBF9B593700000000), !dbg !36
+  %620 = tail call noundef float @llvm.fmuladd.f32(float %617, float %619, float 0x3FBCE077C0000000), !dbg !36
+  %621 = tail call noundef float @llvm.fmuladd.f32(float %617, float %620, float 0xBFD8126600000000), !dbg !36
+  %622 = tail call noundef float @llvm.fmuladd.f32(float %617, float %621, float 0x3FC06EBA00000000), !dbg !36
+  %623 = tail call float @llvm.fma.f32(float %614, float %622, float %614), !dbg !36
+  br label %__ocml_erf_f32.exit139, !dbg !36
+
+624:                                              ; preds = %__ocml_erf_f32.exit
+  %625 = tail call noundef float @llvm.fmuladd.f32(float %614, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %626 = tail call noundef float @llvm.fmuladd.f32(float %614, float %625, float 0x3F6F9A6D20000000), !dbg !36
+  %627 = tail call noundef float @llvm.fmuladd.f32(float %614, float %626, float 0xBF98C31640000000), !dbg !36
+  %628 = tail call noundef float @llvm.fmuladd.f32(float %614, float %627, float 0x3FBB4E9C80000000), !dbg !36
+  %629 = tail call noundef float @llvm.fmuladd.f32(float %614, float %628, float 0x3FE4515FA0000000), !dbg !36
+  %630 = tail call noundef float @llvm.fmuladd.f32(float %614, float %629, float 0x3FC078E500000000), !dbg !36
+  %631 = tail call float @llvm.fma.f32(float %614, float %630, float %614), !dbg !36
+  %632 = fneg float %631, !dbg !36
+  %633 = tail call noundef float @llvm.exp.f32(float %632), !dbg !36
+  %634 = fsub float 1.000000e+00, %633, !dbg !36
+  br label %__ocml_erf_f32.exit139, !dbg !36
+
+__ocml_erf_f32.exit139:                           ; preds = %616, %624
+  %635 = phi float [ %623, %616 ], [ %634, %624 ], !dbg !36
+  %636 = tail call noundef float @llvm.copysign.f32(float %635, float %578), !dbg !36
+  %637 = tail call float @llvm.fabs.f32(float %580), !dbg !36
+  %638 = fcmp olt float %637, 1.000000e+00, !dbg !36
+  br i1 %638, label %639, label %647, !dbg !36
+
+639:                                              ; preds = %__ocml_erf_f32.exit139
+  %640 = fmul nnan float %580, %580, !dbg !36
+  %641 = tail call noundef float @llvm.fmuladd.f32(float %640, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %642 = tail call noundef float @llvm.fmuladd.f32(float %640, float %641, float 0xBF9B593700000000), !dbg !36
+  %643 = tail call noundef float @llvm.fmuladd.f32(float %640, float %642, float 0x3FBCE077C0000000), !dbg !36
+  %644 = tail call noundef float @llvm.fmuladd.f32(float %640, float %643, float 0xBFD8126600000000), !dbg !36
+  %645 = tail call noundef float @llvm.fmuladd.f32(float %640, float %644, float 0x3FC06EBA00000000), !dbg !36
+  %646 = tail call float @llvm.fma.f32(float %637, float %645, float %637), !dbg !36
+  br label %__ocml_erf_f32.exit140, !dbg !36
+
+647:                                              ; preds = %__ocml_erf_f32.exit139
+  %648 = tail call noundef float @llvm.fmuladd.f32(float %637, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %649 = tail call noundef float @llvm.fmuladd.f32(float %637, float %648, float 0x3F6F9A6D20000000), !dbg !36
+  %650 = tail call noundef float @llvm.fmuladd.f32(float %637, float %649, float 0xBF98C31640000000), !dbg !36
+  %651 = tail call noundef float @llvm.fmuladd.f32(float %637, float %650, float 0x3FBB4E9C80000000), !dbg !36
+  %652 = tail call noundef float @llvm.fmuladd.f32(float %637, float %651, float 0x3FE4515FA0000000), !dbg !36
+  %653 = tail call noundef float @llvm.fmuladd.f32(float %637, float %652, float 0x3FC078E500000000), !dbg !36
+  %654 = tail call float @llvm.fma.f32(float %637, float %653, float %637), !dbg !36
+  %655 = fneg float %654, !dbg !36
+  %656 = tail call noundef float @llvm.exp.f32(float %655), !dbg !36
+  %657 = fsub float 1.000000e+00, %656, !dbg !36
+  br label %__ocml_erf_f32.exit140, !dbg !36
+
+__ocml_erf_f32.exit140:                           ; preds = %639, %647
+  %658 = phi float [ %646, %639 ], [ %657, %647 ], !dbg !36
+  %659 = tail call noundef float @llvm.copysign.f32(float %658, float %580), !dbg !36
+  %660 = tail call float @llvm.fabs.f32(float %582), !dbg !36
+  %661 = fcmp olt float %660, 1.000000e+00, !dbg !36
+  br i1 %661, label %662, label %670, !dbg !36
+
+662:                                              ; preds = %__ocml_erf_f32.exit140
+  %663 = fmul nnan float %582, %582, !dbg !36
+  %664 = tail call noundef float @llvm.fmuladd.f32(float %663, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %665 = tail call noundef float @llvm.fmuladd.f32(float %663, float %664, float 0xBF9B593700000000), !dbg !36
+  %666 = tail call noundef float @llvm.fmuladd.f32(float %663, float %665, float 0x3FBCE077C0000000), !dbg !36
+  %667 = tail call noundef float @llvm.fmuladd.f32(float %663, float %666, float 0xBFD8126600000000), !dbg !36
+  %668 = tail call noundef float @llvm.fmuladd.f32(float %663, float %667, float 0x3FC06EBA00000000), !dbg !36
+  %669 = tail call float @llvm.fma.f32(float %660, float %668, float %660), !dbg !36
+  br label %__ocml_erf_f32.exit141, !dbg !36
+
+670:                                              ; preds = %__ocml_erf_f32.exit140
+  %671 = tail call noundef float @llvm.fmuladd.f32(float %660, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %672 = tail call noundef float @llvm.fmuladd.f32(float %660, float %671, float 0x3F6F9A6D20000000), !dbg !36
+  %673 = tail call noundef float @llvm.fmuladd.f32(float %660, float %672, float 0xBF98C31640000000), !dbg !36
+  %674 = tail call noundef float @llvm.fmuladd.f32(float %660, float %673, float 0x3FBB4E9C80000000), !dbg !36
+  %675 = tail call noundef float @llvm.fmuladd.f32(float %660, float %674, float 0x3FE4515FA0000000), !dbg !36
+  %676 = tail call noundef float @llvm.fmuladd.f32(float %660, float %675, float 0x3FC078E500000000), !dbg !36
+  %677 = tail call float @llvm.fma.f32(float %660, float %676, float %660), !dbg !36
+  %678 = fneg float %677, !dbg !36
+  %679 = tail call noundef float @llvm.exp.f32(float %678), !dbg !36
+  %680 = fsub float 1.000000e+00, %679, !dbg !36
+  br label %__ocml_erf_f32.exit141, !dbg !36
+
+__ocml_erf_f32.exit141:                           ; preds = %662, %670
+  %681 = phi float [ %669, %662 ], [ %680, %670 ], !dbg !36
+  %682 = tail call noundef float @llvm.copysign.f32(float %681, float %582), !dbg !36
+  %683 = tail call float @llvm.fabs.f32(float %584), !dbg !36
+  %684 = fcmp olt float %683, 1.000000e+00, !dbg !36
+  br i1 %684, label %685, label %693, !dbg !36
+
+685:                                              ; preds = %__ocml_erf_f32.exit141
+  %686 = fmul nnan float %584, %584, !dbg !36
+  %687 = tail call noundef float @llvm.fmuladd.f32(float %686, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %688 = tail call noundef float @llvm.fmuladd.f32(float %686, float %687, float 0xBF9B593700000000), !dbg !36
+  %689 = tail call noundef float @llvm.fmuladd.f32(float %686, float %688, float 0x3FBCE077C0000000), !dbg !36
+  %690 = tail call noundef float @llvm.fmuladd.f32(float %686, float %689, float 0xBFD8126600000000), !dbg !36
+  %691 = tail call noundef float @llvm.fmuladd.f32(float %686, float %690, float 0x3FC06EBA00000000), !dbg !36
+  %692 = tail call float @llvm.fma.f32(float %683, float %691, float %683), !dbg !36
+  br label %__ocml_erf_f32.exit142, !dbg !36
+
+693:                                              ; preds = %__ocml_erf_f32.exit141
+  %694 = tail call noundef float @llvm.fmuladd.f32(float %683, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %695 = tail call noundef float @llvm.fmuladd.f32(float %683, float %694, float 0x3F6F9A6D20000000), !dbg !36
+  %696 = tail call noundef float @llvm.fmuladd.f32(float %683, float %695, float 0xBF98C31640000000), !dbg !36
+  %697 = tail call noundef float @llvm.fmuladd.f32(float %683, float %696, float 0x3FBB4E9C80000000), !dbg !36
+  %698 = tail call noundef float @llvm.fmuladd.f32(float %683, float %697, float 0x3FE4515FA0000000), !dbg !36
+  %699 = tail call noundef float @llvm.fmuladd.f32(float %683, float %698, float 0x3FC078E500000000), !dbg !36
+  %700 = tail call float @llvm.fma.f32(float %683, float %699, float %683), !dbg !36
+  %701 = fneg float %700, !dbg !36
+  %702 = tail call noundef float @llvm.exp.f32(float %701), !dbg !36
+  %703 = fsub float 1.000000e+00, %702, !dbg !36
+  br label %__ocml_erf_f32.exit142, !dbg !36
+
+__ocml_erf_f32.exit142:                           ; preds = %685, %693
+  %704 = phi float [ %692, %685 ], [ %703, %693 ], !dbg !36
+  %705 = tail call noundef float @llvm.copysign.f32(float %704, float %584), !dbg !36
+  %706 = tail call float @llvm.fabs.f32(float %586), !dbg !36
+  %707 = fcmp olt float %706, 1.000000e+00, !dbg !36
+  br i1 %707, label %708, label %716, !dbg !36
+
+708:                                              ; preds = %__ocml_erf_f32.exit142
+  %709 = fmul nnan float %586, %586, !dbg !36
+  %710 = tail call noundef float @llvm.fmuladd.f32(float %709, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %711 = tail call noundef float @llvm.fmuladd.f32(float %709, float %710, float 0xBF9B593700000000), !dbg !36
+  %712 = tail call noundef float @llvm.fmuladd.f32(float %709, float %711, float 0x3FBCE077C0000000), !dbg !36
+  %713 = tail call noundef float @llvm.fmuladd.f32(float %709, float %712, float 0xBFD8126600000000), !dbg !36
+  %714 = tail call noundef float @llvm.fmuladd.f32(float %709, float %713, float 0x3FC06EBA00000000), !dbg !36
+  %715 = tail call float @llvm.fma.f32(float %706, float %714, float %706), !dbg !36
+  br label %__ocml_erf_f32.exit143, !dbg !36
+
+716:                                              ; preds = %__ocml_erf_f32.exit142
+  %717 = tail call noundef float @llvm.fmuladd.f32(float %706, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %718 = tail call noundef float @llvm.fmuladd.f32(float %706, float %717, float 0x3F6F9A6D20000000), !dbg !36
+  %719 = tail call noundef float @llvm.fmuladd.f32(float %706, float %718, float 0xBF98C31640000000), !dbg !36
+  %720 = tail call noundef float @llvm.fmuladd.f32(float %706, float %719, float 0x3FBB4E9C80000000), !dbg !36
+  %721 = tail call noundef float @llvm.fmuladd.f32(float %706, float %720, float 0x3FE4515FA0000000), !dbg !36
+  %722 = tail call noundef float @llvm.fmuladd.f32(float %706, float %721, float 0x3FC078E500000000), !dbg !36
+  %723 = tail call float @llvm.fma.f32(float %706, float %722, float %706), !dbg !36
+  %724 = fneg float %723, !dbg !36
+  %725 = tail call noundef float @llvm.exp.f32(float %724), !dbg !36
+  %726 = fsub float 1.000000e+00, %725, !dbg !36
+  br label %__ocml_erf_f32.exit143, !dbg !36
+
+__ocml_erf_f32.exit143:                           ; preds = %708, %716
+  %727 = phi float [ %715, %708 ], [ %726, %716 ], !dbg !36
+  %728 = tail call noundef float @llvm.copysign.f32(float %727, float %586), !dbg !36
+  %729 = tail call float @llvm.fabs.f32(float %588), !dbg !36
+  %730 = fcmp olt float %729, 1.000000e+00, !dbg !36
+  br i1 %730, label %731, label %739, !dbg !36
+
+731:                                              ; preds = %__ocml_erf_f32.exit143
+  %732 = fmul nnan float %588, %588, !dbg !36
+  %733 = tail call noundef float @llvm.fmuladd.f32(float %732, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %734 = tail call noundef float @llvm.fmuladd.f32(float %732, float %733, float 0xBF9B593700000000), !dbg !36
+  %735 = tail call noundef float @llvm.fmuladd.f32(float %732, float %734, float 0x3FBCE077C0000000), !dbg !36
+  %736 = tail call noundef float @llvm.fmuladd.f32(float %732, float %735, float 0xBFD8126600000000), !dbg !36
+  %737 = tail call noundef float @llvm.fmuladd.f32(float %732, float %736, float 0x3FC06EBA00000000), !dbg !36
+  %738 = tail call float @llvm.fma.f32(float %729, float %737, float %729), !dbg !36
+  br label %__ocml_erf_f32.exit144, !dbg !36
+
+739:                                              ; preds = %__ocml_erf_f32.exit143
+  %740 = tail call noundef float @llvm.fmuladd.f32(float %729, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %741 = tail call noundef float @llvm.fmuladd.f32(float %729, float %740, float 0x3F6F9A6D20000000), !dbg !36
+  %742 = tail call noundef float @llvm.fmuladd.f32(float %729, float %741, float 0xBF98C31640000000), !dbg !36
+  %743 = tail call noundef float @llvm.fmuladd.f32(float %729, float %742, float 0x3FBB4E9C80000000), !dbg !36
+  %744 = tail call noundef float @llvm.fmuladd.f32(float %729, float %743, float 0x3FE4515FA0000000), !dbg !36
+  %745 = tail call noundef float @llvm.fmuladd.f32(float %729, float %744, float 0x3FC078E500000000), !dbg !36
+  %746 = tail call float @llvm.fma.f32(float %729, float %745, float %729), !dbg !36
+  %747 = fneg float %746, !dbg !36
+  %748 = tail call noundef float @llvm.exp.f32(float %747), !dbg !36
+  %749 = fsub float 1.000000e+00, %748, !dbg !36
+  br label %__ocml_erf_f32.exit144, !dbg !36
+
+__ocml_erf_f32.exit144:                           ; preds = %731, %739
+  %750 = phi float [ %738, %731 ], [ %749, %739 ], !dbg !36
+  %751 = tail call noundef float @llvm.copysign.f32(float %750, float %588), !dbg !36
+  %752 = tail call float @llvm.fabs.f32(float %590), !dbg !36
+  %753 = fcmp olt float %752, 1.000000e+00, !dbg !36
+  br i1 %753, label %754, label %762, !dbg !36
+
+754:                                              ; preds = %__ocml_erf_f32.exit144
+  %755 = fmul nnan float %590, %590, !dbg !36
+  %756 = tail call noundef float @llvm.fmuladd.f32(float %755, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %757 = tail call noundef float @llvm.fmuladd.f32(float %755, float %756, float 0xBF9B593700000000), !dbg !36
+  %758 = tail call noundef float @llvm.fmuladd.f32(float %755, float %757, float 0x3FBCE077C0000000), !dbg !36
+  %759 = tail call noundef float @llvm.fmuladd.f32(float %755, float %758, float 0xBFD8126600000000), !dbg !36
+  %760 = tail call noundef float @llvm.fmuladd.f32(float %755, float %759, float 0x3FC06EBA00000000), !dbg !36
+  %761 = tail call float @llvm.fma.f32(float %752, float %760, float %752), !dbg !36
+  br label %__ocml_erf_f32.exit145, !dbg !36
+
+762:                                              ; preds = %__ocml_erf_f32.exit144
+  %763 = tail call noundef float @llvm.fmuladd.f32(float %752, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %764 = tail call noundef float @llvm.fmuladd.f32(float %752, float %763, float 0x3F6F9A6D20000000), !dbg !36
+  %765 = tail call noundef float @llvm.fmuladd.f32(float %752, float %764, float 0xBF98C31640000000), !dbg !36
+  %766 = tail call noundef float @llvm.fmuladd.f32(float %752, float %765, float 0x3FBB4E9C80000000), !dbg !36
+  %767 = tail call noundef float @llvm.fmuladd.f32(float %752, float %766, float 0x3FE4515FA0000000), !dbg !36
+  %768 = tail call noundef float @llvm.fmuladd.f32(float %752, float %767, float 0x3FC078E500000000), !dbg !36
+  %769 = tail call float @llvm.fma.f32(float %752, float %768, float %752), !dbg !36
+  %770 = fneg float %769, !dbg !36
+  %771 = tail call noundef float @llvm.exp.f32(float %770), !dbg !36
+  %772 = fsub float 1.000000e+00, %771, !dbg !36
+  br label %__ocml_erf_f32.exit145, !dbg !36
+
+__ocml_erf_f32.exit145:                           ; preds = %754, %762
+  %773 = phi float [ %761, %754 ], [ %772, %762 ], !dbg !36
+  %774 = tail call noundef float @llvm.copysign.f32(float %773, float %590), !dbg !36
+  %775 = insertelement <2 x float> poison, float %613, i64 0, !dbg !37
+  %776 = insertelement <2 x float> %775, float %636, i64 1, !dbg !37
+  %777 = fadd <2 x float> %776, splat (float 1.000000e+00), !dbg !37
+  %778 = insertelement <2 x float> poison, float %659, i64 0, !dbg !37
+  %779 = insertelement <2 x float> %778, float %682, i64 1, !dbg !37
+  %780 = fadd <2 x float> %779, splat (float 1.000000e+00), !dbg !37
+  %781 = insertelement <2 x float> poison, float %705, i64 0, !dbg !37
+  %782 = insertelement <2 x float> %781, float %728, i64 1, !dbg !37
+  %783 = fadd <2 x float> %782, splat (float 1.000000e+00), !dbg !37
+  %784 = fmul <2 x float> %571, %777, !dbg !38
+  %785 = fmul <2 x float> %494, %784, !dbg !39
+  %786 = fadd <2 x float> %493, %785, !dbg !40
+  %787 = fadd <2 x float> %492, %786, !dbg !41
+  %788 = fadd <2 x float> %491, %787, !dbg !42
+  %789 = fmul <2 x float> %572, %780, !dbg !38
+  %790 = fmul <2 x float> %488, %789, !dbg !39
+  %791 = fadd <2 x float> %487, %790, !dbg !40
+  %792 = fadd <2 x float> %486, %791, !dbg !41
+  %793 = fadd <2 x float> %485, %792, !dbg !42
+  %794 = fmul <2 x float> %573, %783, !dbg !38
+  %795 = fmul <2 x float> %482, %794, !dbg !39
+  %796 = fadd <2 x float> %481, %795, !dbg !40
+  %797 = fadd <2 x float> %480, %796, !dbg !41
+  %798 = fadd <2 x float> %479, %797, !dbg !42
+  %799 = insertelement <2 x float> poison, float %751, i64 0, !dbg !37
+  %800 = insertelement <2 x float> %799, float %774, i64 1, !dbg !37
+  %801 = fadd <2 x float> %800, splat (float 1.000000e+00), !dbg !37
+  %802 = fmul <2 x float> %574, %801, !dbg !38
+  %803 = fmul <2 x float> %476, %802, !dbg !39
+  %804 = fadd <2 x float> %475, %803, !dbg !40
+  %805 = fadd <2 x float> %474, %804, !dbg !41
+  %806 = fadd <2 x float> %473, %805, !dbg !42
+  %807 = select <2 x i1> %407, <2 x float> %788, <2 x float> %491, !dbg !43
+  %808 = select <2 x i1> %407, <2 x float> %793, <2 x float> %485, !dbg !43
+  %809 = select <2 x i1> %407, <2 x float> %798, <2 x float> %479, !dbg !43
+  %810 = select <2 x i1> %407, <2 x float> %806, <2 x float> %473, !dbg !43
+  %shift = shufflevector <2 x float> %499, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop = fsub <2 x float> %787, %shift, !dbg !49
+  %811 = extractelement <2 x float> %foldExtExtBinop, i64 0, !dbg !49
+  %812 = fadd float %.pn412, 1.000000e+00, !dbg !54
+  %813 = fdiv float %811, %812, !dbg !55
+  %814 = fadd <2 x float> %498, splat (float 1.000000e+00), !dbg !54
+  %815 = fadd float %.pn408, 1.000000e+00, !dbg !54
+  %816 = shufflevector <2 x float> %787, <2 x float> %792, <2 x i32> <i32 1, i32 2>, !dbg !49
+  %817 = fsub <2 x float> %816, %500, !dbg !49
+  %818 = insertelement <2 x float> %814, float %815, i64 1, !dbg !55
+  %819 = fdiv <2 x float> %817, %818, !dbg !55
+  %820 = fadd <2 x float> %500, %819, !dbg !56
+  %shift608 = shufflevector <2 x float> %787, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop609 = fsub <2 x float> %shift608, %820, !dbg !57
+  %foldExtExtBinop611 = fmul <2 x float> %817, %foldExtExtBinop609, !dbg !58
+  %821 = extractelement <2 x float> %foldExtExtBinop611, i64 0, !dbg !58
+  %822 = fadd float %465, %821, !dbg !59
+  %shift613 = shufflevector <2 x float> %820, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop614 = fsub <2 x float> %792, %shift613, !dbg !57
+  %shift616 = shufflevector <2 x float> %817, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !58
+  %foldExtExtBinop617 = fmul <2 x float> %shift616, %foldExtExtBinop614, !dbg !58
+  %823 = extractelement <2 x float> %foldExtExtBinop617, i64 0, !dbg !58
+  %824 = fadd float %466, %823, !dbg !59
+  %825 = fadd float %.pn404, 1.000000e+00, !dbg !54
+  %826 = shufflevector <2 x float> %792, <2 x float> %797, <2 x i32> <i32 1, i32 2>, !dbg !49
+  %827 = fsub <2 x float> %826, %501, !dbg !49
+  %828 = shufflevector <2 x float> %814, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !55
+  %829 = insertelement <2 x float> %828, float %825, i64 1, !dbg !55
+  %830 = fdiv <2 x float> %827, %829, !dbg !55
+  %831 = fadd <2 x float> %501, %830, !dbg !56
+  %shift619 = shufflevector <2 x float> %792, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop620 = fsub <2 x float> %shift619, %831, !dbg !57
+  %foldExtExtBinop622 = fmul <2 x float> %827, %foldExtExtBinop620, !dbg !58
+  %832 = extractelement <2 x float> %foldExtExtBinop622, i64 0, !dbg !58
+  %833 = fadd float %467, %832, !dbg !59
+  %shift624 = shufflevector <2 x float> %831, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop625 = fsub <2 x float> %797, %shift624, !dbg !57
+  %shift627 = shufflevector <2 x float> %827, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !58
+  %foldExtExtBinop628 = fmul <2 x float> %shift627, %foldExtExtBinop625, !dbg !58
+  %834 = extractelement <2 x float> %foldExtExtBinop628, i64 0, !dbg !58
+  %835 = fadd float %468, %834, !dbg !59
+  %836 = fadd <2 x float> %497, splat (float 1.000000e+00), !dbg !54
+  %837 = insertelement <2 x float> <float 1.000000e+00, float poison>, float %813, i64 1, !dbg !54
+  %838 = fadd <2 x float> %499, %837, !dbg !54
+  %shift630 = shufflevector <2 x float> %838, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop631 = fsub <2 x float> %787, %shift630, !dbg !57
+  %foldExtExtBinop633 = fmul <2 x float> %foldExtExtBinop, %foldExtExtBinop631, !dbg !58
+  %839 = extractelement <2 x float> %foldExtExtBinop633, i64 0, !dbg !58
+  %840 = fadd float %464, %839, !dbg !59
+  %841 = shufflevector <2 x float> %797, <2 x float> %805, <2 x i32> <i32 1, i32 2>, !dbg !49
+  %842 = fsub <2 x float> %841, %502, !dbg !49
+  %843 = shufflevector <2 x float> %836, <2 x float> %838, <2 x i32> <i32 0, i32 2>, !dbg !55
+  %844 = fdiv <2 x float> %842, %843, !dbg !55
+  %845 = fadd <2 x float> %502, %844, !dbg !56
+  %shift635 = shufflevector <2 x float> %797, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop636 = fsub <2 x float> %shift635, %845, !dbg !57
+  %foldExtExtBinop638 = fmul <2 x float> %842, %foldExtExtBinop636, !dbg !58
+  %846 = extractelement <2 x float> %foldExtExtBinop638, i64 0, !dbg !58
+  %847 = fadd float %469, %846, !dbg !59
+  %shift640 = shufflevector <2 x float> %845, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !57
+  %foldExtExtBinop641 = fsub <2 x float> %805, %shift640, !dbg !57
+  %shift643 = shufflevector <2 x float> %842, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !58
+  %foldExtExtBinop644 = fmul <2 x float> %shift643, %foldExtExtBinop641, !dbg !58
+  %848 = extractelement <2 x float> %foldExtExtBinop644, i64 0, !dbg !58
+  %849 = fadd float %470, %848, !dbg !59
+  %850 = extractelement <2 x float> %805, i64 1, !dbg !57
+  %851 = fsub float %850, %.pn414, !dbg !49
+  %852 = extractelement <2 x float> %836, i64 1, !dbg !55
+  %853 = fdiv float %851, %852, !dbg !55
+  %854 = fadd float %.pn414, %853, !dbg !56
+  %855 = fsub float %850, %854, !dbg !57
+  %856 = fmul float %851, %855, !dbg !58
+  %857 = fadd float %471, %856, !dbg !59
+  %858 = select <2 x i1> %407, <2 x float> %820, <2 x float> %500, !dbg !44
+  %859 = select <2 x i1> %407, <2 x float> %831, <2 x float> %501, !dbg !44
+  %860 = select <2 x i1> %407, <2 x float> %845, <2 x float> %502, !dbg !44
+  %861 = select i1 %23, float %854, float %.pn414, !dbg !44
+  %862 = select i1 %23, float %840, float %464, !dbg !60
+  %863 = select i1 %23, float %822, float %465, !dbg !60
+  %864 = select i1 %23, float %824, float %466, !dbg !60
+  %865 = select i1 %23, float %833, float %467, !dbg !60
+  %866 = select i1 %23, float %835, float %468, !dbg !60
+  %867 = select i1 %23, float %847, float %469, !dbg !60
+  %868 = select i1 %23, float %849, float %470, !dbg !60
+  %869 = select i1 %23, float %857, float %471, !dbg !60
+  %870 = select i1 %23, float %812, float %.pn412, !dbg !45
+  %871 = select i1 %23, float %815, float %.pn408, !dbg !45
+  %872 = select <2 x i1> %407, <2 x float> %814, <2 x float> %498, !dbg !45
+  %873 = select i1 %23, float %825, float %.pn404, !dbg !45
+  %874 = select <2 x i1> %407, <2 x float> %838, <2 x float> %499, !dbg !45
+  %875 = select <2 x i1> %407, <2 x float> %836, <2 x float> %497, !dbg !45
+  br i1 %23, label %876, label %.critedge136, !dbg !46
+
+876:                                              ; preds = %__ocml_erf_f32.exit145
+  %877 = shufflevector <2 x float> %797, <2 x float> %805, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %878 = sext i32 %.pn116197 to i64
+  %879 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %878
+  %880 = shufflevector <2 x float> %787, <2 x float> %792, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %881 = sext i32 %.pn108198 to i64, !dbg !47
+  %882 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %881, !dbg !47
+  store <4 x float> %880, ptr addrspace(1) %879, align 16, !dbg !46
+  store <4 x float> %877, ptr addrspace(1) %882, align 16, !dbg !46
+  br label %.critedge136, !dbg !46
+
+.critedge136:                                     ; preds = %__ocml_erf_f32.exit145, %876
+  %883 = icmp samesign ult i32 %472, 8176, !dbg !48
+  %884 = shufflevector <4 x float> %518, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %885 = shufflevector <4 x float> %562, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %886 = shufflevector <4 x float> %551, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %887 = shufflevector <4 x float> %529, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %888 = shufflevector <4 x float> %540, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %889 = shufflevector <4 x float> %518, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %890 = shufflevector <4 x float> %562, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %891 = shufflevector <4 x float> %551, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %892 = shufflevector <4 x float> %529, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %893 = shufflevector <4 x float> %540, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %894 = shufflevector <4 x float> %514, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %895 = shufflevector <4 x float> %558, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %896 = shufflevector <4 x float> %547, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %897 = shufflevector <4 x float> %525, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %898 = shufflevector <4 x float> %536, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %899 = shufflevector <4 x float> %514, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %900 = shufflevector <4 x float> %558, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %901 = shufflevector <4 x float> %547, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %902 = shufflevector <4 x float> %525, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %903 = shufflevector <4 x float> %536, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  br i1 %883, label %.peel.next, label %.loopexit, !dbg !48, !llvm.loop !61
+
+.loopexit:                                        ; preds = %.critedge136
+  %904 = extractelement <2 x float> %499, i64 1
+  %905 = fmul <2 x float> %899, %902, !dbg !32
+  %906 = fmul <2 x float> %894, %897, !dbg !32
+  %907 = fmul <2 x float> %889, %892, !dbg !32
+  %908 = fmul <2 x float> %884, %887, !dbg !32
+  %909 = fadd <2 x float> %905, %903, !dbg !33
+  %910 = fadd <2 x float> %906, %898, !dbg !33
+  %911 = fadd <2 x float> %907, %893, !dbg !33
+  %912 = fadd <2 x float> %908, %888, !dbg !33
+  %913 = fmul <2 x float> %909, splat (float 5.000000e-01), !dbg !34
+  %914 = fmul <2 x float> %910, splat (float 5.000000e-01), !dbg !34
+  %915 = fmul <2 x float> %911, splat (float 5.000000e-01), !dbg !34
+  %916 = fmul <2 x float> %912, splat (float 5.000000e-01), !dbg !34
+  %917 = extractelement <2 x float> %909, i64 0, !dbg !35
+  %918 = fmul float %917, 0x3FE6A09E60000000, !dbg !35
+  %919 = extractelement <2 x float> %909, i64 1, !dbg !35
+  %920 = fmul float %919, 0x3FE6A09E60000000, !dbg !35
+  %921 = extractelement <2 x float> %910, i64 0, !dbg !35
+  %922 = fmul float %921, 0x3FE6A09E60000000, !dbg !35
+  %923 = extractelement <2 x float> %910, i64 1, !dbg !35
+  %924 = fmul float %923, 0x3FE6A09E60000000, !dbg !35
+  %925 = extractelement <2 x float> %911, i64 0, !dbg !35
+  %926 = fmul float %925, 0x3FE6A09E60000000, !dbg !35
+  %927 = extractelement <2 x float> %911, i64 1, !dbg !35
+  %928 = fmul float %927, 0x3FE6A09E60000000, !dbg !35
+  %929 = extractelement <2 x float> %912, i64 0, !dbg !35
+  %930 = fmul float %929, 0x3FE6A09E60000000, !dbg !35
+  %931 = extractelement <2 x float> %912, i64 1, !dbg !35
+  %932 = fmul float %931, 0x3FE6A09E60000000, !dbg !35
+  %933 = tail call float @llvm.fabs.f32(float %918), !dbg !36
+  %934 = fcmp olt float %933, 1.000000e+00, !dbg !36
+  br i1 %934, label %935, label %943, !dbg !36
+
+935:                                              ; preds = %.loopexit
+  %936 = fmul nnan float %918, %918, !dbg !36
+  %937 = tail call noundef float @llvm.fmuladd.f32(float %936, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %938 = tail call noundef float @llvm.fmuladd.f32(float %936, float %937, float 0xBF9B593700000000), !dbg !36
+  %939 = tail call noundef float @llvm.fmuladd.f32(float %936, float %938, float 0x3FBCE077C0000000), !dbg !36
+  %940 = tail call noundef float @llvm.fmuladd.f32(float %936, float %939, float 0xBFD8126600000000), !dbg !36
+  %941 = tail call noundef float @llvm.fmuladd.f32(float %936, float %940, float 0x3FC06EBA00000000), !dbg !36
+  %942 = tail call float @llvm.fma.f32(float %933, float %941, float %933), !dbg !36
+  br label %__ocml_erf_f32.exit146, !dbg !36
+
+943:                                              ; preds = %.loopexit
+  %944 = tail call noundef float @llvm.fmuladd.f32(float %933, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %945 = tail call noundef float @llvm.fmuladd.f32(float %933, float %944, float 0x3F6F9A6D20000000), !dbg !36
+  %946 = tail call noundef float @llvm.fmuladd.f32(float %933, float %945, float 0xBF98C31640000000), !dbg !36
+  %947 = tail call noundef float @llvm.fmuladd.f32(float %933, float %946, float 0x3FBB4E9C80000000), !dbg !36
+  %948 = tail call noundef float @llvm.fmuladd.f32(float %933, float %947, float 0x3FE4515FA0000000), !dbg !36
+  %949 = tail call noundef float @llvm.fmuladd.f32(float %933, float %948, float 0x3FC078E500000000), !dbg !36
+  %950 = tail call float @llvm.fma.f32(float %933, float %949, float %933), !dbg !36
+  %951 = fneg float %950, !dbg !36
+  %952 = tail call noundef float @llvm.exp.f32(float %951), !dbg !36
+  %953 = fsub float 1.000000e+00, %952, !dbg !36
+  br label %__ocml_erf_f32.exit146, !dbg !36
+
+__ocml_erf_f32.exit146:                           ; preds = %935, %943
+  %954 = phi float [ %942, %935 ], [ %953, %943 ], !dbg !36
+  %955 = tail call noundef float @llvm.copysign.f32(float %954, float %918), !dbg !36
+  %956 = tail call float @llvm.fabs.f32(float %920), !dbg !36
+  %957 = fcmp olt float %956, 1.000000e+00, !dbg !36
+  br i1 %957, label %958, label %966, !dbg !36
+
+958:                                              ; preds = %__ocml_erf_f32.exit146
+  %959 = fmul nnan float %920, %920, !dbg !36
+  %960 = tail call noundef float @llvm.fmuladd.f32(float %959, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %961 = tail call noundef float @llvm.fmuladd.f32(float %959, float %960, float 0xBF9B593700000000), !dbg !36
+  %962 = tail call noundef float @llvm.fmuladd.f32(float %959, float %961, float 0x3FBCE077C0000000), !dbg !36
+  %963 = tail call noundef float @llvm.fmuladd.f32(float %959, float %962, float 0xBFD8126600000000), !dbg !36
+  %964 = tail call noundef float @llvm.fmuladd.f32(float %959, float %963, float 0x3FC06EBA00000000), !dbg !36
+  %965 = tail call float @llvm.fma.f32(float %956, float %964, float %956), !dbg !36
+  br label %__ocml_erf_f32.exit147, !dbg !36
+
+966:                                              ; preds = %__ocml_erf_f32.exit146
+  %967 = tail call noundef float @llvm.fmuladd.f32(float %956, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %968 = tail call noundef float @llvm.fmuladd.f32(float %956, float %967, float 0x3F6F9A6D20000000), !dbg !36
+  %969 = tail call noundef float @llvm.fmuladd.f32(float %956, float %968, float 0xBF98C31640000000), !dbg !36
+  %970 = tail call noundef float @llvm.fmuladd.f32(float %956, float %969, float 0x3FBB4E9C80000000), !dbg !36
+  %971 = tail call noundef float @llvm.fmuladd.f32(float %956, float %970, float 0x3FE4515FA0000000), !dbg !36
+  %972 = tail call noundef float @llvm.fmuladd.f32(float %956, float %971, float 0x3FC078E500000000), !dbg !36
+  %973 = tail call float @llvm.fma.f32(float %956, float %972, float %956), !dbg !36
+  %974 = fneg float %973, !dbg !36
+  %975 = tail call noundef float @llvm.exp.f32(float %974), !dbg !36
+  %976 = fsub float 1.000000e+00, %975, !dbg !36
+  br label %__ocml_erf_f32.exit147, !dbg !36
+
+__ocml_erf_f32.exit147:                           ; preds = %958, %966
+  %977 = phi float [ %965, %958 ], [ %976, %966 ], !dbg !36
+  %978 = tail call noundef float @llvm.copysign.f32(float %977, float %920), !dbg !36
+  %979 = tail call float @llvm.fabs.f32(float %922), !dbg !36
+  %980 = fcmp olt float %979, 1.000000e+00, !dbg !36
+  br i1 %980, label %981, label %989, !dbg !36
+
+981:                                              ; preds = %__ocml_erf_f32.exit147
+  %982 = fmul nnan float %922, %922, !dbg !36
+  %983 = tail call noundef float @llvm.fmuladd.f32(float %982, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %984 = tail call noundef float @llvm.fmuladd.f32(float %982, float %983, float 0xBF9B593700000000), !dbg !36
+  %985 = tail call noundef float @llvm.fmuladd.f32(float %982, float %984, float 0x3FBCE077C0000000), !dbg !36
+  %986 = tail call noundef float @llvm.fmuladd.f32(float %982, float %985, float 0xBFD8126600000000), !dbg !36
+  %987 = tail call noundef float @llvm.fmuladd.f32(float %982, float %986, float 0x3FC06EBA00000000), !dbg !36
+  %988 = tail call float @llvm.fma.f32(float %979, float %987, float %979), !dbg !36
+  br label %__ocml_erf_f32.exit148, !dbg !36
+
+989:                                              ; preds = %__ocml_erf_f32.exit147
+  %990 = tail call noundef float @llvm.fmuladd.f32(float %979, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %991 = tail call noundef float @llvm.fmuladd.f32(float %979, float %990, float 0x3F6F9A6D20000000), !dbg !36
+  %992 = tail call noundef float @llvm.fmuladd.f32(float %979, float %991, float 0xBF98C31640000000), !dbg !36
+  %993 = tail call noundef float @llvm.fmuladd.f32(float %979, float %992, float 0x3FBB4E9C80000000), !dbg !36
+  %994 = tail call noundef float @llvm.fmuladd.f32(float %979, float %993, float 0x3FE4515FA0000000), !dbg !36
+  %995 = tail call noundef float @llvm.fmuladd.f32(float %979, float %994, float 0x3FC078E500000000), !dbg !36
+  %996 = tail call float @llvm.fma.f32(float %979, float %995, float %979), !dbg !36
+  %997 = fneg float %996, !dbg !36
+  %998 = tail call noundef float @llvm.exp.f32(float %997), !dbg !36
+  %999 = fsub float 1.000000e+00, %998, !dbg !36
+  br label %__ocml_erf_f32.exit148, !dbg !36
+
+__ocml_erf_f32.exit148:                           ; preds = %981, %989
+  %1000 = phi float [ %988, %981 ], [ %999, %989 ], !dbg !36
+  %1001 = tail call noundef float @llvm.copysign.f32(float %1000, float %922), !dbg !36
+  %1002 = tail call float @llvm.fabs.f32(float %924), !dbg !36
+  %1003 = fcmp olt float %1002, 1.000000e+00, !dbg !36
+  br i1 %1003, label %1004, label %1012, !dbg !36
+
+1004:                                             ; preds = %__ocml_erf_f32.exit148
+  %1005 = fmul nnan float %924, %924, !dbg !36
+  %1006 = tail call noundef float @llvm.fmuladd.f32(float %1005, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %1007 = tail call noundef float @llvm.fmuladd.f32(float %1005, float %1006, float 0xBF9B593700000000), !dbg !36
+  %1008 = tail call noundef float @llvm.fmuladd.f32(float %1005, float %1007, float 0x3FBCE077C0000000), !dbg !36
+  %1009 = tail call noundef float @llvm.fmuladd.f32(float %1005, float %1008, float 0xBFD8126600000000), !dbg !36
+  %1010 = tail call noundef float @llvm.fmuladd.f32(float %1005, float %1009, float 0x3FC06EBA00000000), !dbg !36
+  %1011 = tail call float @llvm.fma.f32(float %1002, float %1010, float %1002), !dbg !36
+  br label %__ocml_erf_f32.exit149, !dbg !36
+
+1012:                                             ; preds = %__ocml_erf_f32.exit148
+  %1013 = tail call noundef float @llvm.fmuladd.f32(float %1002, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %1014 = tail call noundef float @llvm.fmuladd.f32(float %1002, float %1013, float 0x3F6F9A6D20000000), !dbg !36
+  %1015 = tail call noundef float @llvm.fmuladd.f32(float %1002, float %1014, float 0xBF98C31640000000), !dbg !36
+  %1016 = tail call noundef float @llvm.fmuladd.f32(float %1002, float %1015, float 0x3FBB4E9C80000000), !dbg !36
+  %1017 = tail call noundef float @llvm.fmuladd.f32(float %1002, float %1016, float 0x3FE4515FA0000000), !dbg !36
+  %1018 = tail call noundef float @llvm.fmuladd.f32(float %1002, float %1017, float 0x3FC078E500000000), !dbg !36
+  %1019 = tail call float @llvm.fma.f32(float %1002, float %1018, float %1002), !dbg !36
+  %1020 = fneg float %1019, !dbg !36
+  %1021 = tail call noundef float @llvm.exp.f32(float %1020), !dbg !36
+  %1022 = fsub float 1.000000e+00, %1021, !dbg !36
+  br label %__ocml_erf_f32.exit149, !dbg !36
+
+__ocml_erf_f32.exit149:                           ; preds = %1004, %1012
+  %1023 = phi float [ %1011, %1004 ], [ %1022, %1012 ], !dbg !36
+  %1024 = tail call noundef float @llvm.copysign.f32(float %1023, float %924), !dbg !36
+  %1025 = tail call float @llvm.fabs.f32(float %926), !dbg !36
+  %1026 = fcmp olt float %1025, 1.000000e+00, !dbg !36
+  br i1 %1026, label %1027, label %1035, !dbg !36
+
+1027:                                             ; preds = %__ocml_erf_f32.exit149
+  %1028 = fmul nnan float %926, %926, !dbg !36
+  %1029 = tail call noundef float @llvm.fmuladd.f32(float %1028, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %1030 = tail call noundef float @llvm.fmuladd.f32(float %1028, float %1029, float 0xBF9B593700000000), !dbg !36
+  %1031 = tail call noundef float @llvm.fmuladd.f32(float %1028, float %1030, float 0x3FBCE077C0000000), !dbg !36
+  %1032 = tail call noundef float @llvm.fmuladd.f32(float %1028, float %1031, float 0xBFD8126600000000), !dbg !36
+  %1033 = tail call noundef float @llvm.fmuladd.f32(float %1028, float %1032, float 0x3FC06EBA00000000), !dbg !36
+  %1034 = tail call float @llvm.fma.f32(float %1025, float %1033, float %1025), !dbg !36
+  br label %__ocml_erf_f32.exit150, !dbg !36
+
+1035:                                             ; preds = %__ocml_erf_f32.exit149
+  %1036 = tail call noundef float @llvm.fmuladd.f32(float %1025, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %1037 = tail call noundef float @llvm.fmuladd.f32(float %1025, float %1036, float 0x3F6F9A6D20000000), !dbg !36
+  %1038 = tail call noundef float @llvm.fmuladd.f32(float %1025, float %1037, float 0xBF98C31640000000), !dbg !36
+  %1039 = tail call noundef float @llvm.fmuladd.f32(float %1025, float %1038, float 0x3FBB4E9C80000000), !dbg !36
+  %1040 = tail call noundef float @llvm.fmuladd.f32(float %1025, float %1039, float 0x3FE4515FA0000000), !dbg !36
+  %1041 = tail call noundef float @llvm.fmuladd.f32(float %1025, float %1040, float 0x3FC078E500000000), !dbg !36
+  %1042 = tail call float @llvm.fma.f32(float %1025, float %1041, float %1025), !dbg !36
+  %1043 = fneg float %1042, !dbg !36
+  %1044 = tail call noundef float @llvm.exp.f32(float %1043), !dbg !36
+  %1045 = fsub float 1.000000e+00, %1044, !dbg !36
+  br label %__ocml_erf_f32.exit150, !dbg !36
+
+__ocml_erf_f32.exit150:                           ; preds = %1027, %1035
+  %1046 = phi float [ %1034, %1027 ], [ %1045, %1035 ], !dbg !36
+  %1047 = tail call noundef float @llvm.copysign.f32(float %1046, float %926), !dbg !36
+  %1048 = tail call float @llvm.fabs.f32(float %928), !dbg !36
+  %1049 = fcmp olt float %1048, 1.000000e+00, !dbg !36
+  br i1 %1049, label %1050, label %1058, !dbg !36
+
+1050:                                             ; preds = %__ocml_erf_f32.exit150
+  %1051 = fmul nnan float %928, %928, !dbg !36
+  %1052 = tail call noundef float @llvm.fmuladd.f32(float %1051, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %1053 = tail call noundef float @llvm.fmuladd.f32(float %1051, float %1052, float 0xBF9B593700000000), !dbg !36
+  %1054 = tail call noundef float @llvm.fmuladd.f32(float %1051, float %1053, float 0x3FBCE077C0000000), !dbg !36
+  %1055 = tail call noundef float @llvm.fmuladd.f32(float %1051, float %1054, float 0xBFD8126600000000), !dbg !36
+  %1056 = tail call noundef float @llvm.fmuladd.f32(float %1051, float %1055, float 0x3FC06EBA00000000), !dbg !36
+  %1057 = tail call float @llvm.fma.f32(float %1048, float %1056, float %1048), !dbg !36
+  br label %__ocml_erf_f32.exit151, !dbg !36
+
+1058:                                             ; preds = %__ocml_erf_f32.exit150
+  %1059 = tail call noundef float @llvm.fmuladd.f32(float %1048, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %1060 = tail call noundef float @llvm.fmuladd.f32(float %1048, float %1059, float 0x3F6F9A6D20000000), !dbg !36
+  %1061 = tail call noundef float @llvm.fmuladd.f32(float %1048, float %1060, float 0xBF98C31640000000), !dbg !36
+  %1062 = tail call noundef float @llvm.fmuladd.f32(float %1048, float %1061, float 0x3FBB4E9C80000000), !dbg !36
+  %1063 = tail call noundef float @llvm.fmuladd.f32(float %1048, float %1062, float 0x3FE4515FA0000000), !dbg !36
+  %1064 = tail call noundef float @llvm.fmuladd.f32(float %1048, float %1063, float 0x3FC078E500000000), !dbg !36
+  %1065 = tail call float @llvm.fma.f32(float %1048, float %1064, float %1048), !dbg !36
+  %1066 = fneg float %1065, !dbg !36
+  %1067 = tail call noundef float @llvm.exp.f32(float %1066), !dbg !36
+  %1068 = fsub float 1.000000e+00, %1067, !dbg !36
+  br label %__ocml_erf_f32.exit151, !dbg !36
+
+__ocml_erf_f32.exit151:                           ; preds = %1050, %1058
+  %1069 = phi float [ %1057, %1050 ], [ %1068, %1058 ], !dbg !36
+  %1070 = tail call noundef float @llvm.copysign.f32(float %1069, float %928), !dbg !36
+  %1071 = tail call float @llvm.fabs.f32(float %930), !dbg !36
+  %1072 = fcmp olt float %1071, 1.000000e+00, !dbg !36
+  br i1 %1072, label %1073, label %1081, !dbg !36
+
+1073:                                             ; preds = %__ocml_erf_f32.exit151
+  %1074 = fmul nnan float %930, %930, !dbg !36
+  %1075 = tail call noundef float @llvm.fmuladd.f32(float %1074, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %1076 = tail call noundef float @llvm.fmuladd.f32(float %1074, float %1075, float 0xBF9B593700000000), !dbg !36
+  %1077 = tail call noundef float @llvm.fmuladd.f32(float %1074, float %1076, float 0x3FBCE077C0000000), !dbg !36
+  %1078 = tail call noundef float @llvm.fmuladd.f32(float %1074, float %1077, float 0xBFD8126600000000), !dbg !36
+  %1079 = tail call noundef float @llvm.fmuladd.f32(float %1074, float %1078, float 0x3FC06EBA00000000), !dbg !36
+  %1080 = tail call float @llvm.fma.f32(float %1071, float %1079, float %1071), !dbg !36
+  br label %__ocml_erf_f32.exit152, !dbg !36
+
+1081:                                             ; preds = %__ocml_erf_f32.exit151
+  %1082 = tail call noundef float @llvm.fmuladd.f32(float %1071, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %1083 = tail call noundef float @llvm.fmuladd.f32(float %1071, float %1082, float 0x3F6F9A6D20000000), !dbg !36
+  %1084 = tail call noundef float @llvm.fmuladd.f32(float %1071, float %1083, float 0xBF98C31640000000), !dbg !36
+  %1085 = tail call noundef float @llvm.fmuladd.f32(float %1071, float %1084, float 0x3FBB4E9C80000000), !dbg !36
+  %1086 = tail call noundef float @llvm.fmuladd.f32(float %1071, float %1085, float 0x3FE4515FA0000000), !dbg !36
+  %1087 = tail call noundef float @llvm.fmuladd.f32(float %1071, float %1086, float 0x3FC078E500000000), !dbg !36
+  %1088 = tail call float @llvm.fma.f32(float %1071, float %1087, float %1071), !dbg !36
+  %1089 = fneg float %1088, !dbg !36
+  %1090 = tail call noundef float @llvm.exp.f32(float %1089), !dbg !36
+  %1091 = fsub float 1.000000e+00, %1090, !dbg !36
+  br label %__ocml_erf_f32.exit152, !dbg !36
+
+__ocml_erf_f32.exit152:                           ; preds = %1073, %1081
+  %1092 = phi float [ %1080, %1073 ], [ %1091, %1081 ], !dbg !36
+  %1093 = tail call noundef float @llvm.copysign.f32(float %1092, float %930), !dbg !36
+  %1094 = tail call float @llvm.fabs.f32(float %932), !dbg !36
+  %1095 = fcmp olt float %1094, 1.000000e+00, !dbg !36
+  br i1 %1095, label %1096, label %1104, !dbg !36
+
+1096:                                             ; preds = %__ocml_erf_f32.exit152
+  %1097 = fmul nnan float %932, %932, !dbg !36
+  %1098 = tail call noundef float @llvm.fmuladd.f32(float %1097, float 0xBF4268BC20000000, float 0x3F74208280000000), !dbg !36
+  %1099 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1098, float 0xBF9B593700000000), !dbg !36
+  %1100 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1099, float 0x3FBCE077C0000000), !dbg !36
+  %1101 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1100, float 0xBFD8126600000000), !dbg !36
+  %1102 = tail call noundef float @llvm.fmuladd.f32(float %1097, float %1101, float 0x3FC06EBA00000000), !dbg !36
+  %1103 = tail call float @llvm.fma.f32(float %1094, float %1102, float %1094), !dbg !36
+  br label %__ocml_erf_f32.exit153, !dbg !36
+
+1104:                                             ; preds = %__ocml_erf_f32.exit152
+  %1105 = tail call noundef float @llvm.fmuladd.f32(float %1094, float 0x3EF1D31560000000, float 0xBF38D12900000000), !dbg !36
+  %1106 = tail call noundef float @llvm.fmuladd.f32(float %1094, float %1105, float 0x3F6F9A6D20000000), !dbg !36
+  %1107 = tail call noundef float @llvm.fmuladd.f32(float %1094, float %1106, float 0xBF98C31640000000), !dbg !36
+  %1108 = tail call noundef float @llvm.fmuladd.f32(float %1094, float %1107, float 0x3FBB4E9C80000000), !dbg !36
+  %1109 = tail call noundef float @llvm.fmuladd.f32(float %1094, float %1108, float 0x3FE4515FA0000000), !dbg !36
+  %1110 = tail call noundef float @llvm.fmuladd.f32(float %1094, float %1109, float 0x3FC078E500000000), !dbg !36
+  %1111 = tail call float @llvm.fma.f32(float %1094, float %1110, float %1094), !dbg !36
+  %1112 = fneg float %1111, !dbg !36
+  %1113 = tail call noundef float @llvm.exp.f32(float %1112), !dbg !36
+  %1114 = fsub float 1.000000e+00, %1113, !dbg !36
+  br label %__ocml_erf_f32.exit153, !dbg !36
+
+__ocml_erf_f32.exit153:                           ; preds = %1096, %1104
+  %1115 = phi float [ %1103, %1096 ], [ %1114, %1104 ], !dbg !36
+  %1116 = tail call noundef float @llvm.copysign.f32(float %1115, float %932), !dbg !36
+  %1117 = insertelement <2 x float> poison, float %955, i64 0, !dbg !37
+  %1118 = insertelement <2 x float> %1117, float %978, i64 1, !dbg !37
+  %1119 = fadd <2 x float> %1118, splat (float 1.000000e+00), !dbg !37
+  %1120 = insertelement <2 x float> poison, float %1001, i64 0, !dbg !37
+  %1121 = insertelement <2 x float> %1120, float %1024, i64 1, !dbg !37
+  %1122 = fadd <2 x float> %1121, splat (float 1.000000e+00), !dbg !37
+  %1123 = insertelement <2 x float> poison, float %1047, i64 0, !dbg !37
+  %1124 = insertelement <2 x float> %1123, float %1070, i64 1, !dbg !37
+  %1125 = fadd <2 x float> %1124, splat (float 1.000000e+00), !dbg !37
+  %1126 = fmul <2 x float> %913, %1119, !dbg !38
+  %1127 = fmul <2 x float> %901, %1126, !dbg !39
+  %1128 = fadd <2 x float> %900, %1127, !dbg !40
+  %1129 = fadd <2 x float> %899, %1128, !dbg !41
+  %1130 = fadd <2 x float> %788, %1129, !dbg !42
+  %1131 = fmul <2 x float> %914, %1122, !dbg !38
+  %1132 = fmul <2 x float> %896, %1131, !dbg !39
+  %1133 = fadd <2 x float> %895, %1132, !dbg !40
+  %1134 = fadd <2 x float> %894, %1133, !dbg !41
+  %1135 = fadd <2 x float> %793, %1134, !dbg !42
+  %1136 = fmul <2 x float> %915, %1125, !dbg !38
+  %1137 = fmul <2 x float> %891, %1136, !dbg !39
+  %1138 = fadd <2 x float> %890, %1137, !dbg !40
+  %1139 = fadd <2 x float> %889, %1138, !dbg !41
+  %1140 = fadd <2 x float> %798, %1139, !dbg !42
+  %1141 = insertelement <2 x float> poison, float %1093, i64 0, !dbg !37
+  %1142 = insertelement <2 x float> %1141, float %1116, i64 1, !dbg !37
+  %1143 = fadd <2 x float> %1142, splat (float 1.000000e+00), !dbg !37
+  %1144 = fmul <2 x float> %916, %1143, !dbg !38
+  %1145 = fmul <2 x float> %886, %1144, !dbg !39
+  %1146 = fadd <2 x float> %885, %1145, !dbg !40
+  %1147 = fadd <2 x float> %884, %1146, !dbg !41
+  %1148 = fadd <2 x float> %806, %1147, !dbg !42
+  %1149 = select <2 x i1> %407, <2 x float> %1130, <2 x float> %491, !dbg !43
+  %1150 = select <2 x i1> %407, <2 x float> %1135, <2 x float> %485, !dbg !43
+  %1151 = select <2 x i1> %407, <2 x float> %1140, <2 x float> %479, !dbg !43
+  %1152 = select <2 x i1> %407, <2 x float> %1148, <2 x float> %473, !dbg !43
+  %1153 = extractelement <2 x float> %1129, i64 0, !dbg !57
+  %1154 = extractelement <2 x float> %874, i64 1, !dbg !49
+  %shift646 = shufflevector <2 x float> %874, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop647 = fsub <2 x float> %1129, %shift646, !dbg !49
+  %1155 = extractelement <2 x float> %foldExtExtBinop647, i64 0, !dbg !49
+  %1156 = extractelement <2 x float> %1129, i64 1, !dbg !57
+  %1157 = extractelement <2 x float> %858, i64 0, !dbg !49
+  %shift649 = shufflevector <2 x float> %1129, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop650 = fsub <2 x float> %shift649, %858, !dbg !49
+  %1158 = extractelement <2 x float> %foldExtExtBinop650, i64 0, !dbg !49
+  %1159 = extractelement <2 x float> %1134, i64 0, !dbg !57
+  %1160 = extractelement <2 x float> %858, i64 1, !dbg !49
+  %shift652 = shufflevector <2 x float> %858, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop653 = fsub <2 x float> %1134, %shift652, !dbg !49
+  %1161 = extractelement <2 x float> %foldExtExtBinop653, i64 0, !dbg !49
+  %1162 = extractelement <2 x float> %1134, i64 1, !dbg !57
+  %1163 = extractelement <2 x float> %859, i64 0, !dbg !49
+  %shift655 = shufflevector <2 x float> %1134, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop656 = fsub <2 x float> %shift655, %859, !dbg !49
+  %1164 = extractelement <2 x float> %foldExtExtBinop656, i64 0, !dbg !49
+  %1165 = extractelement <2 x float> %1139, i64 0, !dbg !57
+  %1166 = extractelement <2 x float> %859, i64 1, !dbg !49
+  %shift658 = shufflevector <2 x float> %859, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop659 = fsub <2 x float> %1139, %shift658, !dbg !49
+  %1167 = extractelement <2 x float> %foldExtExtBinop659, i64 0, !dbg !49
+  %1168 = extractelement <2 x float> %1139, i64 1, !dbg !57
+  %1169 = extractelement <2 x float> %860, i64 0, !dbg !49
+  %shift661 = shufflevector <2 x float> %1139, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop662 = fsub <2 x float> %shift661, %860, !dbg !49
+  %1170 = extractelement <2 x float> %foldExtExtBinop662, i64 0, !dbg !49
+  %1171 = extractelement <2 x float> %1147, i64 0, !dbg !57
+  %1172 = extractelement <2 x float> %860, i64 1, !dbg !49
+  %shift664 = shufflevector <2 x float> %860, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !49
+  %foldExtExtBinop665 = fsub <2 x float> %1147, %shift664, !dbg !49
+  %1173 = extractelement <2 x float> %foldExtExtBinop665, i64 0, !dbg !49
+  %1174 = extractelement <2 x float> %1147, i64 1, !dbg !57
+  %1175 = fsub float %1174, %861, !dbg !49
+  %1176 = insertelement <2 x float> poison, float %870, i64 0, !dbg !54
+  %1177 = insertelement <2 x float> %1176, float %871, i64 1, !dbg !54
+  %1178 = fadd <2 x float> %1177, splat (float 1.000000e+00), !dbg !54
+  %1179 = fadd <2 x float> %872, splat (float 1.000000e+00), !dbg !54
+  %1180 = insertelement <2 x float> poison, float %873, i64 0, !dbg !54
+  %1181 = shufflevector <2 x float> %1180, <2 x float> %874, <2 x i32> <i32 0, i32 2>, !dbg !54
+  %1182 = fadd <2 x float> %1181, splat (float 1.000000e+00), !dbg !54
+  %1183 = fadd <2 x float> %875, splat (float 1.000000e+00), !dbg !54
+  %1184 = extractelement <2 x float> %1178, i64 0, !dbg !55
+  %1185 = fdiv float %1155, %1184, !dbg !55
+  %1186 = extractelement <2 x float> %1179, i64 0, !dbg !55
+  %1187 = fdiv float %1158, %1186, !dbg !55
+  %1188 = extractelement <2 x float> %1178, i64 1, !dbg !55
+  %1189 = fdiv float %1161, %1188, !dbg !55
+  %1190 = extractelement <2 x float> %1179, i64 1, !dbg !55
+  %1191 = fdiv float %1164, %1190, !dbg !55
+  %1192 = extractelement <2 x float> %1182, i64 0, !dbg !55
+  %1193 = fdiv float %1167, %1192, !dbg !55
+  %1194 = extractelement <2 x float> %1183, i64 0, !dbg !55
+  %1195 = fdiv float %1170, %1194, !dbg !55
+  %1196 = extractelement <2 x float> %1182, i64 1, !dbg !55
+  %1197 = fdiv float %1173, %1196, !dbg !55
+  %1198 = extractelement <2 x float> %1183, i64 1, !dbg !55
+  %1199 = fdiv float %1175, %1198, !dbg !55
+  %1200 = fadd float %1154, %1185, !dbg !56
+  %1201 = fadd float %1157, %1187, !dbg !56
+  %1202 = fadd float %1160, %1189, !dbg !56
+  %1203 = fadd float %1163, %1191, !dbg !56
+  %1204 = fadd float %1166, %1193, !dbg !56
+  %1205 = fadd float %1169, %1195, !dbg !56
+  %1206 = fadd float %1172, %1197, !dbg !56
+  %1207 = fadd float %861, %1199, !dbg !56
+  %1208 = fsub float %1153, %1200, !dbg !57
+  %1209 = fsub float %1156, %1201, !dbg !57
+  %1210 = fsub float %1159, %1202, !dbg !57
+  %1211 = fsub float %1162, %1203, !dbg !57
+  %1212 = fsub float %1165, %1204, !dbg !57
+  %1213 = fsub float %1168, %1205, !dbg !57
+  %1214 = fsub float %1171, %1206, !dbg !57
+  %1215 = fsub float %1174, %1207, !dbg !57
+  %1216 = fmul float %1155, %1208, !dbg !58
+  %1217 = fmul float %1158, %1209, !dbg !58
+  %1218 = fmul float %1161, %1210, !dbg !58
+  %1219 = fmul float %1164, %1211, !dbg !58
+  %1220 = fmul float %1167, %1212, !dbg !58
+  %1221 = fmul float %1170, %1213, !dbg !58
+  %1222 = fmul float %1173, %1214, !dbg !58
+  %1223 = fmul float %1175, %1215, !dbg !58
+  %1224 = fadd float %840, %1216, !dbg !59
+  %1225 = fadd float %822, %1217, !dbg !59
+  %1226 = fadd float %824, %1218, !dbg !59
+  %1227 = fadd float %833, %1219, !dbg !59
+  %1228 = fadd float %835, %1220, !dbg !59
+  %1229 = fadd float %847, %1221, !dbg !59
+  %1230 = fadd float %849, %1222, !dbg !59
+  %1231 = fadd float %857, %1223, !dbg !59
+  %1232 = select i1 %23, float %1200, float %904, !dbg !44
+  %1233 = extractelement <2 x float> %500, i64 0, !dbg !44
+  %1234 = select i1 %23, float %1201, float %1233, !dbg !44
+  %1235 = extractelement <2 x float> %500, i64 1, !dbg !44
+  %1236 = select i1 %23, float %1202, float %1235, !dbg !44
+  %1237 = extractelement <2 x float> %501, i64 0, !dbg !44
+  %1238 = select i1 %23, float %1203, float %1237, !dbg !44
+  %1239 = extractelement <2 x float> %501, i64 1, !dbg !44
+  %1240 = select i1 %23, float %1204, float %1239, !dbg !44
+  %1241 = extractelement <2 x float> %502, i64 0, !dbg !44
+  %1242 = select i1 %23, float %1205, float %1241, !dbg !44
+  %1243 = extractelement <2 x float> %502, i64 1, !dbg !44
+  %1244 = select i1 %23, float %1206, float %1243, !dbg !44
+  %1245 = select i1 %23, float %1207, float %.pn414, !dbg !44
+  %1246 = select i1 %23, float %1224, float %464, !dbg !60
+  %1247 = select i1 %23, float %1225, float %465, !dbg !60
+  %1248 = select i1 %23, float %1226, float %466, !dbg !60
+  %1249 = select i1 %23, float %1227, float %467, !dbg !60
+  %1250 = select i1 %23, float %1228, float %468, !dbg !60
+  %1251 = select i1 %23, float %1229, float %469, !dbg !60
+  %1252 = select i1 %23, float %1230, float %470, !dbg !60
+  %1253 = select i1 %23, float %1231, float %471, !dbg !60
+  %1254 = insertelement <2 x float> poison, float %.pn412, i64 0, !dbg !45
+  %1255 = insertelement <2 x float> %1254, float %.pn408, i64 1, !dbg !45
+  %1256 = select <2 x i1> %407, <2 x float> %1178, <2 x float> %1255, !dbg !45
+  %1257 = select <2 x i1> %407, <2 x float> %1179, <2 x float> %498, !dbg !45
+  %1258 = insertelement <2 x float> poison, float %.pn404, i64 0, !dbg !45
+  %1259 = shufflevector <2 x float> %1258, <2 x float> %499, <2 x i32> <i32 0, i32 2>, !dbg !45
+  %1260 = select <2 x i1> %407, <2 x float> %1182, <2 x float> %1259, !dbg !45
+  %1261 = select <2 x i1> %407, <2 x float> %1183, <2 x float> %497, !dbg !45
+  br i1 %23, label %1262, label %.critedge138, !dbg !46
+
+1262:                                             ; preds = %__ocml_erf_f32.exit153
+  %1263 = shufflevector <2 x float> %1139, <2 x float> %1147, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %1264 = sext i32 %505 to i64
+  %1265 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %1264
+  %1266 = shufflevector <2 x float> %1129, <2 x float> %1134, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %1267 = sext i32 %506 to i64, !dbg !47
+  %1268 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %1267, !dbg !47
+  store <4 x float> %1266, ptr addrspace(1) %1265, align 16, !dbg !46
+  store <4 x float> %1263, ptr addrspace(1) %1268, align 16, !dbg !46
+  br label %.critedge138, !dbg !46
+
+.critedge138:                                     ; preds = %__ocml_erf_f32.exit153, %1262
+  %1269 = fadd <2 x float> %1149, %1150, !dbg !63
+  %1270 = fadd <2 x float> %1151, %1152, !dbg !63
+  %shift667 = shufflevector <2 x float> %1269, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !67
+  %foldExtExtBinop668 = fadd <2 x float> %1269, %shift667, !dbg !67
+  %1271 = extractelement <2 x float> %foldExtExtBinop668, i64 0, !dbg !67
+  %shift670 = shufflevector <2 x float> %1270, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !67
+  %foldExtExtBinop671 = fadd <2 x float> %1270, %shift670, !dbg !67
+  %1272 = extractelement <2 x float> %foldExtExtBinop671, i64 0, !dbg !67
+  %1273 = bitcast float %1271 to i32, !dbg !63
+  %1274 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1273, i32 %1273, i32 177, i32 15, i32 15, i1 false), !dbg !63
+  %1275 = bitcast i32 %1274 to float, !dbg !63
+  %1276 = fadd float %1271, %1275, !dbg !67
+  %1277 = bitcast float %1272 to i32, !dbg !63
+  %1278 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1277, i32 %1277, i32 177, i32 15, i32 15, i1 false), !dbg !63
+  %1279 = bitcast i32 %1278 to float, !dbg !63
+  %1280 = fadd float %1272, %1279, !dbg !67
+  %1281 = select i1 %26, float %1276, float %1280, !dbg !68
+  %1282 = select i1 %26, float %1280, float %1276, !dbg !68
+  %1283 = shl nuw nsw i32 %17, 3, !dbg !68
+  %1284 = and i32 %1283, 248, !dbg !68
+  %1285 = and i32 %17, 32, !dbg !68
+  %.lobit = lshr exact i32 %1285, 3, !dbg !68
+  %1286 = or disjoint i32 %1284, %.lobit, !dbg !68
+  %1287 = bitcast float %1281 to i32, !dbg !68
+  %1288 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1286, i32 %1287), !dbg !68
+  %1289 = bitcast float %1282 to i32, !dbg !68
+  %1290 = xor i32 %1286, 4, !dbg !68
+  %1291 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1290, i32 %1289), !dbg !68
+  %1292 = fsub float %1234, %1232, !dbg !69
+  %1293 = fadd <2 x float> %1256, %1257, !dbg !72
+  %1294 = extractelement <2 x float> %1293, i64 0, !dbg !73
+  %1295 = fcmp oeq float %1294, 0.000000e+00, !dbg !74
+  %1296 = extractelement <2 x float> %1257, i64 0, !dbg !75
+  %1297 = fdiv float %1296, %1294, !dbg !75
+  %1298 = select i1 %1295, float 0.000000e+00, float %1297, !dbg !76
+  %1299 = fmul float %1298, %1292, !dbg !77
+  %1300 = fadd float %1232, %1299, !dbg !78
+  %1301 = fadd float %1246, %1247, !dbg !79
+  %1302 = fmul float %1292, %1292, !dbg !73
+  %1303 = extractelement <2 x float> %1256, i64 0, !dbg !73
+  %1304 = fmul float %1303, %1302, !dbg !73
+  %1305 = fmul float %1298, %1304, !dbg !73
+  %1306 = fadd float %1301, %1305, !dbg !79
+  %1307 = fsub float %1238, %1236, !dbg !69
+  %1308 = extractelement <2 x float> %1293, i64 1, !dbg !75
+  %1309 = fcmp oeq float %1308, 0.000000e+00, !dbg !74
+  %1310 = extractelement <2 x float> %1257, i64 1, !dbg !75
+  %1311 = fdiv float %1310, %1308, !dbg !75
+  %1312 = select i1 %1309, float 0.000000e+00, float %1311, !dbg !76
+  %1313 = fmul float %1312, %1307, !dbg !77
+  %1314 = fadd float %1236, %1313, !dbg !78
+  %1315 = fadd float %1248, %1249, !dbg !79
+  %1316 = fmul float %1307, %1307, !dbg !73
+  %1317 = extractelement <2 x float> %1256, i64 1, !dbg !73
+  %1318 = fmul float %1317, %1316, !dbg !73
+  %1319 = fmul float %1312, %1318, !dbg !73
+  %1320 = fadd float %1315, %1319, !dbg !79
+  %1321 = fsub float %1314, %1300, !dbg !69
+  %1322 = fadd float %1306, %1320, !dbg !79
+  %1323 = fmul float %1321, %1321, !dbg !73
+  %1324 = fmul float %1294, %1323, !dbg !73
+  %1325 = fsub float %1242, %1240, !dbg !69
+  %1326 = fadd <2 x float> %1260, %1261, !dbg !72
+  %1327 = extractelement <2 x float> %1326, i64 0, !dbg !73
+  %1328 = fcmp oeq float %1327, 0.000000e+00, !dbg !74
+  %1329 = extractelement <2 x float> %1261, i64 0, !dbg !75
+  %1330 = fdiv float %1329, %1327, !dbg !75
+  %1331 = select i1 %1328, float 0.000000e+00, float %1330, !dbg !76
+  %1332 = fmul float %1331, %1325, !dbg !77
+  %1333 = fadd float %1240, %1332, !dbg !78
+  %1334 = fadd float %1250, %1251, !dbg !79
+  %1335 = fmul float %1325, %1325, !dbg !73
+  %1336 = extractelement <2 x float> %1260, i64 0, !dbg !73
+  %1337 = fmul float %1336, %1335, !dbg !73
+  %1338 = fmul float %1331, %1337, !dbg !73
+  %1339 = fadd float %1334, %1338, !dbg !79
+  %1340 = fsub float %1245, %1244, !dbg !69
+  %1341 = extractelement <2 x float> %1326, i64 1, !dbg !75
+  %1342 = fcmp oeq float %1341, 0.000000e+00, !dbg !74
+  %1343 = extractelement <2 x float> %1261, i64 1, !dbg !75
+  %1344 = fdiv float %1343, %1341, !dbg !75
+  %1345 = select i1 %1342, float 0.000000e+00, float %1344, !dbg !76
+  %1346 = fmul float %1345, %1340, !dbg !77
+  %1347 = fadd float %1244, %1346, !dbg !78
+  %1348 = fadd float %1252, %1253, !dbg !79
+  %1349 = fmul float %1340, %1340, !dbg !73
+  %1350 = extractelement <2 x float> %1260, i64 1, !dbg !73
+  %1351 = fmul float %1350, %1349, !dbg !73
+  %1352 = fmul float %1345, %1351, !dbg !73
+  %1353 = fadd float %1348, %1352, !dbg !79
+  %1354 = fsub float %1347, %1333, !dbg !69
+  %1355 = fadd float %1339, %1353, !dbg !79
+  %1356 = fmul float %1354, %1354, !dbg !73
+  %1357 = fmul float %1327, %1356, !dbg !73
+  %1358 = shufflevector <2 x float> %1326, <2 x float> %1293, <2 x i32> <i32 0, i32 2>, !dbg !72
+  %1359 = shufflevector <2 x float> %1326, <2 x float> %1293, <2 x i32> <i32 1, i32 3>, !dbg !72
+  %1360 = fadd <2 x float> %1358, %1359, !dbg !72
+  %1361 = extractelement <2 x float> %1360, i64 1, !dbg !73
+  %1362 = fcmp oeq float %1361, 0.000000e+00, !dbg !74
+  %1363 = fdiv float %1308, %1361, !dbg !75
+  %1364 = select i1 %1362, float 0.000000e+00, float %1363, !dbg !76
+  %1365 = fmul float %1364, %1321, !dbg !77
+  %1366 = fadd float %1300, %1365, !dbg !78
+  %1367 = fmul float %1364, %1324, !dbg !73
+  %1368 = fadd float %1322, %1367, !dbg !79
+  %1369 = extractelement <2 x float> %1360, i64 0, !dbg !73
+  %1370 = fcmp oeq float %1369, 0.000000e+00, !dbg !74
+  %1371 = fdiv float %1341, %1369, !dbg !75
+  %1372 = select i1 %1370, float 0.000000e+00, float %1371, !dbg !76
+  %1373 = fmul float %1372, %1354, !dbg !77
+  %1374 = fadd float %1333, %1373, !dbg !78
+  %1375 = fmul float %1372, %1357, !dbg !73
+  %1376 = fadd float %1355, %1375, !dbg !79
+  %1377 = bitcast float %1366 to i32, !dbg !70
+  %1378 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1377, i32 %1377, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1379 = bitcast i32 %1378 to float, !dbg !70
+  %1380 = bitcast float %1368 to i32, !dbg !70
+  %1381 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1380, i32 %1380, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1382 = bitcast i32 %1381 to float, !dbg !70
+  %1383 = bitcast float %1361 to i32, !dbg !70
+  %1384 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1383, i32 %1383, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1385 = fsub float %1379, %1366, !dbg !69
+  %1386 = bitcast float %1369 to i32, !dbg !70
+  %1387 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1386, i32 %1386, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1388 = insertelement <2 x i32> poison, i32 %1387, i64 0, !dbg !70
+  %1389 = insertelement <2 x i32> %1388, i32 %1384, i64 1, !dbg !70
+  %1390 = bitcast <2 x i32> %1389 to <2 x float>, !dbg !70
+  %1391 = fadd <2 x float> %1360, %1390, !dbg !72
+  %1392 = extractelement <2 x float> %1391, i64 1, !dbg !80
+  %1393 = bitcast i32 %1384 to float, !dbg !75
+  %1394 = fdiv float %1393, %1392, !dbg !75
+  %1395 = fcmp oeq <2 x float> %1391, zeroinitializer, !dbg !74
+  %1396 = extractelement <2 x i1> %1395, i64 1, !dbg !76
+  %1397 = select i1 %1396, float 0.000000e+00, float %1394, !dbg !76
+  %1398 = fmul float %1385, %1397, !dbg !77
+  %1399 = fadd float %1366, %1398, !dbg !78
+  %1400 = fadd float %1368, %1382, !dbg !79
+  %1401 = fmul float %1385, %1385, !dbg !73
+  %1402 = fmul float %1361, %1401, !dbg !73
+  %1403 = fmul float %1402, %1397, !dbg !73
+  %1404 = fadd float %1400, %1403, !dbg !79
+  %1405 = bitcast float %1374 to i32, !dbg !70
+  %1406 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1405, i32 %1405, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1407 = bitcast i32 %1406 to float, !dbg !70
+  %1408 = bitcast float %1376 to i32, !dbg !70
+  %1409 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %1408, i32 %1408, i32 177, i32 15, i32 15, i1 false), !dbg !70
+  %1410 = bitcast i32 %1409 to float, !dbg !70
+  %1411 = fsub float %1407, %1374, !dbg !69
+  %1412 = extractelement <2 x float> %1391, i64 0, !dbg !80
+  %1413 = bitcast i32 %1387 to float, !dbg !75
+  %1414 = fdiv float %1413, %1412, !dbg !75
+  %1415 = extractelement <2 x i1> %1395, i64 0, !dbg !76
+  %1416 = select i1 %1415, float 0.000000e+00, float %1414, !dbg !76
+  %1417 = fmul float %1411, %1416, !dbg !77
+  %1418 = fadd float %1374, %1417, !dbg !78
+  %1419 = fadd float %1376, %1410, !dbg !79
+  %1420 = fmul float %1411, %1411, !dbg !73
+  %1421 = fmul float %1369, %1420, !dbg !73
+  %1422 = fmul float %1421, %1416, !dbg !73
+  %1423 = fadd float %1419, %1422, !dbg !79
+  %1424 = select i1 %26, float %1399, float %1418, !dbg !81
+  %1425 = select i1 %26, float %1418, float %1399, !dbg !81
+  %1426 = bitcast float %1424 to i32, !dbg !81
+  %1427 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1286, i32 %1426), !dbg !81
+  %1428 = bitcast float %1425 to i32, !dbg !81
+  %1429 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1290, i32 %1428), !dbg !81
+  %1430 = select i1 %26, float %1404, float %1423, !dbg !82
+  %1431 = select i1 %26, float %1423, float %1404, !dbg !82
+  %1432 = bitcast float %1430 to i32, !dbg !82
+  %1433 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1286, i32 %1432), !dbg !82
+  %1434 = bitcast float %1431 to i32, !dbg !82
+  %1435 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1290, i32 %1434), !dbg !82
+  %1436 = select i1 %26, float %1392, float %1412, !dbg !80
+  %1437 = select i1 %26, float %1412, float %1392, !dbg !80
+  %1438 = bitcast float %1436 to i32, !dbg !80
+  %1439 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1286, i32 %1438), !dbg !80
+  %1440 = bitcast float %1437 to i32, !dbg !80
+  %1441 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %1290, i32 %1440), !dbg !80
+  br i1 %24, label %.critedge, label %.critedge4, !dbg !83
+
+.critedge:                                        ; preds = %.critedge138
+  %1442 = sext i32 %22 to i64
+  %1443 = getelementptr [4 x i8], ptr addrspace(1) %9, i64 %1442
+  %1444 = getelementptr [4 x i8], ptr addrspace(1) %8, i64 %1442
+  %1445 = getelementptr [4 x i8], ptr addrspace(1) %7, i64 %1442
+  %.not = icmp eq i32 %1285, 0, !dbg !68
+  %.v117 = select i1 %.not, i32 %1427, i32 %1429
+  %1446 = getelementptr [4 x i8], ptr addrspace(1) %6, i64 %1442
+  %.v = select i1 %.not, i32 %1288, i32 %1291
+  %.v119 = select i1 %.not, i32 %1439, i32 %1441, !dbg !80
+  %.v118 = select i1 %.not, i32 %1433, i32 %1435, !dbg !82
+  store i32 %.v, ptr addrspace(1) %1446, align 4, !dbg !83
+  store i32 %.v117, ptr addrspace(1) %1445, align 4, !dbg !84
+  store i32 %.v118, ptr addrspace(1) %1444, align 4, !dbg !85
+  store i32 %.v119, ptr addrspace(1) %1443, align 4, !dbg !86
+  br label %.critedge4, !dbg !86
+
+.critedge4:                                       ; preds = %.critedge138, %.critedge
+  ret void, !dbg !87
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.x() #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.amdgcn.workitem.id.x() #1
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32 immarg, i32 immarg, i32 immarg, i1 immarg) #2
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.ds.bpermute(i32, i32) #2
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fabs.f32(float) #3
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #3
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.copysign.f32(float, float) #3
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.exp.f32(float) #3
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fmuladd.f32(float, float, float) #3
+
+attributes #0 = { nofree norecurse nounwind memory(argmem: readwrite) "amdgpu-agpr-alloc"="0" "amdgpu-cluster-dims"="1,1,1" "amdgpu-flat-work-group-size"="1,64" "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-waves-per-eu"="0, 0" "denormal-fp-math-f32"="ieee" "uniform-work-group-size" }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { convergent mustprogress nocallback nofree nounwind willreturn memory(none) }
+attributes #3 = { mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3, !4, !5}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "c4pfbawezxrpuejsnp2edrta5ppwofdsg3ewskqshrqty4q5y3d5_p2n_234316.py", directory: "/dockerx/meta-tuning/pytorch/kern_cmp_20260422_110718/cache/4p")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"amdhsa_code_object_version", i32 500}
+!4 = !{i32 1, !"wchar_size", i32 4}
+!5 = !{i32 8, !"PIC Level", i32 0}
+!6 = distinct !DISubprogram(name: "triton_red_fused_add_gelu_mean_mul_std_0", linkageName: "triton_red_fused_add_gelu_mean_mul_std_0", scope: !1, file: !1, line: 22, type: !7, scopeLine: 22, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!7 = !DISubroutineType(cc: DW_CC_normal, types: !8)
+!8 = !{null, !9, !9, !9, !9, !9, !9, !9, !9, !9, !9, !11, !11, !12, !12}
+!9 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !10, size: 64, dwarfAddressSpace: 1)
+!10 = !DIBasicType(name: "float", size: 32, encoding: DW_ATE_float)
+!11 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!12 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !13, size: 64, dwarfAddressSpace: 1)
+!13 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!14 = !DILocation(line: 27, column: 15, scope: !6)
+!15 = !DILocation(line: 28, column: 24, scope: !6)
+!16 = !DILocation(line: 28, column: 14, scope: !6)
+!17 = !DILocation(line: 29, column: 13, scope: !6)
+!18 = !DILocation(line: 30, column: 15, scope: !6)
+!19 = !DILocation(line: 43, column: 42, scope: !6)
+!20 = !DILocation(line: 43, column: 35, scope: !6)
+!21 = !DILocation(line: 43, column: 24, scope: !6)
+!22 = !DILocation(line: 43, column: 16, scope: !6)
+!23 = !DILocation(line: 44, column: 24, scope: !6)
+!24 = !DILocation(line: 44, column: 16, scope: !6)
+!25 = !DILocation(line: 45, column: 24, scope: !6)
+!26 = !DILocation(line: 45, column: 16, scope: !6)
+!27 = !DILocation(line: 46, column: 25, scope: !6)
+!28 = !DILocation(line: 46, column: 17, scope: !6)
+!29 = !DILocation(line: 47, column: 25, scope: !6)
+!30 = !DILocation(line: 47, column: 17, scope: !6)
+!31 = !DILocation(line: 38, column: 20, scope: !6)
+!32 = !DILocation(line: 48, column: 16, scope: !6)
+!33 = !DILocation(line: 49, column: 16, scope: !6)
+!34 = !DILocation(line: 51, column: 16, scope: !6)
+!35 = !DILocation(line: 53, column: 16, scope: !6)
+!36 = !DILocation(line: 54, column: 16, scope: !6)
+!37 = !DILocation(line: 56, column: 17, scope: !6)
+!38 = !DILocation(line: 57, column: 17, scope: !6)
+!39 = !DILocation(line: 58, column: 17, scope: !6)
+!40 = !DILocation(line: 59, column: 17, scope: !6)
+!41 = !DILocation(line: 60, column: 17, scope: !6)
+!42 = !DILocation(line: 62, column: 17, scope: !6)
+!43 = !DILocation(line: 63, column: 18, scope: !6)
+!44 = !DILocation(line: 67, column: 22, scope: !6)
+!45 = !DILocation(line: 69, column: 24, scope: !6)
+!46 = !DILocation(line: 70, column: 9, scope: !6)
+!47 = !DILocation(line: 70, column: 18, scope: !6)
+!48 = !DILocation(line: 37, column: 5, scope: !6)
+!49 = !DILocation(line: 222, column: 17, scope: !50, inlinedAt: !52)
+!50 = distinct !DILexicalBlockFile(scope: !6, file: !51, discriminator: 0)
+!51 = !DIFile(filename: "triton_helpers.py", directory: "/dockerx/meta-tuning/pytorch/torch/_inductor/runtime")
+!52 = !DILocation(line: 64, column: 61, scope: !53)
+!53 = distinct !DILexicalBlockFile(scope: !6, file: !1, discriminator: 0)
+!54 = !DILocation(line: 223, column: 22, scope: !50, inlinedAt: !52)
+!55 = !DILocation(line: 224, column: 27, scope: !50, inlinedAt: !52)
+!56 = !DILocation(line: 224, column: 20, scope: !50, inlinedAt: !52)
+!57 = !DILocation(line: 225, column: 32, scope: !50, inlinedAt: !52)
+!58 = !DILocation(line: 225, column: 23, scope: !50, inlinedAt: !52)
+!59 = !DILocation(line: 225, column: 18, scope: !50, inlinedAt: !52)
+!60 = !DILocation(line: 68, column: 20, scope: !6)
+!61 = distinct !{!61, !62}
+!62 = !{!"llvm.loop.peeled.count", i32 1}
+!63 = !DILocation(line: 293, column: 12, scope: !64, inlinedAt: !66)
+!64 = distinct !DILexicalBlockFile(scope: !6, file: !65, discriminator: 0)
+!65 = !DIFile(filename: "standard.py", directory: "/opt/conda/envs/py_3.10/lib/python3.10/site-packages/triton/language")
+!66 = !DILocation(line: 71, column: 13, scope: !53)
+!67 = !DILocation(line: 263, column: 12, scope: !64, inlinedAt: !63)
+!68 = !DILocation(line: 71, column: 13, scope: !6)
+!69 = !DILocation(line: 231, column: 13, scope: !50, inlinedAt: !70)
+!70 = !DILocation(line: 243, column: 12, scope: !50, inlinedAt: !71)
+!71 = !DILocation(line: 72, column: 27, scope: !53)
+!72 = !DILocation(line: 232, column: 18, scope: !50, inlinedAt: !70)
+!73 = !DILocation(line: 236, column: 23, scope: !50, inlinedAt: !70)
+!74 = !DILocation(line: 233, column: 26, scope: !50, inlinedAt: !70)
+!75 = !DILocation(line: 233, column: 50, scope: !50, inlinedAt: !70)
+!76 = !DILocation(line: 233, column: 17, scope: !50, inlinedAt: !70)
+!77 = !DILocation(line: 235, column: 18, scope: !50, inlinedAt: !70)
+!78 = !DILocation(line: 235, column: 9, scope: !50, inlinedAt: !70)
+!79 = !DILocation(line: 236, column: 9, scope: !50, inlinedAt: !70)
+!80 = !DILocation(line: 75, column: 13, scope: !6)
+!81 = !DILocation(line: 73, column: 13, scope: !6)
+!82 = !DILocation(line: 74, column: 13, scope: !6)
+!83 = !DILocation(line: 76, column: 5, scope: !6)
+!84 = !DILocation(line: 77, column: 5, scope: !6)
+!85 = !DILocation(line: 78, column: 5, scope: !6)
+!86 = !DILocation(line: 79, column: 5, scope: !6)
+!87 = !DILocation(line: 22, column: 1, scope: !6)

@@ -1,0 +1,1219 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+target triple = "amdgcn-amd-amdhsa"
+
+@global_smem = external local_unnamed_addr addrspace(3) global [0 x i8], align 16
+
+; Function Attrs: nofree norecurse nounwind
+define amdgpu_kernel void @triton_red_fused_add_div_mean_mul_var_4(ptr addrspace(1) inreg readonly captures(none) %0, ptr addrspace(1) inreg readonly captures(none) %1, ptr addrspace(1) inreg readonly captures(none) %2, ptr addrspace(1) inreg writeonly captures(none) %3, ptr addrspace(1) inreg writeonly captures(none) %4, ptr addrspace(1) inreg writeonly captures(none) %5, ptr addrspace(1) inreg writeonly captures(none) %6, ptr addrspace(1) inreg writeonly captures(none) %7, i32 inreg %8, i32 inreg %9, ptr addrspace(1) inreg readnone captures(none) %10, ptr addrspace(1) inreg readnone captures(none) %11) local_unnamed_addr #0 !dbg !4 {
+  %13 = tail call i32 @llvm.amdgcn.workitem.id.x(), !dbg !12
+  %14 = and i32 %13, 127, !dbg !12
+  %15 = tail call i32 @llvm.amdgcn.readfirstlane.i32(i32 %14), !dbg !12
+  %16 = tail call i32 @llvm.amdgcn.workgroup.id.x(), !dbg !13
+  %17 = icmp slt i32 %16, 8, !dbg !14
+  %18 = and i32 %13, 63, !dbg !15
+  %19 = and i32 %15, 64, !dbg !15
+  %20 = or disjoint i32 %19, %18, !dbg !15
+  %21 = shl nuw nsw i32 %20, 2, !dbg !15
+  %22 = or disjoint i32 %21, 512, !dbg !15
+  %23 = or disjoint i32 %21, 1024, !dbg !15
+  %24 = or disjoint i32 %21, 1536, !dbg !15
+  %25 = load <1 x float>, ptr addrspace(1) %1, align 4, !dbg !16, !amdgpu.noclobber !17
+  %26 = extractelement <1 x float> %25, i64 0, !dbg !16
+  %27 = shl i32 %16, 13, !dbg !18
+  %28 = fadd float %26, 0x3E112E0BE0000000, !dbg !19
+  %29 = or disjoint i32 %21, %27, !dbg !20
+  %30 = or disjoint i32 %22, %27, !dbg !20
+  %31 = or disjoint i32 %23, %27, !dbg !20
+  %32 = or disjoint i32 %24, %27, !dbg !20
+  %33 = sext i32 %30 to i64, !dbg !21
+  %34 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %33, !dbg !21
+  %35 = sext i32 %31 to i64, !dbg !21
+  %36 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %35, !dbg !21
+  %37 = sext i32 %32 to i64, !dbg !21
+  %38 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %37, !dbg !21
+  br i1 %17, label %39, label %43, !dbg !22
+
+39:                                               ; preds = %12
+  %40 = sext i32 %29 to i64
+  %41 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %40
+  %42 = load <4 x float>, ptr addrspace(1) %41, align 16, !dbg !22
+  br label %43, !dbg !22
+
+43:                                               ; preds = %39, %12
+  %44 = phi <4 x float> [ %42, %39 ], [ zeroinitializer, %12 ], !dbg !22
+  br i1 %17, label %45, label %47, !dbg !22
+
+45:                                               ; preds = %43
+  %46 = load <4 x float>, ptr addrspace(1) %34, align 16, !dbg !22
+  br label %47, !dbg !22
+
+47:                                               ; preds = %45, %43
+  %48 = phi <4 x float> [ %46, %45 ], [ zeroinitializer, %43 ], !dbg !22
+  br i1 %17, label %49, label %51, !dbg !22
+
+49:                                               ; preds = %47
+  %50 = load <4 x float>, ptr addrspace(1) %36, align 16, !dbg !22
+  br label %51, !dbg !22
+
+51:                                               ; preds = %49, %47
+  %52 = phi <4 x float> [ %50, %49 ], [ zeroinitializer, %47 ], !dbg !22
+  br i1 %17, label %53, label %55, !dbg !22
+
+53:                                               ; preds = %51
+  %54 = load <4 x float>, ptr addrspace(1) %38, align 16, !dbg !22
+  br label %55, !dbg !22
+
+55:                                               ; preds = %53, %51
+  %56 = phi <4 x float> [ %54, %53 ], [ zeroinitializer, %51 ], !dbg !22
+  %57 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %33, !dbg !23
+  %58 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %35, !dbg !23
+  %59 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %37, !dbg !23
+  br i1 %17, label %60, label %64, !dbg !24
+
+60:                                               ; preds = %55
+  %61 = sext i32 %29 to i64
+  %62 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %61
+  %63 = load <4 x float>, ptr addrspace(1) %62, align 16, !dbg !24
+  br label %64, !dbg !24
+
+64:                                               ; preds = %60, %55
+  %65 = phi <4 x float> [ %63, %60 ], [ zeroinitializer, %55 ], !dbg !24
+  br i1 %17, label %66, label %68, !dbg !24
+
+66:                                               ; preds = %64
+  %67 = load <4 x float>, ptr addrspace(1) %57, align 16, !dbg !24
+  br label %68, !dbg !24
+
+68:                                               ; preds = %66, %64
+  %69 = phi <4 x float> [ %67, %66 ], [ zeroinitializer, %64 ], !dbg !24
+  br i1 %17, label %70, label %72, !dbg !24
+
+70:                                               ; preds = %68
+  %71 = load <4 x float>, ptr addrspace(1) %58, align 16, !dbg !24
+  br label %72, !dbg !24
+
+72:                                               ; preds = %70, %68
+  %73 = phi <4 x float> [ %71, %70 ], [ zeroinitializer, %68 ], !dbg !24
+  br i1 %17, label %74, label %76, !dbg !24
+
+74:                                               ; preds = %72
+  %75 = load <4 x float>, ptr addrspace(1) %59, align 16, !dbg !24
+  br label %76, !dbg !24
+
+76:                                               ; preds = %74, %72
+  %77 = phi <4 x float> [ %75, %74 ], [ zeroinitializer, %72 ], !dbg !24
+  %78 = shufflevector <4 x float> %56, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %79 = shufflevector <4 x float> %77, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %80 = shufflevector <4 x float> %56, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %81 = shufflevector <4 x float> %77, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %82 = shufflevector <4 x float> %52, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %83 = shufflevector <4 x float> %73, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %84 = shufflevector <4 x float> %52, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %85 = shufflevector <4 x float> %73, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %86 = shufflevector <4 x float> %48, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %87 = shufflevector <4 x float> %69, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %88 = shufflevector <4 x float> %48, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %89 = shufflevector <4 x float> %69, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %90 = shufflevector <4 x float> %44, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %91 = shufflevector <4 x float> %65, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %92 = shufflevector <4 x float> %44, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %93 = shufflevector <4 x float> %65, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %94 = insertelement <2 x float> poison, float %28, i64 0, !dbg !25
+  %95 = shufflevector <2 x float> %94, <2 x float> poison, <2 x i32> zeroinitializer, !dbg !25
+  %96 = insertelement <2 x i1> poison, i1 %17, i64 0, !dbg !26
+  %97 = shufflevector <2 x i1> %96, <2 x i1> poison, <2 x i32> zeroinitializer, !dbg !26
+  br label %98, !dbg !27
+
+98:                                               ; preds = %76, %.critedge160
+  %.pn103207 = phi i32 [ %32, %76 ], [ %156, %.critedge160 ]
+  %.pn111206 = phi i32 [ %31, %76 ], [ %155, %.critedge160 ]
+  %.pn119205 = phi i32 [ %30, %76 ], [ %154, %.critedge160 ]
+  %.pn127204 = phi i32 [ %29, %76 ], [ %153, %.critedge160 ]
+  %99 = phi i32 [ 0, %76 ], [ %148, %.critedge160 ]
+  %100 = phi <2 x float> [ zeroinitializer, %76 ], [ %443, %.critedge160 ]
+  %101 = phi <2 x float> [ %78, %76 ], [ %444, %.critedge160 ]
+  %102 = phi <2 x float> [ %79, %76 ], [ %445, %.critedge160 ]
+  %103 = phi <2 x float> [ zeroinitializer, %76 ], [ %447, %.critedge160 ]
+  %104 = phi <2 x float> [ %80, %76 ], [ %448, %.critedge160 ]
+  %105 = phi <2 x float> [ %81, %76 ], [ %449, %.critedge160 ]
+  %106 = phi <2 x float> [ zeroinitializer, %76 ], [ %451, %.critedge160 ]
+  %107 = phi <2 x float> [ %82, %76 ], [ %452, %.critedge160 ]
+  %108 = phi <2 x float> [ %83, %76 ], [ %453, %.critedge160 ]
+  %109 = phi <2 x float> [ zeroinitializer, %76 ], [ %455, %.critedge160 ]
+  %110 = phi <2 x float> [ %84, %76 ], [ %456, %.critedge160 ]
+  %111 = phi <2 x float> [ %85, %76 ], [ %457, %.critedge160 ]
+  %112 = phi <2 x float> [ zeroinitializer, %76 ], [ %459, %.critedge160 ]
+  %113 = phi <2 x float> [ %86, %76 ], [ %460, %.critedge160 ]
+  %114 = phi <2 x float> [ %87, %76 ], [ %461, %.critedge160 ]
+  %115 = phi <2 x float> [ zeroinitializer, %76 ], [ %463, %.critedge160 ]
+  %116 = phi <2 x float> [ %88, %76 ], [ %464, %.critedge160 ]
+  %117 = phi <2 x float> [ %89, %76 ], [ %465, %.critedge160 ]
+  %118 = phi <2 x float> [ zeroinitializer, %76 ], [ %467, %.critedge160 ]
+  %119 = phi <2 x float> [ %90, %76 ], [ %468, %.critedge160 ]
+  %120 = phi <2 x float> [ %91, %76 ], [ %469, %.critedge160 ]
+  %121 = phi <2 x float> [ zeroinitializer, %76 ], [ %471, %.critedge160 ]
+  %122 = phi <2 x float> [ %92, %76 ], [ %472, %.critedge160 ]
+  %123 = phi <2 x float> [ %93, %76 ], [ %473, %.critedge160 ]
+  %124 = phi <2 x float> [ zeroinitializer, %76 ], [ %393, %.critedge160 ]
+  %125 = phi <2 x float> [ zeroinitializer, %76 ], [ %421, %.critedge160 ]
+  %126 = phi <2 x float> [ zeroinitializer, %76 ], [ %422, %.critedge160 ]
+  %127 = phi <2 x float> [ zeroinitializer, %76 ], [ %394, %.critedge160 ]
+  %128 = phi <2 x float> [ zeroinitializer, %76 ], [ %423, %.critedge160 ]
+  %129 = phi <2 x float> [ zeroinitializer, %76 ], [ %424, %.critedge160 ]
+  %130 = phi <2 x float> [ zeroinitializer, %76 ], [ %395, %.critedge160 ]
+  %131 = phi <2 x float> [ zeroinitializer, %76 ], [ %396, %.critedge160 ]
+  %132 = phi <2 x float> [ zeroinitializer, %76 ], [ %425, %.critedge160 ]
+  %133 = phi <2 x float> [ zeroinitializer, %76 ], [ %426, %.critedge160 ]
+  %134 = phi <2 x float> [ zeroinitializer, %76 ], [ %427, %.critedge160 ]
+  %135 = phi <2 x float> [ zeroinitializer, %76 ], [ %428, %.critedge160 ]
+  %136 = phi <2 x float> [ zeroinitializer, %76 ], [ %397, %.critedge160 ]
+  %137 = phi <2 x float> [ zeroinitializer, %76 ], [ %398, %.critedge160 ]
+  %138 = phi <2 x float> [ zeroinitializer, %76 ], [ %399, %.critedge160 ]
+  %139 = phi <2 x float> [ zeroinitializer, %76 ], [ %400, %.critedge160 ]
+  %140 = phi <2 x float> [ zeroinitializer, %76 ], [ %475, %.critedge160 ]
+  %141 = phi <2 x float> [ zeroinitializer, %76 ], [ %407, %.critedge160 ]
+  %142 = phi <2 x float> [ zeroinitializer, %76 ], [ %408, %.critedge160 ]
+  %143 = phi <2 x float> [ zeroinitializer, %76 ], [ %409, %.critedge160 ]
+  %144 = phi <2 x float> [ zeroinitializer, %76 ], [ %477, %.critedge160 ]
+  %145 = phi <2 x float> [ zeroinitializer, %76 ], [ %416, %.critedge160 ]
+  %146 = phi <2 x float> [ zeroinitializer, %76 ], [ %417, %.critedge160 ]
+  %147 = phi <2 x float> [ zeroinitializer, %76 ], [ %418, %.critedge160 ]
+  %148 = add nuw nsw i32 %99, 2048, !dbg !27
+  %149 = or disjoint i32 %148, %21, !dbg !28
+  %150 = or disjoint i32 %148, %22, !dbg !28
+  %151 = or disjoint i32 %148, %23, !dbg !28
+  %152 = or disjoint i32 %148, %24, !dbg !28
+  %153 = add i32 %149, %27, !dbg !20
+  %154 = add i32 %150, %27, !dbg !20
+  %155 = add i32 %151, %27, !dbg !20
+  %156 = add i32 %152, %27, !dbg !20
+  %157 = sext i32 %154 to i64, !dbg !21
+  %158 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %157, !dbg !21
+  %159 = sext i32 %155 to i64, !dbg !21
+  %160 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %159, !dbg !21
+  %161 = sext i32 %156 to i64, !dbg !21
+  %162 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %161, !dbg !21
+  br i1 %17, label %163, label %167, !dbg !22
+
+163:                                              ; preds = %98
+  %164 = sext i32 %153 to i64
+  %165 = getelementptr [4 x i8], ptr addrspace(1) %0, i64 %164
+  %166 = load <4 x float>, ptr addrspace(1) %165, align 16, !dbg !22
+  br label %167, !dbg !22
+
+167:                                              ; preds = %163, %98
+  %168 = phi <4 x float> [ %166, %163 ], [ zeroinitializer, %98 ], !dbg !22
+  br i1 %17, label %169, label %171, !dbg !22
+
+169:                                              ; preds = %167
+  %170 = load <4 x float>, ptr addrspace(1) %158, align 16, !dbg !22
+  br label %171, !dbg !22
+
+171:                                              ; preds = %169, %167
+  %172 = phi <4 x float> [ %170, %169 ], [ zeroinitializer, %167 ], !dbg !22
+  br i1 %17, label %173, label %175, !dbg !22
+
+173:                                              ; preds = %171
+  %174 = load <4 x float>, ptr addrspace(1) %160, align 16, !dbg !22
+  br label %175, !dbg !22
+
+175:                                              ; preds = %173, %171
+  %176 = phi <4 x float> [ %174, %173 ], [ zeroinitializer, %171 ], !dbg !22
+  br i1 %17, label %177, label %179, !dbg !22
+
+177:                                              ; preds = %175
+  %178 = load <4 x float>, ptr addrspace(1) %162, align 16, !dbg !22
+  br label %179, !dbg !22
+
+179:                                              ; preds = %177, %175
+  %180 = phi <4 x float> [ %178, %177 ], [ zeroinitializer, %175 ], !dbg !22
+  %181 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %157, !dbg !23
+  %182 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %159, !dbg !23
+  %183 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %161, !dbg !23
+  br i1 %17, label %184, label %188, !dbg !24
+
+184:                                              ; preds = %179
+  %185 = sext i32 %153 to i64
+  %186 = getelementptr [4 x i8], ptr addrspace(1) %2, i64 %185
+  %187 = load <4 x float>, ptr addrspace(1) %186, align 16, !dbg !24
+  br label %188, !dbg !24
+
+188:                                              ; preds = %184, %179
+  %189 = phi <4 x float> [ %187, %184 ], [ zeroinitializer, %179 ], !dbg !24
+  br i1 %17, label %190, label %192, !dbg !24
+
+190:                                              ; preds = %188
+  %191 = load <4 x float>, ptr addrspace(1) %181, align 16, !dbg !24
+  br label %192, !dbg !24
+
+192:                                              ; preds = %190, %188
+  %193 = phi <4 x float> [ %191, %190 ], [ zeroinitializer, %188 ], !dbg !24
+  br i1 %17, label %194, label %196, !dbg !24
+
+194:                                              ; preds = %192
+  %195 = load <4 x float>, ptr addrspace(1) %182, align 16, !dbg !24
+  br label %196, !dbg !24
+
+196:                                              ; preds = %194, %192
+  %197 = phi <4 x float> [ %195, %194 ], [ zeroinitializer, %192 ], !dbg !24
+  br i1 %17, label %198, label %200, !dbg !24
+
+198:                                              ; preds = %196
+  %199 = load <4 x float>, ptr addrspace(1) %183, align 16, !dbg !24
+  br label %200, !dbg !24
+
+200:                                              ; preds = %198, %196
+  %201 = phi <4 x float> [ %199, %198 ], [ zeroinitializer, %196 ], !dbg !24
+  %202 = fdiv <2 x float> %122, %95, !dbg !25
+  %203 = fdiv <2 x float> %119, %95, !dbg !25
+  %204 = fdiv <2 x float> %116, %95, !dbg !25
+  %205 = fdiv <2 x float> %113, %95, !dbg !25
+  %206 = fdiv <2 x float> %110, %95, !dbg !25
+  %207 = fdiv <2 x float> %107, %95, !dbg !25
+  %208 = fdiv <2 x float> %104, %95, !dbg !25
+  %209 = fdiv <2 x float> %101, %95, !dbg !25
+  %210 = fmul <2 x float> %202, %123, !dbg !29
+  %211 = fadd <2 x float> %121, %210, !dbg !30
+  %212 = fmul <2 x float> %203, %120, !dbg !29
+  %213 = fadd <2 x float> %118, %212, !dbg !30
+  %214 = fmul <2 x float> %204, %117, !dbg !29
+  %215 = fadd <2 x float> %115, %214, !dbg !30
+  %216 = fmul <2 x float> %205, %114, !dbg !29
+  %217 = fadd <2 x float> %112, %216, !dbg !30
+  %218 = fmul <2 x float> %206, %111, !dbg !29
+  %219 = fadd <2 x float> %109, %218, !dbg !30
+  %220 = fmul <2 x float> %207, %108, !dbg !29
+  %221 = fadd <2 x float> %106, %220, !dbg !30
+  %222 = fmul <2 x float> %208, %105, !dbg !29
+  %223 = fadd <2 x float> %103, %222, !dbg !30
+  %224 = fmul <2 x float> %209, %102, !dbg !29
+  %225 = fadd <2 x float> %100, %224, !dbg !30
+  %226 = extractelement <2 x float> %211, i64 0, !dbg !31
+  %227 = extractelement <2 x float> %121, i64 0, !dbg !31
+  %228 = select i1 %17, float %226, float %227, !dbg !31
+  %229 = extractelement <2 x float> %211, i64 1, !dbg !31
+  %230 = extractelement <2 x float> %121, i64 1, !dbg !31
+  %231 = select i1 %17, float %229, float %230, !dbg !31
+  %232 = extractelement <2 x float> %213, i64 0, !dbg !31
+  %233 = extractelement <2 x float> %118, i64 0, !dbg !31
+  %234 = select i1 %17, float %232, float %233, !dbg !31
+  %235 = extractelement <2 x float> %213, i64 1, !dbg !31
+  %236 = extractelement <2 x float> %118, i64 1, !dbg !31
+  %237 = select i1 %17, float %235, float %236, !dbg !31
+  %238 = extractelement <2 x float> %215, i64 0, !dbg !31
+  %239 = extractelement <2 x float> %115, i64 0, !dbg !31
+  %240 = select i1 %17, float %238, float %239, !dbg !31
+  %241 = extractelement <2 x float> %215, i64 1, !dbg !31
+  %242 = extractelement <2 x float> %115, i64 1, !dbg !31
+  %243 = select i1 %17, float %241, float %242, !dbg !31
+  %244 = extractelement <2 x float> %217, i64 0, !dbg !31
+  %245 = extractelement <2 x float> %112, i64 0, !dbg !31
+  %246 = select i1 %17, float %244, float %245, !dbg !31
+  %247 = extractelement <2 x float> %217, i64 1, !dbg !31
+  %248 = extractelement <2 x float> %112, i64 1, !dbg !31
+  %249 = select i1 %17, float %247, float %248, !dbg !31
+  %250 = extractelement <2 x float> %219, i64 0, !dbg !31
+  %251 = extractelement <2 x float> %109, i64 0, !dbg !31
+  %252 = select i1 %17, float %250, float %251, !dbg !31
+  %253 = extractelement <2 x float> %219, i64 1, !dbg !31
+  %254 = extractelement <2 x float> %109, i64 1, !dbg !31
+  %255 = select i1 %17, float %253, float %254, !dbg !31
+  %256 = extractelement <2 x float> %221, i64 0, !dbg !31
+  %257 = extractelement <2 x float> %106, i64 0, !dbg !31
+  %258 = select i1 %17, float %256, float %257, !dbg !31
+  %259 = extractelement <2 x float> %221, i64 1, !dbg !31
+  %260 = extractelement <2 x float> %106, i64 1, !dbg !31
+  %261 = select i1 %17, float %259, float %260, !dbg !31
+  %262 = extractelement <2 x float> %223, i64 0, !dbg !31
+  %263 = extractelement <2 x float> %103, i64 0, !dbg !31
+  %264 = select i1 %17, float %262, float %263, !dbg !31
+  %265 = extractelement <2 x float> %223, i64 1, !dbg !31
+  %266 = extractelement <2 x float> %103, i64 1, !dbg !31
+  %267 = select i1 %17, float %265, float %266, !dbg !31
+  %268 = extractelement <2 x float> %225, i64 0, !dbg !31
+  %269 = extractelement <2 x float> %100, i64 0, !dbg !31
+  %270 = select i1 %17, float %268, float %269, !dbg !31
+  %271 = extractelement <2 x float> %225, i64 1, !dbg !31
+  %272 = extractelement <2 x float> %100, i64 1, !dbg !31
+  %273 = select i1 %17, float %271, float %272, !dbg !31
+  %274 = icmp eq i32 %99, 0, !dbg !32
+  %275 = shufflevector <2 x float> %218, <2 x float> %210, <2 x i32> <i32 0, i32 2>
+  %276 = shufflevector <2 x float> %218, <2 x float> %210, <2 x i32> <i32 1, i32 3>
+  %277 = shufflevector <2 x float> %220, <2 x float> %212, <2 x i32> <i32 0, i32 2>
+  %278 = shufflevector <2 x float> %220, <2 x float> %212, <2 x i32> <i32 1, i32 3>
+  %279 = shufflevector <2 x float> %222, <2 x float> %214, <2 x i32> <i32 0, i32 2>
+  %280 = shufflevector <2 x float> %222, <2 x float> %214, <2 x i32> <i32 1, i32 3>
+  %281 = shufflevector <2 x float> %224, <2 x float> %216, <2 x i32> <i32 0, i32 2>
+  %282 = shufflevector <2 x float> %224, <2 x float> %216, <2 x i32> <i32 1, i32 3>
+  br i1 %274, label %._crit_edge, label %283, !dbg !33
+
+283:                                              ; preds = %200
+  %284 = fadd <2 x float> %125, splat (float 1.000000e+00), !dbg !38
+  %285 = fadd <2 x float> %126, splat (float 1.000000e+00), !dbg !38
+  %286 = fadd <2 x float> %128, splat (float 1.000000e+00), !dbg !38
+  %287 = fadd <2 x float> %129, splat (float 1.000000e+00), !dbg !38
+  %288 = fadd <2 x float> %132, splat (float 1.000000e+00), !dbg !38
+  %289 = fadd <2 x float> %133, splat (float 1.000000e+00), !dbg !38
+  %290 = fadd <2 x float> %134, splat (float 1.000000e+00), !dbg !38
+  %291 = fadd <2 x float> %135, splat (float 1.000000e+00), !dbg !38
+  %292 = fsub <2 x float> %280, %137, !dbg !39
+  %293 = fdiv <2 x float> %292, %289, !dbg !40
+  %294 = fsub <2 x float> %281, %138, !dbg !39
+  %295 = fdiv <2 x float> %294, %290, !dbg !40
+  %296 = fsub <2 x float> %275, %124, !dbg !39
+  %297 = fsub <2 x float> %276, %127, !dbg !39
+  %298 = fsub <2 x float> %277, %130, !dbg !39
+  %299 = fsub <2 x float> %279, %136, !dbg !39
+  %300 = fdiv <2 x float> %296, %284, !dbg !40
+  %301 = fdiv <2 x float> %297, %285, !dbg !40
+  %302 = fdiv <2 x float> %298, %286, !dbg !40
+  %303 = fdiv <2 x float> %299, %288, !dbg !40
+  %304 = fadd <2 x float> %124, %300, !dbg !41
+  %305 = fadd <2 x float> %127, %301, !dbg !41
+  %306 = fadd <2 x float> %130, %302, !dbg !41
+  %307 = fadd <2 x float> %136, %303, !dbg !41
+  %308 = fadd <2 x float> %137, %293, !dbg !41
+  %309 = fadd <2 x float> %138, %295, !dbg !41
+  %310 = shufflevector <2 x float> %212, <2 x float> %216, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %311 = shufflevector <2 x float> %210, <2 x float> %214, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %312 = shufflevector <2 x float> %304, <2 x float> %307, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %313 = fsub <2 x float> %311, %312, !dbg !42
+  %314 = shufflevector <2 x float> %210, <2 x float> %214, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %315 = shufflevector <2 x float> %305, <2 x float> %308, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %316 = fsub <2 x float> %314, %315, !dbg !42
+  %317 = shufflevector <2 x float> %212, <2 x float> %216, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %318 = shufflevector <2 x float> %306, <2 x float> %309, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %319 = fsub <2 x float> %317, %318, !dbg !42
+  %320 = shufflevector <2 x float> %296, <2 x float> %299, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %321 = fmul <2 x float> %320, %313, !dbg !43
+  %322 = shufflevector <2 x float> %297, <2 x float> %292, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %323 = fmul <2 x float> %322, %316, !dbg !43
+  %324 = shufflevector <2 x float> %298, <2 x float> %294, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %325 = fmul <2 x float> %324, %319, !dbg !43
+  %326 = fsub <2 x float> %278, %131, !dbg !39
+  %327 = fdiv <2 x float> %326, %287, !dbg !40
+  %328 = fadd <2 x float> %131, %327, !dbg !41
+  %329 = shufflevector <2 x float> %220, <2 x float> %224, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %330 = shufflevector <2 x float> %328, <2 x float> %139, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %331 = fsub <2 x float> %329, %330, !dbg !42
+  %332 = shufflevector <2 x float> %218, <2 x float> %222, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %333 = shufflevector <2 x float> %304, <2 x float> %307, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %334 = fsub <2 x float> %332, %333, !dbg !42
+  %335 = shufflevector <2 x float> %218, <2 x float> %222, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %336 = shufflevector <2 x float> %305, <2 x float> %308, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %337 = fsub <2 x float> %335, %336, !dbg !42
+  %338 = shufflevector <2 x float> %220, <2 x float> %224, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %339 = shufflevector <2 x float> %306, <2 x float> %309, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %340 = fsub <2 x float> %338, %339, !dbg !42
+  %341 = shufflevector <2 x float> %328, <2 x float> %139, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %342 = fsub <2 x float> %310, %341, !dbg !42
+  %343 = shufflevector <2 x float> %331, <2 x float> %342, <2 x i32> <i32 1, i32 3>, !dbg !40
+  %344 = fdiv <2 x float> %343, %291, !dbg !40
+  %345 = fadd <2 x float> %139, %344, !dbg !41
+  %foldExtExtBinop744 = fsub <2 x float> %216, %345, !dbg !42
+  %346 = shufflevector <2 x float> %326, <2 x float> %foldExtExtBinop744, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %347 = fmul <2 x float> %342, %346, !dbg !43
+  %348 = shufflevector <2 x float> %296, <2 x float> %299, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %349 = fmul <2 x float> %348, %334, !dbg !43
+  %350 = shufflevector <2 x float> %297, <2 x float> %292, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %351 = fmul <2 x float> %350, %337, !dbg !43
+  %352 = shufflevector <2 x float> %298, <2 x float> %294, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %353 = fmul <2 x float> %352, %340, !dbg !43
+  %354 = shufflevector <2 x float> %220, <2 x float> %224, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %355 = shufflevector <2 x float> %131, <2 x float> %345, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %356 = fsub <2 x float> %354, %355, !dbg !43
+  %357 = fmul <2 x float> %331, %356, !dbg !43
+  %358 = fadd <2 x float> %140, %321, !dbg !44
+  %359 = fadd <2 x float> %141, %323, !dbg !44
+  %360 = fadd <2 x float> %142, %325, !dbg !44
+  %361 = fadd <2 x float> %143, %347, !dbg !44
+  %362 = fadd <2 x float> %144, %349, !dbg !44
+  %363 = fadd <2 x float> %145, %351, !dbg !44
+  %364 = fadd <2 x float> %146, %353, !dbg !44
+  %365 = fadd <2 x float> %147, %357, !dbg !44
+  %366 = extractelement <2 x float> %284, i64 0, !dbg !33
+  %367 = extractelement <2 x float> %284, i64 1, !dbg !33
+  br label %._crit_edge, !dbg !33
+
+._crit_edge:                                      ; preds = %200, %283
+  %368 = phi float [ %367, %283 ], [ 1.000000e+00, %200 ], !dbg !45
+  %369 = phi float [ %366, %283 ], [ 1.000000e+00, %200 ], !dbg !45
+  %370 = phi <2 x float> [ %304, %283 ], [ %275, %200 ]
+  %371 = phi <2 x float> [ %285, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %372 = phi <2 x float> [ %305, %283 ], [ %276, %200 ]
+  %373 = phi <2 x float> [ %286, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %374 = phi <2 x float> [ %287, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %375 = phi <2 x float> [ %306, %283 ], [ %277, %200 ]
+  %376 = phi <2 x float> [ %328, %283 ], [ %278, %200 ]
+  %377 = phi <2 x float> [ %288, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %378 = phi <2 x float> [ %289, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %379 = phi <2 x float> [ %290, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %380 = phi <2 x float> [ %291, %283 ], [ splat (float 1.000000e+00), %200 ], !dbg !45
+  %381 = phi <2 x float> [ %307, %283 ], [ %279, %200 ]
+  %382 = phi <2 x float> [ %308, %283 ], [ %280, %200 ]
+  %383 = phi <2 x float> [ %309, %283 ], [ %281, %200 ]
+  %384 = phi <2 x float> [ %358, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %385 = phi <2 x float> [ %359, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %386 = phi <2 x float> [ %360, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %387 = phi <2 x float> [ %361, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %388 = phi <2 x float> [ %362, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %389 = phi <2 x float> [ %363, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %390 = phi <2 x float> [ %364, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %391 = phi <2 x float> [ %365, %283 ], [ zeroinitializer, %200 ], !dbg !45
+  %392 = phi <2 x float> [ %345, %283 ], [ %282, %200 ]
+  %393 = select <2 x i1> %97, <2 x float> %370, <2 x float> %124, !dbg !26
+  %394 = select <2 x i1> %97, <2 x float> %372, <2 x float> %127, !dbg !26
+  %395 = select <2 x i1> %97, <2 x float> %375, <2 x float> %130, !dbg !26
+  %396 = select <2 x i1> %97, <2 x float> %376, <2 x float> %131, !dbg !26
+  %397 = select <2 x i1> %97, <2 x float> %381, <2 x float> %136, !dbg !26
+  %398 = select <2 x i1> %97, <2 x float> %382, <2 x float> %137, !dbg !26
+  %399 = select <2 x i1> %97, <2 x float> %383, <2 x float> %138, !dbg !26
+  %400 = select <2 x i1> %97, <2 x float> %392, <2 x float> %139, !dbg !26
+  %401 = extractelement <2 x float> %384, i64 0, !dbg !46
+  %402 = extractelement <2 x float> %140, i64 0, !dbg !46
+  %403 = select i1 %17, float %401, float %402, !dbg !46
+  %404 = extractelement <2 x float> %384, i64 1, !dbg !46
+  %405 = extractelement <2 x float> %140, i64 1, !dbg !46
+  %406 = select i1 %17, float %404, float %405, !dbg !46
+  %407 = select <2 x i1> %97, <2 x float> %385, <2 x float> %141, !dbg !46
+  %408 = select <2 x i1> %97, <2 x float> %386, <2 x float> %142, !dbg !46
+  %409 = select <2 x i1> %97, <2 x float> %387, <2 x float> %143, !dbg !46
+  %410 = extractelement <2 x float> %388, i64 0, !dbg !46
+  %411 = extractelement <2 x float> %144, i64 0, !dbg !46
+  %412 = select i1 %17, float %410, float %411, !dbg !46
+  %413 = extractelement <2 x float> %388, i64 1, !dbg !46
+  %414 = extractelement <2 x float> %144, i64 1, !dbg !46
+  %415 = select i1 %17, float %413, float %414, !dbg !46
+  %416 = select <2 x i1> %97, <2 x float> %389, <2 x float> %145, !dbg !46
+  %417 = select <2 x i1> %97, <2 x float> %390, <2 x float> %146, !dbg !46
+  %418 = select <2 x i1> %97, <2 x float> %391, <2 x float> %147, !dbg !46
+  %419 = insertelement <2 x float> poison, float %369, i64 0, !dbg !47
+  %420 = insertelement <2 x float> %419, float %368, i64 1, !dbg !47
+  %421 = select <2 x i1> %97, <2 x float> %420, <2 x float> %125, !dbg !47
+  %422 = select <2 x i1> %97, <2 x float> %371, <2 x float> %126, !dbg !47
+  %423 = select <2 x i1> %97, <2 x float> %373, <2 x float> %128, !dbg !47
+  %424 = select <2 x i1> %97, <2 x float> %374, <2 x float> %129, !dbg !47
+  %425 = select <2 x i1> %97, <2 x float> %377, <2 x float> %132, !dbg !47
+  %426 = select <2 x i1> %97, <2 x float> %378, <2 x float> %133, !dbg !47
+  %427 = select <2 x i1> %97, <2 x float> %379, <2 x float> %134, !dbg !47
+  %428 = select <2 x i1> %97, <2 x float> %380, <2 x float> %135, !dbg !47
+  br i1 %17, label %.critedge, label %.critedge160, !dbg !48
+
+.critedge:                                        ; preds = %._crit_edge
+  %429 = shufflevector <2 x float> %222, <2 x float> %224, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %430 = shufflevector <2 x float> %218, <2 x float> %220, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %431 = shufflevector <2 x float> %214, <2 x float> %216, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %432 = sext i32 %.pn127204 to i64
+  %433 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %432
+  %434 = shufflevector <2 x float> %210, <2 x float> %212, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %435 = sext i32 %.pn103207 to i64, !dbg !49
+  %436 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %435, !dbg !49
+  %437 = sext i32 %.pn111206 to i64, !dbg !49
+  %438 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %437, !dbg !49
+  %439 = sext i32 %.pn119205 to i64, !dbg !49
+  %440 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %439, !dbg !49
+  store <4 x float> %434, ptr addrspace(1) %433, align 16, !dbg !48
+  store <4 x float> %431, ptr addrspace(1) %440, align 16, !dbg !48
+  store <4 x float> %430, ptr addrspace(1) %438, align 16, !dbg !48
+  store <4 x float> %429, ptr addrspace(1) %436, align 16, !dbg !48
+  br label %.critedge160, !dbg !48
+
+.critedge160:                                     ; preds = %._crit_edge, %.critedge
+  %441 = icmp samesign ult i32 %99, 4096, !dbg !27
+  %442 = insertelement <2 x float> poison, float %270, i64 0
+  %443 = insertelement <2 x float> %442, float %273, i64 1
+  %444 = shufflevector <4 x float> %180, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %445 = shufflevector <4 x float> %201, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %446 = insertelement <2 x float> poison, float %264, i64 0
+  %447 = insertelement <2 x float> %446, float %267, i64 1
+  %448 = shufflevector <4 x float> %180, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %449 = shufflevector <4 x float> %201, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %450 = insertelement <2 x float> poison, float %258, i64 0
+  %451 = insertelement <2 x float> %450, float %261, i64 1
+  %452 = shufflevector <4 x float> %176, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %453 = shufflevector <4 x float> %197, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %454 = insertelement <2 x float> poison, float %252, i64 0
+  %455 = insertelement <2 x float> %454, float %255, i64 1
+  %456 = shufflevector <4 x float> %176, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %457 = shufflevector <4 x float> %197, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %458 = insertelement <2 x float> poison, float %246, i64 0
+  %459 = insertelement <2 x float> %458, float %249, i64 1
+  %460 = shufflevector <4 x float> %172, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %461 = shufflevector <4 x float> %193, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %462 = insertelement <2 x float> poison, float %240, i64 0
+  %463 = insertelement <2 x float> %462, float %243, i64 1
+  %464 = shufflevector <4 x float> %172, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %465 = shufflevector <4 x float> %193, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %466 = insertelement <2 x float> poison, float %234, i64 0
+  %467 = insertelement <2 x float> %466, float %237, i64 1
+  %468 = shufflevector <4 x float> %168, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %469 = shufflevector <4 x float> %189, <4 x float> poison, <2 x i32> <i32 2, i32 3>
+  %470 = insertelement <2 x float> poison, float %228, i64 0
+  %471 = insertelement <2 x float> %470, float %231, i64 1
+  %472 = shufflevector <4 x float> %168, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %473 = shufflevector <4 x float> %189, <4 x float> poison, <2 x i32> <i32 0, i32 1>
+  %474 = insertelement <2 x float> poison, float %403, i64 0
+  %475 = insertelement <2 x float> %474, float %406, i64 1
+  %476 = insertelement <2 x float> poison, float %412, i64 0
+  %477 = insertelement <2 x float> %476, float %415, i64 1
+  br i1 %441, label %98, label %478, !dbg !27
+
+478:                                              ; preds = %.critedge160
+  %479 = fdiv <2 x float> %472, %95, !dbg !25
+  %480 = fdiv <2 x float> %468, %95, !dbg !25
+  %481 = fdiv <2 x float> %464, %95, !dbg !25
+  %482 = fdiv <2 x float> %460, %95, !dbg !25
+  %483 = fdiv <2 x float> %456, %95, !dbg !25
+  %484 = fdiv <2 x float> %452, %95, !dbg !25
+  %485 = fdiv <2 x float> %448, %95, !dbg !25
+  %486 = fdiv <2 x float> %444, %95, !dbg !25
+  %487 = fmul <2 x float> %479, %473, !dbg !29
+  %488 = fadd <2 x float> %211, %487, !dbg !30
+  %489 = fmul <2 x float> %480, %469, !dbg !29
+  %490 = fadd <2 x float> %213, %489, !dbg !30
+  %491 = fmul <2 x float> %481, %465, !dbg !29
+  %492 = fadd <2 x float> %215, %491, !dbg !30
+  %493 = fmul <2 x float> %482, %461, !dbg !29
+  %494 = fadd <2 x float> %217, %493, !dbg !30
+  %495 = fmul <2 x float> %483, %457, !dbg !29
+  %496 = fadd <2 x float> %219, %495, !dbg !30
+  %497 = fmul <2 x float> %484, %453, !dbg !29
+  %498 = fadd <2 x float> %221, %497, !dbg !30
+  %499 = fmul <2 x float> %485, %449, !dbg !29
+  %500 = fadd <2 x float> %223, %499, !dbg !30
+  %501 = fmul <2 x float> %486, %445, !dbg !29
+  %502 = fadd <2 x float> %225, %501, !dbg !30
+  %503 = select <2 x i1> %97, <2 x float> %488, <2 x float> %121, !dbg !31
+  %504 = select <2 x i1> %97, <2 x float> %490, <2 x float> %118, !dbg !31
+  %505 = select <2 x i1> %97, <2 x float> %492, <2 x float> %115, !dbg !31
+  %506 = select <2 x i1> %97, <2 x float> %494, <2 x float> %112, !dbg !31
+  %507 = select <2 x i1> %97, <2 x float> %496, <2 x float> %109, !dbg !31
+  %508 = select <2 x i1> %97, <2 x float> %498, <2 x float> %106, !dbg !31
+  %509 = select <2 x i1> %97, <2 x float> %500, <2 x float> %103, !dbg !31
+  %510 = select <2 x i1> %97, <2 x float> %502, <2 x float> %100, !dbg !31
+  %511 = shufflevector <2 x float> %501, <2 x float> %493, <2 x i32> <i32 1, i32 3>, !dbg !39
+  %512 = fsub <2 x float> %511, %400, !dbg !39
+  %513 = fadd <2 x float> %421, splat (float 1.000000e+00), !dbg !38
+  %514 = fadd <2 x float> %422, splat (float 1.000000e+00), !dbg !38
+  %515 = fadd <2 x float> %423, splat (float 1.000000e+00), !dbg !38
+  %516 = fadd <2 x float> %424, splat (float 1.000000e+00), !dbg !38
+  %517 = fadd <2 x float> %425, splat (float 1.000000e+00), !dbg !38
+  %518 = fadd <2 x float> %426, splat (float 1.000000e+00), !dbg !38
+  %519 = fadd <2 x float> %427, splat (float 1.000000e+00), !dbg !38
+  %520 = fadd <2 x float> %428, splat (float 1.000000e+00), !dbg !38
+  %521 = shufflevector <2 x float> %495, <2 x float> %487, <2 x i32> <i32 0, i32 2>, !dbg !39
+  %522 = fsub <2 x float> %521, %393, !dbg !39
+  %523 = shufflevector <2 x float> %495, <2 x float> %487, <2 x i32> <i32 1, i32 3>, !dbg !39
+  %524 = fsub <2 x float> %523, %394, !dbg !39
+  %525 = shufflevector <2 x float> %497, <2 x float> %489, <2 x i32> <i32 0, i32 2>, !dbg !39
+  %526 = fsub <2 x float> %525, %395, !dbg !39
+  %527 = shufflevector <2 x float> %497, <2 x float> %489, <2 x i32> <i32 1, i32 3>, !dbg !39
+  %528 = fsub <2 x float> %527, %396, !dbg !39
+  %529 = shufflevector <2 x float> %499, <2 x float> %491, <2 x i32> <i32 0, i32 2>, !dbg !39
+  %530 = fsub <2 x float> %529, %397, !dbg !39
+  %531 = shufflevector <2 x float> %499, <2 x float> %491, <2 x i32> <i32 1, i32 3>, !dbg !39
+  %532 = fsub <2 x float> %531, %398, !dbg !39
+  %533 = shufflevector <2 x float> %501, <2 x float> %493, <2 x i32> <i32 0, i32 2>, !dbg !39
+  %534 = fsub <2 x float> %533, %399, !dbg !39
+  %535 = fdiv <2 x float> %522, %513, !dbg !40
+  %536 = fdiv <2 x float> %524, %514, !dbg !40
+  %537 = fdiv <2 x float> %526, %515, !dbg !40
+  %538 = fdiv <2 x float> %528, %516, !dbg !40
+  %539 = fdiv <2 x float> %530, %517, !dbg !40
+  %540 = fdiv <2 x float> %532, %518, !dbg !40
+  %541 = fdiv <2 x float> %534, %519, !dbg !40
+  %542 = fdiv <2 x float> %512, %520, !dbg !40
+  %543 = fadd <2 x float> %393, %535, !dbg !41
+  %544 = fadd <2 x float> %394, %536, !dbg !41
+  %545 = fadd <2 x float> %395, %537, !dbg !41
+  %546 = fadd <2 x float> %396, %538, !dbg !41
+  %547 = fadd <2 x float> %397, %539, !dbg !41
+  %548 = fadd <2 x float> %398, %540, !dbg !41
+  %549 = fadd <2 x float> %399, %541, !dbg !41
+  %550 = fadd <2 x float> %400, %542, !dbg !41
+  %551 = shufflevector <2 x float> %487, <2 x float> %491, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %552 = shufflevector <2 x float> %543, <2 x float> %547, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %553 = fsub <2 x float> %551, %552, !dbg !42
+  %554 = shufflevector <2 x float> %487, <2 x float> %491, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %555 = shufflevector <2 x float> %544, <2 x float> %548, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %556 = fsub <2 x float> %554, %555, !dbg !42
+  %557 = shufflevector <2 x float> %489, <2 x float> %493, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %558 = shufflevector <2 x float> %545, <2 x float> %549, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %559 = fsub <2 x float> %557, %558, !dbg !42
+  %560 = shufflevector <2 x float> %489, <2 x float> %493, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %561 = shufflevector <2 x float> %546, <2 x float> %550, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %562 = fsub <2 x float> %560, %561, !dbg !42
+  %563 = shufflevector <2 x float> %522, <2 x float> %530, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %564 = fmul <2 x float> %563, %553, !dbg !43
+  %565 = shufflevector <2 x float> %524, <2 x float> %532, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %566 = fmul <2 x float> %565, %556, !dbg !43
+  %567 = shufflevector <2 x float> %526, <2 x float> %534, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %568 = fmul <2 x float> %567, %559, !dbg !43
+  %569 = shufflevector <2 x float> %528, <2 x float> %512, <2 x i32> <i32 1, i32 3>, !dbg !43
+  %570 = fmul <2 x float> %569, %562, !dbg !43
+  %571 = fadd <2 x float> %384, %564, !dbg !44
+  %572 = fadd <2 x float> %385, %566, !dbg !44
+  %573 = fadd <2 x float> %386, %568, !dbg !44
+  %574 = fadd <2 x float> %387, %570, !dbg !44
+  %575 = shufflevector <2 x float> %495, <2 x float> %499, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %576 = shufflevector <2 x float> %543, <2 x float> %547, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %577 = fsub <2 x float> %575, %576, !dbg !42
+  %578 = shufflevector <2 x float> %495, <2 x float> %499, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %579 = shufflevector <2 x float> %544, <2 x float> %548, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %580 = fsub <2 x float> %578, %579, !dbg !42
+  %581 = shufflevector <2 x float> %497, <2 x float> %501, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %582 = shufflevector <2 x float> %545, <2 x float> %549, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %583 = fsub <2 x float> %581, %582, !dbg !42
+  %584 = shufflevector <2 x float> %497, <2 x float> %501, <2 x i32> <i32 1, i32 3>, !dbg !42
+  %585 = shufflevector <2 x float> %546, <2 x float> %550, <2 x i32> <i32 0, i32 2>, !dbg !42
+  %586 = fsub <2 x float> %584, %585, !dbg !42
+  %587 = shufflevector <2 x float> %522, <2 x float> %530, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %588 = fmul <2 x float> %587, %577, !dbg !43
+  %589 = shufflevector <2 x float> %524, <2 x float> %532, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %590 = fmul <2 x float> %589, %580, !dbg !43
+  %591 = shufflevector <2 x float> %526, <2 x float> %534, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %592 = fmul <2 x float> %591, %583, !dbg !43
+  %593 = shufflevector <2 x float> %528, <2 x float> %512, <2 x i32> <i32 0, i32 2>, !dbg !43
+  %594 = fmul <2 x float> %593, %586, !dbg !43
+  %595 = fadd <2 x float> %388, %588, !dbg !44
+  %596 = fadd <2 x float> %389, %590, !dbg !44
+  %597 = fadd <2 x float> %390, %592, !dbg !44
+  %598 = fadd <2 x float> %391, %594, !dbg !44
+  %599 = select <2 x i1> %97, <2 x float> %543, <2 x float> %124, !dbg !26
+  %600 = select <2 x i1> %97, <2 x float> %544, <2 x float> %127, !dbg !26
+  %601 = select <2 x i1> %97, <2 x float> %545, <2 x float> %130, !dbg !26
+  %602 = select <2 x i1> %97, <2 x float> %546, <2 x float> %131, !dbg !26
+  %603 = select <2 x i1> %97, <2 x float> %547, <2 x float> %136, !dbg !26
+  %604 = select <2 x i1> %97, <2 x float> %548, <2 x float> %137, !dbg !26
+  %605 = select <2 x i1> %97, <2 x float> %549, <2 x float> %138, !dbg !26
+  %606 = select <2 x i1> %97, <2 x float> %550, <2 x float> %139, !dbg !26
+  %607 = select <2 x i1> %97, <2 x float> %571, <2 x float> %140, !dbg !46
+  %608 = select <2 x i1> %97, <2 x float> %572, <2 x float> %141, !dbg !46
+  %609 = select <2 x i1> %97, <2 x float> %573, <2 x float> %142, !dbg !46
+  %610 = select <2 x i1> %97, <2 x float> %574, <2 x float> %143, !dbg !46
+  %611 = select <2 x i1> %97, <2 x float> %595, <2 x float> %144, !dbg !46
+  %612 = select <2 x i1> %97, <2 x float> %596, <2 x float> %145, !dbg !46
+  %613 = select <2 x i1> %97, <2 x float> %597, <2 x float> %146, !dbg !46
+  %614 = select <2 x i1> %97, <2 x float> %598, <2 x float> %147, !dbg !46
+  %615 = select <2 x i1> %97, <2 x float> %513, <2 x float> %125, !dbg !47
+  %616 = select <2 x i1> %97, <2 x float> %514, <2 x float> %126, !dbg !47
+  %617 = select <2 x i1> %97, <2 x float> %515, <2 x float> %128, !dbg !47
+  %618 = select <2 x i1> %97, <2 x float> %516, <2 x float> %129, !dbg !47
+  %619 = select <2 x i1> %97, <2 x float> %517, <2 x float> %132, !dbg !47
+  %620 = select <2 x i1> %97, <2 x float> %518, <2 x float> %133, !dbg !47
+  %621 = select <2 x i1> %97, <2 x float> %519, <2 x float> %134, !dbg !47
+  %622 = select <2 x i1> %97, <2 x float> %520, <2 x float> %135, !dbg !47
+  br i1 %17, label %.critedge162, label %.critedge164, !dbg !48
+
+.critedge162:                                     ; preds = %478
+  %623 = shufflevector <2 x float> %499, <2 x float> %501, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %624 = shufflevector <2 x float> %495, <2 x float> %497, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %625 = shufflevector <2 x float> %491, <2 x float> %493, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %626 = sext i32 %153 to i64
+  %627 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %626
+  %628 = shufflevector <2 x float> %487, <2 x float> %489, <4 x i32> <i32 0, i32 1, i32 2, i32 3>
+  %629 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %161, !dbg !49
+  %630 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %159, !dbg !49
+  %631 = getelementptr [4 x i8], ptr addrspace(1) %3, i64 %157, !dbg !49
+  store <4 x float> %628, ptr addrspace(1) %627, align 16, !dbg !48
+  store <4 x float> %625, ptr addrspace(1) %631, align 16, !dbg !48
+  store <4 x float> %624, ptr addrspace(1) %630, align 16, !dbg !48
+  store <4 x float> %623, ptr addrspace(1) %629, align 16, !dbg !48
+  br label %.critedge164, !dbg !48
+
+.critedge164:                                     ; preds = %478, %.critedge162
+  %632 = fadd <2 x float> %503, %504, !dbg !50
+  %633 = fadd <2 x float> %505, %506, !dbg !50
+  %634 = fadd <2 x float> %507, %508, !dbg !50
+  %635 = fadd <2 x float> %509, %510, !dbg !50
+  %636 = fadd <2 x float> %632, %633, !dbg !50
+  %637 = fadd <2 x float> %634, %635, !dbg !50
+  %638 = fadd <2 x float> %636, %637, !dbg !50
+  %shift746 = shufflevector <2 x float> %638, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !54
+  %foldExtExtBinop747 = fadd <2 x float> %638, %shift746, !dbg !54
+  %639 = extractelement <2 x float> %foldExtExtBinop747, i64 0, !dbg !54
+  %640 = tail call float @llvm.amdgcn.update.dpp.f32(float poison, float %639, i32 280, i32 15, i32 15, i1 true), !dbg !50
+  %641 = fadd float %639, %640, !dbg !54
+  %642 = tail call float @llvm.amdgcn.update.dpp.f32(float poison, float %641, i32 276, i32 15, i32 15, i1 true), !dbg !50
+  %643 = fadd float %641, %642, !dbg !54
+  %644 = tail call float @llvm.amdgcn.update.dpp.f32(float poison, float %643, i32 274, i32 15, i32 15, i1 true), !dbg !50
+  %645 = fadd float %643, %644, !dbg !54
+  %646 = tail call float @llvm.amdgcn.update.dpp.f32(float poison, float %645, i32 273, i32 15, i32 15, i1 true), !dbg !50
+  %647 = fadd float %645, %646, !dbg !54
+  %648 = tail call float @llvm.amdgcn.update.dpp.f32(float %647, float %647, i32 322, i32 10, i32 15, i1 true), !dbg !50
+  %649 = fadd float %647, %648, !dbg !54
+  %650 = tail call float @llvm.amdgcn.update.dpp.f32(float poison, float %649, i32 323, i32 15, i32 15, i1 true), !dbg !50
+  %651 = fadd float %649, %650, !dbg !54
+  %652 = tail call float @llvm.amdgcn.readlane.f32(float %651, i32 63), !dbg !50
+  %653 = lshr i32 %15, 4, !dbg !50
+  %654 = and i32 %653, 4, !dbg !50
+  %655 = getelementptr inbounds nuw i8, ptr addrspace(3) @global_smem, i32 %654, !dbg !50
+  %656 = insertelement <1 x float> poison, float %652, i64 0, !dbg !50
+  store <1 x float> %656, ptr addrspace(3) %655, align 4, !dbg !50
+  tail call void @llvm.amdgcn.s.waitcnt(i32 49279), !dbg !50
+  tail call void @llvm.amdgcn.s.barrier(), !dbg !50
+  %657 = shl nuw nsw i32 %13, 2, !dbg !50
+  %658 = and i32 %657, 4, !dbg !50
+  %659 = getelementptr inbounds nuw i8, ptr addrspace(3) @global_smem, i32 %658, !dbg !50
+  %660 = load <1 x float>, ptr addrspace(3) %659, align 4, !dbg !50
+  %661 = extractelement <1 x float> %660, i64 0, !dbg !50
+  %662 = bitcast float %661 to i32, !dbg !50
+  %663 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %662, i32 %662, i32 177, i32 15, i32 15, i1 false), !dbg !50
+  tail call void @llvm.amdgcn.s.waitcnt(i32 49279), !dbg !55
+  tail call void @llvm.amdgcn.s.barrier(), !dbg !55
+  %664 = fsub <2 x float> %600, %599, !dbg !57
+  %665 = fadd <2 x float> %615, %616, !dbg !58
+  %666 = fadd <2 x float> %607, %608, !dbg !59
+  %667 = fsub <2 x float> %602, %601, !dbg !57
+  %668 = fadd <2 x float> %617, %618, !dbg !58
+  %669 = fadd <2 x float> %609, %610, !dbg !59
+  %670 = fsub <2 x float> %604, %603, !dbg !57
+  %671 = fadd <2 x float> %619, %620, !dbg !58
+  %672 = fsub <2 x float> %606, %605, !dbg !57
+  %673 = fadd <2 x float> %621, %622, !dbg !58
+  %674 = fadd <2 x float> %611, %612, !dbg !59
+  %675 = fadd <2 x float> %613, %614, !dbg !59
+  %676 = fcmp oeq <2 x float> %665, zeroinitializer, !dbg !60
+  %677 = fdiv <2 x float> %616, %665, !dbg !61
+  %678 = select <2 x i1> %676, <2 x float> zeroinitializer, <2 x float> %677, !dbg !62
+  %679 = fcmp oeq <2 x float> %668, zeroinitializer, !dbg !60
+  %680 = fdiv <2 x float> %618, %668, !dbg !61
+  %681 = select <2 x i1> %679, <2 x float> zeroinitializer, <2 x float> %680, !dbg !62
+  %682 = fcmp oeq <2 x float> %671, zeroinitializer, !dbg !60
+  %683 = fdiv <2 x float> %620, %671, !dbg !61
+  %684 = select <2 x i1> %682, <2 x float> zeroinitializer, <2 x float> %683, !dbg !62
+  %685 = fcmp oeq <2 x float> %673, zeroinitializer, !dbg !60
+  %686 = fdiv <2 x float> %622, %673, !dbg !61
+  %687 = select <2 x i1> %685, <2 x float> zeroinitializer, <2 x float> %686, !dbg !62
+  %688 = fmul <2 x float> %678, %664, !dbg !63
+  %689 = fadd <2 x float> %599, %688, !dbg !64
+  %690 = fmul <2 x float> %681, %667, !dbg !63
+  %691 = fadd <2 x float> %601, %690, !dbg !64
+  %692 = fmul <2 x float> %684, %670, !dbg !63
+  %693 = fadd <2 x float> %603, %692, !dbg !64
+  %694 = fmul <2 x float> %687, %672, !dbg !63
+  %695 = fadd <2 x float> %605, %694, !dbg !64
+  %696 = fsub <2 x float> %691, %689, !dbg !57
+  %697 = fadd <2 x float> %665, %668, !dbg !58
+  %698 = fcmp oeq <2 x float> %697, zeroinitializer, !dbg !60
+  %699 = fdiv <2 x float> %668, %697, !dbg !61
+  %700 = select <2 x i1> %698, <2 x float> zeroinitializer, <2 x float> %699, !dbg !62
+  %701 = fsub <2 x float> %695, %693, !dbg !57
+  %702 = fadd <2 x float> %671, %673, !dbg !58
+  %703 = fcmp oeq <2 x float> %702, zeroinitializer, !dbg !60
+  %704 = fdiv <2 x float> %673, %702, !dbg !61
+  %705 = select <2 x i1> %703, <2 x float> zeroinitializer, <2 x float> %704, !dbg !62
+  %706 = shufflevector <2 x float> %664, <2 x float> %670, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %707 = fmul <2 x float> %706, %706, !dbg !65
+  %708 = shufflevector <2 x float> %615, <2 x float> %619, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %709 = fmul <2 x float> %708, %707, !dbg !65
+  %710 = shufflevector <2 x float> %667, <2 x float> %672, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %711 = fmul <2 x float> %710, %710, !dbg !65
+  %712 = shufflevector <2 x float> %617, <2 x float> %621, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %713 = fmul <2 x float> %712, %711, !dbg !65
+  %714 = shufflevector <2 x float> %678, <2 x float> %684, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %715 = fmul <2 x float> %714, %709, !dbg !65
+  %716 = fadd <2 x float> %666, %715, !dbg !59
+  %717 = shufflevector <2 x float> %681, <2 x float> %687, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %718 = fmul <2 x float> %717, %713, !dbg !65
+  %719 = fadd <2 x float> %669, %718, !dbg !59
+  %720 = fadd <2 x float> %716, %719, !dbg !59
+  %721 = shufflevector <2 x float> %696, <2 x float> %701, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %722 = fmul <2 x float> %721, %721, !dbg !65
+  %723 = shufflevector <2 x float> %665, <2 x float> %671, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %724 = fmul <2 x float> %723, %722, !dbg !65
+  %725 = shufflevector <2 x float> %700, <2 x float> %705, <2 x i32> <i32 1, i32 3>, !dbg !65
+  %726 = fmul <2 x float> %725, %724, !dbg !65
+  %727 = fadd <2 x float> %720, %726, !dbg !59
+  %728 = fmul <2 x float> %700, %696, !dbg !63
+  %729 = fadd <2 x float> %689, %728, !dbg !64
+  %730 = fmul <2 x float> %705, %701, !dbg !63
+  %731 = fadd <2 x float> %693, %730, !dbg !64
+  %732 = shufflevector <2 x float> %664, <2 x float> %670, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %733 = fmul <2 x float> %732, %732, !dbg !65
+  %734 = shufflevector <2 x float> %615, <2 x float> %619, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %735 = fmul <2 x float> %734, %733, !dbg !65
+  %736 = shufflevector <2 x float> %667, <2 x float> %672, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %737 = fmul <2 x float> %736, %736, !dbg !65
+  %738 = shufflevector <2 x float> %617, <2 x float> %621, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %739 = fmul <2 x float> %738, %737, !dbg !65
+  %740 = shufflevector <2 x float> %678, <2 x float> %684, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %741 = fmul <2 x float> %740, %735, !dbg !65
+  %742 = fadd <2 x float> %674, %741, !dbg !59
+  %743 = shufflevector <2 x float> %681, <2 x float> %687, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %744 = fmul <2 x float> %743, %739, !dbg !65
+  %745 = fadd <2 x float> %675, %744, !dbg !59
+  %746 = fadd <2 x float> %742, %745, !dbg !59
+  %747 = shufflevector <2 x float> %696, <2 x float> %701, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %748 = fmul <2 x float> %747, %747, !dbg !65
+  %749 = shufflevector <2 x float> %665, <2 x float> %671, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %750 = fmul <2 x float> %749, %748, !dbg !65
+  %751 = shufflevector <2 x float> %700, <2 x float> %705, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %752 = fmul <2 x float> %751, %750, !dbg !65
+  %753 = fadd <2 x float> %746, %752, !dbg !59
+  %shift749 = shufflevector <2 x float> %727, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !59
+  %foldExtExtBinop750 = fadd <2 x float> %727, %shift749, !dbg !59
+  %754 = fsub <2 x float> %731, %729, !dbg !57
+  %foldExtExtBinop752 = fmul <2 x float> %754, %754, !dbg !65
+  %foldExtExtBinop754 = fmul <2 x float> %697, %foldExtExtBinop752, !dbg !65
+  %755 = fadd <2 x float> %697, %702, !dbg !58
+  %756 = fcmp oeq <2 x float> %755, zeroinitializer, !dbg !60
+  %757 = fdiv <2 x float> %702, %755, !dbg !61
+  %758 = select <2 x i1> %756, <2 x float> zeroinitializer, <2 x float> %757, !dbg !62
+  %foldExtExtBinop756 = fmul <2 x float> %758, %foldExtExtBinop754, !dbg !65
+  %759 = fmul <2 x float> %758, %754, !dbg !63
+  %760 = fadd <2 x float> %729, %759, !dbg !64
+  %foldExtExtBinop764 = fmul <2 x float> %754, %754, !dbg !65
+  %761 = extractelement <2 x float> %755, i64 0, !dbg !61
+  %shift766 = shufflevector <2 x float> %755, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !58
+  %foldExtExtBinop767 = fadd <2 x float> %shift766, %755, !dbg !58
+  %762 = extractelement <2 x float> %foldExtExtBinop767, i64 0, !dbg !58
+  %763 = fcmp oeq float %762, 0.000000e+00, !dbg !60
+  %764 = fdiv float %761, %762, !dbg !61
+  %765 = select i1 %763, float 0.000000e+00, float %764, !dbg !62
+  %766 = shl nuw nsw i32 %14, 2, !dbg !55
+  %767 = xor i32 %766, 128, !dbg !55
+  %768 = bitcast float %762 to i32, !dbg !55
+  %769 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %767, i32 %768), !dbg !55
+  %770 = bitcast i32 %769 to float, !dbg !55
+  %771 = fadd float %762, %770, !dbg !58
+  %772 = fcmp oeq float %771, 0.000000e+00, !dbg !60
+  %773 = fdiv float %770, %771, !dbg !61
+  %774 = select i1 %772, float 0.000000e+00, float %773, !dbg !62
+  %775 = shufflevector <2 x float> %697, <2 x float> %760, <2 x i32> <i32 0, i32 2>, !dbg !65
+  %776 = shufflevector <2 x float> %foldExtExtBinop764, <2 x float> %760, <2 x i32> <i32 0, i32 3>, !dbg !65
+  %777 = fmul <2 x float> %775, %776, !dbg !65
+  %778 = fsub <2 x float> %775, %776, !dbg !65
+  %779 = shufflevector <2 x float> %777, <2 x float> %778, <2 x i32> <i32 0, i32 3>, !dbg !65
+  %780 = insertelement <2 x float> %758, float %765, i64 1, !dbg !65
+  %781 = fmul <2 x float> %780, %779, !dbg !65
+  %782 = shufflevector <2 x float> %753, <2 x float> %729, <2 x i32> <i32 0, i32 3>, !dbg !59
+  %783 = shufflevector <2 x float> %759, <2 x float> %753, <2 x i32> <i32 3, i32 1>, !dbg !59
+  %784 = fadd <2 x float> %782, %783, !dbg !59
+  %785 = fadd <2 x float> %784, %781, !dbg !59
+  %foldExtExtBinop769 = fmul <2 x float> %779, %779, !dbg !65
+  %foldExtExtBinop771 = fmul <2 x float> %755, %foldExtExtBinop769, !dbg !65
+  %786 = extractelement <2 x float> %foldExtExtBinop771, i64 1, !dbg !65
+  %787 = fmul float %765, %786, !dbg !65
+  %788 = extractelement <2 x float> %785, i64 1, !dbg !64
+  %789 = bitcast float %788 to i32, !dbg !55
+  %790 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %767, i32 %789), !dbg !55
+  %791 = bitcast i32 %790 to float, !dbg !55
+  %792 = shufflevector <2 x float> %foldExtExtBinop756, <2 x float> poison, <2 x i32> <i32 1, i32 poison>, !dbg !59
+  %793 = fadd <2 x float> %foldExtExtBinop750, %792, !dbg !59
+  %794 = insertelement <2 x float> %793, float %791, i64 1, !dbg !59
+  %795 = fadd <2 x float> %794, %785, !dbg !59
+  %796 = fsub <2 x float> %794, %785, !dbg !59
+  %797 = shufflevector <2 x float> %795, <2 x float> %796, <2 x i32> <i32 0, i32 3>, !dbg !59
+  %798 = insertelement <2 x float> %797, float %787, i64 0, !dbg !59
+  %799 = fadd <2 x float> %797, %798, !dbg !59
+  %800 = fmul <2 x float> %797, %798, !dbg !59
+  %801 = shufflevector <2 x float> %799, <2 x float> %800, <2 x i32> <i32 0, i32 3>, !dbg !59
+  %bc = bitcast <2 x float> %799 to <2 x i32>, !dbg !55
+  %802 = extractelement <2 x i32> %bc, i64 0, !dbg !55
+  %803 = tail call i32 @llvm.amdgcn.ds.bpermute(i32 %767, i32 %802), !dbg !55
+  %804 = extractelement <2 x float> %796, i64 1, !dbg !63
+  %805 = fmul float %804, %774, !dbg !63
+  %806 = fadd float %788, %805, !dbg !64
+  %807 = insertelement <2 x i32> poison, i32 %803, i64 0, !dbg !59
+  %808 = bitcast <2 x i32> %807 to <2 x float>, !dbg !59
+  %809 = shufflevector <2 x float> %808, <2 x float> %foldExtExtBinop767, <2 x i32> <i32 0, i32 2>, !dbg !59
+  %810 = fadd <2 x float> %801, %809, !dbg !59
+  %811 = fmul <2 x float> %801, %809, !dbg !59
+  %812 = extractelement <2 x float> %811, i64 1, !dbg !65
+  %813 = fmul float %812, %774, !dbg !65
+  %814 = extractelement <2 x float> %810, i64 0, !dbg !59
+  %815 = fadd float %814, %813, !dbg !59
+  %816 = bitcast float %806 to i32, !dbg !55
+  %817 = tail call i32 @llvm.amdgcn.ds.swizzle(i32 %816, i32 16415), !dbg !55
+  %818 = bitcast i32 %817 to float, !dbg !55
+  %819 = bitcast float %815 to i32, !dbg !55
+  %820 = tail call i32 @llvm.amdgcn.ds.swizzle(i32 %819, i32 16415), !dbg !55
+  %821 = bitcast i32 %820 to float, !dbg !55
+  %822 = bitcast float %771 to i32, !dbg !55
+  %823 = tail call i32 @llvm.amdgcn.ds.swizzle(i32 %822, i32 16415), !dbg !55
+  %824 = bitcast i32 %823 to float, !dbg !55
+  %825 = fsub float %818, %806, !dbg !57
+  %826 = fadd float %771, %824, !dbg !58
+  %827 = fcmp oeq float %826, 0.000000e+00, !dbg !60
+  %828 = fdiv float %824, %826, !dbg !61
+  %829 = select i1 %827, float 0.000000e+00, float %828, !dbg !62
+  %830 = fmul float %825, %829, !dbg !63
+  %831 = fadd float %806, %830, !dbg !64
+  %832 = fadd float %815, %821, !dbg !59
+  %833 = fmul float %825, %825, !dbg !65
+  %834 = fmul float %771, %833, !dbg !65
+  %835 = fmul float %829, %834, !dbg !65
+  %836 = fadd float %832, %835, !dbg !59
+  %837 = bitcast float %831 to i32, !dbg !55
+  %838 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %837, i32 %837, i32 280, i32 15, i32 12, i1 false), !dbg !55
+  %839 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %838, i32 %837, i32 264, i32 15, i32 3, i1 false), !dbg !55
+  %840 = bitcast i32 %839 to float, !dbg !55
+  %841 = bitcast float %836 to i32, !dbg !55
+  %842 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %841, i32 %841, i32 280, i32 15, i32 12, i1 false), !dbg !55
+  %843 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %842, i32 %841, i32 264, i32 15, i32 3, i1 false), !dbg !55
+  %844 = bitcast i32 %843 to float, !dbg !55
+  %845 = bitcast float %826 to i32, !dbg !55
+  %846 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %845, i32 %845, i32 280, i32 15, i32 12, i1 false), !dbg !55
+  %847 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %846, i32 %845, i32 264, i32 15, i32 3, i1 false), !dbg !55
+  %848 = bitcast i32 %847 to float, !dbg !55
+  %849 = fsub float %840, %831, !dbg !57
+  %850 = fadd float %826, %848, !dbg !58
+  %851 = fcmp oeq float %850, 0.000000e+00, !dbg !60
+  %852 = fdiv float %848, %850, !dbg !61
+  %853 = select i1 %851, float 0.000000e+00, float %852, !dbg !62
+  %854 = fmul float %849, %853, !dbg !63
+  %855 = fadd float %831, %854, !dbg !64
+  %856 = fadd float %836, %844, !dbg !59
+  %857 = fmul float %849, %849, !dbg !65
+  %858 = fmul float %826, %857, !dbg !65
+  %859 = fmul float %858, %853, !dbg !65
+  %860 = fadd float %856, %859, !dbg !59
+  %861 = bitcast float %855 to i32, !dbg !55
+  %862 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %861, i32 %861, i32 276, i32 15, i32 10, i1 false), !dbg !55
+  %863 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %862, i32 %861, i32 260, i32 15, i32 5, i1 false), !dbg !55
+  %864 = bitcast i32 %863 to float, !dbg !55
+  %865 = bitcast float %860 to i32, !dbg !55
+  %866 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %865, i32 %865, i32 276, i32 15, i32 10, i1 false), !dbg !55
+  %867 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %866, i32 %865, i32 260, i32 15, i32 5, i1 false), !dbg !55
+  %868 = bitcast i32 %867 to float, !dbg !55
+  %869 = bitcast float %850 to i32, !dbg !55
+  %870 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %869, i32 %869, i32 276, i32 15, i32 10, i1 false), !dbg !55
+  %871 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %870, i32 %869, i32 260, i32 15, i32 5, i1 false), !dbg !55
+  %872 = bitcast i32 %871 to float, !dbg !55
+  %873 = fsub float %864, %855, !dbg !57
+  %874 = fadd float %850, %872, !dbg !58
+  %875 = fcmp oeq float %874, 0.000000e+00, !dbg !60
+  %876 = fdiv float %872, %874, !dbg !61
+  %877 = select i1 %875, float 0.000000e+00, float %876, !dbg !62
+  %878 = fmul float %873, %877, !dbg !63
+  %879 = fadd float %855, %878, !dbg !64
+  %880 = fadd float %860, %868, !dbg !59
+  %881 = fmul float %873, %873, !dbg !65
+  %882 = fmul float %850, %881, !dbg !65
+  %883 = fmul float %882, %877, !dbg !65
+  %884 = fadd float %880, %883, !dbg !59
+  %885 = bitcast float %879 to i32, !dbg !55
+  %886 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %885, i32 %885, i32 78, i32 15, i32 15, i1 false), !dbg !55
+  %887 = bitcast i32 %886 to float, !dbg !55
+  %888 = bitcast float %884 to i32, !dbg !55
+  %889 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %888, i32 %888, i32 78, i32 15, i32 15, i1 false), !dbg !55
+  %890 = bitcast i32 %889 to float, !dbg !55
+  %891 = bitcast float %874 to i32, !dbg !55
+  %892 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %891, i32 %891, i32 78, i32 15, i32 15, i1 false), !dbg !55
+  %893 = bitcast i32 %892 to float, !dbg !55
+  %894 = fsub float %887, %879, !dbg !57
+  %895 = fadd float %874, %893, !dbg !58
+  %896 = fcmp oeq float %895, 0.000000e+00, !dbg !60
+  %897 = fdiv float %893, %895, !dbg !61
+  %898 = select i1 %896, float 0.000000e+00, float %897, !dbg !62
+  %899 = fmul float %894, %898, !dbg !63
+  %900 = fadd float %879, %899, !dbg !64
+  %901 = fadd float %884, %890, !dbg !59
+  %902 = fmul float %894, %894, !dbg !65
+  %903 = fmul float %874, %902, !dbg !65
+  %904 = fmul float %898, %903, !dbg !65
+  %905 = fadd float %901, %904, !dbg !59
+  %906 = bitcast float %900 to i32, !dbg !55
+  %907 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %906, i32 %906, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %908 = bitcast i32 %907 to float, !dbg !55
+  %909 = bitcast float %905 to i32, !dbg !55
+  %910 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %909, i32 %909, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %911 = bitcast i32 %910 to float, !dbg !55
+  %912 = bitcast float %895 to i32, !dbg !55
+  %913 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %912, i32 %912, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %914 = bitcast i32 %913 to float, !dbg !55
+  %915 = fsub float %908, %900, !dbg !57
+  %916 = fadd float %895, %914, !dbg !58
+  %917 = fcmp oeq float %916, 0.000000e+00, !dbg !60
+  %918 = fdiv float %914, %916, !dbg !61
+  %919 = select i1 %917, float 0.000000e+00, float %918, !dbg !62
+  %920 = fmul float %915, %919, !dbg !63
+  %921 = fadd float %900, %920, !dbg !64
+  %922 = fadd float %905, %911, !dbg !59
+  %923 = fmul float %915, %915, !dbg !65
+  %924 = fmul float %895, %923, !dbg !65
+  %925 = fmul float %919, %924, !dbg !65
+  %926 = fadd float %922, %925, !dbg !59
+  %927 = insertelement <1 x float> poison, float %921, i64 0, !dbg !55
+  store <1 x float> %927, ptr addrspace(3) %655, align 4, !dbg !55
+  tail call void @llvm.amdgcn.s.waitcnt(i32 49279), !dbg !55
+  tail call void @llvm.amdgcn.s.barrier(), !dbg !55
+  %928 = load <1 x float>, ptr addrspace(3) %659, align 4, !dbg !55
+  %929 = extractelement <1 x float> %928, i64 0, !dbg !55
+  %930 = getelementptr inbounds nuw i8, ptr addrspace(3) getelementptr (i8, ptr addrspace(3) @global_smem, i32 8), i32 %654, !dbg !55
+  %931 = insertelement <1 x float> poison, float %926, i64 0, !dbg !55
+  store <1 x float> %931, ptr addrspace(3) %930, align 4, !dbg !55
+  tail call void @llvm.amdgcn.s.waitcnt(i32 49279), !dbg !55
+  tail call void @llvm.amdgcn.s.barrier(), !dbg !55
+  %932 = getelementptr inbounds nuw i8, ptr addrspace(3) getelementptr (i8, ptr addrspace(3) @global_smem, i32 8), i32 %658, !dbg !55
+  %933 = load <1 x float>, ptr addrspace(3) %932, align 4, !dbg !55
+  %934 = extractelement <1 x float> %933, i64 0, !dbg !55
+  %935 = getelementptr inbounds nuw i8, ptr addrspace(3) getelementptr (i8, ptr addrspace(3) @global_smem, i32 16), i32 %654, !dbg !55
+  %936 = insertelement <1 x float> poison, float %916, i64 0, !dbg !55
+  store <1 x float> %936, ptr addrspace(3) %935, align 4, !dbg !55
+  tail call void @llvm.amdgcn.s.waitcnt(i32 49279), !dbg !55
+  tail call void @llvm.amdgcn.s.barrier(), !dbg !55
+  %937 = getelementptr inbounds nuw i8, ptr addrspace(3) getelementptr (i8, ptr addrspace(3) @global_smem, i32 16), i32 %658, !dbg !55
+  %938 = load <1 x float>, ptr addrspace(3) %937, align 4, !dbg !55
+  %939 = extractelement <1 x float> %938, i64 0, !dbg !55
+  %940 = bitcast float %929 to i32, !dbg !55
+  %941 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %940, i32 %940, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %942 = bitcast float %934 to i32, !dbg !55
+  %943 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %942, i32 %942, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %944 = bitcast float %939 to i32, !dbg !55
+  %945 = tail call i32 @llvm.amdgcn.update.dpp.i32(i32 %944, i32 %944, i32 177, i32 15, i32 15, i1 false), !dbg !55
+  %946 = icmp eq i32 %20, 0, !dbg !66
+  %947 = and i1 %17, %946, !dbg !66
+  br i1 %947, label %.critedge166, label %.critedge168, !dbg !66
+
+.critedge166:                                     ; preds = %.critedge164
+  %948 = sext i32 %16 to i64
+  %949 = getelementptr [4 x i8], ptr addrspace(1) %7, i64 %948
+  %950 = bitcast i32 %945 to float, !dbg !55
+  %951 = fadd float %939, %950, !dbg !58
+  %952 = insertelement <1 x float> poison, float %951, i64 0
+  %953 = getelementptr [4 x i8], ptr addrspace(1) %6, i64 %948
+  %954 = bitcast i32 %943 to float, !dbg !55
+  %955 = fadd float %934, %954, !dbg !59
+  %956 = bitcast i32 %941 to float, !dbg !55
+  %957 = fsub float %956, %929, !dbg !57
+  %958 = fmul float %957, %957, !dbg !65
+  %959 = fmul float %939, %958, !dbg !65
+  %960 = fcmp oeq float %951, 0.000000e+00, !dbg !60
+  %961 = fdiv float %950, %951, !dbg !61
+  %962 = select i1 %960, float 0.000000e+00, float %961, !dbg !62
+  %963 = fmul float %959, %962, !dbg !65
+  %964 = fadd float %955, %963, !dbg !59
+  %965 = insertelement <1 x float> poison, float %964, i64 0
+  %966 = getelementptr [4 x i8], ptr addrspace(1) %5, i64 %948
+  %967 = fmul float %957, %962, !dbg !63
+  %968 = fadd float %929, %967, !dbg !64
+  %969 = insertelement <1 x float> poison, float %968, i64 0
+  %970 = getelementptr [4 x i8], ptr addrspace(1) %4, i64 %948
+  %971 = bitcast i32 %663 to float
+  %972 = fadd float %661, %971
+  %973 = insertelement <1 x float> poison, float %972, i64 0
+  store <1 x float> %973, ptr addrspace(1) %970, align 4, !dbg !66
+  store <1 x float> %969, ptr addrspace(1) %966, align 4, !dbg !67
+  store <1 x float> %965, ptr addrspace(1) %953, align 4, !dbg !68
+  store <1 x float> %952, ptr addrspace(1) %949, align 4, !dbg !12
+  br label %.critedge168, !dbg !12
+
+.critedge168:                                     ; preds = %.critedge164, %.critedge166
+  ret void, !dbg !69
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.amdgcn.workitem.id.x() #1
+
+; Function Attrs: convergent mustprogress nocallback nocreateundeforpoison nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.readfirstlane.i32(i32) #2
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef i32 @llvm.amdgcn.workgroup.id.x() #1
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare float @llvm.amdgcn.update.dpp.f32(float, float, i32 immarg, i32 immarg, i32 immarg, i1 immarg) #3
+
+; Function Attrs: mustprogress nocallback nofree nounwind willreturn
+declare void @llvm.amdgcn.s.waitcnt(i32 immarg) #4
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn
+declare void @llvm.amdgcn.s.barrier() #5
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32 immarg, i32 immarg, i32 immarg, i1 immarg) #3
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.ds.bpermute(i32, i32) #3
+
+; Function Attrs: convergent mustprogress nocallback nofree nounwind willreturn memory(none)
+declare i32 @llvm.amdgcn.ds.swizzle(i32, i32 immarg) #3
+
+; Function Attrs: convergent nocallback nofree nounwind willreturn memory(none)
+declare float @llvm.amdgcn.readlane.f32(float, i32) #6
+
+attributes #0 = { nofree norecurse nounwind "amdgpu-agpr-alloc"="0" "amdgpu-cluster-dims"="1,1,1" "amdgpu-flat-work-group-size"="1,128" "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-waves-per-eu"="4, 4" "denormal-fp-math-f32"="ieee" "uniform-work-group-size" }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { convergent mustprogress nocallback nocreateundeforpoison nofree nounwind willreturn memory(none) }
+attributes #3 = { convergent mustprogress nocallback nofree nounwind willreturn memory(none) }
+attributes #4 = { mustprogress nocallback nofree nounwind willreturn }
+attributes #5 = { convergent mustprogress nocallback nofree nounwind willreturn }
+attributes #6 = { convergent nocallback nofree nounwind willreturn memory(none) }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "c3nbe6luf7zrq575jkrbgnlx3hbf6o4xy7pdgnqny2q6m47kwszc_p2n_234316.py", directory: "/dockerx/meta-tuning/pytorch/kern_cmp_20260422_110718/cache/3n")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"amdhsa_code_object_version", i32 500}
+!4 = distinct !DISubprogram(name: "triton_red_fused_add_div_mean_mul_var_4", linkageName: "triton_red_fused_add_div_mean_mul_var_4", scope: !1, file: !1, line: 22, type: !5, scopeLine: 22, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!5 = !DISubroutineType(cc: DW_CC_normal, types: !6)
+!6 = !{null, !7, !7, !7, !7, !7, !7, !7, !7, !9, !9, !10, !10}
+!7 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !8, size: 64, dwarfAddressSpace: 1)
+!8 = !DIBasicType(name: "float", size: 32, encoding: DW_ATE_float)
+!9 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!10 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !11, size: 64, dwarfAddressSpace: 1)
+!11 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!12 = !DILocation(line: 69, column: 5, scope: !4)
+!13 = !DILocation(line: 27, column: 15, scope: !4)
+!14 = !DILocation(line: 29, column: 13, scope: !4)
+!15 = !DILocation(line: 30, column: 15, scope: !4)
+!16 = !DILocation(line: 33, column: 12, scope: !4)
+!17 = !{}
+!18 = !DILocation(line: 45, column: 42, scope: !4)
+!19 = !DILocation(line: 48, column: 16, scope: !4)
+!20 = !DILocation(line: 45, column: 35, scope: !4)
+!21 = !DILocation(line: 45, column: 24, scope: !4)
+!22 = !DILocation(line: 45, column: 16, scope: !4)
+!23 = !DILocation(line: 46, column: 24, scope: !4)
+!24 = !DILocation(line: 46, column: 16, scope: !4)
+!25 = !DILocation(line: 49, column: 17, scope: !4)
+!26 = !DILocation(line: 57, column: 22, scope: !4)
+!27 = !DILocation(line: 39, column: 5, scope: !4)
+!28 = !DILocation(line: 40, column: 20, scope: !4)
+!29 = !DILocation(line: 50, column: 16, scope: !4)
+!30 = !DILocation(line: 52, column: 17, scope: !4)
+!31 = !DILocation(line: 53, column: 17, scope: !4)
+!32 = !DILocation(line: 55, column: 55, scope: !4)
+!33 = !DILocation(line: 217, column: 5, scope: !34, inlinedAt: !36)
+!34 = distinct !DILexicalBlockFile(scope: !4, file: !35, discriminator: 0)
+!35 = !DIFile(filename: "triton_helpers.py", directory: "/dockerx/meta-tuning/pytorch/torch/_inductor/runtime")
+!36 = !DILocation(line: 54, column: 61, scope: !37)
+!37 = distinct !DILexicalBlockFile(scope: !4, file: !1, discriminator: 0)
+!38 = !DILocation(line: 223, column: 22, scope: !34, inlinedAt: !36)
+!39 = !DILocation(line: 222, column: 17, scope: !34, inlinedAt: !36)
+!40 = !DILocation(line: 224, column: 27, scope: !34, inlinedAt: !36)
+!41 = !DILocation(line: 224, column: 20, scope: !34, inlinedAt: !36)
+!42 = !DILocation(line: 225, column: 32, scope: !34, inlinedAt: !36)
+!43 = !DILocation(line: 225, column: 23, scope: !34, inlinedAt: !36)
+!44 = !DILocation(line: 225, column: 18, scope: !34, inlinedAt: !36)
+!45 = !DILocation(line: 54, column: 61, scope: !4)
+!46 = !DILocation(line: 58, column: 20, scope: !4)
+!47 = !DILocation(line: 59, column: 24, scope: !4)
+!48 = !DILocation(line: 60, column: 9, scope: !4)
+!49 = !DILocation(line: 60, column: 18, scope: !4)
+!50 = !DILocation(line: 293, column: 12, scope: !51, inlinedAt: !53)
+!51 = distinct !DILexicalBlockFile(scope: !4, file: !52, discriminator: 0)
+!52 = !DIFile(filename: "standard.py", directory: "/opt/conda/envs/py_3.10/lib/python3.10/site-packages/triton/language")
+!53 = !DILocation(line: 61, column: 12, scope: !37)
+!54 = !DILocation(line: 263, column: 12, scope: !51, inlinedAt: !50)
+!55 = !DILocation(line: 243, column: 12, scope: !34, inlinedAt: !56)
+!56 = !DILocation(line: 62, column: 27, scope: !37)
+!57 = !DILocation(line: 231, column: 13, scope: !34, inlinedAt: !55)
+!58 = !DILocation(line: 232, column: 18, scope: !34, inlinedAt: !55)
+!59 = !DILocation(line: 236, column: 9, scope: !34, inlinedAt: !55)
+!60 = !DILocation(line: 233, column: 26, scope: !34, inlinedAt: !55)
+!61 = !DILocation(line: 233, column: 50, scope: !34, inlinedAt: !55)
+!62 = !DILocation(line: 233, column: 17, scope: !34, inlinedAt: !55)
+!63 = !DILocation(line: 235, column: 18, scope: !34, inlinedAt: !55)
+!64 = !DILocation(line: 235, column: 9, scope: !34, inlinedAt: !55)
+!65 = !DILocation(line: 236, column: 23, scope: !34, inlinedAt: !55)
+!66 = !DILocation(line: 66, column: 5, scope: !4)
+!67 = !DILocation(line: 67, column: 5, scope: !4)
+!68 = !DILocation(line: 68, column: 5, scope: !4)
+!69 = !DILocation(line: 22, column: 1, scope: !4)

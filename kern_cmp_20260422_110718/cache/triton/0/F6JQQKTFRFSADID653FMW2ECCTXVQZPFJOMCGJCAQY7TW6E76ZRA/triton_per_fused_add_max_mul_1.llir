@@ -1,0 +1,227 @@
+; ModuleID = 'LLVMDialectModule'
+source_filename = "LLVMDialectModule"
+target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7:160:256:256:32-p8:128:128:128:48-p9:192:256:256:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9"
+target triple = "amdgcn-amd-amdhsa"
+
+; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite)
+define amdgpu_kernel void @triton_per_fused_add_max_mul_1(ptr addrspace(1) inreg readonly captures(none) %0, ptr addrspace(1) inreg writeonly captures(none) %1, i32 inreg %2, ptr addrspace(1) inreg readnone captures(none) %3, ptr addrspace(1) inreg readnone captures(none) %4) local_unnamed_addr #0 !dbg !4 {
+  %6 = tail call i32 @llvm.amdgcn.workitem.id.x(), !dbg !12
+  %7 = and i32 %6, 63, !dbg !12
+  %8 = icmp eq i32 %7, 0, !dbg !12
+  br i1 %8, label %9, label %176, !dbg !12
+
+9:                                                ; preds = %5
+  %10 = tail call ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) %0, i16 0, i64 2147483646, i32 159744), !dbg !13
+  %11 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 0, i32 0, i32 0), !dbg !13
+  %12 = extractelement <4 x float> %11, i64 0, !dbg !13
+  %13 = extractelement <4 x float> %11, i64 1, !dbg !13
+  %14 = fcmp ogt float %12, %13, !dbg !14
+  %15 = fcmp uno float %12, 0.000000e+00, !dbg !20
+  %16 = or i1 %14, %15, !dbg !21
+  %17 = select i1 %16, float %12, float %13, !dbg !22
+  %18 = extractelement <4 x float> %11, i64 2, !dbg !13
+  %19 = extractelement <4 x float> %11, i64 3, !dbg !13
+  %20 = fcmp ogt float %18, %19, !dbg !14
+  %21 = fcmp uno float %18, 0.000000e+00, !dbg !20
+  %22 = or i1 %20, %21, !dbg !21
+  %23 = select i1 %22, float %18, float %19, !dbg !22
+  %24 = fcmp ogt float %17, %23, !dbg !14
+  %25 = fcmp uno float %17, 0.000000e+00, !dbg !20
+  %26 = or i1 %24, %25, !dbg !21
+  %27 = select i1 %26, float %17, float %23, !dbg !22
+  %28 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 16, i32 0, i32 0), !dbg !13
+  %29 = extractelement <4 x float> %28, i64 0, !dbg !13
+  %30 = extractelement <4 x float> %28, i64 1, !dbg !13
+  %31 = fcmp ogt float %29, %30, !dbg !14
+  %32 = fcmp uno float %29, 0.000000e+00, !dbg !20
+  %33 = or i1 %31, %32, !dbg !21
+  %34 = select i1 %33, float %29, float %30, !dbg !22
+  %35 = extractelement <4 x float> %28, i64 2, !dbg !13
+  %36 = extractelement <4 x float> %28, i64 3, !dbg !13
+  %37 = fcmp ogt float %35, %36, !dbg !14
+  %38 = fcmp uno float %35, 0.000000e+00, !dbg !20
+  %39 = or i1 %37, %38, !dbg !21
+  %40 = select i1 %39, float %35, float %36, !dbg !22
+  %41 = fcmp ogt float %34, %40, !dbg !14
+  %42 = fcmp uno float %34, 0.000000e+00, !dbg !20
+  %43 = or i1 %41, %42, !dbg !21
+  %44 = select i1 %43, float %34, float %40, !dbg !22
+  %45 = fcmp ogt float %27, %44, !dbg !14
+  %46 = fcmp uno float %27, 0.000000e+00, !dbg !20
+  %47 = or i1 %46, %45, !dbg !21
+  %48 = select i1 %47, float %27, float %44, !dbg !22
+  %49 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 32, i32 0, i32 0), !dbg !13
+  %50 = extractelement <4 x float> %49, i64 0, !dbg !13
+  %51 = extractelement <4 x float> %49, i64 1, !dbg !13
+  %52 = fcmp ogt float %50, %51, !dbg !14
+  %53 = fcmp uno float %50, 0.000000e+00, !dbg !20
+  %54 = or i1 %52, %53, !dbg !21
+  %55 = select i1 %54, float %50, float %51, !dbg !22
+  %56 = extractelement <4 x float> %49, i64 2, !dbg !13
+  %57 = extractelement <4 x float> %49, i64 3, !dbg !13
+  %58 = fcmp ogt float %56, %57, !dbg !14
+  %59 = fcmp uno float %56, 0.000000e+00, !dbg !20
+  %60 = or i1 %58, %59, !dbg !21
+  %61 = select i1 %60, float %56, float %57, !dbg !22
+  %62 = fcmp ogt float %55, %61, !dbg !14
+  %63 = fcmp uno float %55, 0.000000e+00, !dbg !20
+  %64 = or i1 %62, %63, !dbg !21
+  %65 = select i1 %64, float %55, float %61, !dbg !22
+  %66 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 48, i32 0, i32 0), !dbg !13
+  %67 = extractelement <4 x float> %66, i64 0, !dbg !13
+  %68 = extractelement <4 x float> %66, i64 1, !dbg !13
+  %69 = fcmp ogt float %67, %68, !dbg !14
+  %70 = fcmp uno float %67, 0.000000e+00, !dbg !20
+  %71 = or i1 %69, %70, !dbg !21
+  %72 = select i1 %71, float %67, float %68, !dbg !22
+  %73 = extractelement <4 x float> %66, i64 2, !dbg !13
+  %74 = extractelement <4 x float> %66, i64 3, !dbg !13
+  %75 = fcmp ogt float %73, %74, !dbg !14
+  %76 = fcmp uno float %73, 0.000000e+00, !dbg !20
+  %77 = or i1 %75, %76, !dbg !21
+  %78 = select i1 %77, float %73, float %74, !dbg !22
+  %79 = fcmp ogt float %72, %78, !dbg !14
+  %80 = fcmp uno float %72, 0.000000e+00, !dbg !20
+  %81 = or i1 %79, %80, !dbg !21
+  %82 = select i1 %81, float %72, float %78, !dbg !22
+  %83 = fcmp ogt float %65, %82, !dbg !14
+  %84 = fcmp uno float %65, 0.000000e+00, !dbg !20
+  %85 = or i1 %84, %83, !dbg !21
+  %86 = select i1 %85, float %65, float %82, !dbg !22
+  %87 = fcmp ogt float %48, %86, !dbg !14
+  %88 = fcmp uno float %48, 0.000000e+00, !dbg !20
+  %89 = or i1 %88, %87, !dbg !21
+  %90 = select i1 %89, float %48, float %86, !dbg !22
+  %91 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 64, i32 0, i32 0), !dbg !13
+  %92 = extractelement <4 x float> %91, i64 0, !dbg !13
+  %93 = extractelement <4 x float> %91, i64 1, !dbg !13
+  %94 = fcmp ogt float %92, %93, !dbg !14
+  %95 = fcmp uno float %92, 0.000000e+00, !dbg !20
+  %96 = or i1 %94, %95, !dbg !21
+  %97 = select i1 %96, float %92, float %93, !dbg !22
+  %98 = extractelement <4 x float> %91, i64 2, !dbg !13
+  %99 = extractelement <4 x float> %91, i64 3, !dbg !13
+  %100 = fcmp ogt float %98, %99, !dbg !14
+  %101 = fcmp uno float %98, 0.000000e+00, !dbg !20
+  %102 = or i1 %100, %101, !dbg !21
+  %103 = select i1 %102, float %98, float %99, !dbg !22
+  %104 = fcmp ogt float %97, %103, !dbg !14
+  %105 = fcmp uno float %97, 0.000000e+00, !dbg !20
+  %106 = or i1 %104, %105, !dbg !21
+  %107 = select i1 %106, float %97, float %103, !dbg !22
+  %108 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 80, i32 0, i32 0), !dbg !13
+  %109 = extractelement <4 x float> %108, i64 0, !dbg !13
+  %110 = extractelement <4 x float> %108, i64 1, !dbg !13
+  %111 = fcmp ogt float %109, %110, !dbg !14
+  %112 = fcmp uno float %109, 0.000000e+00, !dbg !20
+  %113 = or i1 %111, %112, !dbg !21
+  %114 = select i1 %113, float %109, float %110, !dbg !22
+  %115 = extractelement <4 x float> %108, i64 2, !dbg !13
+  %116 = extractelement <4 x float> %108, i64 3, !dbg !13
+  %117 = fcmp ogt float %115, %116, !dbg !14
+  %118 = fcmp uno float %115, 0.000000e+00, !dbg !20
+  %119 = or i1 %117, %118, !dbg !21
+  %120 = select i1 %119, float %115, float %116, !dbg !22
+  %121 = fcmp ogt float %114, %120, !dbg !14
+  %122 = fcmp uno float %114, 0.000000e+00, !dbg !20
+  %123 = or i1 %121, %122, !dbg !21
+  %124 = select i1 %123, float %114, float %120, !dbg !22
+  %125 = fcmp ogt float %107, %124, !dbg !14
+  %126 = fcmp uno float %107, 0.000000e+00, !dbg !20
+  %127 = or i1 %126, %125, !dbg !21
+  %128 = select i1 %127, float %107, float %124, !dbg !22
+  %129 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 96, i32 0, i32 0), !dbg !13
+  %130 = extractelement <4 x float> %129, i64 0, !dbg !13
+  %131 = extractelement <4 x float> %129, i64 1, !dbg !13
+  %132 = fcmp ogt float %130, %131, !dbg !14
+  %133 = fcmp uno float %130, 0.000000e+00, !dbg !20
+  %134 = or i1 %132, %133, !dbg !21
+  %135 = select i1 %134, float %130, float %131, !dbg !22
+  %136 = extractelement <4 x float> %129, i64 2, !dbg !13
+  %137 = extractelement <4 x float> %129, i64 3, !dbg !13
+  %138 = fcmp ogt float %136, %137, !dbg !14
+  %139 = fcmp uno float %136, 0.000000e+00, !dbg !20
+  %140 = or i1 %138, %139, !dbg !21
+  %141 = select i1 %140, float %136, float %137, !dbg !22
+  %142 = fcmp ogt float %135, %141, !dbg !14
+  %143 = fcmp uno float %135, 0.000000e+00, !dbg !20
+  %144 = or i1 %142, %143, !dbg !21
+  %145 = select i1 %144, float %135, float %141, !dbg !22
+  %146 = tail call <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) %10, i32 112, i32 0, i32 0), !dbg !13
+  %147 = extractelement <4 x float> %146, i64 0, !dbg !13
+  %148 = extractelement <4 x float> %146, i64 1, !dbg !13
+  %149 = fcmp ogt float %147, %148, !dbg !14
+  %150 = fcmp uno float %147, 0.000000e+00, !dbg !20
+  %151 = or i1 %149, %150, !dbg !21
+  %152 = select i1 %151, float %147, float %148, !dbg !22
+  %153 = extractelement <4 x float> %146, i64 2, !dbg !13
+  %154 = extractelement <4 x float> %146, i64 3, !dbg !13
+  %155 = fcmp ogt float %153, %154, !dbg !14
+  %156 = fcmp uno float %153, 0.000000e+00, !dbg !20
+  %157 = or i1 %155, %156, !dbg !21
+  %158 = select i1 %157, float %153, float %154, !dbg !22
+  %159 = fcmp ogt float %152, %158, !dbg !14
+  %160 = fcmp uno float %152, 0.000000e+00, !dbg !20
+  %161 = or i1 %159, %160, !dbg !21
+  %162 = select i1 %161, float %152, float %158, !dbg !22
+  %163 = fcmp ogt float %145, %162, !dbg !14
+  %164 = fcmp uno float %145, 0.000000e+00, !dbg !20
+  %165 = or i1 %164, %163, !dbg !21
+  %166 = select i1 %165, float %145, float %162, !dbg !22
+  %167 = fcmp ogt float %128, %166, !dbg !14
+  %168 = fcmp uno float %128, 0.000000e+00, !dbg !20
+  %169 = or i1 %168, %167, !dbg !21
+  %170 = select i1 %169, float %128, float %166, !dbg !22
+  %171 = fcmp ogt float %90, %170, !dbg !14
+  %172 = fcmp uno float %90, 0.000000e+00, !dbg !20
+  %173 = or i1 %172, %171, !dbg !21
+  %174 = select i1 %173, float %90, float %170, !dbg !22
+  %175 = insertelement <1 x float> poison, float %174, i64 0, !dbg !12
+  store <1 x float> %175, ptr addrspace(1) %1, align 4, !dbg !12
+  br label %176, !dbg !12
+
+176:                                              ; preds = %9, %5
+  ret void, !dbg !23
+}
+
+; Function Attrs: mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none)
+declare ptr addrspace(8) @llvm.amdgcn.make.buffer.rsrc.p8.p1(ptr addrspace(1) readnone, i16, i64, i32) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind willreturn memory(argmem: read)
+declare <4 x float> @llvm.amdgcn.raw.ptr.buffer.load.v4f32(ptr addrspace(8) readonly captures(none), i32, i32, i32 immarg) #2
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare noundef range(i32 0, 1024) i32 @llvm.amdgcn.workitem.id.x() #3
+
+attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite) "amdgpu-agpr-alloc"="0" "amdgpu-cluster-dims"="1,1,1" "amdgpu-flat-work-group-size"="1,64" "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-waves-per-eu"="4, 4" "denormal-fp-math-f32"="ieee" "uniform-work-group-size" }
+attributes #1 = { mustprogress nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { mustprogress nocallback nofree nosync nounwind willreturn memory(argmem: read) }
+attributes #3 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+!llvm.dbg.cu = !{!0}
+!llvm.module.flags = !{!2, !3}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C, file: !1, producer: "triton", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly)
+!1 = !DIFile(filename: "cm4xuo6k7nbyqikaxayyl4ahykoayghtym4efhjdkfhdsytrmofy.py", directory: "/dockerx/meta-tuning/pytorch/kern_cmp_20260422_110718/cache/m4")
+!2 = !{i32 2, !"Debug Info Version", i32 3}
+!3 = !{i32 1, !"amdhsa_code_object_version", i32 500}
+!4 = distinct !DISubprogram(name: "triton_per_fused_add_max_mul_1", linkageName: "triton_per_fused_add_max_mul_1", scope: !1, file: !1, line: 22, type: !5, scopeLine: 22, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!5 = !DISubroutineType(cc: DW_CC_normal, types: !6)
+!6 = !{null, !7, !7, !9, !10, !10}
+!7 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !8, size: 64, dwarfAddressSpace: 1)
+!8 = !DIBasicType(name: "float", size: 32, encoding: DW_ATE_float)
+!9 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+!10 = !DIDerivedType(tag: DW_TAG_pointer_type, name: "pointer", baseType: !11, size: 64, dwarfAddressSpace: 1)
+!11 = !DIBasicType(name: "unknown_type", encoding: DW_ATE_signed)
+!12 = !DILocation(line: 40, column: 5, scope: !4)
+!13 = !DILocation(line: 37, column: 12, scope: !4)
+!14 = !DILocation(line: 116, column: 12, scope: !15, inlinedAt: !17)
+!15 = distinct !DILexicalBlockFile(scope: !4, file: !16, discriminator: 0)
+!16 = !DIFile(filename: "triton_helpers.py", directory: "/dockerx/meta-tuning/pytorch/torch/_inductor/runtime")
+!17 = !DILocation(line: 129, column: 12, scope: !15, inlinedAt: !18)
+!18 = !DILocation(line: 39, column: 12, scope: !19)
+!19 = distinct !DILexicalBlockFile(scope: !4, file: !1, discriminator: 0)
+!20 = !DILocation(line: 118, column: 17, scope: !15, inlinedAt: !17)
+!21 = !DILocation(line: 118, column: 9, scope: !15, inlinedAt: !17)
+!22 = !DILocation(line: 119, column: 12, scope: !15, inlinedAt: !17)
+!23 = !DILocation(line: 22, column: 1, scope: !4)
