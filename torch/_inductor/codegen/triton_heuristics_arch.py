@@ -10,6 +10,7 @@ triton_heuristics_reduction.py.
 """
 
 import math
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -312,18 +313,40 @@ class ArchitectureConfig:
 
 
 # Module-level singleton, lazily initialised on first call.
+# _arch_config_lock serialises concurrent first-time initialisation so two
+# threads cannot both pass the `is None` check and both call from_device().
+# After initialisation the lock is never acquired again (fast path: just read
+# the already-set global).
 _arch_config: Optional[ArchitectureConfig] = None
+_arch_config_lock: threading.Lock = threading.Lock()
 
 
 def get_architecture_config(device: Optional[torch.device] = None) -> ArchitectureConfig:
-    """Return the hardware configuration, querying the device on first call."""
+    """Return the hardware configuration, querying the device on first call.
+
+    Thread-safe: at most one thread will call ArchitectureConfig.from_device().
+    Subsequent calls return the cached value without acquiring the lock.
+
+    Note: ``device`` is only honoured on the very first call.  Later calls with
+    a different device value are silently ignored — reset the singleton with
+    reset_architecture_config() before calling again if a different device is
+    needed.
+    """
     global _arch_config
-    if _arch_config is None:
-        _arch_config = ArchitectureConfig.from_device(device)
+    # Fast path: already initialised (no lock needed for a plain read in CPython
+    # because the GIL ensures reference reads are atomic).
+    if _arch_config is not None:
+        return _arch_config
+    with _arch_config_lock:
+        # Re-check inside the lock: another thread may have initialised while
+        # we were waiting to acquire it.
+        if _arch_config is None:
+            _arch_config = ArchitectureConfig.from_device(device)
     return _arch_config
 
 
 def reset_architecture_config() -> None:
     """Clear the cached configuration (useful in tests that mock device props)."""
     global _arch_config
-    _arch_config = None
+    with _arch_config_lock:
+        _arch_config = None

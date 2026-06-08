@@ -513,9 +513,15 @@ max_autotune_prune_choices_based_on_shared_mem = (
 # See: HEURISTICS_FLOW.md for complete documentation
 #
 # Environment Variable: TORCHINDUCTOR_HEURISTICS_REAL_BENCH
-# Default: "1" (enabled for validation)
+# Default: "0" (disabled — use heuristic score only, no compilation benchmarking)
+#
+# Rationale for off-by-default: REAL_BENCH mode compiles *every* candidate
+# Triton config for every kernel at model load time, which can add minutes of
+# wall-clock latency and MBs of compiler cache in production deployments.
+# Enable explicitly (TORCHINDUCTOR_HEURISTICS_REAL_BENCH=1) only when
+# validating heuristic quality or profiling a new architecture.
 heuristics_real_bench: bool = (
-    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "1") == "1"
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "0") == "1"
 )
 
 # ── Heuristics real-bench candidate limit ────────────────────────────────────
@@ -572,6 +578,34 @@ heuristics_top_n_configs: int = int(
 # Default: 0 (disabled)
 heuristics_spill_fallback_buffer: int = int(
     os.environ.get("TORCHINDUCTOR_HEURISTICS_SPILL_BUFFER", "0")
+)
+
+# ── Heuristics bench repetitions ─────────────────────────────────────────────
+#
+# Number of timed repetitions passed to do_bench for each candidate config
+# when the heuristic is benchmarking multiple candidates to pick a winner.
+# This covers two modes:
+#
+#   heuristics_real_bench=False, top_n > 1  (production mode5):
+#     Only the top-N heuristic configs are compiled; the fastest is chosen.
+#     Higher rep → more reliable ranking, longer first-compile time.
+#
+#   heuristics_real_bench=True  (validation mode):
+#     All configs are compiled and benchmarked; winner is picked from top-N.
+#
+# The standard autotuner uses rep=40.  Increasing this value makes each
+# per-config timing estimate more reliable (lower variance) at the cost of
+# proportionally longer autotuning time.  Useful when GPU thermal noise is
+# causing poor config selection (e.g. on large kernels where config latencies
+# are close together).
+#
+# Has no effect when heuristics_top_n_configs=1 (single-config path) or
+# when max_autotune is used (rep=40 there as well; change separately).
+#
+# Environment Variable: TORCHINDUCTOR_HEURISTICS_BENCH_REP
+# Default: 40  (matches the standard do_bench rep)
+heuristics_bench_rep: int = int(
+    os.environ.get("TORCHINDUCTOR_HEURISTICS_BENCH_REP", "40")
 )
 
 # ── Heuristics XBLOCK diversity pass ─────────────────────────────────────────

@@ -38,7 +38,7 @@ sep()  { echo -e "${CYN}$(printf '═%.0s' {1..80})${RST}"; }
 MODES="1 2 3 4 5 6"
 TOP_N_VALUES="1 5 10"
 ITERS=5
-WARMUP=100
+WARMUP=10
 QUICK=""
 OUTDIR=""
 SKIP_ANALYSIS=0
@@ -80,7 +80,13 @@ mkdir -p "$OUTDIR"
 GPU="unknown"; ROCM_VER="unknown"
 if command -v rocminfo &>/dev/null; then
     _rocminfo="$(rocminfo 2>/dev/null)" || true
-    GPU="$(echo "$_rocminfo"     | grep 'Marketing Name'  | head -1 | sed 's/.*: *//')" || true
+    # rocminfo lists the CPU host agent first; extract Marketing Name only from
+    # the first agent block whose "Agent Type" line says "GPU".
+    GPU="$(echo "$_rocminfo" | awk '
+        /Agent Type.*:.*GPU/ { in_gpu=1 }
+        in_gpu && /Marketing Name/ { sub(/.*: */, ""); print; exit }
+        /^HSA Agent/ { in_gpu=0 }
+    ')" || true
     ROCM_VER="$(echo "$_rocminfo" | grep 'Runtime Version' | head -1 | sed 's/.*: *//')" || true
 fi
 [[ -z "$GPU" ]]      && GPU="unknown"

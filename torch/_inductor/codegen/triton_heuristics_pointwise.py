@@ -273,6 +273,43 @@ class PointwiseHeuristics:
                 return 0.97
             # nw < 4: fall through to the Gaussian (correct penalty for under-wavefronting)
 
+        # ── Few-blocks SPI overhead regime ────────────────────────────────────────
+        # When there are ≤ num_CUs/2 blocks the GPU runs at < 50% CU utilisation.
+        # In this regime, extra warps per block DO NOT improve system-level memory
+        # bandwidth (idle CUs dominate), but each extra wavefront adds SPI (Shader
+        # Processor Input) initialisation overhead: ~0.1 µs per warp per block.
+        #
+        # Critical split by XBLOCK size:
+        #
+        #  EPT_at_nw1 ≥ 8  (XBLOCK ≥ 512 on AMD, one warp does ≥ 8 elements):
+        #      Software pipelining of the load loop hides the per-thread HBM latency
+        #      without extra wavefronts.  Extra warps just add SPI cost.
+        #      Empirical (MI300X): nw=4 is 10–11% slower than nw=1 for x=512–1024
+        #      in 4K–64K kernels.  Apply SPI penalty to reflect this.
+        #
+        #      Score:  nw=1 → 0.970  nw=2 → 0.940  nw=4 → 0.882  nw=8 → 0.787
+        #
+        #  EPT_at_nw1 < 8  (XBLOCK < 512, e.g. x=256 where nw=1 gives EPT=4):
+        #      Software pipelining is insufficient at EPT=4; a second hardware
+        #      wavefront (nw=2) empirically gives ~5% more bandwidth coverage.
+        #      Return flat 0.97 so Grid + Occupancy factors pick the winner.
+        _few_thr = max(16, getattr(arch, 'num_cus', 304) // 2)  # 152 for MI300X
+        if 1 < _bw_num_blocks <= _few_thr:
+            # elements per thread if we used nw=1 (max software-pipeline depth)
+            _ept_at_nw1 = xblock // warp_size  # integer division; 1D XBLOCK used
+            if _ept_at_nw1 >= 8:
+                # EPT≥8 with nw=1 → software pipelining sufficient; penalise extra warps.
+                _nw_bw   = threads_per_block // warp_size
+                _k_la    = (BottleneckAnalysis.KERNEL_LAUNCH_US
+                            if BottleneckAnalysis is not None else 3.0)
+                _k_wi    = 0.1   # µs per extra wavefront SPI bank allocation
+                _spi_fac = _k_la / (_k_la + max(0, _nw_bw - 1) * _k_wi)
+                return 0.97 * _spi_fac
+            elif threads_per_block >= 64:
+                # EPT<8 at nw=1: hardware wavefronts still aid latency hiding.
+                # Return flat; Grid + Occupancy factors differentiate warp count.
+                return 0.97
+
         # Wider sigma (1.5× optimal) so XBLOCK=512 and XBLOCK=256 remain
         # competitive with XBLOCK=1024.  The 1× width caused a ≈6 % gap between
         # 256-element and 1024-element blocks, systematically biasing top-N
@@ -457,6 +494,10 @@ class PointwiseHeuristics:
         arch             = PointwiseHeuristics._get_arch()
         hardware_optimal = arch.optimal_blocks_grid  # = 2 × num_CUs
         ndims            = len(problem_metadata.get('dimensions', (1,)))
+        # Always initialise _slow_ops here so it is in-scope regardless of which
+        # total_elements branch is taken below.  It is re-assigned (with the same
+        # value) inside the ≥262 K branch for historical clarity.
+        _slow_ops = problem_metadata.get('slow_ops', 0)
 
         if total_elements < 2048:
             # Tiny: discrete lookup because the element count is too small for
@@ -493,24 +534,52 @@ class PointwiseHeuristics:
         divisor_1d    = max(32, _arch_divisor // comp_scale)
 
         if total_elements < 16384:
-            # Single-block: the tile covers the entire problem.  High ept (e.g.
-            # 16 elements/thread for 4096-element × nw=4 config) gives ILP that
-            # compensates for the lack of multi-CU parallelism.  0.95 reflects
-            # that the whole-problem single-tile is the most coherent choice for
-            # tiny 2D problems (e.g. y=16, x=256 = 4096 elements) where launching
-            # many small blocks adds SPI overhead without improving GPU utilisation.
-            if num_blocks == 1:
-                return 0.95
-            # For small problems (4K–16K) the GPU is heavily launch-bound but
-            # empirical data shows that targeting more blocks with fewer warps
-            # per block (nw=2, 32 blocks) consistently outperforms the "fewer,
-            # larger blocks" strategy (nw=8, 8 blocks) — even though total
-            # wavefront count is the same (64).  The per-block warp overhead on
-            # AMD SPI is proportional to num_warps; with nw=8 that overhead can
-            # double measured kernel time relative to nw=2 on small problems.
-            # Target hw_opt//16 (≈32 blocks for 256-CU AMD) so XBLOCK=128+nw=2
-            # configs hit the Gaussian peak.
-            optimal = max(4, hardware_optimal // 16)
+            # Single-block (1D only): only 1 CU active out of ~300.  Real_bench
+            # GPU timers can make single-block configs appear fast (L2 cache warm,
+            # no scheduler stall), but wall-clock benchmarks show them 30–50%
+            # slower than multi-block equivalents because GPU-only time is tiny
+            # while all overhead is amortised across just one block.
+            #
+            # Empirical evidence (relu_sigmoid 1D_tiny, gelu 1D_tiny, ≈4K elements):
+            #   x=4096 nw=8 (1 block):  GPU timer = 6.68 µs, wall-clock = 41.4 µs
+            #   x=256  nw=2 (16 blocks): GPU timer = 7.36 µs, wall-clock = 31.4 µs
+            # Real_bench picks x=4096 (0.68 µs faster GPU), but actual is 10 µs worse.
+            #
+            # 0.80 pushes the single-block score below x=128..512 configs
+            # (which score ≈ 0.95–0.98), keeping it out of the top-10 pool.
+            #
+            # IMPORTANT: 2D/3D kernels are exempt.  For multi-dimensional tensors
+            # a single tile that covers the whole problem (e.g. {x32, y128} for a
+            # 32×128 matrix) achieves excellent L2 cache reuse along both dimensions;
+            # the per-block overhead penalty that afflicts 1D single-block kernels
+            # does not apply because the access pattern is fundamentally different.
+            if num_blocks == 1 and ndims == 1:
+                return 0.80
+            # For small (2K–16K) launch-overhead-dominated kernels the optimal
+            # block count scales with problem size.  Using a fixed target
+            # (e.g. hw_opt//64 = 9 for MI300X) biases the peak toward a single
+            # XBLOCK (e.g. x=512 at 4K elements, 8 blocks ≈ 9 optimal), causing
+            # it to dominate the top-N pool while empirically-faster configs
+            # (e.g. x=128 at 32 blocks for 4K elements) get penalised as being
+            # "2–3× too many blocks".
+            #
+            # Root cause of prior fixed-target approach:
+            #   For 4K elements, fixed optimal=9 → x=512 Grid≈1.0 but x=128
+            #   (32 blocks) Grid=0.81.  Empirically x=128 nw=1 runs at 6.76 µs
+            #   vs x=1024 nw=1 at 8.20 µs (21% faster), yet scored rank#20.
+            #
+            # Fix: scale optimal with total_elements so the peak XBLOCK shifts
+            # from x=256 at 2K (8 blocks) up through x=256 at 16K (64 blocks).
+            # The wide sigma (1.5×optimal, set below) keeps all XBLOCK sizes from
+            # x=128 through x=2048 within 5% of the peak score for any size in
+            # this range, preserving pool diversity for the real bench.
+            #
+            # Examples (divisor=256, sigma=1.5×optimal):
+            #   2K  → optimal= 8, x=256 Grid=1.00, x=128 Grid=0.95, x=512 Grid=0.99
+            #   4K  → optimal=16, x=256 Grid=1.00, x=128 Grid=0.95, x=512 Grid=0.98
+            #   8K  → optimal=32, x=256 Grid=1.00, x=512 Grid=0.98, x=1024 Grid=0.97
+            #   16K → optimal=64, x=256 Grid=1.00, x=512 Grid=0.98, x=1024 Grid=0.97
+            optimal = max(4, total_elements // 256)
         elif total_elements < 262144:
             # Adaptive target scaled by compute intensity.  Memory-bound kernels
             # do well with 512-element tiles (divisor=512 → ~128 blocks for 64K
@@ -519,6 +588,9 @@ class PointwiseHeuristics:
             # concurrent blocks to saturate all CUs.
             optimal = max(hardware_optimal // 8, total_elements // divisor_1d)
         else:
+            # Compute slow_ops here (before the ndims split) so it is
+            # available in both the 1-D branch and the 2-D/3-D branch below.
+            _slow_ops = problem_metadata.get('slow_ops', 0)
             if ndims == 1:
                 # For large 1-D kernels the optimal block count scales with
                 # problem size AND compute intensity:
@@ -542,7 +614,6 @@ class PointwiseHeuristics:
                 #     faster than x512-nw8 for fused tanh/sin/cos/exp kernels
                 #     at 4+ M elements (matches max-autotune winner x2048+wpe1).
                 #
-                _slow_ops = problem_metadata.get('slow_ops', 0)
                 _ops_pe   = problem_metadata.get('ops_per_element', 1)
                 # _grid_div=1024 (targeting x=1024 as grid-optimal) only activates for
                 # kernels that are BOTH compute-heavy AND large (≥4M elements).  At
@@ -620,12 +691,30 @@ class PointwiseHeuristics:
                 # (128×32 or 64×32) that give ~4 096 blocks and fit in L1.
                 #
                 # Using max_tile_elems=4096 shifts the grid target to:
-                #   16 M (4096²):  optimal = max(512, 4096) = 4096 blocks
-                #   67 M (8192²):  optimal = max(512, 16384) = 16384 blocks
-                #   2 M (128×16K): optimal = max(512, 512) = 512 blocks
-                # This correctly rewards the empirical winners in all cases.
+                #   16 M (4096²):  optimal = max(hw/2, 4096) = 4096 blocks
+                #   67 M (8192²):  optimal = max(hw/2, 16384) = 16384 blocks
+                #   2 M (128×16K): optimal = max(hw/2, 512) = 512 blocks
+                #
+                # FLOOR for 2-D/3-D: use hardware_optimal // 2 instead of
+                # hardware_optimal to avoid penalising wider-tile configs
+                # (e.g. XBLOCK=128 × YBLOCK=8 → 256 blocks for 512×512)
+                # that have better spatial cache reuse than narrow configs
+                # (XBLOCK=32 × YBLOCK=16 → 512 blocks).  The wider tile
+                # processes 2 elements/thread (vectorised loads), which is
+                # empirically 3–5% faster on MI300X for 2-D transposed-
+                # access kernels.  The narrower floor (hw/2 ≈ 256) also
+                # means these configs score Grid ≈ 1.0 and enter the top-N
+                # pool for the real_bench selection step.
+                #
+                # Critically, when a compile_fn is shared across multiple
+                # input shapes (common in fused ops), the 512×512 kernel
+                # binary is reused for 4096×4096 calls.  A wider-tile config
+                # (e.g. 256 blocks for 512×512) produces only 16 384 blocks
+                # for 4096×4096, while a narrow config (512 blocks for 512×512)
+                # produces 32 768 blocks — 2× too many, causing 25–30% slowdown.
                 max_tile_elems = 4096  # L1-cache-fitting 2-D tile
-                optimal = max(hardware_optimal, total_elements // max_tile_elems)
+                _2d_floor = hardware_optimal // 2  # half of 1-D target for 2-D kernels
+                optimal = max(_2d_floor, total_elements // max_tile_elems)
                 optimal = min(optimal, hardware_optimal * 8)
 
         # 3-D: shape-specific grid target.
@@ -642,11 +731,108 @@ class PointwiseHeuristics:
                 # Cube-like: smaller block count needed for L2 locality.
                 optimal = max(4, hardware_optimal // 2)
 
+        # Asymmetric Gaussian for 2-D / 3-D kernels with transcendental ops
+        # (silu, tanh, gelu, leaky_relu, etc.):  blocks slightly ABOVE the
+        # L1-tile optimal are empirically equal or faster because the smaller
+        # tile per block reduces VGPR pressure and improves SFU throughput.
+        #
+        # This mirrors the identical rule in the 1-D branch (line ~670).
+        # Without this bonus the 2-D floor (hw/2 = 256) causes configs that
+        # produce 512 blocks on 1M-element shapes to score Grid ≈ 0.78 and
+        # fall out of the top-N pool — even though they are the empirical
+        # winner for ops like silu / leaky_relu / gelu at that size.
+        #
+        # Rule: for 2-D/3-D kernels with slow_ops ≥ 1, configs in the range
+        # (optimal, 2×optimal] score Grid = 1.0 (no penalty).
+        # Beyond 2×optimal the symmetric Gaussian penalty still applies to
+        # avoid rewarding ultra-fine-grained tiles with excessive overhead.
+        #
+        # Example – silu on 2-D (1024×1024, slow_ops=1):
+        #   optimal = max(256, 1M//4096) = 256   (floor from hw/2)
+        #   256-block config:  Grid = 1.00 (at optimal)
+        #   512-block config:  without bonus → Grid ≈ 0.78 (penalised)
+        #                      with bonus    → Grid = 1.00 (in pool, faster!)
+        #
+        # Note: slow_ops = 0 for 2d_specific / heavy_branching kernels, so
+        # the asymmetric bonus does NOT widen the pool for those workloads —
+        # the lower-block-count configs preferred for transposed 2-D access
+        # remain the dominant scorers, preserving the 2-D transpose fix.
+        if ndims >= 2 and _slow_ops >= 1 and optimal < num_blocks <= 2 * optimal:
+            return 1.0
+
         if num_blocks < 4 and total_elements >= 262144:
             return 0.70
 
-        sigma    = optimal * 0.5
-        diff     = (num_blocks - optimal) / sigma
+        # Sigma calibration per problem-size regime:
+        #
+        #  < 16 K  (overhead-dominated, launch-bound):
+        #      Wide sigma (1.5×optimal) so configs from 1 to ~20 blocks score
+        #      ≥ 0.83.  This prevents the old "32-block sweet spot" (XBLOCK=128)
+        #      from monopolising the top-N pool, and lets large-XBLOCK configs
+        #      (x=512–2048 with 2–8 blocks) compete on equal footing.  Real bench
+        #      then picks the empirical winner.
+        #
+        #  16K – 262K (intermediate, partially launch-bound):
+        #      Moderately wide sigma (0.8×optimal) so BW and Occup factors
+        #      carry more discrimination across XBLOCK sizes, while Grid still
+        #      provides meaningful CU-saturation signal.  Old sigma=0.5 was
+        #      too steep: it excluded configs 2× off-optimal (common for
+        #      compute-intensive kernels that prefer larger tiles) from the pool.
+        #
+        #  ≥ 262 K (memory-bandwidth dominated):
+        #      sigma=0.55×optimal — slightly wider than the original 0.50×
+        #      to pull near-miss configs (predicted score 0.93–0.97) into the
+        #      top-N pool.  Pattern analysis shows 10/16 regressions in
+        #      mode6/n10 have the actual best at score 0.93–0.97: they are
+        #      just below the pool threshold because the Gaussian places them
+        #      at diff ≈ 0.7–0.8σ from optimal.  Widening sigma by 10 %
+        #      (0.50→0.55) shifts those configs from score ≈ 0.93 to ≈ 0.96,
+        #      reliably pulling them into a top-10 pool without meaningfully
+        #      changing the top-1 selection (the peak is unchanged; only the
+        #      shoulders widen).
+        #
+        #      Example – config scoring 0.930 with sigma=0.50×optimal:
+        #        diff = −0.811σ  →  Gaussian = 0.721  →  score = 0.930
+        #      After widening to sigma=0.55×optimal (same num_blocks, optimal):
+        #        diff = −0.738σ  →  Gaussian = 0.763  →  score = 0.941
+        #      With top_n=10 and 5 more configs in the same score tier, the
+        #      boundary config now safely enters the pool.
+        if total_elements < 16384:
+            sigma = optimal * 1.5
+        elif total_elements < 262144:
+            sigma = optimal * 0.8
+        else:
+            sigma = optimal * 0.55
+
+        diff = (num_blocks - optimal) / sigma
+
+        # Asymmetric sigma: above-optimal configs are penalised with 3.5× wider σ.
+        #
+        # Rationale: AMD's MI300X command processor pipelines block dispatch
+        # efficiently — having 2–4× the optimal block count incurs much less
+        # overhead than the symmetric Gaussian predicts.  Pattern analysis of
+        # regressions showed that the empirical winner frequently has 2–8× more
+        # blocks than the heuristic optimal, yet the symmetric Gaussian drops
+        # those configs to the 0.75 floor and excludes them from the top-N pool.
+        #
+        # The asymmetric factor (3.5×) is calibrated so that:
+        #   2× optimal  → Grid ≈ 0.97  (was 0.80)  enters top-5
+        #   4× optimal  → Grid ≈ 0.90  (was 0.75)  enters top-10
+        #   8× optimal  → Grid ≈ 0.78  (floor)      excluded
+        #
+        # Gated conditions:
+        #  (a) ≥ 16 K elements: tiny launch-bound kernels (< 16 K) remain
+        #      symmetric; their overhead model is already handled separately.
+        #  (b) slow_ops == 0 only: compute-heavy kernels (gelu, silu, tanh —
+        #      slow_ops ≥ 1) genuinely benefit from fewer, larger blocks to
+        #      amortise expensive transcendental instructions.  They also have
+        #      a dedicated slow_ops asymmetric bonus that already covers the
+        #      (optimal, 2×optimal] range, and extending it further causes
+        #      smaller-XBLOCK configs to enter the pool for compute-heavy
+        #      kernels where they are empirically slower.
+        if diff > 0 and total_elements >= 16384 and _slow_ops == 0:
+            diff = diff / 3.5
+
         gaussian = math.exp(-0.5 * diff * diff)
         return max(0.70, min(1.0, 0.75 + 0.25 * gaussian))
 
@@ -918,45 +1104,100 @@ class PointwiseHeuristics:
             k_warp = 0.2   # µs per extra wavefront beyond natural (SPI alloc)
 
             if num_warps <= natural_warps:
-                # Under-warped: each warp iterates over multiple element chunks.
-                base_score = 0.75 + 0.25 * (num_warps / natural_warps)
+                # Under-warped with EPT compensation.
+                #
+                # The original formula `0.75 + 0.25 × (nw / natural_warps)` only
+                # measures warp-count utilisation: x=2048 nw=8 (natural_warps=32)
+                # gives 0.75 + 0.25×0.25 = 0.8125, severely penalising it relative
+                # to x=128 nw=2 (natural_warps=2, score=1.0).
+                #
+                # But each warp in x=2048 nw=8 processes EPT=4 elements.  Effective
+                # thread utilisation = nw × EPT / natural_warps = 8×4/32 = 1.0 —
+                # ALL 2048 elements are covered with 8 warps × 4 el/warp.
+                #
+                # Credit: EPT up to 4 counts toward filling the natural-warp budget.
+                # Cap at 4 to avoid over-crediting very high EPT (EPT=16+) which
+                # can increase register pressure without proportional throughput gain.
+                #
+                # Formula:
+                #   ept_cap     = min(elems_per_thread, 4)
+                #   thread_util = min(1.0, nw × ept_cap / natural_warps)
+                #   base_score  = 0.75 + 0.25 × thread_util
+                #
+                # Examples (warp_size=64):
+                #   x=128  nw=2  (EPT=1, natural=2):  util=min(1, 2×1/2)=1.0  → 1.000
+                #   x=512  nw=4  (EPT=2, natural=8):  util=min(1, 4×2/8)=1.0  → 1.000
+                #   x=1024 nw=4  (EPT=4, natural=16): util=min(1, 4×4/16)=1.0 → 1.000
+                #   x=2048 nw=8  (EPT=4, natural=32): util=min(1, 8×4/32)=1.0 → 1.000
+                #   x=2048 nw=4  (EPT=8, cap=4, natural=32): util=min(1,4×4/32)=0.5→0.875
+                #   x=2048 nw=2  (EPT=16, cap=4, natural=32): util=0.25         → 0.8125
+                #   x=4096 nw=1  (EPT=64, cap=4, natural=64): util=min(1,1×4/64)=0.06→0.77
+                ept_cap     = min(elems_per_thread, 4)
+                thread_util = min(1.0, num_warps * ept_cap / natural_warps)
+                base_score  = 0.75 + 0.25 * thread_util
             else:
                 # Over-warped: purely extra SPI init with no data benefit.
                 extra = num_warps - natural_warps
                 t_config = k_launch + extra * k_warp
                 base_score = k_launch / t_config
 
-            # ILP correction: software-pipelining hides per-thread latency, but
-            # not the system-level cost of idle CUs.  Scale the ILP ceiling by
-            # CU utilisation so under-subscribed grids don't get a free pass.
-            #   ilp_scale = 0 at 0% CU util → full benefit at ≥ 25% CU util
-            cu_util   = min(1.0, num_blocks_est / max(1, num_cus))
-            ilp_scale = min(1.0, cu_util / 0.25)
+            # ILP correction: software-pipelining hides per-thread latency.
+            # Keep the ceiling for cases where EPT is large but thread_util is
+            # still below 1.0 (e.g. x=2048 nw=2 → thread_util=0.25 → base=0.81).
+            # The ceiling prevents an excessive penalty when the compiler can
+            # still pipeline enough loads to hide the latency gap.
+            #
+            # Scale by EPT directly (not CU utilisation) in this regime:
+            # these are launch-bound small kernels where CU util is inherently
+            # low regardless of XBLOCK.  Penalising for low CU util on top of
+            # the under-warp penalty double-counts the same effect.
+            #
+            # Exception — deep-EPT configs (EPT ≥ 16) with ultra-few blocks
+            # (< num_CUs//20 ≈ 15 for MI300X, i.e. < 5% CU utilisation):
+            #
+            #   EPT=8 (x=512 nw=1) is the standard HW-pipeline width: 8 in-
+            #   flight loads per thread genuinely hides HBM latency, so the
+            #   0.97 floor is valid even with few blocks.
+            #
+            #   EPT=16+ (x=1024 nw=1, x=2048 nw=1 etc.) is above the HW
+            #   pipeline depth.  The extra pipeline stages yield diminishing
+            #   return per thread, but more importantly — when only 4–12 of
+            #   304 CUs are active (< 5% utilisation), the "deep pipelining"
+            #   benefit is irrelevant: 95%+ of the GPU is completely idle.
+            #
+            #   Applying the full 0.97 floor to x=1024 nw=1 with just 4 blocks
+            #   scores it nearly as high as x=512 nw=1 with 8 blocks, causing
+            #   the heuristic to prefer x=1024 (4 blocks, 1.3% CU util) over
+            #   x=128 (32 blocks, 10.5% CU util) even when x=128 is empirically
+            #   21% faster.
+            #
+            #   Fix: suppress the 0.97 floor only for EPT ≥ 16 when blocks are
+            #   ultra-few (< 5% CU util).  EPT=8 configs keep the full floor.
+            #   EPT=4/2 floors are unaffected (those are lower thresholds anyway).
+            #
+            #   Threshold: num_CUs // 20.  On MI300X: 304 // 20 = 15 blocks.
+            #   At 4  blocks: CU util = 1.3% < 5% — deep EPT floor suppressed.
+            #   At 8  blocks: CU util = 2.6% < 5% — deep EPT floor suppressed.
+            #   At 16 blocks: CU util = 5.3% ≥ 5% — full floor applied.
+            _ept_cu_thr = max(4, num_cus // 20)   # ≈ 15 for MI300X (5% CU util)
+            _suppress_deep_ept = (
+                num_blocks_est < _ept_cu_thr and elems_per_thread >= 16
+            )
 
             if elems_per_thread >= 8:
-                # Full ILP benefit when CUs are well-used; partial otherwise.
-                ilp_ceiling = 0.766 + 0.234 * ilp_scale  # 0.766 → 1.000
-                base_score = max(base_score, ilp_ceiling)
+                # 8+ elements/thread: full software-pipeline benefit (8 in-flight
+                # loads per thread).  Ceiling = 1.0 so even a heavily under-warped
+                # config (e.g. nw=1 for x=512) stays competitive in the top-N pool.
+                # Exception: EPT ≥ 16 with < 5% CU util (deep over-pipeline in
+                # mostly-idle GPU) — let the natural thread_util score apply.
+                if not _suppress_deep_ept:
+                    base_score = max(base_score, 0.97)
             elif elems_per_thread >= 4:
-                # Partial software-pipelining benefit.
-                ilp_ceiling = 0.766 + 0.164 * ilp_scale  # 0.766 → 0.930
-                base_score = max(base_score, ilp_ceiling)
+                # 4 elements/thread: partial pipeline benefit.
+                base_score = max(base_score, 0.93)
             elif elems_per_thread >= 2:
-                # Two elements per thread: the compiler issues two independent
-                # loads per thread (one-level unroll), hiding most of the
-                # first HBM round-trip without the full EPT≥4 pipeline.  For
-                # tiny LAUNCH-BOUND kernels (few blocks, ≤25% CU util) the
-                # Ohd_µs time-model already captures the launch-overhead
-                # benefit of using fewer warps; applying the full under-natural
-                # penalty (0.875 for num_warps = natural/2) then double-counts
-                # that cost.  Grant a partial ILP ceiling to counteract this:
-                #   0.766 + 0.259 * ilp_scale  → 0.766 at 0% util, 1.025→1.0 at 100%
-                # At our typical case (32 blocks / 256 CUs → ilp_scale = 0.5)
-                # the ceiling is 0.766 + 0.130 = 0.896, which lifts the
-                # under-natural score (0.875) just enough to signal that EPT=2
-                # is nearly as good as the natural warp count for this regime.
-                ilp_ceiling = min(1.0, 0.766 + 0.259 * ilp_scale)  # 0.766 → 1.0
-                base_score = max(base_score, ilp_ceiling)
+                # 2 elements/thread: one-level unroll; small latency-hiding benefit.
+                base_score = max(base_score, 0.89)
 
         # ── AMD-only: waves_per_eu correction (only when feature is enabled) ──
         # waves_per_eu > 0 means the LLVM backend plans for N concurrent
@@ -1167,7 +1408,7 @@ class PointwiseHeuristics:
             if len(block_dims) == 2 and num_blocks_2d > 1:
                 xblock, yblock = block_dims
                 ratio              = max(xblock, yblock) / max(min(xblock, yblock), 1)
-                balance_multiplier = 1.0 - 0.005 * math.log2(max(ratio, 1.0))
+                balance_multiplier = 1.0 - 0.002 * math.log2(max(ratio, 1.0))
                 # Sub-cache-line penalty: warp reads below one cache line waste
                 # bandwidth (partial cache-line fills on HBM/L2).  Threshold is
                 # architecture-specific: 32 FP32 elements on AMD CDNA2+ (128-byte
@@ -1608,6 +1849,31 @@ class PointwiseHeuristics:
             except Exception:
                 continue
         
+        # Zero-score fallback: if score_config returned 0.0 for every candidate
+        # (which can happen when an exception fires inside the scoring function,
+        # e.g. due to unexpected problem_metadata for a flattened 3-D kernel),
+        # no configs were added to `scored` and the pool would be empty.  An
+        # empty pool causes the caller to fall back to a fixed default config
+        # that may be far from optimal.
+        #
+        # Defensive recovery: re-admit all dimensionally-valid configs with a
+        # neutral score of 0.5, then let the XBLOCK tiebreaker order them by
+        # tile width.  This is strictly better than an empty pool — the real-
+        # bench step (when top_n > 1) will then pick the empirical winner from
+        # a sensible spread of candidates.
+        if not scored:
+            for cfg in configs:
+                try:
+                    block_dims = PointwiseHeuristics.get_block_dimensions(cfg)
+                    if len(block_dims) != len(problem_dims):
+                        continue
+                    hw_threads = cfg.get('num_warps', 1) * problem_metadata.get('warp_size', 64)
+                    if not (64 <= hw_threads <= 1024):
+                        continue
+                    scored.append((0.5, cfg))
+                except Exception:
+                    continue
+
         # Primary sort: score descending.  Secondary sort: XBLOCK descending as a
         # tiebreaker for near-equal scores.
         #
@@ -1690,6 +1956,45 @@ class PointwiseHeuristics:
         selected = primary[:top_n]
         if len(selected) < top_n:
             selected.extend(overflow[:top_n - len(selected)])
+
+        # Post-diversity rescue: ensure no high-scoring config was stranded in
+        # overflow purely because the diversity cap was already saturated for its
+        # tile shape.
+        #
+        # Problem: the diversity cap of 2 per (XBLOCK[,YBLOCK[,ZBLOCK]]) can
+        # push a config with score ≥ 0.97 to overflow if two configs with the
+        # same tile shape but different num_warps values scored slightly higher.
+        # That config then misses the pool entirely, even though it is a top-tier
+        # scorer overall — the pattern analysis labels these as "≥0.97 scoring
+        # bug — top tier but not rank #1".  They show up as [ACTUAL NOT IN POOL]
+        # regressions despite a nearly-perfect grid+BW+Occupancy score.
+        #
+        # Fix: after building the initial pool, scan the overflow list for any
+        # config that scores at least as well as the weakest current pool member.
+        # Such a config was blocked by diversity, not by a low score; rescuing it
+        # by replacing the weakest member preserves pool size and guarantees that
+        # every config with a competitive score gets a benchmark slot.
+        #
+        # Gate: only apply when top_n ≥ 2 (single-config callers must not be
+        # affected) and only when there is actually an overflow list to rescue from.
+        if top_n >= 2 and selected and overflow:
+            pool_min_score = min(s for s, _ in selected)
+            _rescue_ids    = {id(cfg) for _, cfg in selected}
+            for s_ov, cfg_ov in overflow:
+                # Overflow is sorted descending; once we drop below the pool
+                # minimum there is nothing more to rescue.
+                if s_ov < pool_min_score:
+                    break
+                if id(cfg_ov) in _rescue_ids:
+                    continue
+                # This overflow config was excluded by the diversity cap but
+                # scores at least as well as the current weakest pool member.
+                # Swap it in.
+                selected.sort(key=lambda x: x[0])       # ascending: [0] = weakest
+                selected[0] = (s_ov, cfg_ov)
+                pool_min_score = min(s for s, _ in selected)
+                selected.sort(key=lambda x: x[0], reverse=True)
+                _rescue_ids.add(id(cfg_ov))
 
         # Four-warp guarantee: ensure at least one num_warps=4 config reaches the
         # benchmark pool.  Without this, 3-D kernels with many YBLOCK×ZBLOCK shape

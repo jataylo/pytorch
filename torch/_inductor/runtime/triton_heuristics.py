@@ -538,10 +538,32 @@ def _print_heuristics_validation_summary(problem_key):
             occ  = details.get('occupancy',        0)
             nblk = details.get('num_blocks',       0)
             tpb  = details.get('threads_per_block',0)
+            # Compute adaptive exponent percentages from BottleneckAnalysis so the
+            # displayed weights reflect the actual scoring (not hardcoded 40/30/20/10).
+            bw_pct = lnch_pct = grid_pct = occ_pct = 0
+            try:
+                if POINTWISE_HEURISTICS_AVAILABLE and cfg is not None:
+                    from torch._inductor.codegen.triton_heuristics_bottleneck import (
+                        BottleneckAnalysis as _BA,
+                    )
+                    _an = _BA.analyze_bottleneck(cfg, prob_meta, None)
+                    _w  = _BA.get_adaptive_weights(cfg, prob_meta, analysis=_an)
+                    _e  = _BA.get_adaptive_exponents(_w)
+                    _te = sum(_e.values())
+                    if _te > 0:
+                        bw_pct   = round(_e['bandwidth']  / _te * 100)
+                        lnch_pct = round(_e['launch']      / _te * 100)
+                        grid_pct = round(_e['grid']        / _te * 100)
+                        occ_pct  = round(_e['occupancy']   / _te * 100)
+            except Exception:
+                pass
+            if bw_pct == 0:
+                # Fallback: display default exponent ratios
+                bw_pct, lnch_pct, grid_pct, occ_pct = 40, 30, 20, 10
             print(
                 f"{indent}  Factors    : "
-                f"BW={bw:.3f}(40%)  Launch={lnch:.3f}(30%)  "
-                f"Grid={grid:.3f}(20%)  Occup={occ:.3f}(10%)",
+                f"BW={bw:.3f}({bw_pct}%)  Launch={lnch:.3f}({lnch_pct}%)  "
+                f"Grid={grid:.3f}({grid_pct}%)  Occup={occ:.3f}({occ_pct}%)",
                 flush=True,
             )
             print(f"{indent}  Grid       : {nblk:,} blocks  |  {tpb} threads/block", flush=True)
@@ -1608,11 +1630,25 @@ class CachingAutotuner(KernelInterface):
             _primary: list = []
             _overflow: list = []
             _xb_counts: dict = {}
+            _xb_nw_counts: dict = {}
             for _entry in scored:
                 _xb = _entry[2].get('XBLOCK', 0)
-                _cap = 2  # allow both nw=4 and nw=8 variants per XBLOCK
-                if _xb_counts.get(_xb, 0) < _cap:
+                _nw = _entry[2].get('num_warps', 8)
+                # Cap per (XBLOCK, num_warps) pair: when WPEU is enabled, each
+                # (XBLOCK, num_warps) config generates wpe=0/1/2 variants that
+                # would otherwise consume two XBLOCK-level diversity slots with
+                # identical configurations.  By counting (XBLOCK, num_warps) as
+                # the key with cap=1, only the highest-scoring WPEU variant per
+                # config pair enters the primary pool.  The XBLOCK-level cap=2
+                # still applies to ensure both nw=4 and nw=8 variants of each
+                # XBLOCK can enter (the core diversity purpose).
+                _xbnw_key = (_xb, _nw)
+                _xb_nw_cap = 1   # at most 1 WPEU variant per (XBLOCK, num_warps)
+                _xb_cap    = 2   # allow 2 distinct num_warps per XBLOCK
+                if (_xb_nw_counts.get(_xbnw_key, 0) < _xb_nw_cap
+                        and _xb_counts.get(_xb, 0) < _xb_cap):
                     _primary.append(_entry)
+                    _xb_nw_counts[_xbnw_key] = _xb_nw_counts.get(_xbnw_key, 0) + 1
                     _xb_counts[_xb] = _xb_counts.get(_xb, 0) + 1
                 else:
                     _overflow.append(_entry)
@@ -2889,15 +2925,29 @@ class CachingAutotuner(KernelInterface):
             self.restore_args_from_cpu(cpu_copies)
 
         # only use profiler when not already in a profiler instance
+        # Use the heuristics bench rep when we're selecting among multiple
+        # heuristic candidates (either real_bench validation mode, or the normal
+        # heuristics top-N > 1 production path). For single-config heuristics
+        # (top_n=1) and max_autotune the standard rep=40 is used.
+        _heuristic_multi_candidate = (
+            bool(torch.version.hip)
+            and self.heuristic_type == HeuristicType.POINTWISE
+            and self.size_hints is not None
+            and (
+                inductor_config.heuristics_real_bench
+                or inductor_config.heuristics_top_n_configs > 1
+            )
+        )
+        _rep = inductor_config.heuristics_bench_rep if _heuristic_multi_candidate else 40
         if with_profiler and not autograd_profiler._is_profiler_enabled:
             from torch._inductor.utils import do_bench_using_profiling
 
-            timing = do_bench_using_profiling(kernel_call, warmup=10, rep=40)
+            timing = do_bench_using_profiling(kernel_call, warmup=10, rep=_rep)
         else:
             benchmark_kwargs = (
                 {}
                 if self.device_props.type == "cpu"
-                else {"rep": 40, "is_vetted_benchmarking": True}
+                else {"rep": _rep, "is_vetted_benchmarking": True}
             )
             timing = benchmarker.benchmark(
                 fn=kernel_call,
@@ -3399,7 +3449,7 @@ class CachingAutotuner(KernelInterface):
 
                         # YBLOCK-stability veto (2D pointwise kernels only):
                         # If the real-bench winner has YBLOCK=1 AND a YBLOCK≥4
-                        # config is available in the pool with timing ≤ 30% slower,
+                        # config is available in the pool with timing ≤ 10% slower,
                         # prefer the YBLOCK≥4 config.
                         #
                         # Rationale: torch.compile's dynamic-shape caching reuses a
@@ -3413,6 +3463,14 @@ class CachingAutotuner(KernelInterface):
                         # YBLOCK=1) prevents these configs from entering top-N; this
                         # veto is a belt-and-suspenders fallback for edge cases where
                         # the scoring does not fully suppress YBLOCK=1.
+                        #
+                        # Threshold tightened from 30 % → 10 %: the old 30 % threshold
+                        # caused the veto to fire even when the YBLOCK≥4 config was
+                        # measurably 15 %+ slower (e.g. 0.010720ms vs YBLOCK=1 at
+                        # 0.009601ms = 11.7 % slower), replacing a faster config with
+                        # a slower one.  The veto is only a guard against noise-driven
+                        # YBLOCK=1 wins; if YBLOCK≥4 is more than 10 % slower it is
+                        # genuinely slower and the veto should not override.
                         if (not _is_reduction_kernel
                                 and _winner.config.kwargs.get('YBLOCK') == 1
                                 and _winner_t < float("inf")):
@@ -3424,7 +3482,7 @@ class CachingAutotuner(KernelInterface):
                             ]
                             if _y4_candidates:
                                 _y4_t, _y4_lnch = min(_y4_candidates, key=lambda x: x[0])
-                                if _y4_t <= _winner_t * 1.30:
+                                if _y4_t <= _winner_t * 1.10:
                                     _winner = _y4_lnch
                                     _y4_yb  = _y4_lnch.config.kwargs.get('YBLOCK')
                                     _veto_msg = (
