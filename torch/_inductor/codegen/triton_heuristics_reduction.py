@@ -61,10 +61,6 @@ Tuning axes and their effects:
              Larger → fewer iterations (lower loop overhead), more registers.
              Smaller → fewer registers (avoids spill for Welford/var/std).
 
-  waves_per_eu: AMD scheduler hint — co-schedule N wavefronts per SIMD unit.
-             wpe=2 can hide DPP+DS latency when few blocks are active.
-             Gated by TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1.
-
 ------------------------------------------------------------------------------
 Filtering:
 ------------------------------------------------------------------------------
@@ -81,11 +77,10 @@ Filtering:
      threads would be idle, wasting wavefront slots).
 
   3. Deduplication: configs that collapse to the same (XBLOCK, R0_BLOCK,
-     num_warps, waves_per_eu) after AMD's _num_warps clamping are removed.
+     num_warps, num_stages) after AMD's _num_warps clamping are removed.
 """
 
 import math
-import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 __all__ = ["ReductionHeuristics"]
@@ -107,10 +102,8 @@ class ReductionHeuristics:
     All public methods are @classmethods; the class is never instantiated.
     The _arch_config cache is a process-level singleton (one GPU per process).
 
-    Environment variables
-    ---------------------
-    TORCHINDUCTOR_REDUCTION_HEURISTICS=1   Enable AMD reduction heuristics
-    TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1 Also emit waves_per_eu=2 variants
+    Enabled by default on ROCm.  To disable:
+        TORCHINDUCTOR_REDUCTION_HEURISTICS=0
     """
 
     _arch_config = None
@@ -129,12 +122,17 @@ class ReductionHeuristics:
                 except Exception:
                     pass
             if cls._arch_config is None:
-                # Conservative defaults when no GPU context is available
+                # Conservative defaults when no GPU context is available.
+                # Use CDNA2 (MI250X) values: 65536 VGPRs/CU, 2048 threads/CU
+                # → vgpr_budget_per_thread=32 → _max_r0_per_thread()=16.
                 from types import SimpleNamespace
                 cls._arch_config = SimpleNamespace(
-                    num_cus=256,        # MI300X
-                    warp_size=64,       # AMD wavefront = 64 lanes
-                    occupancy_sweetspot_max=8,   # max useful warps per block
+                    num_cus=256,
+                    warp_size=64,
+                    occupancy_sweetspot_max=8,
+                    regs_per_cu=65536,
+                    max_threads_per_cu=2048,
+                    vgpr_budget_per_thread=32,  # 65536 // 2048
                 )
         return cls._arch_config
 
@@ -233,16 +231,39 @@ class ReductionHeuristics:
     #   R0/thread = 32  : 14 inf, 85 OK               (kernel-dependent)
     #   R0/thread ≥ 64  : 76 inf, 7 OK                (almost always inf)
     #
-    # Default threshold: 32 r-elements per thread is the safe upper bound for
-    # simple reduction kernels on AMD MI300X (256 VGPRs per thread).
-    # For register_intensive kernels (many fused ops / transcendentals) this is
-    # halved to 16 inside _is_valid_inner to avoid spills on complex kernels
-    # where computational temps consume a significant portion of the VGPR file.
-    MAX_R0_PER_THREAD: int = 32
+    @classmethod
+    def _max_r0_per_thread(cls) -> int:
+        """Maximum reduction-domain elements per thread before register spilling.
 
-    # Minimum threads-per-output required when r0_per_thread is at the hard limit.
-    # See Guard 3b in _is_valid_inner for the hardware derivation.
-    MIN_TPO_AT_R0_LIMIT: int = 128  # 2 × warp_size (64)
+        Derived from the device's actual VGPR file rather than a compile-time
+        constant.  The formula is:
+
+            vgpr_budget = regs_per_cu // max_threads_per_cu
+            max_r0      = clamp(vgpr_budget // 2, lo=8, hi=32)
+
+        The //2 factor reserves half the VGPR budget for non-accumulator
+        registers (loop indices, address computation, compiler temporaries).
+
+        Representative values:
+          CDNA2 (MI250X): 65536 // 2048 = 32 VGPRs/thread → max_r0 = 16
+          CDNA3 (MI300X): 131072 // 2048 = 64 VGPRs/thread → max_r0 = 32
+          fallback (no GPU): vgpr_budget=32 → max_r0 = 16 (conservative)
+
+        Clamped to [8, 32] so heuristics stay sane on exotic or future
+        architectures where the device property may be unreliable.
+        """
+        arch = cls._get_arch()
+        vgpr_budget = getattr(arch, 'vgpr_budget_per_thread', 32)
+        return max(8, min(32, vgpr_budget // 2))
+
+    @classmethod
+    def _min_tpo_at_r0_limit(cls) -> int:
+        """Minimum threads-per-output when r0_per_thread is at the VGPR limit.
+
+        Derived from 2 × warp_size so this generalises across wave32 (RDNA) and
+        wave64 (CDNA) architectures rather than being hardcoded to 128.
+        """
+        return 2 * cls._warp_size()
 
     @classmethod
     def _is_valid_inner(
@@ -267,19 +288,19 @@ class ReductionHeuristics:
 
         Guard 3a — Register pressure hard ceiling:
           r0_per_thread = R0_BLOCK / threads_per_output
-          r0_per_thread ≤ MAX_R0_PER_THREAD (default 32)
+          r0_per_thread ≤ _max_r0_per_thread()   (device-derived, see method)
 
           Each thread holds r0_per_thread reduction-domain elements in VGPRs.
-          Exceeding the threshold guarantees register spilling on AMD MI300X.
+          Exceeding the threshold guarantees register spilling on AMD hardware.
 
         Guard 3b — Boundary unroll pressure (AMD-specific):
-          When r0_per_thread == MAX_R0_PER_THREAD (the boundary, default 32),
-          enforce threads_per_output ≥ MIN_TPO_AT_R0_LIMIT (default 128).
+          When r0_per_thread == _max_r0_per_thread() (the boundary),
+          enforce threads_per_output ≥ _min_tpo_at_r0_limit() (2 × warp_size).
 
-          Hardware rationale (AMD MI300X, 256 VGPRs/thread):
-          ─────────────────────────────────────────────────────
-          At r0/thread=32, kernel complexity determines whether the VGPR budget
-          holds.  The Triton/AMDGPU compiler's inner-loop unroll factor U is
+          Hardware rationale (AMD CDNA, boundary occupancy):
+          ──────────────────────────────────────────────────
+          At r0/thread == _max_r0_per_thread(), kernel complexity determines
+          whether the VGPR budget holds.  The Triton/AMDGPU compiler's inner-loop unroll factor U is
           inversely related to the number of threads contributing to each output
           element (threads_per_output, TPO):
 
@@ -297,7 +318,7 @@ class ReductionHeuristics:
 
           At TPO ≥ 128 (2+ warps per output), thread-level parallelism provides
           sufficient HBM-latency hiding, allowing U=1–2.  VGPR usage stays below
-          256 for all observed kernel complexities.
+          the per-thread budget for all observed kernel complexities.
 
           Empirical validation (tuning66 + tuning67 logs):
             • 55 spilling configs at r0pt=32, all with TPO < 128 (100% spill rate)
@@ -312,14 +333,19 @@ class ReductionHeuristics:
             return False
         if r0_block > 0:
             r0_per_thread = r0_block / max(1.0, threads_per_output)
-            effective_max = cls.MAX_R0_PER_THREAD // 2 if register_intensive else cls.MAX_R0_PER_THREAD
+            max_r0 = cls._max_r0_per_thread()
+            # register_intensive kernels (fused transcendentals, many ops) use
+            # half the budget because computational temps consume significant
+            # portions of the VGPR file alongside the reduction accumulators.
+            effective_max = max_r0 // 2 if register_intensive else max_r0
             if r0_per_thread > effective_max:
                 return False
             # Guard 3b: at the VGPR-pressure boundary, require enough threads per
             # output so the compiler can use thread-level (not instruction-level)
-            # parallelism to hide memory latency.
-            if r0_per_thread >= cls.MAX_R0_PER_THREAD:
-                if threads_per_output < cls.MIN_TPO_AT_R0_LIMIT:
+            # parallelism to hide memory latency.  Uses effective_max (halved for
+            # register-intensive kernels) so the boundary is consistent with 3a.
+            if r0_per_thread >= effective_max:
+                if threads_per_output < cls._min_tpo_at_r0_limit():
                     return False
         return True
 
@@ -335,7 +361,6 @@ class ReductionHeuristics:
         rnumel: int,
         max_r0_block: int,
         register_intensive: bool,
-        waves_per_eu_enabled: bool,
         make_config_fn: Callable,
     ) -> List[Any]:
         """Generate semi-exhaustive INNER reduction candidates.
@@ -349,10 +374,9 @@ class ReductionHeuristics:
         rnumel            : total reduction elements across all r-dimensions
         max_r0_block      : hard cap on R0_BLOCK (typically 2048 on AMD)
         register_intensive: True for Welford/var/std — halves nw cap & adds r_quarter
-        waves_per_eu_enabled: True when TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1
         make_config_fn    : factory that creates a triton.Config
                             signature: (xblock, r0, num_warps, *, num_stages,
-                                        waves_per_eu, register_intensive) → Config
+                                        register_intensive) → Config
 
         Returns
         -------
@@ -366,9 +390,6 @@ class ReductionHeuristics:
         has no additional effect on reduction pipelining.  All configs here use
         ``num_stages=1`` (the default) intentionally.
         """
-        arch  = cls._get_arch()
-        ws    = cls._warp_size()
-        nc    = cls._num_cus()
         nw_hw = cls._max_nw()
 
         # AMD halves effective num_warps when register_intensive (spill avoidance)
@@ -423,9 +444,9 @@ class ReductionHeuristics:
         candidates: List[Any] = []
         seen: set = set()
 
-        def _add(xb: int, r0: int, nw: int, wpe: int = 0) -> None:
+        def _add(xb: int, r0: int, nw: int) -> None:
             """Append a config if it passes filters and is not a duplicate."""
-            key = (xb, r0, nw, wpe)
+            key = (xb, r0, nw)
             if key in seen:
                 return
             if not cls._is_valid_inner(xnumel, rnumel, xb, nw, r0_block=r0,
@@ -435,7 +456,6 @@ class ReductionHeuristics:
             candidates.append(make_config_fn(
                 xb, r0, num_warps=nw,
                 num_stages=1,
-                waves_per_eu=wpe if wpe else None,
                 register_intensive=register_intensive,
             ))
 
@@ -467,41 +487,6 @@ class ReductionHeuristics:
             for nw in nw_grid:
                 _add(1, r_xlarge, nw)
 
-        # ── waves_per_eu variants ─────────────────────────────────────────────
-        #  AMD scheduler hint: co-schedule more wavefronts per SIMD unit.
-        #  Most beneficial when rnumel is large (long-running blocks) and the
-        #  CU grid is small (few blocks in flight, so extra wavefronts help
-        #  hide memory latency).
-        #
-        #  Coverage:
-        #    XBLOCK=1 — always the baseline; emit wpe for top nw values
-        #    XBLOCK=2 — small second grid; wpe still useful
-        #    r_full, r_half: always at XBLOCK=1 when rnumel is large enough
-        #    r_large, r_xlarge: add wpe for non-register-intensive only (same
-        #      guard as the base r_large/r_xlarge section above).
-        #
-        #  Guard: rnumel >= 256 (smaller rnumel → blocks too short for wpe gain)
-        if waves_per_eu_enabled and rnumel >= 256:
-            # XBLOCK=1: emit wpe variants for all nw values in nw_grid
-            for nw in nw_grid:
-                _add(1, r_full, nw, wpe=2)
-                if r_half < r_full:
-                    _add(1, r_half, nw, wpe=2)
-            # XBLOCK=2: useful when xnumel is large but we still want wpe benefit
-            if xnumel >= 4:
-                for nw in [nw_cap, max(2, nw_cap // 2)]:
-                    _add(2, r_full, nw, wpe=2)
-            # r_large / r_xlarge wpe: for very large rnumel the bigger R0_BLOCK
-            # tiers are the most useful configs; add wpe to give the scheduler
-            # the best chance to hide the longer per-iteration latency.
-            # Skip for register_intensive (same risk of spilling as base tier).
-            if not register_intensive and r_large > r_full:
-                for nw in [nw_cap, max(2, nw_cap // 2)]:
-                    _add(1, r_large, nw, wpe=2)
-            if not register_intensive and r_xlarge > r_large:
-                for nw in [nw_cap, max(2, nw_cap // 2)]:
-                    _add(1, r_xlarge, nw, wpe=2)
-
         return candidates
 
     @classmethod
@@ -512,7 +497,6 @@ class ReductionHeuristics:
         rnumel: int,
         register_intensive: bool,
         make_config_fn: Callable,
-        waves_per_eu_enabled: bool = False,
     ) -> List[Any]:
         """Generate semi-exhaustive OUTER reduction candidates.
 
@@ -521,23 +505,16 @@ class ReductionHeuristics:
           - R0_BLOCK controls the inner r-stride step     (HBM coalescing)
 
         Tuning axes:
-          XBLOCK          : sweep to target 12% / 25% / 50% / 100% / 200% CU coverage
-          num_warps       : {1, 2, 4, 8}
-          R0_BLOCK        : {r_full, r_half} where r_full = min(rnumel, 8) for OUTER
-          waves_per_eu    : 0 (disabled) or 2 when waves_per_eu_enabled=True.
-                            OUTER kernels iterate over r in an inner loop, so each
-                            block has many iterations.  wpe=2 hints the scheduler to
-                            co-schedule extra wavefronts and hide HBM latency between
-                            iterations.  Most useful when the block count is low
-                            (few CUs active) or the r-loop is long.
+          XBLOCK   : sweep to target 12% / 25% / 50% / 100% / 200% CU coverage
+          num_warps: {1, 2, 4, 8}
+          R0_BLOCK : {r_full, r_half} where r_full = min(rnumel, 8) for OUTER
 
         Parameters
         ----------
-        xnumel              : number of output elements
-        rnumel              : size of the reduction dimension
-        register_intensive  : currently unused for OUTER but kept for API symmetry
-        make_config_fn      : same factory as for inner_configs
-        waves_per_eu_enabled: emit wpe=2 variants when True
+        xnumel             : number of output elements
+        rnumel             : size of the reduction dimension
+        register_intensive : currently unused for OUTER but kept for API symmetry
+        make_config_fn     : same factory as for inner_configs
 
         Returns
         -------
@@ -557,18 +534,17 @@ class ReductionHeuristics:
         seen: set = set()
         candidates: List[Any] = []
 
-        def _add(xb: int, r0: int, nw: int, wpe: int = 0) -> None:
+        def _add(xb: int, r0: int, nw: int) -> None:
             n_blocks = math.ceil(xnumel / xb)
             if n_blocks < mb:
                 return
-            key = (xb, r0, nw, wpe)
+            key = (xb, r0, nw)
             if key in seen:
                 return
             seen.add(key)
             candidates.append(make_config_fn(
                 xb, r0, num_warps=nw,
                 num_stages=1,
-                waves_per_eu=wpe if wpe else None,
                 register_intensive=register_intensive,
             ))
 
@@ -583,17 +559,6 @@ class ReductionHeuristics:
             for nw in [8, 4, 2, 1]:
                 for r0 in r0_options:
                     _add(xb_t, r0, nw)
-
-        # waves_per_eu variants: OUTER kernels iterate over r many times; wpe=2
-        # helps the scheduler hide HBM latency between iterations.  Emit for
-        # the two most useful nw values at each XBLOCK target.
-        if waves_per_eu_enabled:
-            for target in target_block_counts:
-                raw = max(1, xnumel // max(1, target))
-                xb_t = 1 << (max(0, raw - 1)).bit_length()
-                for nw in [8, 4]:
-                    for r0 in r0_options:
-                        _add(xb_t, r0, nw, wpe=2)
 
         return candidates
 
@@ -1012,7 +977,7 @@ class ReductionHeuristics:
     def get_detailed_scores(
         cls, config: Dict, problem_metadata: Dict
     ) -> Dict[str, float]:
-        """Return a per-factor breakdown dict for verbose logging.
+        """Return a per-factor breakdown dict for config introspection.
 
         Keys: r_efficiency, grid_coverage, sync_overhead (INNER) or
         outer_coalescing (OUTER), warp_parallelism, composite.
@@ -1079,9 +1044,8 @@ class ReductionHeuristics:
 
         for cfg in configs:
             try:
-                xb  = cfg.kwargs.get("XBLOCK", 1)
-                nw  = cfg.num_warps
-                wpe = cfg.kwargs.get("waves_per_eu", 0) or 0
+                xb = cfg.kwargs.get("XBLOCK", 1)
+                nw = cfg.num_warps
 
                 # R0_BLOCK may be absent for persistent reductions (dynamic tile).
                 # Treat the effective tile as rnumel so scoring reflects the full
@@ -1101,54 +1065,30 @@ class ReductionHeuristics:
                     continue
 
                 hdict = {"XBLOCK": xb, "R0_BLOCK": r0, "num_warps": nw}
-                if wpe:
-                    hdict["waves_per_eu"] = wpe
-
                 s = cls.score_config(hdict, problem_metadata)
                 if s > 0:
                     scored.append((s, cfg, hdict))
             except Exception:
                 continue
 
-        # Sort descending by score; tiebreakers (all reversed=True so descending):
-        #   1. score (primary)
-        #   2. R0_BLOCK: larger → fewer reduction iterations → prefer when tied
-        #   3. waves_per_eu: prefer wpe=2 over wpe=0 when score and R0_BLOCK tie.
-        #
-        # Rationale for wpe=2 preference: certain (R0_BLOCK, nw) combinations
-        # run 3–6× slower WITHOUT wpe=2 on AMD MI300X due to scheduler imbalance
-        # (e.g. R0_BLOCK=8192 nw=8 no-wpe → 104 µs; same config wpe=2 → 19 µs).
-        # The scoring formula gives wpe=0 and wpe=2 IDENTICAL scores (wpe is not
-        # modeled), so the tiebreaker decides which gets benchmarked in N=1 mode.
-        # For N=5 this has no effect: the diversity cap uses (XBLOCK, bool(wpe))
-        # buckets, so both wpe=0 and wpe=2 variants already appear in the top-N
-        # pool and the benchmark picks the empirically faster one.
+        # Sort descending by score; tiebreaker: larger R0_BLOCK preferred when
+        # scores tie (fewer reduction iterations → lower loop overhead).
         scored.sort(
-            key=lambda x: (
-                round(x[0], 4),
-                x[2].get("R0_BLOCK", 0),
-                int(bool(x[2].get("waves_per_eu", 0))),  # wpe=2 → 1 > wpe=0 → 0
-            ),
+            key=lambda x: (round(x[0], 4), x[2].get("R0_BLOCK", 0)),
             reverse=True,
         )
 
-        # Diversity cap: at most 2 configs per (XBLOCK, wpe_regime) bucket.
-        # Using (xb, bool(wpe)) rather than just xb ensures that wpe=2 variants
-        # get their own diversity slots and are not crowded out by wpe=0 configs
-        # that score identically (since the scoring formula doesn't reward wpe
-        # directly — the real benefit is only measurable via benchmarking).
+        # Diversity cap: at most 2 configs per XBLOCK bucket.
         # Prevents large-XBLOCK variants from monopolising the top-N when many
         # (XBLOCK, num_warps, R0_BLOCK) combos score nearly identically.
-        xb_counts: Dict[tuple, int] = {}
+        xb_counts: Dict[int, int] = {}
         primary: List[Tuple[float, Any, Dict]] = []
         overflow: List[Tuple[float, Any, Dict]] = []
         for entry in scored:
-            xb  = entry[2].get("XBLOCK", 1)
-            wpe = bool(entry[2].get("waves_per_eu", 0))
-            key = (xb, wpe)
-            if xb_counts.get(key, 0) < 2:
+            xb = entry[2].get("XBLOCK", 1)
+            if xb_counts.get(xb, 0) < 2:
                 primary.append(entry)
-                xb_counts[key] = xb_counts.get(key, 0) + 1
+                xb_counts[xb] = xb_counts.get(xb, 0) + 1
             else:
                 overflow.append(entry)
 
@@ -1159,17 +1099,4 @@ class ReductionHeuristics:
 
         return top_n_configs, all_scored_out
 
-    # ------------------------------------------------------------------
-    # Env-var gate
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def is_enabled() -> bool:
-        """True when TORCHINDUCTOR_REDUCTION_HEURISTICS=1."""
-        return os.environ.get("TORCHINDUCTOR_REDUCTION_HEURISTICS", "0") == "1"
-
-    @staticmethod
-    def waves_per_eu_enabled() -> bool:
-        """True when TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1."""
-        return os.environ.get("TORCHINDUCTOR_POINTWISE_WAVES_PER_EU", "0") == "1"
 

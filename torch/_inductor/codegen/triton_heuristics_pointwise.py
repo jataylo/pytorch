@@ -3,8 +3,7 @@
 Provides PointwiseHeuristics, which:
   - enumerates every legal (XBLOCK[×YBLOCK[×ZBLOCK]], num_warps) combination
     for a given problem shape (generate_all_candidate_configs),
-  - scores each combination on four factors and ranks them (prune_configs), and
-  - exposes individual factor functions for the verbose debug table.
+  - scores each combination on four factors and ranks them (prune_configs).
 
 The four scoring factors are:
   1. Memory bandwidth utilisation — Gaussian peak at the thread count that
@@ -17,8 +16,8 @@ The four scoring factors are:
      (sweet-spot model for memory-bound, overhead-ratio model for tiny multi-
      block kernels where grid spread already provides latency hiding).
 
-Weights are computed per-config by BottleneckAnalysis (adaptive.py) based on
-which of the three cost components (overhead, memory, compute) dominates.
+Weights are computed per-config by BottleneckAnalysis (triton_heuristics_bottleneck.py)
+based on which of the three cost components (overhead, memory, compute) dominates.
 """
 
 import math
@@ -48,7 +47,6 @@ class PointwiseHeuristics:
     """
     
     _arch_config = None
-    _is_hip: Optional[bool] = None  # lazily populated; None = not yet detected
 
     # Hard limits on per-dimension block size.
     MIN_BLOCK_SIZE = 1
@@ -58,36 +56,6 @@ class PointwiseHeuristics:
     # Helpers
     # -------------------------------------------------------------------------
 
-    @classmethod
-    def _get_is_hip(cls) -> bool:
-        """Return True when running on a ROCm/HIP (AMD GPU) build.
-
-        Cached after the first call.  Returns False when torch is unavailable
-        or when running on a CUDA (NVIDIA) build.  The result is used to gate
-        AMD-specific config dimensions such as waves_per_eu.
-        """
-        if cls._is_hip is None:
-            try:
-                import torch as _torch
-                cls._is_hip = bool(_torch.version.hip)
-            except Exception:
-                cls._is_hip = False
-        return cls._is_hip
-
-    @staticmethod
-    def _is_waves_per_eu_enabled() -> bool:
-        """Return True when waves_per_eu config generation is enabled.
-
-        Controlled by the TORCHINDUCTOR_POINTWISE_WAVES_PER_EU environment
-        variable (default: 0 = disabled).  Must also be on an AMD/HIP build —
-        waves_per_eu is an AMD-only Triton parameter and is ignored on CUDA.
-
-        Enable with:
-            TORCHINDUCTOR_POINTWISE_WAVES_PER_EU=1
-        """
-        import os as _os
-        return _os.environ.get("TORCHINDUCTOR_POINTWISE_WAVES_PER_EU", "0") == "1"
-    
     @classmethod
     def _get_arch(cls):
         """Return the cached ArchitectureConfig, initialising on first call.
@@ -246,7 +214,7 @@ class PointwiseHeuristics:
         # Return a flat 0.97 for any nw ≥ 4 (256 threads) in this regime so
         # that nw=4 and nw=8 are treated equally.  The grid score and secondary
         # XBLOCK tiebreaker then rank configs by block count — which IS a
-        # meaningful discriminator for large kernels.  The real bench (TOP_N>1)
+        # meaningful discriminator for large kernels.  The autotuner (TOP_N>1)
         # subsequently picks the empirical winner.
         _bw_xblock      = max(1, xblock)
         _bw_yblock      = max(1, yblock) if yblock else 1
@@ -268,7 +236,7 @@ class PointwiseHeuristics:
             #
             # Return a flat 0.97 for any nw ≥ 4 so the grid factor and secondary
             # XBLOCK tiebreaker rank configs instead of the BW Gaussian.  The
-            # real bench (TOP_N > 1) selects the empirical winner.
+            # autotuner (TOP_N > 1) selects the empirical winner.
             if threads_per_block >= 256:  # nw ≥ 4 on AMD (4 × 64-thread wavefronts)
                 return 0.97
             # nw < 4: fall through to the Gaussian (correct penalty for under-wavefronting)
@@ -293,7 +261,7 @@ class PointwiseHeuristics:
         #      Software pipelining is insufficient at EPT=4; a second hardware
         #      wavefront (nw=2) empirically gives ~5% more bandwidth coverage.
         #      Return flat 0.97 so Grid + Occupancy factors pick the winner.
-        _few_thr = max(16, getattr(arch, 'num_cus', 304) // 2)  # 152 for MI300X
+        _few_thr = max(16, arch.num_cus // 2)
         if 1 < _bw_num_blocks <= _few_thr:
             # elements per thread if we used nw=1 (max software-pipeline depth)
             _ept_at_nw1 = xblock // warp_size  # integer division; 1D XBLOCK used
@@ -572,7 +540,7 @@ class PointwiseHeuristics:
             # from x=256 at 2K (8 blocks) up through x=256 at 16K (64 blocks).
             # The wide sigma (1.5×optimal, set below) keeps all XBLOCK sizes from
             # x=128 through x=2048 within 5% of the peak score for any size in
-            # this range, preserving pool diversity for the real bench.
+            # this range, preserving pool coverage for the autotuner.
             #
             # Examples (divisor=256, sigma=1.5×optimal):
             #   2K  → optimal= 8, x=256 Grid=1.00, x=128 Grid=0.95, x=512 Grid=0.99
@@ -672,7 +640,7 @@ class PointwiseHeuristics:
                 #   x=512 nw=8:  4096 blocks → Grid=1.0 (at optimal)
                 #   x=256 nw=4:  8192 blocks → Grid=1.0 (asymmetric, no penalty)
                 #   x=1024 nw=4: 2048 blocks → Grid=0.90 (below optimal, penalised)
-                # → x=512 and x=256 both enter the top-5 pool; real bench picks x=256.
+                # → x=512 and x=256 both enter the top-5 pool; autotuner picks x=256.
                 if _slow_ops >= 1 and optimal < num_blocks <= 2 * optimal:
                     return 1.0
             else:
@@ -704,7 +672,7 @@ class PointwiseHeuristics:
                 # empirically 3–5% faster on MI300X for 2-D transposed-
                 # access kernels.  The narrower floor (hw/2 ≈ 256) also
                 # means these configs score Grid ≈ 1.0 and enter the top-N
-                # pool for the real_bench selection step.
+                # pool for autotuner selection.
                 #
                 # Critically, when a compile_fn is shared across multiple
                 # input shapes (common in fused ops), the 512×512 kernel
@@ -1199,87 +1167,6 @@ class PointwiseHeuristics:
                 # 2 elements/thread: one-level unroll; small latency-hiding benefit.
                 base_score = max(base_score, 0.89)
 
-        # ── AMD-only: waves_per_eu correction (only when feature is enabled) ──
-        # waves_per_eu > 0 means the LLVM backend plans for N concurrent
-        # wavefronts per EU, which has two countervailing effects:
-        #
-        # 1. Occupancy boost  (positive): sibling blocks co-reside on the same
-        #    CU, increasing the total wavefronts available to the scheduler
-        #    for latency hiding.  Effective wavefronts ≈ num_warps × waves_per_eu.
-        #    Applied only in the well-saturated regime (not natural-warps) and
-        #    only when the grid is large enough to actually fill the extra slots.
-        #
-        # 2. VGPR pressure penalty (negative): the register file is partitioned
-        #    across N concurrent blocks, reducing the per-thread VGPR budget
-        #    from  65536 / threads  to  65536 / (threads × waves_per_eu).
-        #    If the kernel's estimated VGPR need exceeds the tighter budget,
-        #    register spills occur → score penalty proportional to the excess.
-        #
-        # On CUDA or when the env var is off, waves_per_eu is always 0 (no
-        # variants were generated), so this block is a no-op in both cases.
-        waves_per_eu = config.get('waves_per_eu', 0)
-        if waves_per_eu > 0 and PointwiseHeuristics._is_waves_per_eu_enabled():
-            # wpe=1: max VGPR per thread (1 wave per EU); no occupancy penalty or
-            # boost relative to wpe=0.  For compute-heavy kernels (slow_ops ≥ 4)
-            # this lets LLVM use all 256 VGPRs freely.  Give a tiny bonus so the
-            # real bench gets the chance to compare wpe=1 against wpe=0 variants.
-            if waves_per_eu == 1:
-                _slow_ops_wpe = problem_metadata.get('slow_ops', 0)
-                if _slow_ops_wpe >= 4 and not use_natural_warps:
-                    base_score = min(1.0, base_score * 1.003)  # 0.3% tie-breaker
-                # No VGPR pressure change (budget identical to wpe=0).
-            else:
-                # --- Occupancy boost (wpe ≥ 2) ---
-                # Only when under the sweet spot and not in the natural-warps regime.
-                # Require enough blocks for the concurrent-block scheduling to engage:
-                #   num_blocks ≥ num_cus × waves_per_eu
-                if not use_natural_warps and num_warps < sweet_min:
-                    if num_blocks_est >= num_cus * waves_per_eu:
-                        effective_warps = min(sweet_max, num_warps * waves_per_eu)
-                        base_score = max(base_score, _sweet_spot_score(effective_warps))
-                else:
-                        # Grid too small: wpe tightened the VGPR budget but the extra
-                        # wavefront slots will sit empty — pure downside, no gain.
-                        # Penalise proportionally to how far below the fill threshold
-                        # we are.  Range: 0.95 (completely empty) → 1.00 (just filled).
-                        _fill = num_blocks_est / max(1, num_cus * waves_per_eu)
-                        base_score *= 0.95 + 0.05 * min(1.0, _fill)
-
-            # --- VGPR pressure penalty (only for wpe ≥ 2) ---
-            # wpe=1 does NOT reduce the per-thread VGPR budget (budget = 256,
-            # identical to wpe=0), so no spill risk and no penalty needed.
-            # For wpe ≥ 2 the budget is halved/quartered and may cause spills.
-            if waves_per_eu >= 2:
-                # Budget when waves_per_eu blocks share the CU register file:
-                #   budget = floor(65536 / (threads_per_block × waves_per_eu))
-                # rounded down to the 8-register hardware granule.
-                _threads_wpe    = (num_warps * warp_size) * waves_per_eu
-                _raw_budget     = 65536 // max(1, _threads_wpe)   # AMD CDNA2/3 per CU
-                _vgpr_budget    = min(256, (_raw_budget // 8) * 8)
-
-                if _vgpr_budget > 0:
-                    ops_pe     = problem_metadata.get('ops_per_element', 3)
-                    # Lightweight VGPR estimate: base overhead + tensor arg overhead
-                    # (pointers, masks, values) + op temporaries.
-                    # load_ops ≈ n_input_tensors; +1 for the output tensor.
-                    # The full model lives in _estimate_spill_risk (runtime);
-                    # this is a cheap scoring proxy.
-                    _load_ops_s       = problem_metadata.get('load_ops', 0)
-                    _n_tensors_s      = max(3, _load_ops_s + 1)
-                    # Use ×4 per op (not ×2) to better capture actual VGPR usage
-                    # in fused kernels with loop-carried temporaries.
-                    # Base raised from 16→24 to match the generation pre-filter.
-                    _rough_vgpr_need  = 24 + _n_tensors_s * 4 + min(ops_pe * 4, 128)
-                    _spill_ratio      = _rough_vgpr_need / _vgpr_budget
-                    if _spill_ratio > 1.0:
-                        # Over budget: penalise proportionally to the excess.
-                        # e.g. ratio=1.5 → ×0.667, ratio=2.0 → ×0.500.
-                        base_score *= 1.0 / _spill_ratio
-                    elif _spill_ratio > 0.75:
-                        # Marginal (within 25% of budget): small tie-breaker penalty.
-                        # Threshold tightened from 0.80→0.75 to match generation gate.
-                        base_score *= 0.97
-
         return max(0.70, min(1.0, base_score))
 
     # -------------------------------------------------------------------------
@@ -1397,7 +1284,7 @@ class PointwiseHeuristics:
             # Y-direction cache locality.  The balance_multiplier alone
             # (−4 % at ratio=256) is insufficient.  A dedicated floor penalty
             # of −20 % at YBLOCK=1 and −10 % at YBLOCK=2 pushes these configs
-            # out of the top-N pool so they are never selected by real-bench:
+            # out of the top-N pool so they are never selected by the autotuner:
             #   YBLOCK ≥ 4: 0 % penalty
             #   YBLOCK = 2: −10 %
             #   YBLOCK = 1: −20 %
@@ -1516,21 +1403,45 @@ class PointwiseHeuristics:
     TRITON_MAX_TILE_NUMEL: int = 1048576   # 2^20
 
     # Hardware register-pressure limit for multi-dimensional tile kernels.
+    # See _max_elems_per_thread() for the device-derived value (replaces the
+    # old hardcoded constant of 32 which was calibrated only for CDNA3/MI300X).
     #
-    # On AMD MI300X each thread has 256 VGPRs (32-bit slots).  A 2-D/3-D
-    # pointwise kernel must hold `tile_size / threads_per_block` data elements
-    # simultaneously in registers while the inner loops are live.  Profiling of
-    # tuning66 shows that, without exception, every config with
-    #   elems_per_thread = tile_size / (num_warps × warp_size) ≥ 64
-    # produces `inf µs` (register spill / PTXASError / OutOfResources).
-    # No config at elems_per_thread ≤ 32 ever spills.  The range 33–63 is
-    # safe for simple kernels but complex fused ops (many transcendentals) can
-    # still spill there – we cap at 32 for conservatism and zero spill risk.
-    #
-    # Mathematically: 32 data elements × 2 VGPRs each = 64 VGPRs for data;
-    # leaving 192 VGPRs for address registers, accumulators, loop variables,
-    # and compiler temps – sufficient for even heavily-fused kernels.
-    MAX_ELEMS_PER_THREAD_MULTIDIM: int = 32  # reject if > this (avoids VGPR spills)
+    # Empirical basis (MI300X, CDNA3):
+    #   elems_per_thread ≥ 64 → always `inf µs` (register spill)
+    #   elems_per_thread ≤ 32 → never spills  ← this was the hardcoded value
+    #   33–63              → safe for simple, risky for heavily-fused ops
+    # The formula below reproduces 32 for CDNA3 and gives 16 for CDNA2,
+    # scaling automatically with the VGPR file size of future architectures.
+
+    @classmethod
+    def _max_elems_per_thread(cls) -> int:
+        """Maximum elements-per-thread before multi-dim tile kernels risk spilling.
+
+        Pointwise kernels run at occupancy_sweetspot_max wavefronts (typically 8
+        on AMD CDNA), so the relevant VGPR budget per thread is:
+
+            vgpr_sweetspot = regs_per_cu / (occupancy_sweetspot_max × warp_size)
+            max_elems      = clamp(vgpr_sweetspot // 8, lo=8, hi=32)
+
+        The //8 divisor means data registers (2 VGPRs/element) consume at most
+        25% of the per-thread budget, reserving 75% for address registers, loop
+        variables, compiler temporaries, and transcendental-function scratch.
+
+        Representative values:
+          CDNA2 (MI250X): 65536 / (8×64) = 128 → max_elems = 16
+          CDNA3 (MI300X): 131072 / (8×64) = 256 → max_elems = 32  (empirical match)
+          fallback (no GPU): 256 → max_elems = 32 (conservative upper bound)
+
+        Clamped to [8, 32]: never go below 8 (kernel still useful) nor above 32
+        (empirically validated spill boundary on the reference architecture).
+        """
+        arch = cls._get_arch()
+        regs_per_cu          = getattr(arch, 'regs_per_cu', 65536)
+        occupancy_sweetspot  = getattr(arch, 'occupancy_sweetspot_max', 8)
+        warp_size            = getattr(arch, 'warp_size', 64)
+        threads_at_sweetspot = max(occupancy_sweetspot * warp_size, 1)
+        vgpr_sweetspot       = regs_per_cu // threads_at_sweetspot
+        return max(8, min(32, vgpr_sweetspot // 8))
 
     @staticmethod
     def generate_all_candidate_configs(problem_metadata: Dict) -> List[Dict]:
@@ -1550,11 +1461,13 @@ class PointwiseHeuristics:
 
         Returns 30–80 configs for 1-D problems, 60–120 for 2-D.
         """
-        problem_dims = PointwiseHeuristics.get_problem_dimensions(problem_metadata)
-        ndims        = len(problem_dims)
-        warp_size    = problem_metadata.get('warp_size', 64)
-        max_threads  = problem_metadata.get('max_threads_per_block', 1024)
-        max_warps    = max_threads // warp_size
+        problem_dims        = PointwiseHeuristics.get_problem_dimensions(problem_metadata)
+        ndims               = len(problem_dims)
+        warp_size           = problem_metadata.get('warp_size', 64)
+        max_threads         = problem_metadata.get('max_threads_per_block', 1024)
+        max_warps           = max_threads // warp_size
+        # Device-derived VGPR guard; see _max_elems_per_thread() for the formula.
+        max_ept             = PointwiseHeuristics._max_elems_per_thread()
 
         warp_candidates    = [1, 2, 4, 8]
         block_sizes_1d     = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -1578,7 +1491,7 @@ class PointwiseHeuristics:
                     # (ept=64 → 16 iterations), 16 copies of the kernel body are
                     # live simultaneously.  For kernels with many transcendental
                     # ops (gelu, exp, tanh, …) or Welford accumulators, this
-                    # pushes VGPR usage past the 256-VGPR MI300X limit, causing
+                    # pushes VGPR usage past the per-thread VGPR limit, causing
                     # n_spills > 32 → bench() returns inf.
                     #
                     # Empirical evidence (tuning68):
@@ -1589,7 +1502,7 @@ class PointwiseHeuristics:
                     # cases where ept=64 was the empirical winner — the second-best
                     # config at ept=32 is within measurement noise.
                     elems_per_thread = xblock / (nw * warp_size)
-                    if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                    if elems_per_thread > max_ept:
                         continue
                     configs.append({'XBLOCK': xblock, 'num_warps': nw})
         
@@ -1617,10 +1530,10 @@ class PointwiseHeuristics:
                             continue
                         # Register-pressure guard: empirically, every 2-D config with
                         # elems_per_thread ≥ 64 spills on AMD MI300X (100% inf rate).
-                        # Cap at MAX_ELEMS_PER_THREAD_MULTIDIM to pre-filter safely.
+                        # max_ept is device-derived; see _max_elems_per_thread().
                         threads_per_block = nw * warp_size
                         elems_per_thread  = tile_size / threads_per_block
-                        if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                        if elems_per_thread > max_ept:
                             continue
                         configs.append({'XBLOCK': xblock, 'YBLOCK': yblock, 'num_warps': nw})
         
@@ -1646,127 +1559,12 @@ class PointwiseHeuristics:
                                 continue
                             threads_per_block = nw * warp_size
                             elems_per_thread  = tile_size / threads_per_block
-                            if elems_per_thread > PointwiseHeuristics.MAX_ELEMS_PER_THREAD_MULTIDIM:
+                            if elems_per_thread > max_ept:
                                 continue
                             configs.append({
                                 'XBLOCK': xblock, 'YBLOCK': yblock,
                                 'ZBLOCK': zblock, 'num_warps': nw,
                             })
-
-        # ── AMD-only: waves_per_eu variants ──────────────────────────────────
-        # waves_per_eu instructs the LLVM AMDGPU backend to reserve register
-        # space for N concurrent wavefronts per Execution Unit (≈ per SIMD).
-        # This trades VGPR budget for inter-block occupancy:
-        #
-        #   waves_per_eu=2 → VGPR budget per thread = 65536 / (threads × 2)
-        #   waves_per_eu=4 → VGPR budget per thread = 65536 / (threads × 4)
-        #
-        # Effect on performance:
-        #   • Memory-bound (simple ops):    lower VGPR need anyway; extra
-        #     co-resident blocks improve HBM pipeline utilisation → FASTER.
-        #   • Compute-heavy (fused kernels): tight budget causes register
-        #     spills → SLOWER.
-        #
-        # Two pre-generation gates prevent creating configs that can never win:
-        #
-        #   Gate 1 — VGPR budget: the tighter per-thread VGPR budget must not
-        #     exceed the estimated kernel VGPR need (same formula as the scorer).
-        #     budget = floor(65536 / (threads × wpe)) rounded to 8-reg granule.
-        #     Avoids generating e.g. XBLOCK=512, num_warps=8, wpe=4 (32 VGPRs)
-        #     which virtually every non-trivial kernel will spill.
-        #
-        #   Gate 2 — Grid size: the problem must have enough grid blocks for the
-        #     hardware scheduler to actually co-reside N wavefronts per SIMD.
-        #     Requires num_blocks_est ≥ num_cus × wpe.  Without this, the extra
-        #     wavefront slots sit empty — pure VGPR cost, zero occupancy gain.
-        #
-        # Only generated on HIP builds when explicitly enabled via env var.
-        # Double guard: _get_is_hip() ensures CUDA is never affected;
-        # _is_waves_per_eu_enabled() requires the opt-in flag so existing
-        # benchmarks are not disrupted until the feature is validated.
-        if PointwiseHeuristics._get_is_hip() and PointwiseHeuristics._is_waves_per_eu_enabled():
-            _arch          = PointwiseHeuristics._get_arch()
-            _num_cus       = getattr(_arch, 'num_cus', 110)
-            _total_el      = problem_metadata.get('total_elements', 1)
-            _ops_pe        = problem_metadata.get('ops_per_element', 3)
-            _load_ops      = problem_metadata.get('load_ops', 0)
-            # VGPR estimate: base overhead + tensor arg overhead + op temporaries.
-            # Use load_ops as proxy for n_input_tensors (+1 for the output).
-            # Multiply by 4 per op (was 2) to better capture actual register usage
-            # in fused kernels with loop-carried state (temporaries across iterations).
-            # Base raised from 16→24 to better capture untracked overhead (index
-            # arithmetic, loop counters, predicate registers, etc.) which is
-            # consistently under-counted, leading to OutOfResources failures.
-            _n_tensors_est = max(3, _load_ops + 1)
-            _vgpr_need     = 24 + _n_tensors_est * 4 + min(int(_ops_pe) * 4, 128)
-
-            # Gate 3: Compute intensity — very simple ops (launch/memory-bound)
-            # don't benefit from the occupancy boost that waves_per_eu provides.
-            # Generating wpe variants for them only adds compilation overhead in
-            # REAL_BENCH mode and can cause measurement noise.
-            # Threshold of 8 weighted ops/element excludes add/mul/leaky_relu/silu
-            # (≤6 ops) while keeping gelu (14), bias_relu, fused, heavy_* kernels.
-            _skip_wpe  = (_ops_pe < 8)
-            _slow_ops  = problem_metadata.get('slow_ops', 0)
-
-            # Gate 4: Dimensionality — skip waves_per_eu for 2D/3D problems.
-            # Multi-dimensional kernels (YBLOCK/ZBLOCK tiling) already leverage
-            # the XBLOCK × YBLOCK × ... grid for occupancy.  Adding waves_per_eu
-            # triples an already-large config space (70 → 200-860+ for 3D shapes)
-            # without empirical benefit (wpe is never chosen for multi-dim shapes
-            # in practice), while REAL_BENCH GPU benchmarking of the expanded set
-            # thermally throttles the GPU, degrading the last few shapes in a
-            # multi-shape benchmark run (3D_batch_video, 3D_odd_*).
-            _problem_ndims = len(PointwiseHeuristics.get_problem_dimensions(problem_metadata))
-            _wpe_allowed_by_dims = (_problem_ndims == 1)
-
-            for _cfg in list(configs):   # snapshot — iterate base configs only
-                if _skip_wpe or not _wpe_allowed_by_dims:
-                    continue
-                nw   = _cfg['num_warps']
-                tile = (  _cfg.get('XBLOCK', 1)
-                        * _cfg.get('YBLOCK', 1)
-                        * _cfg.get('ZBLOCK', 1))
-                _num_blocks_est = max(1, math.ceil(_total_el / max(1, tile)))
-                _threads        = nw * warp_size
-
-                for _wpe in (1, 2, 4):
-                    # wpe=1: signal to LLVM to allocate max VGPRs (1 concurrent
-                    # wave per EU).  Only beneficial for compute-heavy kernels
-                    # dominated by transcendental ops (tanh/sin/cos/exp fused)
-                    # where VGPR pressure — not occupancy — is the bottleneck.
-                    # The VGPR budget at wpe=1 is identical to wpe=0 (256), so
-                    # there is no risk of spilling; the grid gate still applies.
-                    if _wpe == 1:
-                        if _slow_ops < 4:
-                            continue  # only for heavy transcendental fusions
-                        # Grid must have at least num_cus blocks to keep all CUs
-                        # busy (since each EU runs only 1 wave at a time).
-                        if _num_blocks_est < _num_cus:
-                            continue
-                        _new = dict(_cfg)
-                        _new['waves_per_eu'] = 1
-                        configs.append(_new)
-                        continue
-
-                    # Gate 1: VGPR budget — must leave headroom for the compiler.
-                    _raw_budget  = 65536 // max(1, _threads * _wpe)
-                    _wpe_budget  = min(256, (_raw_budget // 8) * 8)
-                    # Hard minimum: a budget below 96 VGPRs is too tight for any
-                    # non-trivial fused kernel.  High-warp configs (num_warps=8)
-                    # with wpe=2 land at exactly 64 VGPRs, which causes systematic
-                    # OutOfResources failures on complex kernels (heavy_mlp,
-                    # heavy_attn, etc.).  Skip these entirely.
-                    if _wpe_budget < 96:
-                        continue   # absolute budget floor; skip
-                    if _vgpr_need >= _wpe_budget * 0.75:
-                        continue   # would spill; skip (tightened from 0.80)
-                    # Gate 2: grid must be large enough to fill the extra slots.
-                    if _num_blocks_est < _num_cus * _wpe:
-                        continue   # slots would be empty; skip
-                    _new = dict(_cfg)
-                    _new['waves_per_eu'] = _wpe
-                    configs.append(_new)
 
         return configs
     
@@ -1788,13 +1586,8 @@ class PointwiseHeuristics:
           - threads_per_block > 1024 (hardware limit)
           - excessively large grids (> 10 M blocks)
 
-        A diversity pass limits the returned list to at most 2 configs per
-        distinct XBLOCK value, ensuring the top-N pool covers multiple block
-        widths.  Without this, XBLOCK=1024 variants (varying only in num_warps)
-        can fill all top-N slots and crowd out XBLOCK=512/256 candidates that
-        the scoring model rates only slightly lower but often win empirically.
-        If the diversity cap would leave fewer than top_n total entries, the
-        remaining slots are filled with overflow configs (uncapped, best-first).
+        Pool quality guarantees (4-warp, YBLOCK≥4, large-XBLOCK, low-warp)
+        ensure important config types are always represented in the candidate pool.
         """
         problem_dims   = PointwiseHeuristics.get_problem_dimensions(problem_metadata)
         total_elements = PointwiseHeuristics.prod(problem_dims)
@@ -1858,9 +1651,9 @@ class PointwiseHeuristics:
         #
         # Defensive recovery: re-admit all dimensionally-valid configs with a
         # neutral score of 0.5, then let the XBLOCK tiebreaker order them by
-        # tile width.  This is strictly better than an empty pool — the real-
-        # bench step (when top_n > 1) will then pick the empirical winner from
-        # a sensible spread of candidates.
+        # tile width.  This is strictly better than an empty pool — the
+        # autotuner will then pick the empirical winner from a sensible spread
+        # of candidates.
         if not scored:
             for cfg in configs:
                 try:
@@ -1874,143 +1667,19 @@ class PointwiseHeuristics:
                 except Exception:
                     continue
 
-        # Primary sort: score descending.  Secondary sort: XBLOCK descending as a
-        # tiebreaker for near-equal scores.
-        #
-        # Why rounding? When Grid is at its floor (0.75) for all configs — which
-        # happens for very large problems where every valid block count far exceeds
-        # the target — all XBLOCK values in a warp-group score identically on Grid,
-        # BW, Launch, and Occ.  However, the bottleneck analysis computes a
-        # different T_overhead per config (more blocks → more overhead), which
-        # shifts the exponents in the geometric mean by ~1e-7.  This tiny
-        # difference makes the sort pick the smallest XBLOCK (first generated)
-        # arbitrarily rather than the more ILP-efficient larger tile.
-        #
-        # Rounding to 4 decimal places collapses configs that differ by < 5e-5 into
-        # a single score bucket, and within a bucket the XBLOCK tiebreaker picks
-        # the largest tile — which empirically tends to win on large streaming
-        # workloads (higher elements-per-thread → better pipelining).
+        # Sort: score descending, XBLOCK descending as tiebreaker.
+        # Rounding to 4 decimal places collapses configs differing by < 5e-5 so
+        # the XBLOCK tiebreaker picks the larger tile within a score bucket.
         scored.sort(
             reverse=True,
             key=lambda x: (round(x[0], 4), x[1].get('XBLOCK', 0)),
         )
 
-        # Diversity pass: ensure the top-N pool covers a wide range of tile widths
-        # AND warp counts.
-        #
-        # Diversity cap rationale:
-        #
-        # Diversity cap rationale (updated):
-        #
-        # For all XBLOCK sizes:  cap = 2 (both nw=4 and nw=8 variants included)
-        #
-        # Previously, large XBLOCK (>256) used cap=1 on the assumption that the
-        # scoring model reliably picked the better warp count.  After the BW
-        # saturation fix (BW is flat at 0.97 for any nw≥4 when the grid has ≥2048
-        # blocks) the scoring intentionally makes nw=4 and nw=8 equivalent — grid
-        # score and XBLOCK size differentiate configs, but warp count is left to
-        # the real bench.  Keeping cap=1 would mean only one of {nw=4, nw=8} per
-        # XBLOCK reaches the bench pool, making the other permanently invisible to
-        # the real-bench stage regardless of how many candidates (TOP_N) are used.
-        #
-        # cap=2 for all XBLOCK ensures that both the 4-warp and 8-warp variants
-        # of the best XBLOCK values are bench-tested.  Empirically:
-        #   - silu / leaky_relu (simple ops):    nw=8 is 15-28 % faster  → bench picks it
-        #   - mul_0 / add_gelu_mul (large tiles): nw=4 is 15 % faster    → bench picks it
-        #   - tanh / multi-SFU kernels (small):   EPT bonus already distinguishes
-        #
-        # The trade-off: top_n=5 now covers ~2-3 distinct XBLOCK values (with both
-        # nw variants each) instead of ~4-5 values (one nw variant each).  Because
-        # the grid-target formula now correctly ranks XBLOCK values, the 2-3
-        # XBLOCK values admitted are the right ones; sacrificing one extra XBLOCK
-        # width to gain the nw discrimination is empirically worthwhile.
-        #
-        # Overflow configs fill any remaining slots so the pool always reaches
-        # exactly top_n entries when enough valid configs exist.
-        # Diversity bucketing:
-        # - 1-D kernels: bucket by XBLOCK (original behaviour).
-        # - 2-D kernels: bucket by (XBLOCK, YBLOCK) so that the top-N pool
-        #   covers a matrix of tile shapes, not just XBLOCK widths.  Without
-        #   this, the diversity cap could pass two (XBLOCK=64, YBLOCK=64, nw=4)
-        #   and (XBLOCK=64, YBLOCK=64, nw=8) while blocking a clearly different
-        #   shape like (XBLOCK=128, YBLOCK=32).
-        # - 3-D kernels: bucket by (XBLOCK, YBLOCK, ZBLOCK) for the same reason.
-        # Cap stays at 2 for all shapes: keep both nw=4 and nw=8 variants.
-        tile_counts: Dict[tuple, int] = {}
-        primary:  List[Tuple[float, Dict]] = []
-        overflow: List[Tuple[float, Dict]] = []
-        for s, cfg in scored:
-            if ndims == 1:
-                tile_key = (cfg.get('XBLOCK', 0),)
-            elif ndims == 2:
-                tile_key = (cfg.get('XBLOCK', 0), cfg.get('YBLOCK', 0))
-            else:
-                tile_key = (cfg.get('XBLOCK', 0), cfg.get('YBLOCK', 0), cfg.get('ZBLOCK', 0))
-            cap = 2  # allow both nw=4 and nw=8 variants per tile shape
-            if tile_counts.get(tile_key, 0) < cap:
-                primary.append((s, cfg))
-                tile_counts[tile_key] = tile_counts.get(tile_key, 0) + 1
-            else:
-                overflow.append((s, cfg))
+        selected = scored[:top_n]
 
-        selected = primary[:top_n]
-        if len(selected) < top_n:
-            selected.extend(overflow[:top_n - len(selected)])
-
-        # Post-diversity rescue: ensure no high-scoring config was stranded in
-        # overflow purely because the diversity cap was already saturated for its
-        # tile shape.
-        #
-        # Problem: the diversity cap of 2 per (XBLOCK[,YBLOCK[,ZBLOCK]]) can
-        # push a config with score ≥ 0.97 to overflow if two configs with the
-        # same tile shape but different num_warps values scored slightly higher.
-        # That config then misses the pool entirely, even though it is a top-tier
-        # scorer overall — the pattern analysis labels these as "≥0.97 scoring
-        # bug — top tier but not rank #1".  They show up as [ACTUAL NOT IN POOL]
-        # regressions despite a nearly-perfect grid+BW+Occupancy score.
-        #
-        # Fix: after building the initial pool, scan the overflow list for any
-        # config that scores at least as well as the weakest current pool member.
-        # Such a config was blocked by diversity, not by a low score; rescuing it
-        # by replacing the weakest member preserves pool size and guarantees that
-        # every config with a competitive score gets a benchmark slot.
-        #
-        # Gate: only apply when top_n ≥ 2 (single-config callers must not be
-        # affected) and only when there is actually an overflow list to rescue from.
-        if top_n >= 2 and selected and overflow:
-            pool_min_score = min(s for s, _ in selected)
-            _rescue_ids    = {id(cfg) for _, cfg in selected}
-            for s_ov, cfg_ov in overflow:
-                # Overflow is sorted descending; once we drop below the pool
-                # minimum there is nothing more to rescue.
-                if s_ov < pool_min_score:
-                    break
-                if id(cfg_ov) in _rescue_ids:
-                    continue
-                # This overflow config was excluded by the diversity cap but
-                # scores at least as well as the current weakest pool member.
-                # Swap it in.
-                selected.sort(key=lambda x: x[0])       # ascending: [0] = weakest
-                selected[0] = (s_ov, cfg_ov)
-                pool_min_score = min(s for s, _ in selected)
-                selected.sort(key=lambda x: x[0], reverse=True)
-                _rescue_ids.add(id(cfg_ov))
-
-        # Four-warp guarantee: ensure at least one num_warps=4 config reaches the
-        # benchmark pool.  Without this, 3-D kernels with many YBLOCK×ZBLOCK shape
-        # variants can fill every diversity-cap slot with 8-warp configs, completely
-        # evicting the 4-warp variants.  Empirically, for compute-heavy fused
-        # kernels (many ops per element), the 4-warp variant often wins because
-        # fewer threads → more VGPRs per thread → the compiler avoids register
-        # spills.  Guaranteeing one slot costs at most one suboptimal benchmark
-        # invocation per problem shape; the runtime overhead is negligible.
-        #
-        # Guard: only apply when top_n ≥ 3.  For top_n=1 (get_optimal_config)
-        # we want the single highest-scoring config unconditionally.
-        #
-        # Implementation: if the selected pool contains no num_warps=4 config, find
-        # the highest-scoring 4-warp config not already selected and swap it in for
-        # the lowest-scored entry currently in the pool.
+        # Four-warp guarantee: ensure at least one num_warps=4 config is in the
+        # pool.  For compute-heavy kernels, fewer threads → more VGPRs per thread
+        # → avoids register spills.  Guard: only apply when top_n ≥ 3.
         if top_n >= 3:
             selected_ids = {id(cfg) for _, cfg in selected}
             has_four_warp = any(cfg.get('num_warps', 8) == 4 for _, cfg in selected)
@@ -2029,12 +1698,10 @@ class PointwiseHeuristics:
         # at least one config with YBLOCK ≥ 4.
         #
         # Rationale: the YBLOCK-floor scoring penalty (−20 % for YBLOCK=1,
-        # −10 % for YBLOCK=2) strongly discourages low-YBLOCK configs in the
-        # primary pool.  However, with the diversity cap at 2 per (XBLOCK,YBLOCK)
-        # tile and a small top_n (e.g. top_n=3), it is possible for all slots to
-        # be filled by high-scoring YBLOCK=2 configs before any YBLOCK≥4 config
-        # is admitted.  This guarantee ensures that even in such edge cases a
-        # balanced tile is always reachable by the real-bench.
+        # −10 % for YBLOCK=2) strongly discourages low-YBLOCK configs, but with
+        # a small top_n (e.g. top_n=3), all slots could be filled by high-scoring
+        # YBLOCK=2 configs before any YBLOCK≥4 config is admitted.  This guarantee
+        # ensures that even in such edge cases a balanced tile is always reachable.
         #
         # Applied to 2-D problems at top_n ≥ 3 only; at top_n=1 we take the
         # highest-scoring config unconditionally (which the scoring model already
@@ -2062,7 +1729,7 @@ class PointwiseHeuristics:
         # (XBLOCK=512–1024).  The higher EPT enables 4-wide vectorised loads
         # (128-bit) per thread, cutting instruction count and improving HBM
         # streaming efficiency.  For complex compute kernels (gelu, tanh) the
-        # large XBLOCK is slower — but the real bench then prefers the scoring
+        # large XBLOCK is slower — but the autotuner then prefers the scoring
         # model's choice, so the cost is just one extra benchmark invocation.
         #
         # Similarly, for smaller 1-D kernels (16 K–512 K elements), ILP-heavy
@@ -2091,7 +1758,7 @@ class PointwiseHeuristics:
         # also ensure the pool contains at least one config with XBLOCK≥4096 nw=2.
         #
         # Rationale: for kernels with transcendental ops (exp, sqrt, var) nw=2 provides
-        # 2× the VGPR budget vs nw=4 (128 vs 64 VGPRs/thread on MI300X at max occupancy).
+        # 2× the VGPR budget vs nw=4 (fewer wavefronts → more VGPRs per thread).
         # With large XBLOCK (EPT=32) this allows the compiler to hold all element-level
         # intermediates in registers without spilling, often outperforming nw=4 by 15-30%.
         # Example: var_7 x=262K — x=4096 nw=2 (9.68µs) >> x=4096 nw=4 (12.56µs).
@@ -2147,23 +1814,6 @@ class PointwiseHeuristics:
 
         return [cfg for _, cfg in selected]
 
-    @staticmethod
-    def get_optimal_config(problem_metadata: Dict) -> Dict:
-        """Return the single highest-scoring config for a problem."""
-        all_configs = PointwiseHeuristics.generate_all_candidate_configs(problem_metadata)
-        top         = PointwiseHeuristics.prune_configs(all_configs, problem_metadata, top_n=1)
-        
-        if top:
-            return top[0]
-        
-        # Safe fallback if all configs were pruned (shouldn't happen in practice).
-        ndims = len(PointwiseHeuristics.get_problem_dimensions(problem_metadata))
-        if ndims == 1:
-            return {'XBLOCK': 256, 'num_warps': 4}
-        elif ndims == 2:
-            return {'XBLOCK': 128, 'YBLOCK': 64, 'num_warps': 8}
-            return {'XBLOCK': 32, 'YBLOCK': 32, 'ZBLOCK': 8, 'num_warps': 8}
-    
     # -------------------------------------------------------------------------
     # Debug / introspection
     # -------------------------------------------------------------------------
@@ -2172,7 +1822,7 @@ class PointwiseHeuristics:
     def get_detailed_scores(config: Dict,
                             problem_metadata: Dict,
                             kernel_code: Optional[str] = None) -> Dict:
-        """Return a per-factor breakdown for debugging and the verbose log table.
+        """Return a per-factor breakdown for debugging and diagnostics.
 
         Returns a dict with keys:
             memory_bandwidth, launch_overhead, grid_granularity, occupancy,

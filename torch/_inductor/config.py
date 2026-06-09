@@ -484,74 +484,32 @@ max_autotune_prune_choices_based_on_shared_mem = (
     == "1"
 )
 
-# Heuristics Real Bench Mode: Full validation of heuristic predictions
-# -------------------------------------------------------------------------
-# When enabled, benchmarks ALL valid configs (not just top 5) to validate
-# heuristic accuracy against real performance.
+# ── Heuristics enable/disable toggles ────────────────────────────────────────
 #
-# Behavior:
-#   True (default):
-#     - Generate & score ALL candidate configs (e.g., 15 configs)
-#     - Benchmark ALL configs for complete validation data
-#     - Select winner from TOP 5 predicted (trust heuristics + safety net)
-#     - Print detailed validation summary comparing:
-#       * Predicted best (rank #1) vs Actual best (from all benchmarked)
-#       * Factor scores breakdown (bandwidth, launch, grid, occupancy)
-#       * Bottleneck analysis (overhead/memory/compute)
-#       * Performance gap and accuracy metrics
+# Master on/off switches for the AMD ROCm pointwise and reduction heuristics.
+# When disabled, the autotuner falls back to standard inductor default configs.
+# These mirror the TORCHINDUCTOR_POINTWISE_HEURISTICS and
+# TORCHINDUCTOR_REDUCTION_HEURISTICS environment variables read in
+# torch/_inductor/runtime/triton_heuristics.py.  Setting either variable via
+# os.environ before importing torch also works; these config entries allow
+# programmatic control (e.g. in tests) without environment-variable mutation.
 #
-#   False:
-#     - Generate & score ALL candidate configs
-#     - Benchmark ONLY top 5 predicted configs (faster, less validation)
-#     - Select winner from benchmarked configs
-#     - No validation summary (can't compare against configs not benchmarked)
-#
-# Use Cases:
-#   - Development: Enable to validate heuristic improvements
-#   - Production: Disable for faster compilation (5-10x speedup vs full autotune)
-#
-# See: HEURISTICS_FLOW.md for complete documentation
-#
-# Environment Variable: TORCHINDUCTOR_HEURISTICS_REAL_BENCH
-# Default: "0" (disabled — use heuristic score only, no compilation benchmarking)
-#
-# Rationale for off-by-default: REAL_BENCH mode compiles *every* candidate
-# Triton config for every kernel at model load time, which can add minutes of
-# wall-clock latency and MBs of compiler cache in production deployments.
-# Enable explicitly (TORCHINDUCTOR_HEURISTICS_REAL_BENCH=1) only when
-# validating heuristic quality or profiling a new architecture.
-heuristics_real_bench: bool = (
-    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH", "0") == "1"
+# Default: True on ROCm builds (heuristics enabled), False on CUDA (no-op).
+# Environment Variables: TORCHINDUCTOR_POINTWISE_HEURISTICS,
+#                        TORCHINDUCTOR_REDUCTION_HEURISTICS
+pointwise_heuristics: bool = (
+    os.environ.get("TORCHINDUCTOR_POINTWISE_HEURISTICS", "1") != "0"
 )
-
-# ── Heuristics real-bench candidate limit ────────────────────────────────────
-#
-# Maximum number of scored configs that REAL_BENCH mode will compile and
-# benchmark.  0 (the default) means unlimited — every generated candidate is
-# compiled and measured.  Set to a positive integer to cap compilation time
-# when the candidate pool is very large (e.g. with waves_per_eu enabled).
-#
-# Environment Variable: TORCHINDUCTOR_HEURISTICS_REAL_BENCH_LIMIT
-# Default: 0 (unlimited — benchmark all candidates)
-heuristics_real_bench_limit: int = int(
-    os.environ.get("TORCHINDUCTOR_HEURISTICS_REAL_BENCH_LIMIT", "0")
+reduction_heuristics: bool = (
+    os.environ.get("TORCHINDUCTOR_REDUCTION_HEURISTICS", "1") != "0"
 )
 
 # ── Heuristics top-N selection pool ──────────────────────────────────────────
 #
-# Number of top-scoring configs that form the "selection pool" for the
-# heuristic winner:
-#
-#   REAL_BENCH mode  (heuristics_real_bench=True):
-#     All candidate configs are compiled and benchmarked (subject to
-#     heuristics_real_bench_limit), but the final kernel is chosen only from
-#     the top-N predicted by the heuristic.  Raising N gives the benchmark
-#     more candidates to pick from (safer); lowering N tests the heuristic
-#     more aggressively.
-#
-#   Heuristics-only mode  (heuristics_real_bench=False):
-#     Only the top-N configs are compiled at all.  Lower = faster compilation;
-#     higher = more robustness if the #1 prediction is occasionally wrong.
+# Number of top-scoring heuristic configs to compile and benchmark.
+# The fastest of those N configs is chosen as the kernel configuration.
+# Lower N → faster compilation; higher N → more robustness against occasional
+# heuristic mis-rankings.
 #
 # Environment Variable: TORCHINDUCTOR_HEURISTICS_TOP_N
 # Default: 5
@@ -561,10 +519,10 @@ heuristics_top_n_configs: int = int(
 
 # ── Heuristics spill fallback buffer ─────────────────────────────────────────
 #
-# In heuristics-only mode (heuristics_real_bench=False), normally only the
-# top-N predicted configs are compiled and benchmarked.  If those N configs
-# all exceed the register-spill threshold at runtime, the autotuner has no
-# valid fallback and is forced to pick the "best" spilling config.
+# Normally only the top-N heuristic configs are compiled and benchmarked.
+# If those N configs all exceed the register-spill threshold at runtime,
+# the autotuner has no valid fallback and is forced to pick the "best"
+# spilling config.
 #
 # When this option is > 0, an additional BUFFER configs (ranked N+1 to N+BUFFER
 # by the heuristic score) are also compiled and benchmarked as a safety net.
@@ -583,15 +541,8 @@ heuristics_spill_fallback_buffer: int = int(
 # ── Heuristics bench repetitions ─────────────────────────────────────────────
 #
 # Number of timed repetitions passed to do_bench for each candidate config
-# when the heuristic is benchmarking multiple candidates to pick a winner.
-# This covers two modes:
-#
-#   heuristics_real_bench=False, top_n > 1  (production mode5):
-#     Only the top-N heuristic configs are compiled; the fastest is chosen.
-#     Higher rep → more reliable ranking, longer first-compile time.
-#
-#   heuristics_real_bench=True  (validation mode):
-#     All configs are compiled and benchmarked; winner is picked from top-N.
+# when the heuristic is benchmarking multiple candidates (top_n > 1).
+# Higher rep → more reliable ranking, longer first-compile time.
 #
 # The standard autotuner uses rep=40.  Increasing this value makes each
 # per-config timing estimate more reliable (lower variance) at the cost of
@@ -606,46 +557,6 @@ heuristics_spill_fallback_buffer: int = int(
 # Default: 40  (matches the standard do_bench rep)
 heuristics_bench_rep: int = int(
     os.environ.get("TORCHINDUCTOR_HEURISTICS_BENCH_REP", "40")
-)
-
-# ── Heuristics XBLOCK diversity pass ─────────────────────────────────────────
-#
-# When enabled, the top-N selection pool enforces a per-XBLOCK cap so that a
-# single XBLOCK value cannot flood all N slots (which happens when one XBLOCK
-# hits the Grid score target exactly and outscores every other XBLOCK variant).
-#
-# Cap rules:
-#   XBLOCK ≤ 256  →  at most 2 configs in the primary pool
-#   XBLOCK > 256  →  at most 1 config in the primary pool
-#
-# Any configs that exceed their cap are placed in an "overflow" list that fills
-# remaining slots *after* the primary pool, so the returned list always has
-# exactly top-N entries when enough valid configs exist.
-#
-# Environment Variable: TORCHINDUCTOR_HEURISTICS_DIVERSITY
-# Default: "0" (disabled – opt-in while under evaluation)
-heuristics_diversity: bool = (
-    os.environ.get("TORCHINDUCTOR_HEURISTICS_DIVERSITY", "0") == "1"
-)
-
-# ── Heuristics verbosity ─────────────────────────────────────────────────────
-#
-# Controls whether the pointwise heuristics system prints detailed diagnostic
-# output: the Kernel & Problem Analysis box, the full per-config scoring table,
-# and the predicted-vs-actual validation summary.
-#
-# When disabled (0), only compact one-liners are printed:
-#   • "[HEURISTICS] REAL_BENCH mode: benchmarking N configs …"
-#   • "[HEURISTICS] Selected from top 5 predicted configs …"
-# This is suitable for production runs where the extra output is noise.
-#
-# When enabled (1, default), all diagnostic tables are printed.
-# Useful during heuristic development and performance analysis.
-#
-# Environment Variable: TORCHINDUCTOR_HEURISTICS_VERBOSE
-# Default: "1" (verbose – matches current behaviour)
-heuristics_verbose: bool = (
-    os.environ.get("TORCHINDUCTOR_HEURISTICS_VERBOSE", "1") == "1"
 )
 
 # Disable triton from trying to initialize and detect devices on the host

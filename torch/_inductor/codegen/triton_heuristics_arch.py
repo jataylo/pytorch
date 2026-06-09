@@ -80,7 +80,9 @@ class ArchitectureConfig:
     num_cus:               int   # Compute units / multiprocessors
     warp_size:             int   # 64 on AMD (wave64), 32 on NVIDIA
     max_threads_per_block: int
+    max_threads_per_cu:    int   # Maximum threads concurrently resident on one CU/SM
     max_wavefronts_per_cu: int
+    regs_per_cu:           int   # Total VGPR file per CU (e.g. 65536 CDNA2, 131072 CDNA3)
     l1_cache_size:         int   # Per-CU L1 in bytes (32 KB for AMD CDNA)
     l2_cache_size:         int   # Total L2 in bytes (e.g. 4 MB on MI350X)
     l3_cache_size:         int   # Infinity Cache / L3 in bytes (0 if absent)
@@ -94,6 +96,9 @@ class ArchitectureConfig:
     occupancy_sweetspot_min:    int   # Min wavefronts/block for latency hiding
     occupancy_sweetspot_max:    int   # Max wavefronts/block before VGPR pressure
     optimal_elements_per_block: int   # Elements/block to amortise launch overhead
+    vgpr_budget_per_thread:     int   # VGPRs available per thread at full occupancy
+                                       # = regs_per_cu // max_threads_per_cu
+                                       # CDNA2: 65536//2048=32, CDNA3: 131072//2048=64
 
     # Raw latency / throughput constants — exposed so callers can recompute
     # optimal_threads with a kernel-specific instructions_per_load value.
@@ -123,6 +128,20 @@ class ArchitectureConfig:
         max_threads_per_block = props.max_threads_per_block
         max_threads_per_cu    = props.max_threads_per_multi_processor
         max_wavefronts_per_cu = max_threads_per_cu // warp_size
+
+        # Total VGPR file size per CU/SM.
+        # AMD:    65 536 on CDNA2 (gfx90a / MI250X),
+        #        131 072 on CDNA3 (gfx942 / MI300X) and CDNA4.
+        # NVIDIA: varies; Ampere SM = 65 536, Hopper = 65 536.
+        # PyTorch exposes this as regs_per_multiprocessor; fall back to the
+        # conservative CDNA2 value (65 536) when not available or reported as 0.
+        regs_per_cu = int(getattr(props, 'regs_per_multiprocessor', 0)) or 65536
+
+        # VGPRs available per thread when the CU/SM is fully occupied.
+        # This is the per-thread VGPR budget at maximum theoretical occupancy.
+        # A reduction kernel that uses more than this many VGPRs for accumulator
+        # registers will prevent full-occupancy scheduling.
+        vgpr_budget_per_thread = regs_per_cu // max(max_threads_per_cu, 1)
 
         # ROCm exposes 'L2_cache_size' (capital); CUDA uses 'l2_cache_size'.
         l2_cache_size = getattr(props, 'L2_cache_size',
@@ -215,10 +234,14 @@ class ArchitectureConfig:
         # ------------------------------------------------------------------
         # Occupancy: wavefront sweet spot
         # ------------------------------------------------------------------
+        # Assume a typical reduction/elementwise kernel uses ~50 VGPRs/thread
+        # (indices + accumulator + temporaries).  Compute how many wavefronts
+        # can be resident on one CU before the VGPR file is exhausted.
+        # Uses the device-queried regs_per_cu so MI300X (131072) and future
+        # parts with larger VGPR files are handled correctly.
         assumed_vgprs_per_thread = 50
-        vgprs_per_cu             = 65536
         vgprs_per_wavefront      = assumed_vgprs_per_thread * warp_size
-        max_wf_by_vgpr           = vgprs_per_cu // vgprs_per_wavefront
+        max_wf_by_vgpr           = regs_per_cu // max(vgprs_per_wavefront, 1)
 
         occupancy_sweetspot_min = 4
         occupancy_sweetspot_max = min(8, max_wf_by_vgpr)
@@ -245,7 +268,9 @@ class ArchitectureConfig:
             num_cus=num_cus,
             warp_size=warp_size,
             max_threads_per_block=max_threads_per_block,
+            max_threads_per_cu=max_threads_per_cu,
             max_wavefronts_per_cu=max_wavefronts_per_cu,
+            regs_per_cu=regs_per_cu,
             l1_cache_size=l1_cache_size,
             l2_cache_size=l2_cache_size,
             l3_cache_size=l3_cache_size,
@@ -256,6 +281,7 @@ class ArchitectureConfig:
             occupancy_sweetspot_min=occupancy_sweetspot_min,
             occupancy_sweetspot_max=occupancy_sweetspot_max,
             optimal_elements_per_block=optimal_elements_per_block,
+            vgpr_budget_per_thread=vgpr_budget_per_thread,
             simd_units=simd_units,
             effective_latency=effective_latency,
             hbm_bytes_per_cycle_per_cu=hbm_bytes_per_cycle_per_cu,
@@ -263,13 +289,22 @@ class ArchitectureConfig:
 
     @classmethod
     def _get_default_config(cls) -> 'ArchitectureConfig':
-        """Conservative fallback when no GPU is available."""
+        """Conservative fallback when no GPU is available.
+
+        Values are conservatively chosen for AMD CDNA2 (MI250X):
+          - regs_per_cu=65536, max_threads_per_cu=2048  →  vgpr_budget_per_thread=32
+        This is the lower bound across all supported AMD CDNA generations, so
+        heuristic pruning will be cautious rather than over-aggressive when no
+        real device is accessible.
+        """
         return cls(
             device_name='CPU (fallback)',
             num_cus=1,
             warp_size=32,
             max_threads_per_block=1024,
+            max_threads_per_cu=2048,
             max_wavefronts_per_cu=32,
+            regs_per_cu=65536,         # conservative CDNA2 value
             l1_cache_size=32 * 1024,
             l2_cache_size=0,
             l3_cache_size=0,
@@ -280,6 +315,7 @@ class ArchitectureConfig:
             occupancy_sweetspot_min=4,
             occupancy_sweetspot_max=8,
             optimal_elements_per_block=1024,
+            vgpr_budget_per_thread=32,  # 65536 // 2048
             simd_units=4,
             effective_latency=275.0,
             hbm_bytes_per_cycle_per_cu=1.8,
@@ -294,7 +330,10 @@ class ArchitectureConfig:
             f"  CUs / SMs              : {self.num_cus}",
             f"  Warp size              : {self.warp_size}",
             f"  Max threads/block      : {self.max_threads_per_block}",
+            f"  Max threads/CU         : {self.max_threads_per_cu}",
             f"  Max wavefronts/CU      : {self.max_wavefronts_per_cu}",
+            f"  VGPR file / CU         : {self.regs_per_cu} "
+                f"({self.vgpr_budget_per_thread} VGPRs/thread at full occupancy)",
             f"  Cache-line             : {cl} B ({cl // 4} FP32 elements)",
             f"  L1 cache (per CU)      : {self.l1_cache_size // 1024} KB",
             f"  L2 cache               : {self.l2_cache_size // 1024} KB"
