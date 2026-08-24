@@ -1,0 +1,140 @@
+{# FlyDSL FlexAttention forward template (ROCm, forward only).
+
+   The FlyDSL analog of flash_attention.py.jinja. Two structural differences from the
+   CuteDSL template, both forced by the kernel this drives:
+
+   - The mods and the launcher are built at *module* level, not inside the kernel body.
+     A FlyDSL flash launcher is produced by a build call that traces the mods at build
+     time, so it must be built once and reused; the kernel body only launches. CuteDSL
+     can define its mods inside the body because `_flash_attn_fwd` takes them as
+     arguments on every call. This does not change how captures are handled: as in
+     CuteDSL, a mod body names only its slot in the `aux` list it is passed, never a
+     kernel argument, so nothing here depends on the mods being rendered after the
+     kernel signature.
+   - No block-mask inputs. This kernel visits partial and fully-unmasked blocks with the
+     same body, so it wants the *union* of the two block lists as one array, not the two
+     lists FlexAttention supplies. Building that union is host-side work per call, so
+     the KV-block-skip path is left to the step that plumbs BlockMask properly; here the
+     KV walk is dense and mask_mod is applied to every element, which is correct but
+     forfeits the sparsity speedup.
+#}
+{{gen_defines()}}
+
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
+    build_flex_flash_generic_module,
+)
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (
+    flex_flash_attn_bhsd,
+)
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_mods import (
+    elementwise,
+    elementwise_mask,
+)
+
+{% if HAS_SCORE_MOD %}
+def _score_mod_scalar(score, b, h, q_idx, kv_idx, aux=None):
+    {{ modification(
+        subgraph_number=0,
+        output_name="score_mod_out",
+        score="score",
+        b="b",
+        h="h",
+        m="q_idx",
+        n="kv_idx",
+    ) | indent_except_first(1) }}
+    return score_mod_out
+
+
+# The lowered body is scalar-shaped; `elementwise` lifts it to the vectorized ABI so the
+# kernel can hand it either one score or MOD_VEC_SIZE contiguous ones.
+score_mod = elementwise(_score_mod_scalar)
+{% else %}
+score_mod = None
+{% endif %}
+
+{% if HAS_MASK_MOD %}
+{# mask_mod is subgraph 1 when there is also a score_mod, else subgraph 0. #}
+{% set mask_subgraph_idx = 1 if HAS_SCORE_MOD else 0 %}
+def _mask_mod_scalar(b, h, q_idx, kv_idx, aux=None):
+    {{ modification(
+        subgraph_number=mask_subgraph_idx,
+        output_name="mask_mod_out",
+        b="b",
+        h="h",
+        m="q_idx",
+        n="kv_idx",
+    ) | indent_except_first(1) }}
+    return mask_mod_out
+
+
+mask_mod = elementwise_mask(_mask_mod_scalar)
+{% else %}
+mask_mod = None
+{% endif %}
+
+{# Both derived from what the mods above turned out to read, so they must come after. #}
+{% if HAS_SCORE_MOD or HAS_MASK_MOD %}
+MOD_KEY = "{{ mod_key(MOD_VEC_SIZE) }}"
+{% else %}
+{# Plain attention: no mod bodies to discriminate, and the builder wants None. #}
+MOD_KEY = None
+{% endif %}
+{# Captured tensors become aux slots as the mods above turn out to read them, so both of
+   these have to be rendered after the mods and neither can be a template argument. #}
+{% set aux_args = get_tensor_buffers() %}
+NUM_AUX_TENSORS = {{ aux_args | length }}
+# (stride_b, stride_h, stride_q, stride_kv) per capture; 0 means broadcast over that axis.
+AUX_SPECS = {{ aux_specs() }}
+
+_LAUNCHER = None
+
+
+def _launcher():
+    """Build the flash launcher once, tracing the mods above into it.
+
+    MOD_KEY is not optional. FlyDSL's JIT cache keys on traced source plus recursively
+    collected scalar closure values, so a constant a mod reads any other way -- a module
+    global, a constexpr above -- is invisible to it, and two generated mods differing
+    only in such a constant would silently share the first one's binary.
+    """
+    global _LAUNCHER
+    if _LAUNCHER is None:
+        _LAUNCHER = build_flex_flash_generic_module(
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            num_kv_heads=NUM_KV_HEADS,
+            causal=False,
+            dtype_str=DTYPE_STR,
+            sm_scale=SM_SCALE,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            mod_key=MOD_KEY,
+            mod_vec_size=MOD_VEC_SIZE,
+            return_lse=True,
+            num_aux_tensors=NUM_AUX_TENSORS,
+            aux_specs=AUX_SPECS,
+            block_mask=False,
+        )
+    return _LAUNCHER
+
+
+{# Only Q/K/V/LSE are declared here. Captures were registered as kernel inputs while the
+   mods above rendered, and def_kernel's signature is a deferred hook, so they still reach
+   the argument list -- under the names `aux_args` holds, in aux-slot order. #}
+{{def_kernel("Q", "K", "V", "LSE")}}
+    out = {{get_output()}}
+
+    {% if aux_args %}
+    # The kernel reads aux as flat contiguous f32, which is what AUX_SPECS describes. Both
+    # calls are no-ops when the capture already satisfies that.
+    aux = [
+        {% for name in aux_args %}
+        {{name}}.to(torch.float32).contiguous(),
+        {% endfor %}
+    ]
+    {% else %}
+    aux = None
+    {% endif %}
+
+    # out and LSE are filled in place.
+    flex_flash_attn_bhsd(_launcher(), Q, K, V, out=out, lse=LSE, aux=aux)

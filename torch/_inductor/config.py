@@ -2793,6 +2793,29 @@ class mtia:
     disable_welford_reduction = False
 
 
+class flydsl:
+    """FlyDSL backend knobs. Currently only the FlexAttention path has any.
+
+    The FlexAttention backend is ROCm-only, experimental and forward only, and is
+    selected only by kernel_options={"BACKEND": "FLYDSL"}; never by AUTO.
+    """
+
+    # Allow architectures whose flex kernel is written but has never been executed on
+    # hardware (currently gfx950). Off by default: "the code exists" is not the same as
+    # "the code works", and the failure mode of an unvalidated attention kernel is wrong
+    # numbers rather than an error.
+    allow_unvalidated_arch: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_ALLOW_UNVALIDATED_ARCH") == "1"
+    )
+
+    # Offer mod_vec_size 1, 2 and 4 as autotune choices instead of just 1. Each is a
+    # separate kernel build, so the compile cost is three JIT compilations rather than
+    # one; worth it when the mod is expensive enough for the vectorization to matter.
+    autotune_mod_vec_size: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_MOD_VEC_SIZE", "1") == "1"
+    )
+
+
 class halide:
     # Base halide target to use for CPU devices
     cpu_target = "host"

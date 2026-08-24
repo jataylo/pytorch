@@ -54,6 +54,10 @@ from .flex_flash_attention import (
     is_trivial_mask_graph,
     is_trivial_score_graph,
 )
+from .flydsl_flash_attention import (
+    _use_flydsl_flash_attention,
+    create_flex_flydsl_attention_kernel,
+)
 
 
 if TYPE_CHECKING:
@@ -236,7 +240,9 @@ def flex_attention(
             score_mod_other_buffers, mask_mod_other_buffers
         )
 
-    if backend == "FLASH":
+    if backend in ("FLASH", "FLYDSL"):
+        # Both read captures as whole tensors at per-axis coordinates rather than through
+        # Inductor's flattened indexing, so the captures have to be real buffers.
         score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
         mask_mod_other_buffers = realize_captures_for_cutedsl(mask_mod_other_buffers)
 
@@ -330,6 +336,37 @@ def flex_attention(
             full_q_indices,
         ]
     )
+
+    if _use_flydsl_flash_attention(
+        query,
+        key,
+        value,
+        subgraph,
+        mask_graph,
+        kernel_options,
+        num_score_mod_placeholders=len(placeholder_inps),
+        backend=backend,
+    ):
+        return create_flex_flydsl_attention_kernel(
+            query,
+            key,
+            value,
+            block_mask,
+            scale,
+            kernel_options,
+            subgraph_buffer,
+            mask_graph_buffer,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+            kv_num_blocks,
+            kv_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+            SPARSE_Q_BLOCK_SIZE,
+            SPARSE_KV_BLOCK_SIZE,
+            mask_graph=mask_graph,
+            subgraph=subgraph,
+        )
 
     if _use_flex_flash_attention(
         subgraph,

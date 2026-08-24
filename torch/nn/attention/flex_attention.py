@@ -137,7 +137,11 @@ __all__ = [
 
 _score_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor, Tensor], Tensor]
 _mask_mod_signature = Callable[[Tensor, Tensor, Tensor, Tensor], Tensor]
-_Backend: TypeAlias = Literal["AUTO", "TRITON", "FLASH", "TRITON_DECODE"]
+_Backend: TypeAlias = Literal["AUTO", "TRITON", "FLASH", "TRITON_DECODE", "FLYDSL"]
+
+# Backends whose kernels write logsumexp in natural log. The Triton kernels work in
+# log2 internally and the wrapper converts, so anything not listed here gets scaled.
+_NATURAL_LOG_LSE_BACKENDS = frozenset({"FLASH", "FLYDSL"})
 _R = TypeVar("_R")
 
 
@@ -269,6 +273,8 @@ class FlexKernelOptions(TypedDict, total=False):
         - "TRITON": Standard Triton flex_attention kernel
         - "TRITON_DECODE": Triton flex_decoding kernel, only available for short sequence lengths with specific configurations
         - "FLASH": Experimental: Flash Attention kernel (cute-dsl), user needs to have flash installed
+        - "FLYDSL": Experimental, ROCm only: FlyDSL flash attention kernel. Requires the
+          ``flydsl`` package and a supported AMD architecture. Forward only.
 
     This option cannot be combined with legacy knobs such as ``FORCE_USE_FLEX_ATTENTION``.
     Raises an error if the requested backend cannot be used. Default: "AUTO"
@@ -2179,9 +2185,9 @@ def _apply_kernel_options(
     # If forward kernel needs to return max is decided by this rule internally.
     if "OUTPUT_MAX" in kernel_options:
         raise AssertionError("OUTPUT_MAX must not be in kernel_options")
-    if kernel_options["BACKEND"] == "FLASH" and output_max:
+    if kernel_options["BACKEND"] in ("FLASH", "FLYDSL") and output_max:
         raise NotImplementedError(
-            "Returning max scores is not supported with BACKEND='FLASH'. "
+            f"Returning max scores is not supported with BACKEND='{kernel_options['BACKEND']}'. "
             "Use return_aux=AuxRequest(lse=True) or omit max_scores."
         )
     kernel_options["OUTPUT_MAX"] = output_max
@@ -2589,7 +2595,8 @@ def flex_attention(
             max_scores,
             return_aux=return_aux,
             return_lse=return_lse,
-            stats_are_log2=kernel_options["BACKEND"] != "FLASH",
+            stats_are_log2=kernel_options["BACKEND"]
+            not in _NATURAL_LOG_LSE_BACKENDS,
         )
 
     if not _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG:
@@ -2636,5 +2643,5 @@ def flex_attention(
         return_aux=return_aux,
         return_lse=return_lse,
         stats_are_log2=_FLEX_ATTENTION_DISABLE_COMPILE_DEBUG
-        or kernel_options["BACKEND"] != "FLASH",
+        or kernel_options["BACKEND"] not in _NATURAL_LOG_LSE_BACKENDS,
     )
