@@ -16,9 +16,12 @@ from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
-from flydsl.expr import buffer_ops
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+# Not `from flydsl.expr import buffer_ops`: that module is gone in FlyDSL 0.3.1, where
+# these helpers moved kernel-side. See flex_kernels/buffer_ops.py.
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
 
 
 @contextmanager

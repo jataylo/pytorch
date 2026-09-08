@@ -183,6 +183,17 @@ class FlyDSLTemplateCaller(ChoiceCaller):
     def __str__(self) -> str:
         return f"FlyDSLTemplateCaller({self.name})"
 
+    def precompile(self) -> None:
+        """Compile ahead of the benchmark loop, in a worker process.
+
+        Defining this at all is what routes FlyDSL choices off the serial path, since the
+        autotune driver dispatches on `hasattr(choice, "precompile")`. It calls this from
+        a thread pool, which on its own buys nothing here -- FlyDSL's compiler does not
+        overlap across threads -- so the request hands the work to a process pool and
+        blocks on it. See `FlyDSLBenchmarkRequest.precompile`.
+        """
+        self.bmreq.precompile()
+
     def benchmark(self, *args, out) -> float:
         return self.bmreq.benchmark(*args, out=out)
 

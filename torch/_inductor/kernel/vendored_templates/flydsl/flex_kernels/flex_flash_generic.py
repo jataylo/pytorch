@@ -3,26 +3,25 @@
 
 """FlexAttention-capable flash-attention forward kernel builder (generic / portable path).
 
-Derived from `kernels/flash_attn_generic.py`. **This is a separate experimental copy** —
-the vendored kernels under `flydsl-rfc/kernels/` are left untouched so the flex work can
-iterate without destabilising them. Re-sync by diffing against the upstream file.
+Derived from FlyDSL's ``flash_attn_generic.py``; re-sync by diffing against that file.
 
 FlexAttention additions over the upstream kernel (forward only):
 
-- ``score_mod(score, b, h, q_idx, kv_idx) -> score`` evaluated at the score site,
-  before the masks, in the FlexAttention score domain (``q·k * sm_scale``).
+- ``score_mod(score, b, h, q_idx, kv_idx) -> score`` evaluated at the score site, before
+  the masks, in the FlexAttention score domain (``q·k * sm_scale``).
 - ``mask_mod(b, h, q_idx, kv_idx) -> bool`` (True = keep) applied after ``score_mod``.
-- ``return_lse``: emit the per-row log-sum-exp that FlexAttention's template signature
-  and backward pass require (upstream computes and discards it).
+- ``return_lse``: emit the per-row log-sum-exp that FlexAttention's template signature and
+  backward pass require (upstream computes and discards it).
 - ``block_mask``: skip whole KV blocks using a ``BlockMask``-style ``kv_indices`` list
-  instead of walking the KV axis densely, with ``mask_mod`` applied only on partial
-  blocks.
+  instead of walking the KV axis densely, with ``mask_mod`` applied only on partial blocks.
 - ``mod_vec_size``: evaluate the mods over 1/2/4 contiguous KV elements at a time.
 - ``aux_tensors``: captured tensors read inside a mod at ``(b, h, q_idx, kv_idx)``.
 
-Removed relative to upstream, to keep the experiment small: the gfx950 DUALWAVE_SWP
-dispatch (see `flex_flash_950.py`), the M128/M256 runtime auto-dispatch (one tile shape
-per build), varlen/cross-seqlen, and the backward pass (none exists upstream either).
+Dropped relative to upstream: the gfx950 DUALWAVE_SWP dispatch (see `flex_flash_950.py`),
+the M128/M256 runtime auto-dispatch (one tile shape per build), varlen/cross-seqlen, and
+the backward pass (none exists upstream either).
+
+Kernel properties:
 
 - True MFMA32 remap: `mfma_f32_32x32x16bf16` / `mfma_f32_32x32x16f16` for both GEMM stages.
 - Tile shape: BLOCK_M=128 or 256 (auto-selected), BLOCK_N=64.
@@ -38,13 +37,13 @@ Layout: Q/K/V/O are 1D flattened from BSHD (batch, seq_len, num_heads, head_dim)
 Grid:   (batch * num_q_tiles * num_heads,) where num_q_tiles = seq_len / BLOCK_M.
 Block:  (256,) or (512,) depending on BLOCK_M.
 
-Requires: head_dim == 128. The inherited claim of "head_dim % 32 == 0, head_dim >= 64" is
+Requires head_dim == 128. The inherited claim of "head_dim % 32 == 0, head_dim >= 64" is
 wrong: 64 builds and returns wrong numbers (~44% relative error), and the other multiples
-of 32 assert during build. See phase1/probe_upstream_head_dim.py.
+of 32 assert during build.
 
-seq_len needs no alignment. The inherited claim of "seq_len % 128 == 0" is stale --
-ragged lengths are handled by the bounds checks in the tile loop, and match eager to the
-same tolerance as aligned ones.
+seq_len needs no alignment. The inherited claim of "seq_len % 128 == 0" is stale: ragged
+lengths are handled by the bounds checks in the tile loop and match eager to the same
+tolerance as aligned ones.
 """
 
 import math as host_math
@@ -55,7 +54,11 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+
+# Not `from flydsl.expr import buffer_ops`: that module is gone in FlyDSL 0.3.1. See
+# the sibling `buffer_ops.py`.
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -103,6 +106,20 @@ def _waitcnt_vm_n(n):
     rocdl.s_waitcnt(val)
 
 
+# Captured-tensor slots in the kernel signature. A FlyDSL kernel's parameter list is a
+# Python `def`, so the slots cannot be generated per build: the signature carries
+# `MAX_AUX_TENSORS` of them unconditionally and unused ones are handed a 1-element dummy.
+# That costs kernel-argument bytes and nothing else -- every read is behind `const_expr`,
+# so an unused slot emits no code and holds no register.
+#
+# Four rather than two because a score_mod and a mask_mod each capturing a tensor or two
+# is ordinary (ALiBi slopes plus a bias, alongside document ids), and two slots made that
+# combination unrepresentable. Raising it further is this constant plus matching entries
+# in the three signatures below, kept honest by `_AUX_SLOT_NAMES`.
+MAX_AUX_TENSORS = 4
+_AUX_SLOT_NAMES = tuple(f"AUX{i}" for i in range(MAX_AUX_TENSORS))
+
+
 def build_flex_flash_generic_module(
     num_heads,
     head_dim,
@@ -124,8 +141,12 @@ def build_flex_flash_generic_module(
     mod_vec_size=1,
     num_aux_tensors=0,
     aux_specs=None,
+    aux_numels=None,
     block_mask=False,
     sparse_kv_block_size=None,
+    layout="bshd",
+    qk_prefetch_depth=2,
+    enable_kv_gpfetch=None,
 ):
     """Build the FlexAttention-capable flash-attention forward launcher.
 
@@ -164,7 +185,8 @@ def build_flex_flash_generic_module(
     ``return_lse`` appends an LSE output (``[B, H, S]`` f32, natural log) to the
     launcher.
 
-    ``num_aux_tensors`` (0-2) enables captured-tensor reads inside the mods. Each
+    ``num_aux_tensors`` (0 to ``MAX_AUX_TENSORS``) enables captured-tensor reads
+    inside the mods. Each
     needs an ``aux_specs`` entry ``(stride_b, stride_h, stride_q, stride_kv)`` of
     element strides, with 0 meaning "broadcast over this axis" — so an ``[H]``
     ALiBi slope table is ``(0, 1, 0, 0)`` and a full ``[B,H,S,S]`` bias is
@@ -174,13 +196,23 @@ def build_flex_flash_generic_module(
     ``block_mask`` switches the KV loop from a dense walk to a ``kv_indices``-driven
     one; ``sparse_kv_block_size`` must then equal the kernel's KV tile
     (``BLOCK_N_OUT``, queryable via ``launcher.kv_block_size``).
+
+    ``layout`` selects the global memory order of Q/K/V/O: ``"bshd"``
+    (``[B, S, H, D]``) or ``"bhsd"`` (``[B, H, S, D]``). Only the four affine
+    coefficients of the global address change; LDS layout, swizzles and the mods are
+    identical, and the mod indices are derived from tile coordinates rather than from
+    memory. ``"bhsd"`` is what ``torch.nn.attention.flex_attention`` hands Inductor, and
+    it also makes each ``(batch, head)`` slice contiguous, so a KV tile is a contiguous
+    run instead of one strided by ``num_heads * head_dim``.
     """
     gpu_arch = get_hip_arch()
 
     if mod_vec_size not in (1, 2, 4):
         raise ValueError(f"mod_vec_size must be 1, 2 or 4 (4 contiguous KV cols per lane), got {mod_vec_size}")
-    if num_aux_tensors not in (0, 1, 2):
-        raise ValueError(f"num_aux_tensors must be 0, 1 or 2, got {num_aux_tensors}")
+    if not (0 <= num_aux_tensors <= MAX_AUX_TENSORS):
+        raise ValueError(
+            f"num_aux_tensors must be 0 to {MAX_AUX_TENSORS}, got {num_aux_tensors}"
+        )
     if (score_mod is not None or mask_mod is not None) and mod_key is None:
         raise ValueError(
             "pass an explicit mod_key when supplying score_mod/mask_mod: the JIT cache key "
@@ -189,6 +221,8 @@ def build_flex_flash_generic_module(
         )
     if block_mask and mask_mod is None:
         raise ValueError("block_mask=True requires a mask_mod (partial blocks need per-element masking)")
+    if layout not in ("bshd", "bhsd"):
+        raise ValueError(f"layout must be 'bshd' ([B,S,H,D]) or 'bhsd' ([B,H,S,D]), got {layout!r}")
 
     if num_kv_heads is None:
         num_kv_heads = num_heads
@@ -205,26 +239,33 @@ def build_flex_flash_generic_module(
     # `flex_flash_950.py` with its own hooks (its score domain differs, so it cannot
     # share this one's mod call sites).
 
-    # Positional index of seq_len in the launcher signature
-    # (Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, AUX0, AUX1, batch_size, seq_len).
-    _SEQ_LEN_ARG = 10
+    # Positional index of the two extents in the launcher signature, which is
+    # (Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, AUX0..AUXn, batch_size, seq_len_q,
+    # seq_len_kv): seven tensors, then the aux slots, then batch_size, so seq_len_q sits
+    # at 8 + n and the KV extent follows it.
+    _SEQ_LEN_Q_ARG = 8 + MAX_AUX_TENSORS
+    _SEQ_LEN_KV_ARG = _SEQ_LEN_Q_ARG + 1
 
-    def _extract_seq_len(args, kwargs):
-        """Return the launch-time seq_len as int, or None if not statically known."""
-        S = args[_SEQ_LEN_ARG] if len(args) > _SEQ_LEN_ARG else kwargs.get("seq_len", None)
+    def _extract_seq_len(args, kwargs, position, name):
+        """Return one launch-time extent as int, or None if not statically known."""
+        S = args[position] if len(args) > position else kwargs.get(name, None)
         try:
             return int(S)
         except (TypeError, ValueError):
             return None
 
     def _guard_seqlen(_dispatched):
-        """Enforce the only correctness floor (seq_len >= 1). A symbolic/non-int
-        seq_len is let through; dense routing is a perf policy, not a bound."""
+        """Enforce the only correctness floor (each extent >= 1). A symbolic/non-int
+        extent is let through; dense routing is a perf policy, not a bound."""
 
         def _guarded(*args, **kwargs):
-            S_int = _extract_seq_len(args, kwargs)
-            if S_int is not None and S_int < 1:
-                raise ValueError(f"flex_flash_generic: seq_len must be >= 1, got {S_int}.")
+            for position, name in (
+                (_SEQ_LEN_Q_ARG, "seq_len_q"),
+                (_SEQ_LEN_KV_ARG, "seq_len_kv"),
+            ):
+                S_int = _extract_seq_len(args, kwargs, position, name)
+                if S_int is not None and S_int < 1:
+                    raise ValueError(f"flex_flash_generic: {name} must be >= 1, got {S_int}.")
             return _dispatched(*args, **kwargs)
 
         if hasattr(_dispatched, "compile"):
@@ -257,6 +298,15 @@ def build_flex_flash_generic_module(
     _has_lds_load_b128 = not gpu_arch.startswith("gfx942")
     ENABLE_DMA = _has_lds_load_b128 and (
         PATH_TAG == "N128" or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
+    )
+    # Stage K global->registers->LDS instead of global->LDS, and carry the next tile's
+    # registers across the loop so its global read overlaps this tile's compute. This is
+    # upstream's main gfx942 lever (`ENABLE_GFX942_KV_GPFETCH`), and it is the gfx942
+    # answer to the DMA-to-LDS prefetch that only gfx950 has the instruction for.
+    ENABLE_KV_GPFETCH = (
+        os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_KV_GPFETCH", "1") == "1"
+        if enable_kv_gpfetch is None
+        else bool(enable_kv_gpfetch)
     )
     ENABLE_LDS_VEC16 = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "1") == "1"
     REDUCE_MODE = os.getenv("FLYDSL_FLASH_ATTN_FUNC_REDUCE_MODE", "xor").strip().lower()
@@ -329,6 +379,28 @@ def build_flex_flash_generic_module(
         aux_specs = [tuple(int(s) for s in spec) for spec in aux_specs]
         if any(len(spec) != 4 for spec in aux_specs):
             raise ValueError("each aux_specs entry must be a 4-tuple of element strides (sb, sh, sq, skv)")
+        # Note [aux reads run past the logical extent]
+        # The mods are evaluated on the whole score tile, padding lanes included, and the
+        # padding is discarded afterwards by the sequence mask. So the aux reader is called
+        # at q rows and kv columns past `seq_len` -- up to a full tile past, plus three more
+        # when `_read.vec` widens the load -- and at the last (b, h) those offsets land off
+        # the end of the captured tensor. At head_dim 128 and seq_len 63 that is element
+        # `numel + 4098`, roughly 16 KB past a [B, H, 63, 63] bias.
+        #
+        # Giving the descriptor the tensor's real size makes the hardware return 0 for those
+        # lanes instead of reading unmapped memory. Valid lanes are unaffected: the host
+        # checks every in-range offset against numel, and aux is f32, so no dword holding
+        # live data can straddle the bound. Hence the size is required, not optional -- the
+        # failure mode without it is a fault whose reproducibility depends on the allocator.
+        if aux_numels is None or len(aux_numels) != num_aux_tensors:
+            raise ValueError(
+                f"aux_numels must supply one element count per aux tensor "
+                f"(num_aux_tensors={num_aux_tensors}); it bounds the buffer descriptor, "
+                "and without it the padding lanes read past the tensor"
+            )
+        aux_numels = [int(n) for n in aux_numels]
+        if any(n <= 0 for n in aux_numels):
+            raise ValueError(f"each aux_numels entry must be a positive element count, got {aux_numels}")
 
     NUM_HEADS_Q = num_heads
     NUM_HEADS_KV = num_kv_heads
@@ -343,39 +415,109 @@ def build_flex_flash_generic_module(
     MOD_VEC = mod_vec_size
     NUM_AUX = num_aux_tensors
     AUX_SPECS = aux_specs or []
+    AUX_NUMELS = aux_numels or []
     RETURN_LSE = bool(return_lse)
     USE_BLOCK_MASK = bool(block_mask)
-    STRIDE_TOKEN_Q = NUM_HEADS_Q * HEAD_DIM
-    STRIDE_TOKEN_KV = NUM_HEADS_KV * HEAD_DIM
+    LAYOUT = layout
+    BHSD = LAYOUT == "bhsd"
+    # Element stride between consecutive tokens of one head. In BSHD a token's heads are
+    # interleaved, so stepping a token steps over every head; in BHSD a head's tokens are
+    # contiguous, so it is just the head width. The other two coefficients (per-head and
+    # per-batch) depend on seq_len and so are formed at launch time, not here.
+    STRIDE_TOKEN_Q = HEAD_DIM if BHSD else NUM_HEADS_Q * HEAD_DIM
+    STRIDE_TOKEN_KV = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
 
     # Mixed into generated symbol names so two builds differing only in a mod cannot
     # collide in the JIT cache (see the mod_key contract in the docstring).
     MOD_TAG = "nomod" if mod_key is None else str(mod_key).replace("-", "_")[:48]
 
     # Bank-conflict-free LDS strides.
-    # K uses XOR swizzle (col ^ ((row & 7) << 4)) at 16-element granularity
-    # instead of padding. This enables ds_read_b128 (stride is 256B-aligned).
-    K_STRIDE = HEAD_DIM
+    # K uses XOR swizzle (col ^ ((row & K_SWZ_ROWMASK) << 4)) at 16-element granularity
+    # where it can, which keeps the row stride at HEAD_DIM and so 256 B aligned for
+    # ds_read_b128, and pads the row where it cannot.
+    # The row mask has to be sized to the row: a fixed 7 swizzles columns up to 127, so at
+    # HEAD_DIM=64 the XOR walks off the end of the row and reads the next one. D=64 must
+    # avoid swizzling past col 63.
+    # ...and it has to be a contiguous mask, which needs HEAD_DIM/16 to be a power of two.
+    # At head_dim 96 it is 6, so the mask is 0b101 and `col ^ 80` leaves a 96-wide row
+    # from col 32 upward. XOR only permutes within a power-of-two extent, so for 96 / 160 /
+    # 192 / 224 the swizzle is off (mask 0 makes every site identity) and the padding below
+    # takes over.
+    K_GRANULES = HEAD_DIM // 16
+    K_SWZ_POW2 = K_GRANULES & (K_GRANULES - 1) == 0
+    K_SWZ_ROWMASK = (K_GRANULES - 1) if K_SWZ_POW2 else 0
+    # Where the swizzle is off, pad the row instead -- it buys the same conflict-freedom
+    # by a different mechanism, and unlike the swizzle it does not care whether the
+    # granule count is a power of two.
+    #
+    # The GEMM1 read is one 128-bit pack per lane at a fixed column, with consecutive
+    # lanes on consecutive rows, so what matters is how far apart in banks two adjacent
+    # rows start. A bare HEAD_DIM stride puts head_dim 192 at 384 B = 96 dwords, an exact
+    # multiple of the 32-bank rotation, so *every* row starts in the same bank: that is
+    # the worst case, and measured 2.6x off. 96 / 160 / 224 land 16 banks apart, a milder
+    # 2-way conflict, and measured ~1.4x off. Eight elements of padding is 16 B = 4 banks,
+    # which is exactly the width one lane reads, so eight consecutive rows tile the 32
+    # banks without overlapping. Sixteen elements spreads no better and costs twice the
+    # LDS, and measured 10-20% worse for it.
+    #
+    # DMA is the one path this cannot serve: it writes LDS contiguously from a lane's
+    # linear id and so fixes the row stride at HEAD_DIM. It is gfx950+ only (gfx94x has
+    # no 16-byte buffer_load_lds), and there the swizzle question is open again.
+    K_PAD = 8 if not K_SWZ_POW2 and not ENABLE_DMA else 0
+    K_STRIDE = HEAD_DIM + K_PAD
     if USE_HW_TR:
         V_STRIDE = HEAD_DIM if ENABLE_DMA else HEAD_DIM + 4
     else:
-        VT_STRIDE = BLOCK_N + 2
+        # V is held transposed, [HEAD_DIM][BLOCK_N]. A plain BLOCK_N stride puts every
+        # row of it in the same LDS bank -- the read is one v4f16 per lane at a fixed
+        # column, so 128 B between lanes lands them all on the same bank pair. Padding
+        # to BLOCK_N + 2 was the fix, and it cost `HEAD_DIM * 2` elements: 512 B at
+        # head_dim 128, which is exactly what pushed the tile from 32768 B to 33280 B
+        # and so from two workgroups per CU to one. Swizzling instead buys the same
+        # conflict-freedom for nothing, the way K already does it.
+        VT_STRIDE = BLOCK_N
         V_STRIDE = VT_STRIDE
 
     # Vectorized cooperative load constants.
+    # How many K packs are read out of LDS before the MFMA chain starts. Deeper hides
+    # more LDS latency and costs registers; past `K_STEPS_QK` there is nothing left to
+    # prefetch and the tail of the loop just stops issuing. Which value wins is
+    # shape-dependent, so this is an autotune knob rather than a constant.
+    QK_PREFETCH_DEPTH = int(qk_prefetch_depth)
+    if QK_PREFETCH_DEPTH < 1:
+        raise ValueError(f"qk_prefetch_depth must be >= 1, got {qk_prefetch_depth}")
+
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
     assert HEAD_DIM % VEC_WIDTH == 0
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    assert BLOCK_SIZE % THREADS_PER_ROW_LOAD == 0
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
 
-    if ROWS_PER_BATCH_LOAD >= BLOCK_N:
-        NUM_BATCHES_KV = 1
-        KV_NEEDS_GUARD = ROWS_PER_BATCH_LOAD > BLOCK_N
-    else:
-        assert BLOCK_N % ROWS_PER_BATCH_LOAD == 0
-        NUM_BATCHES_KV = BLOCK_N // ROWS_PER_BATCH_LOAD
-        KV_NEEDS_GUARD = False
+    if not USE_HW_TR:
+        # Granule is the 4 elements a v4f16 read wants contiguous, so the XOR moves
+        # whole granules and never splits an access.
+        V_SWZ_MASK = BLOCK_N // 4 - 1
+        # The two access patterns step d differently -- the read walks lanes one d
+        # apart, the cooperative store VEC_WIDTH apart -- so a mask taken from d's low
+        # bits alone would be constant across the store's lanes. Folding d's high bits
+        # in with `d ^ (d >> log2(VEC_WIDTH))` makes it vary under both.
+        V_SWZ_DSHIFT = VEC_WIDTH.bit_length() - 1
+    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
+    # A row of the tile is loaded by THREADS_PER_ROW_LOAD lanes, so the workgroup covers
+    # whole rows only when it divides evenly. It does for power-of-two head_dims and does
+    # not for 96 / 160 / 224 (512 % 12, % 20, % 28), where the last lane group is partial.
+    # Rounding down and idling the remainder costs those lanes one load each -- 8 of 512
+    # at head_dim 96 -- which is cheaper than the alternatives (a second geometry, or
+    # padding the tile) and is what makes those head_dims representable at all.
+    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
+    LOAD_HAS_IDLE_LANES = BLOCK_SIZE % THREADS_PER_ROW_LOAD != 0
+
+    # Ceiling, so a tile whose rows do not divide into batches gets a short final batch
+    # rather than dropping its tail.
+    NUM_BATCHES_KV = max(1, -(-BLOCK_N // ROWS_PER_BATCH_LOAD))
+    # One predicate covers both partial cases: idle lanes sit at row >= ROWS_PER_BATCH_LOAD
+    # within their batch, and a short final batch runs past BLOCK_N. Both reduce to
+    # bounding the LDS row, so the guard is needed unless the geometry is exact.
+    KV_NEEDS_GUARD = LOAD_HAS_IDLE_LANES or (
+        NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N
+    )
 
     # K/V circular buffers; defaults to 1/1, optional 3/3 with CK-like LDS sequence.
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
@@ -394,7 +536,7 @@ def build_flex_flash_generic_module(
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,
-        global_sym_name=f"flex_flash_generic_smem_{PATH_TAG}_{MOD_TAG}",
+        global_sym_name=f"flex_flash_generic_smem_{PATH_TAG}_{LAYOUT}_pf{QK_PREFETCH_DEPTH}_{MOD_TAG}",
     )
     lds_kv_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_kv_offset + LDS_KV_TOTAL_SIZE * 2
@@ -414,7 +556,10 @@ def build_flex_flash_generic_module(
         KV_INDICES: fx.Tensor,
         AUX0: fx.Tensor,
         AUX1: fx.Tensor,
-        seq_len: fx.Int32,
+        AUX2: fx.Tensor,
+        AUX3: fx.Tensor,
+        seq_len_q: fx.Int32,
+        seq_len_kv: fx.Int32,
     ):
         elem_dtype = dtype_to_elem_type(dtype_str)
         elem_type = elem_dtype.ir_type
@@ -457,7 +602,8 @@ def build_flex_flash_generic_module(
                 return _mfma(rocdl.mfma_f32_32x32x16_f16, a, b, c)
             return _mfma(rocdl.mfma_f32_32x32x8f16, a, b, c)
 
-        seq_len_v = fx.Index(seq_len)
+        seq_len_q_v = fx.Index(seq_len_q)
+        seq_len_kv_v = fx.Index(seq_len_kv)
 
         # ---- LDS view ----
         base_ptr = allocator.get_base()
@@ -510,7 +656,7 @@ def build_flex_flash_generic_module(
         # Each block computes one Q head (per batch, per Q-tile).
         q_head_idx = block_id % NUM_HEADS_Q
         batch_q_tile_id = block_id // NUM_HEADS_Q
-        num_q_tiles = (seq_len_v + BLOCK_M - 1) // BLOCK_M
+        num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
         q_tile_idx = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
         q_start = q_tile_idx * BLOCK_M
@@ -524,23 +670,71 @@ def build_flex_flash_generic_module(
         load_lane_in_row = tid % THREADS_PER_ROW_LOAD
         load_col_base = load_lane_in_row * VEC_WIDTH
 
+        def _kv_row_valid(lds_row):
+            """Whether this lane's row of the KV tile is one it should store.
+
+            Two ways it is not. The row can sit past the tile, when the tile's rows do
+            not divide into whole batches. Or the lane can belong to a partial row group,
+            which happens when the workgroup does not divide into whole rows: those lanes
+            all land on row ROWS_PER_BATCH_LOAD of their batch, since their `tid`
+            remainder is below THREADS_PER_ROW_LOAD, so one bound excludes the group.
+            """
+            row_valid = lds_row < fx.Index(BLOCK_N)
+            if const_expr(LOAD_HAS_IDLE_LANES):
+                row_valid = row_valid & (
+                    load_row_in_batch < fx.Index(ROWS_PER_BATCH_LOAD)
+                )
+            return row_valid
+
         # ---- Helper: global flat indices ----
         # Q/O are laid out with NUM_HEADS_Q heads; K/V with NUM_HEADS_KV.
-        def global_idx_q(token_idx, col):
-            token = batch_idx * seq_len_v + token_idx
-            return token * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
+        #
+        # Both layouts are affine in (batch, head, token, col); only which axis carries
+        # seq_len differs. BSHD: batch and token are the outer pair and the head sits
+        # inside a token. BHSD: batch and head are the outer pair and tokens are
+        # contiguous within one head, so `slice_*` below is the flat index of this
+        # (batch, head) plane and the tile is a contiguous run.
+        # Defined per layout out here rather than branching inside, so the generated code
+        # carries no trace of the layout it was not built for. `const_expr` because a bare
+        # `if` is rewritten into a dynamic dispatch, which would drop these bindings.
+        if const_expr(BHSD):
+            slice_q = (batch_idx * NUM_HEADS_Q + q_head_idx) * seq_len_q_v
+            slice_kv = (batch_idx * NUM_HEADS_KV + kv_head_idx) * seq_len_kv_v
 
-        def global_idx_kv(token_idx, col):
-            token = batch_idx * seq_len_v + token_idx
-            return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+            def global_idx_q(token_idx, col):
+                return (slice_q + token_idx) * STRIDE_TOKEN_Q + col
+
+            def global_idx_kv(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_KV + col
+
+            def global_byte_kv(token_idx, col_byte):
+                return (slice_kv + token_idx) * fx.Index(STRIDE_TOKEN_KV * 2) + col_byte
+
+        else:
+
+            def global_idx_q(token_idx, col):
+                token = batch_idx * seq_len_q_v + token_idx
+                return token * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
+
+            def global_idx_kv(token_idx, col):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+
+            def global_byte_kv(token_idx, col_byte):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return (
+                    token * fx.Index(STRIDE_TOKEN_KV * 2)
+                    + kv_head_idx * fx.Index(HEAD_DIM * 2)
+                    + col_byte
+                )
 
         def _kv_row_clamp(row_idx):
             # Non-DMA KV loads use raw pointers (no hardware bounds), so clamp the
             # global KV row to the last valid token; partial-tile lanes then read a
             # duplicated in-bounds row whose contribution the score-side causal /
             # padding mask discards. (The DMA path is bounded by num_records.)
-            last = seq_len_v - fx.Index(1)
-            return fx.Index(ArithValue(row_idx < seq_len_v).select(row_idx, last))
+            last = seq_len_kv_v - fx.Index(1)
+            return fx.Index(ArithValue(row_idx < seq_len_kv_v).select(row_idx, last))
 
         def _load_global_half_vec(ptr, base_idx, vec_elems: int):
             gep = buffer_ops.get_element_ptr(ptr, fx.Int64(base_idx), elem_type=elem_type)
@@ -594,29 +788,66 @@ def build_flex_flash_generic_module(
         def v_buf_base(buf_id):
             return fx.Index(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
-        # ---- K XOR swizzle: col ^ ((row & 7) << 4) at 16-element granularity ----
+        # ---- K XOR swizzle: col ^ ((row & K_SWZ_ROWMASK) << 4) at 16-element granularity ----
         def _k_swizzle(row_idx, col_idx):
-            mask = (row_idx & fx.Index(0x7)) << fx.Index(4)
+            mask = (row_idx & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
             return col_idx ^ mask
+
+        # ---- V XOR swizzle, transposed tile only: permutes n within a d row ----
+        # Store and read must agree, so both go through this. `n` keeps its low two
+        # bits, which is what lets the reader still take 4 contiguous elements in one
+        # v4f16: a 4-aligned `n` and its next three land in the same moved granule.
+        def _v_swizzle_t(d_idx, n_idx):
+            m = (d_idx ^ (d_idx >> fx.Index(V_SWZ_DSHIFT))) & fx.Index(V_SWZ_MASK)
+            return (((n_idx >> fx.Index(2)) ^ m) << fx.Index(2)) | (n_idx & fx.Index(3))
+
+        # ---- K staged in two halves, so the global read can run ahead ----
+        # `coop_load_k` below does global->LDS in one call, which pins the tile's global
+        # latency directly in front of the barrier that GEMM1 waits on. Splitting it lets
+        # the loop issue tile i+1's global read before computing tile i (see `_pipe_k`).
+        #
+        # The load is unconditional even under KV_NEEDS_GUARD: `_kv_row_clamp` already
+        # holds the address on the last real row, so an idle lane re-reads a valid row
+        # rather than running off the tensor. Only the *store* is guarded, which is what
+        # keeps the padding rows out of LDS.
+        def coop_load_k_global(tile_start):
+            vecs = []
+            for batch in range_constexpr(NUM_BATCHES_KV):
+                row_offset = batch * ROWS_PER_BATCH_LOAD
+                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
+                g_idx = global_idx_kv(row_idx, load_col_base)
+                vecs.append(load_global_f16xN(k_ptr, g_idx))
+            return vecs
+
+        def coop_store_k_lds(vecs, buf_id=0):
+            k_base = k_buf_base(buf_id)
+            for batch in range_constexpr(NUM_BATCHES_KV):
+                row_offset = batch * ROWS_PER_BATCH_LOAD
+                lds_row = load_row_in_batch + row_offset
+                lds_idx = k_base + lds_row * K_STRIDE + _k_swizzle(lds_row, load_col_base)
+                if const_expr(KV_NEEDS_GUARD):
+                    if _kv_row_valid(lds_row):
+                        Vec(vecs[batch]).store(lds_kv, [lds_idx])
+                else:
+                    Vec(vecs[batch]).store(lds_kv, [lds_idx])
 
         # ---- Cooperative K load (row-major, XOR-swizzled) ----
         def coop_load_k(tile_start, buf_id=0):
             k_base = k_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
+                lds_row = load_row_in_batch + row_offset
+                row_idx = _kv_row_clamp(tile_start + lds_row)
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = _kv_row_valid(lds_row)
                     if row_valid:
                         g_idx = global_idx_kv(row_idx, load_col_base)
-                        lds_row = load_row_in_batch + row_offset
                         swz_col = _k_swizzle(lds_row, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + swz_col
                         vec = load_global_f16xN(k_ptr, g_idx)
                         Vec(vec).store(lds_kv, [lds_idx])
                 else:
                     g_idx = global_idx_kv(row_idx, load_col_base)
-                    lds_row = load_row_in_batch + row_offset
                     swz_col = _k_swizzle(lds_row, load_col_base)
                     lds_idx = k_base + lds_row * K_STRIDE + swz_col
                     vec = load_global_f16xN(k_ptr, g_idx)
@@ -631,7 +862,7 @@ def build_flex_flash_generic_module(
             for _e in range_constexpr(VEC_WIDTH):
                 elem = Vec(vec)[_e]
                 vt_d = load_col_base + _e
-                vt_idx = v_base + vt_d * VT_STRIDE + lds_row
+                vt_idx = v_base + vt_d * VT_STRIDE + _v_swizzle_t(vt_d, lds_row)
                 v1 = Vec.from_elements([elem], elem_dtype)
                 v1.store(lds_kv, [vt_idx])
 
@@ -641,17 +872,16 @@ def build_flex_flash_generic_module(
             v_base = v_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
+                lds_row = load_row_in_batch + row_offset
+                row_idx = _kv_row_clamp(tile_start + lds_row)
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = _kv_row_valid(lds_row)
                     if row_valid:
                         g_idx = global_idx_kv(row_idx, load_col_base)
-                        lds_row = load_row_in_batch + row_offset
                         vec = load_global_f16xN(v_ptr, g_idx)
                         _v_store_to_lds(v_base, lds_row, vec)
                 else:
                     g_idx = global_idx_kv(row_idx, load_col_base)
-                    lds_row = load_row_in_batch + row_offset
                     vec = load_global_f16xN(v_ptr, g_idx)
                     _v_store_to_lds(v_base, lds_row, vec)
 
@@ -670,20 +900,29 @@ def build_flex_flash_generic_module(
             v_base = v_buf_base(buf_id)
             for batch in range_constexpr(NUM_BATCHES_KV):
                 row_offset = batch * ROWS_PER_BATCH_LOAD
+                lds_row = load_row_in_batch + row_offset
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
+                    row_valid = _kv_row_valid(lds_row)
                     if row_valid:
-                        lds_row = load_row_in_batch + row_offset
                         _v_store_to_lds(v_base, lds_row, vecs[batch])
                 else:
-                    lds_row = load_row_in_batch + row_offset
                     _v_store_to_lds(v_base, lds_row, vecs[batch])
 
-        # Per-batch num_records bound: rows >= seq_len read/write past this batch's
-        # region, so OOB loads return 0 and OOB stores drop (arbitrary-seqlen safe;
-        # aligned hot path unchanged). Same asm trick, used for K/V/Q loads + O-store.
-        _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
-        _q_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
+        # num_records bound: rows past their own extent read/write past the region this
+        # block owns,
+        # so OOB loads return 0 and OOB stores drop (arbitrary-seqlen safe; aligned hot
+        # path unchanged). Same asm trick, used for K/V/Q loads + O-store.
+        #
+        # The bound is the end of the innermost region that is contiguous in the layout
+        # and whose tail this block would run into: the batch in BSHD, and the tighter
+        # (batch, head) plane in BHSD, where a row past seq_len would otherwise land in
+        # the next head's tokens rather than past the end of the tensor.
+        if const_expr(BHSD):
+            _kv_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_KV * 2))
+            _q_nrec_bytes = _raw((slice_q + seq_len_q_v) * fx.Index(STRIDE_TOKEN_Q * 2))
+        else:
+            _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_KV * 2))
+            _q_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
         q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=False, num_records_bytes=_q_nrec_bytes)
         o_rsrc = buffer_ops.create_buffer_resource(O, max_size=False, num_records_bytes=_q_nrec_bytes)
 
@@ -718,13 +957,12 @@ def build_flex_flash_generic_module(
 
                     row_in_tile = tid // LANES_PER_K_ROW + fx.Index(d * ROWS_PER_DMA_BATCH)
                     swiz_col_f16 = (tid % LANES_PER_K_ROW) * (DMA_BYTES // 2)
-                    xor_mask = (row_in_tile & fx.Index(0x7)) << fx.Index(4)
+                    # Same row mask as _k_swizzle: sized to HEAD_DIM, not fixed at 7,
+                    # or the XOR walks past the end of a 64-wide row.
+                    xor_mask = (row_in_tile & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_row = batch_idx * seq_len_v + tile_start + row_in_tile
-                    global_byte = (
-                        global_row * fx.Index(STRIDE_TOKEN_KV * 2) + kv_head_idx * fx.Index(HEAD_DIM * 2) + col_byte
-                    )
+                    global_byte = global_byte_kv(tile_start + row_in_tile, col_byte)
                     voffset = fx.Int32(global_byte)
 
                     rocdl.raw_ptr_buffer_load_lds(
@@ -766,10 +1004,7 @@ def build_flex_flash_generic_module(
                     xor_mask = (row_in_tile & fx.Index(0x3)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_row = batch_idx * seq_len_v + tile_start + row_in_tile
-                    global_byte = (
-                        global_row * fx.Index(STRIDE_TOKEN_KV * 2) + kv_head_idx * fx.Index(HEAD_DIM * 2) + col_byte
-                    )
+                    global_byte = global_byte_kv(tile_start + row_in_tile, col_byte)
                     voffset = fx.Int32(global_byte)
 
                     rocdl.raw_ptr_buffer_load_lds(
@@ -852,9 +1087,13 @@ def build_flex_flash_generic_module(
             return _read
 
         if const_expr(NUM_AUX > 0):
-            _aux_bufs = [AUX0, AUX1][:NUM_AUX]
+            _aux_bufs = [AUX0, AUX1, AUX2, AUX3][:NUM_AUX]
             _aux_readers = [
-                _make_aux_reader(buffer_ops.create_buffer_resource(_buf, max_size=True), AUX_SPECS[_i])
+                _make_aux_reader(
+                    # See Note [aux reads run past the logical extent]
+                    buffer_ops.create_buffer_resource(_buf, num_records_bytes=4 * AUX_NUMELS[_i]),
+                    AUX_SPECS[_i],
+                )
                 for _i, _buf in enumerate(_aux_bufs)
             ]
             _mod_kw = {"aux": _aux_readers}
@@ -894,9 +1133,9 @@ def build_flex_flash_generic_module(
         # comes from -- masking alone still pays for the tile.
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Index(ArithValue(_q_end < seq_len_v).select(_q_end, seq_len_v))
+            kv_upper = fx.Index(ArithValue(_q_end < seq_len_kv_v).select(_q_end, seq_len_kv_v))
         else:
-            kv_upper = seq_len_v
+            kv_upper = seq_len_kv_v
 
         if const_expr(USE_BLOCK_MASK):
             # kv_num_blocks [B, H_q, num_q_blocks] i32
@@ -905,7 +1144,7 @@ def build_flex_flash_generic_module(
             # here would need a second stride set for no real gain.
             _nb_rsrc = buffer_ops.create_buffer_resource(KV_NUM_BLOCKS, max_size=True)
             _kvi_rsrc = buffer_ops.create_buffer_resource(KV_INDICES, max_size=True)
-            _kv_blocks_total = (seq_len_v + fx.Index(BLOCK_N_OUT - 1)) // fx.Index(BLOCK_N_OUT)
+            _kv_blocks_total = (seq_len_kv_v + fx.Index(BLOCK_N_OUT - 1)) // fx.Index(BLOCK_N_OUT)
             _qblk_lin = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * num_q_tiles + q_tile_idx
             _n_visit = fx.Index(
                 fx.Int32(buffer_ops.buffer_load(_nb_rsrc, _raw(fx.Int32(_qblk_lin)), vec_width=1, dtype=T.i32))
@@ -915,8 +1154,19 @@ def build_flex_flash_generic_module(
         else:
             _kv_lo, _kv_hi, _kv_step = 0, kv_upper, BLOCK_N_OUT
 
-        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf)]
+        # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
+        #                (next tile's K vecs if _pipe_k)]
         _use_dma_dbuf = ENABLE_DMA and not ENABLE_PREFETCH_3BUF
+        # Carrying K registers across the loop only makes sense when there is exactly one
+        # subtile per iteration (otherwise the "next" tile is the next subtile and the
+        # existing double-buffering already covers it) and when nothing else is already
+        # prefetching K.
+        _pipe_k = (
+            ENABLE_KV_GPFETCH
+            and not _use_dma_dbuf
+            and not ENABLE_PREFETCH_3BUF
+            and N_SUBTILES == 1
+        )
         # A mod can leave a whole KV tile -inf for a given row -- a mask_mod that
         # rejects it, or (just as legally) a score_mod written as
         # `where(cond, score, -inf)`. Then m_running and the tile max are both -inf,
@@ -934,33 +1184,77 @@ def build_flex_flash_generic_module(
         init_args = [c_neg_floor if HAS_ANY_MOD else c_neg_inf, c_zero_f]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(c_zero_v16f32)
-        if const_expr(_use_dma_dbuf):
-            init_args.append(fx.Index(0))
-            coop_dma_k(fx.Index(0), buf_id=0)
+        def _kv_tile_start(iv):
+            """Absolute KV row this iteration's tile starts at.
 
-        loop_results = init_args
-        for _kv_iv, inner_iter_args in range(_kv_lo, _kv_hi, _kv_step, init=init_args):
+            Dense walks step the induction variable directly; a block-mask walk uses it to
+            index the tile list instead. Only ever called for a live iteration -- anything
+            reaching past the walk must go through `_kv_prefetch_tile_start`.
+            """
             if const_expr(USE_BLOCK_MASK):
-                # Gather this iteration's KV tile from the index list. Everything
-                # downstream (prefetch addresses, masks, the mod site) already derives
-                # from kv_block_start, so it does not care that the value stopped being
-                # the affine loop induction variable.
-                kv_block_start = (
+                return (
                     fx.Index(
                         fx.Int32(
                             buffer_ops.buffer_load(
-                                _kvi_rsrc, _raw(fx.Int32(_kvi_base + _kv_iv)), vec_width=1, dtype=T.i32
+                                _kvi_rsrc, _raw(fx.Int32(_kvi_base + iv)), vec_width=1, dtype=T.i32
                             )
                         )
                     )
                     * fx.Index(BLOCK_N_OUT)
                 )
-            else:
-                kv_block_start = _kv_iv
+            return iv
+
+        def _kv_prefetch_tile_start(iv):
+            """Tile start for a prefetch, which may be asked for a tile past the walk.
+
+            The last iteration's lookahead asks for one tile beyond the end, and so does
+            the prime of a walk with no tiles at all. Under a block mask that indexes the
+            tile list out of range, and the value read back is load-bearing: `_kv_row_clamp`
+            bounds only the *top*, so a stale negative int32 there becomes a negative row
+            and addresses off the front of the tensor. That is a memory fault whose
+            reachability depends on what the allocator left in that slot, which is exactly
+            the kind that passes a test suite and then dies in a benchmark.
+
+            So clamp the list index to the last live entry, and the tile to a non-negative
+            row. A prefetch can then only re-read a tile the walk already covers, which is
+            wasted bandwidth on one iteration and nothing worse. The dense walk needs
+            neither: an index past the end is a large positive row, which the row clamp
+            already handles.
+            """
+            if const_expr(not USE_BLOCK_MASK):
+                return iv
+            _last_iv = _kv_hi - fx.Index(1)
+            _iv_hi = fx.Index(ArithValue(iv < _kv_hi).select(iv, _last_iv))
+            _iv_safe = fx.Index(ArithValue(_iv_hi < fx.Index(0)).select(fx.Index(0), _iv_hi))
+            _tile = _kv_tile_start(_iv_safe)
+            return fx.Index(ArithValue(_tile < fx.Index(0)).select(fx.Index(0), _tile))
+
+        if const_expr(_use_dma_dbuf):
+            init_args.append(fx.Index(0))
+            coop_dma_k(fx.Index(0), buf_id=0)
+        if const_expr(_pipe_k):
+            # Prime the pipeline with the first tile's global read. Under a block mask the
+            # first tile is whatever the index list names, not 0, so read it from the list
+            # rather than assuming the dense walk's start.
+            _k0_vecs = coop_load_k_global(_kv_prefetch_tile_start(fx.Index(_kv_lo)))
+            for _kb in range_constexpr(NUM_BATCHES_KV):
+                init_args.append(_k0_vecs[_kb])
+
+        loop_results = init_args
+        for _kv_iv, inner_iter_args in range(_kv_lo, _kv_hi, _kv_step, init=init_args):
+            # Everything downstream (prefetch addresses, masks, the mod site) derives from
+            # kv_block_start, so it does not care that under a block mask the value stopped
+            # being the affine loop induction variable.
+            kv_block_start = _kv_tile_start(_kv_iv)
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             _cur_buf_id = inner_iter_args[2 + D_CHUNKS] if _use_dma_dbuf else None
+            _carried_k_vecs = (
+                [inner_iter_args[2 + D_CHUNKS + _kb] for _kb in range_constexpr(NUM_BATCHES_KV)]
+                if _pipe_k
+                else None
+            )
             preload_k_count = NUM_PREFETCH_K if NUM_PREFETCH_K < N_SUBTILES else N_SUBTILES
 
             if const_expr(ENABLE_PREFETCH_3BUF):
@@ -1004,18 +1298,42 @@ def build_flex_flash_generic_module(
                     k_base = k_buf_base(_k_buf_id)
                 else:
                     k_slot = 0
-                    coop_load_k(kv_start, k_slot)
+                    if const_expr(_pipe_k):
+                        # The carried registers are this tile's K, already in flight since
+                        # the previous iteration. Land them in LDS, then immediately issue
+                        # the *next* tile's global read so its latency sits under this
+                        # tile's GEMMs rather than in front of them. The dswr hint keeps
+                        # the LDS writes together instead of letting the scheduler
+                        # interleave them with the reads that follow the barrier.
+                        _next_kv_start = _kv_prefetch_tile_start(_kv_iv + fx.Index(_kv_step))
+                        _waitcnt_vm_n(0)
+                        coop_store_k_lds(_carried_k_vecs, k_slot)
+                        rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
+                        _next_k_vecs = coop_load_k_global(_next_kv_start)
+                    elif const_expr(ENABLE_KV_GPFETCH):
+                        # Same split without the loop carry: still worth a little, because
+                        # the store side can be scheduled apart from the global read.
+                        _kv_k_vecs = coop_load_k_global(kv_start)
+                        coop_store_k_lds(_kv_k_vecs, k_slot)
+                        rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
+                    else:
+                        coop_load_k(kv_start, k_slot)
                     gpu.barrier()
                 if const_expr(not _use_dma_dbuf):
                     k_base = k_buf_base(k_slot)
 
-                if const_expr(not USE_HW_TR or (not ENABLE_DMA and not ENABLE_PREFETCH_3BUF)):
+                # V's global read is deferred into GEMM1 below when gpfetch is on, so its
+                # latency sits under the QK MFMA chain instead of stacking with K's.
+                if const_expr(
+                    not ENABLE_KV_GPFETCH
+                    and (not USE_HW_TR or (not ENABLE_DMA and not ENABLE_PREFETCH_3BUF))
+                ):
                     _v_vecs_prefetch = coop_load_v_global(kv_start)
 
                 # ==== GEMM1: bulk-read all K packs, then pipeline MFMAs ====
                 k_hi_offset = K_SUB_N * K_STRIDE
-                # XOR swizzle: col ^ ((row & 0x7) << 4) avoids LDS bank conflicts
-                k_swz_mask = (lane_mod_32 & fx.Index(0x7)) << fx.Index(4)
+                # XOR swizzle: col ^ ((row & K_SWZ_ROWMASK) << 4) avoids LDS bank conflicts
+                k_swz_mask = (lane_mod_32 & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
 
                 def _k_idx_lo(ks):
                     col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
@@ -1025,12 +1343,18 @@ def build_flex_flash_generic_module(
                     col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
                     return k_base + k_hi_offset + lane_mod_32 * K_STRIDE + (col ^ k_swz_mask)
 
-                _QK_PREFETCH_DEPTH = 2
+                _QK_PREFETCH_DEPTH = QK_PREFETCH_DEPTH
                 k_packs_lo = [None] * K_STEPS_QK
                 k_packs_hi = [None] * K_STEPS_QK
                 for p in range_constexpr(_QK_PREFETCH_DEPTH):
                     k_packs_lo[p] = Vec.load(mfma_pack_type, lds_kv, [_k_idx_lo(p)])
                     k_packs_hi[p] = Vec.load(mfma_pack_type, lds_kv, [_k_idx_hi(p)])
+                if const_expr(_QK_PREFETCH_DEPTH > 2):
+                    # Upstream pairs a deeper prefetch with this hint (mainline #850, on by
+                    # default for gfx942). Without it the scheduler is free to spread the
+                    # extra ds_reads through the MFMA chain, which is what made a bare
+                    # depth bump regress; grouping them keeps the prefetch a prefetch.
+                    rocdl.sched_group_barrier(rocdl.mask_dsrd, _QK_PREFETCH_DEPTH * 2, 0)
 
                 if const_expr(ENABLE_DMA and not ENABLE_PREFETCH_3BUF):
                     coop_dma_v(kv_start, 0)
@@ -1039,6 +1363,8 @@ def build_flex_flash_generic_module(
                 s_acc_lo = c_zero_v16f32
                 s_acc_hi = c_zero_v16f32
                 for ks in range_constexpr(K_STEPS_QK):
+                    if const_expr(ENABLE_KV_GPFETCH and ks == 0):
+                        _v_vecs_prefetch = coop_load_v_global(kv_start)
                     s_acc_lo = mfma_acc(k_packs_lo[ks], q_b_packs[ks], s_acc_lo)
                     s_acc_hi = mfma_acc(k_packs_hi[ks], q_b_packs[ks], s_acc_hi)
                     if const_expr(ks + _QK_PREFETCH_DEPTH < K_STEPS_QK):
@@ -1262,13 +1588,13 @@ def build_flex_flash_generic_module(
                         s_raw_hi_15,
                     ]
                 else:
-                    # Non-causal KV padding mask: keys with absolute column >= seq_len
+                    # Non-causal KV padding mask: keys with absolute column >= seq_len_kv
                     # -> -inf, so OOB KV (0 or duplicated row) doesn't leak into softmax.
                     # Col layout (mirrors causal): lo = kv_start + lane_div_32*4 +
                     # ((r//4)*8 + r%4); hi = +K_SUB_N.
                     kv_start_i32 = fx.Int32(kv_start)
                     lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
-                    seq_len_i32 = fx.Int32(seq_len_v)
+                    seq_len_i32 = fx.Int32(seq_len_kv_v)
                     for r in range_constexpr(16):
                         _off = (r // 4) * 8 + (r % 4)
                         kv_col = kv_start_i32 + lane_off_i32 + fx.Int32(_off)
@@ -1459,8 +1785,11 @@ def build_flex_flash_generic_module(
                     else:
                         d_pos = fx.Index(dc * D_CHUNK) + lane_mod_32
                         k_base = fx.Index(pks * PV_K_STEP) + lane_div_32 * 4
-                        v_lo_idx = v_base + d_pos * VT_STRIDE + k_base
-                        v_hi_idx = v_lo_idx + fx.Index(K_SUB_N)
+                        # The hi half is a separate swizzle, not `lo + K_SUB_N`: the XOR
+                        # moves the two granules independently.
+                        _row = v_base + d_pos * VT_STRIDE
+                        v_lo_idx = _row + _v_swizzle_t(d_pos, k_base)
+                        v_hi_idx = _row + _v_swizzle_t(d_pos, k_base + fx.Index(K_SUB_N))
                         vl = Vec.load(v4f16_type, lds_kv, [v_lo_idx])
                         vh = Vec.load(v4f16_type, lds_kv, [v_hi_idx])
                     return vl, vh
@@ -1475,8 +1804,15 @@ def build_flex_flash_generic_module(
                         v_lo_nxt, v_hi_nxt = _read_v_pack(si + 1)
                     o_accs[dc] = mfma_acc(v_lo_cur, p_packs_lo[pks], o_accs[dc])
                     o_accs[dc] = mfma_acc(v_hi_cur, p_packs_hi[pks], o_accs[dc])
-                    if const_expr(not USE_HW_TR and dc == 0 and pks < D_CHUNKS - 1):
-                        o_accs[pks + 1] = Vec(o_accs[pks + 1]) * corr_vec
+                    # Chunk 0 was rescaled eagerly above; the rest are deferred into this
+                    # loop to hide the multiply behind the MFMAs. Schedule chunk `si + 1`
+                    # at flat step `si`, which is in time because `_steps` is dc-major so
+                    # chunk `c` is first read at step `c * PV_K_STEPS >= c`. Keying off
+                    # `pks` instead would cap the schedule at `PV_K_STEPS` rescales, which
+                    # is why head_dim 256 (8 chunks, 4 steps) silently left chunks 5-7
+                    # unscaled and wrong from d160 up.
+                    if const_expr(not USE_HW_TR and si + 1 < D_CHUNKS):
+                        o_accs[si + 1] = Vec(o_accs[si + 1]) * corr_vec
                     if const_expr(si + 1 < TOTAL_PV):
                         v_lo_cur = v_lo_nxt
                         v_hi_cur = v_hi_nxt
@@ -1490,6 +1826,9 @@ def build_flex_flash_generic_module(
                     _yield_args.append(fx.Index(1) - _cur_buf_id)
                 else:
                     _yield_args.append(_cur_buf_id)
+            if const_expr(_pipe_k):
+                for _kb in range_constexpr(NUM_BATCHES_KV):
+                    _yield_args.append(_next_k_vecs[_kb])
             loop_results = yield _yield_args
 
         # ---- Normalize and store O (128-bit buffer_store_dwordx4) ----
@@ -1517,9 +1856,9 @@ def build_flex_flash_generic_module(
             lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
             # Layout [B, H_q, S]. Lanes 0-31 and 32-63 hold the same 32 rows (the row
             # reduction is a half-wave xor shuffle), so only the low half stores.
-            lse_idx = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * seq_len_v + q_row
+            lse_idx = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * seq_len_q_v + q_row
             if ArithValue(lane_div_32 == fx.Index(0)):
-                if ArithValue(q_row < seq_len_v):
+                if ArithValue(q_row < seq_len_q_v):
                     buffer_ops.buffer_store(_raw(fx.Float32(lse_val)), lse_rsrc, _raw(fx.Int32(lse_idx)))
 
         inv_l = rocdl.rcp(T.f32, l_final)
@@ -1596,8 +1935,11 @@ def build_flex_flash_generic_module(
         KV_INDICES: fx.Tensor,
         AUX0: fx.Tensor,
         AUX1: fx.Tensor,
+        AUX2: fx.Tensor,
+        AUX3: fx.Tensor,
         batch_size: fx.Int32,
-        seq_len: fx.Int32,
+        seq_len_q: fx.Int32,
+        seq_len_kv: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -1606,7 +1948,7 @@ def build_flex_flash_generic_module(
             allocator.finalize()
 
         bs_idx = fx.Index(batch_size)
-        sl_idx = fx.Index(seq_len)
+        sl_idx = fx.Index(seq_len_q)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
 
@@ -1629,7 +1971,10 @@ def build_flex_flash_generic_module(
             KV_INDICES,
             AUX0,
             AUX1,
-            seq_len,
+            AUX2,
+            AUX3,
+            seq_len_q,
+            seq_len_kv,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": (
@@ -1662,7 +2007,9 @@ def build_flex_flash_generic_module(
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return launch_flex_flash_generic(*args, **kwargs)
 
-    def _compile(Q, K, V, O, LSE, KVNB, KVI, AUX0, AUX1, batch_size, seq_len, stream=None):  # noqa: E741
+    def _compile(  # noqa: E741
+        Q, K, V, O, LSE, KVNB, KVI, AUX0, AUX1, AUX2, AUX3, batch_size, seq_len_q, seq_len_kv, stream=None
+    ):
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return flyc.compile(
                 launch_flex_flash_generic,
@@ -1675,8 +2022,11 @@ def build_flex_flash_generic_module(
                 KVI,
                 AUX0,
                 AUX1,
+                AUX2,
+                AUX3,
                 batch_size,
-                seq_len,
+                seq_len_q,
+                seq_len_kv,
                 fx.Stream(stream),
             )
 
@@ -1688,7 +2038,19 @@ def build_flex_flash_generic_module(
     _guarded.kv_block_size = BLOCK_N_OUT
     _guarded.q_block_size = BLOCK_M
     _guarded.returns_lse = RETURN_LSE
+    # Published because "is the swizzle on" is not visible in the numbers: a bad mask
+    # gives a wrong answer, and a disabled one gives a slow right answer.
+    _guarded.k_swizzle_rowmask = K_SWZ_ROWMASK
     _guarded.num_aux_tensors = NUM_AUX
+    # Published so the host pads the argument list to the signature's width without
+    # importing this module, and so the two cannot drift apart.
+    _guarded.max_aux_tensors = MAX_AUX_TENSORS
     _guarded.aux_specs = list(AUX_SPECS)
     _guarded.uses_block_mask = USE_BLOCK_MASK
+    _guarded.layout = LAYOUT
+    _guarded.qk_prefetch_depth = QK_PREFETCH_DEPTH
+    # Occupancy here is decided by LDS rather than registers, and the threshold is sharp:
+    # a 64 KB CU holds two workgroups only up to 32768 B. Exposed so it can be asserted on
+    # without dumping ISA.
+    _guarded.smem_bytes = allocator.ptr
     return _guarded

@@ -1,22 +1,10 @@
-{# FlyDSL FlexAttention forward template (ROCm, forward only).
+{# FlyDSL FlexAttention forward template (ROCm), the analog of flash_attention.py.jinja.
 
-   The FlyDSL analog of flash_attention.py.jinja. Two structural differences from the
-   CuteDSL template, both forced by the kernel this drives:
-
-   - The mods and the launcher are built at *module* level, not inside the kernel body.
-     A FlyDSL flash launcher is produced by a build call that traces the mods at build
-     time, so it must be built once and reused; the kernel body only launches. CuteDSL
-     can define its mods inside the body because `_flash_attn_fwd` takes them as
-     arguments on every call. This does not change how captures are handled: as in
-     CuteDSL, a mod body names only its slot in the `aux` list it is passed, never a
-     kernel argument, so nothing here depends on the mods being rendered after the
-     kernel signature.
-   - No block-mask inputs. This kernel visits partial and fully-unmasked blocks with the
-     same body, so it wants the *union* of the two block lists as one array, not the two
-     lists FlexAttention supplies. Building that union is host-side work per call, so
-     the KV-block-skip path is left to the step that plumbs BlockMask properly; here the
-     KV walk is dense and mask_mod is applied to every element, which is correct but
-     forfeits the sparsity speedup.
+   The mods and the launcher are built at *module* level rather than inside the kernel
+   body: a FlyDSL flash launcher traces its mods at build time, so it is built once and the
+   kernel body only launches, where CuteDSL's `_flash_attn_fwd` takes its mods as arguments
+   on every call. Captures are unaffected either way -- a mod body names only its slot in
+   the `aux` list it is passed, never a kernel argument.
 #}
 {{gen_defines()}}
 
@@ -25,6 +13,7 @@ from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_ge
 )
 from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (
     flex_flash_attn_bhsd,
+    regrid_block_mask,
 )
 from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_mods import (
     elementwise,
@@ -72,19 +61,19 @@ mask_mod = elementwise_mask(_mask_mod_scalar)
 mask_mod = None
 {% endif %}
 
-{# Both derived from what the mods above turned out to read, so they must come after. #}
 {% if HAS_SCORE_MOD or HAS_MASK_MOD %}
 MOD_KEY = "{{ mod_key(MOD_VEC_SIZE) }}"
 {% else %}
 {# Plain attention: no mod bodies to discriminate, and the builder wants None. #}
 MOD_KEY = None
 {% endif %}
-{# Captured tensors become aux slots as the mods above turn out to read them, so both of
-   these have to be rendered after the mods and neither can be a template argument. #}
+{# MOD_KEY and the aux slots below are both derived from what the mods above turned out to
+   read, so neither can be a template argument and both must be rendered after the mods. #}
 {% set aux_args = get_tensor_buffers() %}
 NUM_AUX_TENSORS = {{ aux_args | length }}
 # (stride_b, stride_h, stride_q, stride_kv) per capture; 0 means broadcast over that axis.
 AUX_SPECS = {{ aux_specs() }}
+AUX_NUMELS = {{ aux_numels() }}
 
 _LAUNCHER = None
 
@@ -92,10 +81,7 @@ _LAUNCHER = None
 def _launcher():
     """Build the flash launcher once, tracing the mods above into it.
 
-    MOD_KEY is not optional. FlyDSL's JIT cache keys on traced source plus recursively
-    collected scalar closure values, so a constant a mod reads any other way -- a module
-    global, a constexpr above -- is invisible to it, and two generated mods differing
-    only in such a constant would silently share the first one's binary.
+    MOD_KEY is not optional; see FlyDSLFlexTemplateKernel.mod_key for why.
     """
     global _LAUNCHER
     if _LAUNCHER is None:
@@ -113,28 +99,86 @@ def _launcher():
             return_lse=True,
             num_aux_tensors=NUM_AUX_TENSORS,
             aux_specs=AUX_SPECS,
-            block_mask=False,
+            aux_numels=AUX_NUMELS,
+            block_mask={{ "True" if USE_BLOCK_MASK else "False" }},
+            # Index the memory FlexAttention already has, whichever way round it is: the
+            # sizes are always [B, H, S, D], but a projection reshaped to [B, S, H, D] and
+            # transposed hands over BSHD memory. Building for the wrong one costs three
+            # contiguous copies of q/k/v and one of the output. See `_kernel_layout`.
+            layout="{{ LAYOUT }}",
+            qk_prefetch_depth=QK_PREFETCH_DEPTH,
+            block_m=BLOCK_M,
+            enable_kv_gpfetch={{ "True" if ENABLE_KV_GPFETCH else "False" }},
         )
     return _LAUNCHER
 
 
-{# Only Q/K/V/LSE are declared here. Captures were registered as kernel inputs while the
-   mods above rendered, and def_kernel's signature is a deferred hook, so they still reach
-   the argument list -- under the names `aux_args` holds, in aux-slot order. #}
+{# Only Q/K/V/LSE and the block-mask arrays are declared here. Captures were registered as
+   kernel inputs while the mods above rendered, and def_kernel's signature is a deferred
+   hook, so they still reach the argument list -- under the names `aux_args` holds, in
+   aux-slot order, after these. #}
+{% if USE_BLOCK_MASK and HAS_FULL_BLOCKS %}
+{{def_kernel("Q", "K", "V", "LSE", "KV_NUM_BLOCKS", "KV_INDICES", "FULL_KV_NUM_BLOCKS", "FULL_KV_INDICES")}}
+{% elif USE_BLOCK_MASK %}
+{{def_kernel("Q", "K", "V", "LSE", "KV_NUM_BLOCKS", "KV_INDICES")}}
+{% else %}
 {{def_kernel("Q", "K", "V", "LSE")}}
+{% endif %}
     out = {{get_output()}}
 
     {% if aux_args %}
     # The kernel reads aux as flat contiguous f32, which is what AUX_SPECS describes. Both
     # calls are no-ops when the capture already satisfies that.
-    aux = [
-        {% for name in aux_args %}
-        {{name}}.to(torch.float32).contiguous(),
+    #
+    # Converted per distinct capture rather than per slot: a tensor read with two index
+    # patterns holds two slots (see Note [FlyDSL aux slots]) and would otherwise be copied
+    # once for each, when what differs between them is the stride spec, not the data.
+    _aux_f32 = {
+        {% for name in aux_args | unique %}
+        "{{name}}": {{name}}.to(torch.float32).contiguous(),
         {% endfor %}
-    ]
+    }
+    aux = [{% for name in aux_args %}_aux_f32["{{name}}"], {% endfor %}]
     {% else %}
     aux = None
     {% endif %}
 
+    {% if USE_BLOCK_MASK %}
+    # FlexAttention's mask is laid out on its own block grid and split into partial and
+    # fully-unmasked lists; the kernel walks one list on its own tile grid. Converting is
+    # a handful of elementwise ops over [B, H, q_tiles, kv_tiles], which is small beside
+    # the tiles the skip then avoids loading.
+    _launch = _launcher()
+    _b, _h, _sq, _ = Q.shape
+    _skv = K.shape[2]
+    _kv_num_blocks, _kv_indices = regrid_block_mask(
+        KV_NUM_BLOCKS,
+        KV_INDICES,
+        {{ "FULL_KV_NUM_BLOCKS" if HAS_FULL_BLOCKS else "None" }},
+        {{ "FULL_KV_INDICES" if HAS_FULL_BLOCKS else "None" }},
+        batch=_b,
+        num_heads=_h,
+        sparse_q_block_size={{ SPARSE_Q_BLOCK_SIZE }},
+        sparse_kv_block_size={{ SPARSE_KV_BLOCK_SIZE }},
+        q_block_size=_launch.q_block_size,
+        kv_block_size=_launch.kv_block_size,
+        num_q_tiles=-(-_sq // _launch.q_block_size),
+        num_kv_tiles=-(-_skv // _launch.kv_block_size),
+    )
+    {% else %}
+    _launch = _launcher()
+    _kv_num_blocks = _kv_indices = None
+    {% endif %}
+
     # out and LSE are filled in place.
-    flex_flash_attn_bhsd(_launcher(), Q, K, V, out=out, lse=LSE, aux=aux)
+    flex_flash_attn_bhsd(
+        _launch,
+        Q,
+        K,
+        V,
+        out=out,
+        lse=LSE,
+        aux=aux,
+        kv_num_blocks=_kv_num_blocks,
+        kv_indices=_kv_indices,
+    )

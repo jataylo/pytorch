@@ -1,0 +1,190 @@
+{# FlyDSL FlexAttention backward template (ROCm).
+
+   Two kernels, because the two directions reduce over opposite axes: `dq` walks the KV
+   axis with a Q tile resident, `dk`/`dv` walk the Q axis with a KV tile resident. They
+   share no loop nest, only the GEMM shapes (see Note [Backward GEMMs are the forward's
+   two GEMMs] in flex_flash_bwd_generic.py).
+
+   Three subgraphs, at fixed indices so the numbering does not shift with what is present:
+     0  the forward score_mod, to recompute the score `lse` was written against
+     1  the joint graph, the chain rule through it, evaluated at the `ds` site
+     2  the mask
+
+   Still refused by the gate: gradients *with respect to* a captured tensor, which need
+   the joint graph's `zeros_and_scatter` outputs accumulated with atomics. Reading a
+   captured tensor inside a mod is fine and goes through the aux slots.
+#}
+{{gen_defines()}}
+
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_bwd_generic import (
+    build_flex_flash_bwd_dkdv_module,
+    build_flex_flash_bwd_dq_module,
+)
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (
+    flex_flash_bwd_dkdv_bhsd,
+    flex_flash_bwd_dq_bhsd,
+)
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_mods import (
+    elementwise,
+    elementwise_joint,
+    elementwise_mask,
+)
+
+{% if HAS_SCORE_MOD %}
+def _score_mod_scalar(score, b, h, q_idx, kv_idx, aux=None):
+    {{ modification(
+        subgraph_number=0,
+        output_name="score_mod_out",
+        score="score",
+        b="b",
+        h="h",
+        m="q_idx",
+        n="kv_idx",
+    ) | indent_except_first(1) }}
+    return score_mod_out
+
+
+def _joint_mod_scalar(score, b, h, q_idx, kv_idx, grad_score, aux=None):
+    {{ modification(
+        subgraph_number=1,
+        output_name="joint_mod_out",
+        score="score",
+        b="b",
+        h="h",
+        m="q_idx",
+        n="kv_idx",
+        grad_score_mod="grad_score",
+    ) | indent_except_first(1) }}
+    return joint_mod_out
+
+
+# The lowered bodies are scalar-shaped; the lifters give them the vectorized ABI so the
+# dq kernel can hand them MOD_VEC_SIZE contiguous elements at a time. (The dkdv kernel
+# always passes one: its contiguous axis is q_idx, not kv_idx.)
+score_mod = elementwise(_score_mod_scalar)
+joint_mod = elementwise_joint(_joint_mod_scalar)
+{% else %}
+score_mod = None
+joint_mod = None
+{% endif %}
+
+{% if HAS_MASK_MOD %}
+def _mask_mod_scalar(b, h, q_idx, kv_idx, aux=None):
+    {{ modification(
+        subgraph_number=2,
+        output_name="mask_mod_out",
+        b="b",
+        h="h",
+        m="q_idx",
+        n="kv_idx",
+    ) | indent_except_first(1) }}
+    return mask_mod_out
+
+
+mask_mod = elementwise_mask(_mask_mod_scalar)
+{% else %}
+mask_mod = None
+{% endif %}
+
+{% if HAS_SCORE_MOD or HAS_MASK_MOD %}
+MOD_KEY = "{{ mod_key(MOD_VEC_SIZE) }}"
+{% else %}
+{# Plain attention: no mod bodies to discriminate, and the builders want None. #}
+MOD_KEY = None
+{% endif %}
+{# MOD_KEY and the aux slots are both derived from what the mods above turned out to read,
+   so neither can be a template argument and both must be rendered after the mods. #}
+{% set aux_args = get_tensor_buffers() %}
+NUM_AUX_TENSORS = {{ aux_args | length }}
+# (stride_b, stride_h, stride_q, stride_kv) per capture; 0 means broadcast over that axis.
+AUX_SPECS = {{ aux_specs() }}
+AUX_NUMELS = {{ aux_numels() }}
+
+_LAUNCHERS = {}
+
+
+def _launcher(which):
+    """Build each launcher once, with the mods traced into it."""
+    if which not in _LAUNCHERS:
+        common = dict(
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            num_kv_heads=NUM_KV_HEADS,
+            dtype_str=DTYPE_STR,
+            sm_scale=SM_SCALE,
+            # Index the memory the caller already has: the sizes are always [B, H, S, D],
+            # but the layout underneath them is whichever one `_kernel_layout` found. The
+            # wrong one here copies q, k, v and do, and dq/dk/dv on the way back.
+            layout="{{ LAYOUT }}",
+            score_mod=score_mod,
+            joint_mod=joint_mod,
+            mask_mod=mask_mod,
+            mod_key=MOD_KEY,
+            num_aux_tensors=NUM_AUX_TENSORS,
+            aux_specs=AUX_SPECS,
+            aux_numels=AUX_NUMELS,
+        )
+        if which == "dq":
+            # dq's tile is not autotuned; its own sweep left nothing to pick between.
+            _LAUNCHERS[which] = build_flex_flash_bwd_dq_module(
+                mod_vec_size=MOD_VEC_SIZE, block_mask=DQ_BLOCK_SKIP, **common
+            )
+        else:
+            _LAUNCHERS[which] = build_flex_flash_bwd_dkdv_module(
+                block_n=DKDV_KV_TILE,
+                block_m=DKDV_Q_TILE,
+                block_mask=DKDV_BLOCK_SKIP,
+                **common,
+            )
+    return _LAUNCHERS[which]
+
+
+{# The list tensors are declared whenever *either* kernel walks a list, because choices in
+   one autotune group have to agree on their inputs and dkdv's decision moves with the
+   tile being swept. An unused declaration costs a kernarg. #}
+{% set skip_any = DQ_BLOCK_SKIP or DKDV_BLOCK_SKIP %}
+{% if skip_any and HAS_FULL_BLOCKS %}
+{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV", "KV_NUM_BLOCKS", "KV_INDICES", "FULL_KV_NUM_BLOCKS", "FULL_KV_INDICES")}}
+{% elif skip_any %}
+{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV", "KV_NUM_BLOCKS", "KV_INDICES")}}
+{% else %}
+{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV")}}
+{% endif %}
+    dq = {{get_output()}}
+    # As in the forward: the kernel reads aux as flat contiguous f32, both calls are no-ops
+    # when the capture already satisfies that, and the conversion is per distinct capture
+    # rather than per slot because one tensor read two ways holds two slots. An integer
+    # capture reaches here through a document mask, whose ids and offsets are both int.
+    _aux_f32 = {
+        {% for name in aux_args | unique %}
+        "{{name}}": {{name}}.to(torch.float32).contiguous(),
+        {% endfor %}
+    }
+    aux = [{% for name in aux_args %}_aux_f32["{{name}}"], {% endfor %}]
+{% if skip_any %}
+    # Handed over raw and regridded inside the interface, once per kernel: the two walk
+    # opposite axes at different tile sizes, so they need lists at different granularities
+    # built from the same occupancy. The sparse block sizes come along because the incoming
+    # lists are on FlexAttention's grid, not on either kernel's.
+    block_mask = (
+        KV_NUM_BLOCKS,
+        KV_INDICES,
+        {{ "FULL_KV_NUM_BLOCKS, FULL_KV_INDICES," if HAS_FULL_BLOCKS else "None, None," }}
+        {{ SPARSE_Q_BLOCK_SIZE }},
+        {{ SPARSE_KV_BLOCK_SIZE }},
+    )
+{% endif %}
+
+    # LSE is natural log here, not log2: this backend's forward wrote it that way, which
+    # is why FLYDSL sits in `_NATURAL_LOG_LSE_BACKENDS`. DELTA is rowsum(do * o),
+    # computed in the lowering so Inductor can fuse it with its neighbours.
+    flex_flash_bwd_dq_bhsd(
+        _launcher("dq"), Q, K, V, DO, LSE, DELTA, dq=dq, aux=aux,
+        block_mask={{ "block_mask" if DQ_BLOCK_SKIP else "None" }},
+    )
+    # GQA needs no reduction after this call: dk/dv for a kv head are the sum over the Q
+    # heads sharing it, and the kernel accumulates that group in registers.
+    flex_flash_bwd_dkdv_bhsd(
+        _launcher("dkdv"), Q, K, V, DO, LSE, DELTA, dk=DK, dv=DV, aux=aux,
+        block_mask={{ "block_mask" if DKDV_BLOCK_SKIP else "None" }},
+    )

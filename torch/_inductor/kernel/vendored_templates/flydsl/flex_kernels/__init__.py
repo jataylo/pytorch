@@ -15,7 +15,7 @@ from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interfac
 )
 
 __all__ = [
-    "build_flex_flash_generic_module",
     "block_mask_tensors",
+    "build_flex_flash_generic_module",
     "flex_flash_attn",
 ]

@@ -1347,10 +1347,134 @@ class CuteDSLBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
         return run_kernel
 
 
+# Waiting for a free worker is bounded so a wedged pool cannot stall autotuning; the job
+# timeout only has to cover one compile, which measures ~1.5s.
+_FLYDSL_PRECOMPILE_ACQUIRE_TIMEOUT = 300.0
+_FLYDSL_PRECOMPILE_JOB_TIMEOUT = 300.0
+
+
+def _flydsl_precompile_in_worker(req: FlyDSLBenchmarkRequest) -> None:
+    """Compile one choice in a worker process, warming the on-disk cache for the parent.
+
+    Nothing is returned: FlyDSL caches compiled kernels on disk and that cache is shared
+    across processes, so the parent's own launch of the same kernel is a hit (measured at
+    0.07s against 1.15s cold). Launching is the only way to trigger a compile, so this is
+    a real launch on scratch tensors -- the same ones `benchmark` would have made.
+    """
+    input_tensors = tuple(x.to_tensor() for x in req.input_tensor_meta)
+    out_meta = req.output_tensor_meta
+    out = (out_meta[0] if isinstance(out_meta, list) else out_meta).to_tensor()
+    req.make_run_fn(*input_tensors, out=out)()
+    torch.cuda.synchronize()
+
+
+class _FlyDSLPrecompilePool:
+    """Pool of subprocesses that compile FlyDSL choices, shared by all of them.
+
+    Built on `TuningProcess` rather than a `ProcessPoolExecutor` for two reasons, both
+    load-bearing. It launches its child through a dedicated entry script, where a
+    spawn-based executor makes the child re-import the parent's `__main__` -- which for a
+    library means re-executing the user's script in every worker. And its children are
+    meant to run kernels, so they have a CUDA context, which these jobs need and Triton's
+    compile workers deliberately do not have.
+
+    Sized by config rather than by device count, unlike `TuningProcessPool`: the work here
+    is compiling, so the useful width is the machine's, not the GPU's.
+    """
+
+    _instance: _FlyDSLPrecompilePool | None = None
+    _lock = threading.Lock()
+
+    def __init__(self, size: int) -> None:
+        self._procs = [TuningProcess(device=None) for _ in range(size)]
+        self._free: queue.Queue[TuningProcess] = queue.Queue()
+        for proc in self._procs:
+            self._free.put(proc)
+        self._running = True
+        atexit.register(self.shutdown)
+
+    @classmethod
+    def get(cls) -> _FlyDSLPrecompilePool | None:
+        """The shared pool, or None if it is switched off or could not be started."""
+        size = config.flydsl.precompile_workers
+        if size <= 0:
+            return None
+        with cls._lock:
+            if cls._instance is None:
+                try:
+                    cls._instance = cls(size)
+                except Exception:
+                    autotuning_log.warning(
+                        "FlyDSL precompile pool unavailable; compiling choices in the "
+                        "benchmark loop instead",
+                        exc_info=True,
+                    )
+                    return None
+            return cls._instance if cls._instance._running else None
+
+    def submit(self, req: FlyDSLBenchmarkRequest) -> None:
+        """Compile `req` in a worker and wait for it to finish.
+
+        Blocking is the design, not a limitation: the autotune driver already calls
+        `precompile()` from a thread pool, and a thread waiting on a pipe holds no GIL, so
+        the width comes from many such threads feeding these workers -- which is the whole
+        point, since the compile itself does not overlap across threads.
+
+        Every failure is swallowed. A choice that does not get precompiled is compiled by
+        the benchmark loop exactly as it was before this existed, so the worst case is
+        losing the speedup; letting an exception out would instead have the driver retire
+        a choice on the say-so of a subprocess, and a systematically broken worker would
+        then empty the candidate list.
+        """
+        if not self._running:
+            return
+        try:
+            proc = self._free.get(timeout=_FLYDSL_PRECOMPILE_ACQUIRE_TIMEOUT)
+        except queue.Empty:
+            return
+        try:
+            proc.put(functools.partial(_flydsl_precompile_in_worker, req))
+            proc.get(timeout=_FLYDSL_PRECOMPILE_JOB_TIMEOUT)
+        except Exception:
+            autotuning_log.debug(
+                "FlyDSL precompile failed for %s; it will compile when benchmarked",
+                req.kernel_name,
+                exc_info=True,
+            )
+        finally:
+            # Returned even when the job killed the child: `TuningProcess.put` starts a
+            # dead one, so a worker that a kernel took down with it is replaced on its next
+            # job rather than costing the pool a slot.
+            self._free.put(proc)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+        for proc in self._procs:
+            proc.shutdown(wait=False)
+        for proc in self._procs:
+            proc.wait()
+
+
 # TODO: Factor out a common DSL benchmark request base shared with
 # CuteDSLBenchmarkRequest.
 class FlyDSLBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest):
     """Benchmark request for FlyDSL kernels."""
+
+    def precompile(self) -> None:
+        """Compile this choice before the benchmark loop reaches it.
+
+        FlyDSL compiles on first launch rather than at build, so without this every
+        choice's compile lands in the serial benchmark loop. See `_FlyDSLPrecompilePool`
+        for why the work goes to a process and not the calling thread, and why a choice
+        that fails to compile here is left for the benchmark loop to reject rather than
+        being retired on a subprocess's word.
+        """
+        pool = _FlyDSLPrecompilePool.get()
+        if pool is not None:
+            pool.submit(self)
 
     def __init__(
         self,

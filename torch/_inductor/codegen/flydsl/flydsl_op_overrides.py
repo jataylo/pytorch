@@ -1,24 +1,19 @@
 # mypy: allow-untyped-defs
 """Map Inductor pointwise ops onto FlyDSL source text.
 
-This is the FlyDSL analog of ``cutedsl_op_overrides.py``, and it is deliberately much
-thinner. CuteDSL's overrides carry a lot of TensorSSA machinery because CuTe ops are
-whole-fragment operations that need shape and lane bookkeeping. FlyDSL mods are scalar
+The FlyDSL analog of ``cutedsl_op_overrides.py``, and much thinner: FlyDSL mods are scalar
 valued -- one score at a time, with the vectorized ABI handled by lifting the whole mod
-rather than by widening each op -- so every op here is a plain function call on
-``flydsl_mod_runtime`` and all the type-promotion trouble lives there.
+rather than by widening each op -- so every op here is a plain call on
+``flydsl_mod_runtime`` and the type promotion lives there.
 
-Nothing in this file may import ``flydsl``: it runs during Inductor lowering, on any
-machine, whether or not FlyDSL is installed. It only produces strings. That is also why
-:data:`UNSUPPORTED_OPS` is declared here rather than beside the shim it describes --
-codegen has to know what the shim cannot do without importing it.
+Nothing in this file may import ``flydsl``: it runs during lowering whether or not FlyDSL
+is installed, and only produces strings. Hence :data:`UNSUPPORTED_OPS` living here rather
+than beside the shim it describes.
 """
 
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
-
-import sympy
 
 import torch
 
@@ -28,30 +23,31 @@ from ..common import CSEVariable, OpOverrides
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import sympy
+
 
 # Module alias the generated kernel binds for the runtime shim.
 RUNTIME_ALIAS = "fdu"
 RUNTIME_MODULE = "torch._inductor.codegen.flydsl.flydsl_mod_runtime"
 
-# Ops a score_mod or mask_mod could contain that do not lower to AMDGPU through FlyDSL
-# and have no expansion in the shim yet. Codegen raises on these so the failure names the
-# op, instead of surfacing as an LLVM "no libcall available" error with no context.
+# Ops that do not lower to AMDGPU through FlyDSL and have no expansion in the shim.
+# Codegen raises on these so the failure names the op, instead of surfacing as an LLVM
+# "no libcall available" error.
 #
-# `tanh` is deliberately absent: it is in the same category but soft-cap is too common to
-# reject, so the shim expands it over exp2.
+# The rest of this family *is* expanded in the shim, over the exp2/log2/sqrt primitives
+# that do lower: `tanh` and `sigmoid` first, and since then `sinh`, `cosh`, `asinh`,
+# `acosh`, `atanh`, `atan`, `atan2`, `asin`, `acos`, `erf` and `erfc`. What is left needs
+# a long rational approximation rather than a few terms, and none of the three is
+# plausible in an attention score_mod:
+#
+#   erfinv   inverse error function; two-branch rational fit
+#   lgamma   log-gamma; Lanczos series plus a reflection for x < 0.5
+#   digamma  gamma's logarithmic derivative; asymptotic series plus recurrence
+#
+# Adding any of them is a matter of transcribing coefficients into the shim next to
+# `erf`, not of kernel work, if a real mod ever wants one.
 UNSUPPORTED_OPS = frozenset(
     {
-        "asin",
-        "acos",
-        "atan",
-        "atan2",
-        "sinh",
-        "cosh",
-        "asinh",
-        "acosh",
-        "atanh",
-        "erf",
-        "erfc",
         "erfinv",
         "lgamma",
         "digamma",
@@ -62,10 +58,9 @@ UNSUPPORTED_OPS = frozenset(
 class FlyDSLCSEVariable(CSEVariable):
     """A named FlyDSL device value.
 
-    ``index_expr`` records the semantic index a value came from when it is a coordinate
-    rather than an opaque number. The vectorized aux-tensor read needs to know that
-    ``kv_idx`` for lane i is ``kv_base + i`` in order to collapse per-lane gathers into
-    one wide load; a value whose provenance is unknown has to be gathered per lane.
+    ``index_expr`` records the semantic index a coordinate came from, so the vectorized
+    aux read can tell that ``kv_idx`` for lane i is ``kv_base + i`` and collapse per-lane
+    gathers into one wide load. A value of unknown provenance is gathered per lane.
     """
 
     def __init__(self, name, bounds, dtype=None, shape=None) -> None:
@@ -148,11 +143,10 @@ def _result_dtype(fn: str, args: Sequence[Any]) -> torch.dtype:
 
 
 def _call(fn: str, *args: Any) -> Any:
-    """Emit a shim call, bound to a temporary so the generated body stays readable.
+    """Emit a shim call, bound to a temporary.
 
-    Without this every op inlines into its operands and a mod of any size renders as one
-    unreadable expression. Binding each step also means a repeated subexpression is
-    traced once rather than once per use.
+    Without the binding every op inlines into its operands, so a mod of any size renders as
+    one unreadable expression and a repeated subexpression is traced once per use.
     """
     from ...virtualized import V
 
@@ -206,6 +200,16 @@ class FlyDSLOpOverrides(OpOverrides):
         "cos",
         "tanh",
         "sigmoid",
+        "sinh",
+        "cosh",
+        "asin",
+        "acos",
+        "atan",
+        "asinh",
+        "acosh",
+        "atanh",
+        "erf",
+        "erfc",
         "relu",
         "logical_not",
         "bitwise_not",
@@ -237,17 +241,18 @@ class FlyDSLOpOverrides(OpOverrides):
         "bitwise_xor",
         "bitwise_left_shift",
         "bitwise_right_shift",
+        "atan2",
     )
 
     @staticmethod
     def constant(value: bool | float | int, dtype: torch.dtype) -> str:
-        # Emitted directly rather than through _call: the value is already a Python
-        # literal, and _call would render it as a constructor and wrap that again.
+        # Emitted directly rather than through _call, which would wrap the literal in a
+        # second constructor.
         if dtype == torch.bool:
             return f"{RUNTIME_ALIAS}.const_bool({bool(value)})"
         if dtype.is_floating_point:
-            # A score_mod masks by returning -inf, so the literal has to survive as a
-            # real float rather than a name Python cannot evaluate.
+            # A score_mod masks by returning -inf, so the literal has to survive as a real
+            # float rather than a name Python cannot evaluate.
             return f"{RUNTIME_ALIAS}.const_f32(float({str(float(value))!r}))"
         return f"{RUNTIME_ALIAS}.const_i32({int(value)})"
 
@@ -333,14 +338,3 @@ def _install_ops() -> None:
 
 
 _install_ops()
-
-
-def rendered_ops() -> Sequence[str]:
-    """Op names this backend can lower. Used by tests and by the coverage audit."""
-    return tuple(
-        sorted(
-            set(FlyDSLOpOverrides._UNARY)
-            | set(FlyDSLOpOverrides._BINARY)
-            | {"constant", "index_expr", "to_dtype", "where"}
-        )
-    )

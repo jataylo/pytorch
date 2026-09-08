@@ -28,7 +28,7 @@ from flydsl.expr.utils.arith import ArithValue
 _LOG2E = math.log2(math.e)
 
 
-# ── ABI adapters ──────────────────────────────────────────────────────────────
+# ABI adapters
 
 
 def elementwise(fn):
@@ -55,7 +55,28 @@ def elementwise_mask(fn):
     return wrapper
 
 
-# ── math helpers ──────────────────────────────────────────────────────────────
+def elementwise_joint(fn):
+    """Lift a scalar joint_mod body to also accept the vectorised list ABI.
+
+    A ``joint_mod`` is the chain rule through a ``score_mod``: given the *pre*-mod score
+    and the gradient with respect to the *post*-mod score, it returns the gradient with
+    respect to the pre-mod score. Only the backward kernels call it -- there is no forward
+    equivalent -- and it is what makes a non-additive mod like a soft-cap differentiable
+    rather than silently wrong by a factor of the mod's derivative.
+    """
+
+    def wrapper(score, b, h, q_idx, kv_idx, grad, **kw):
+        if isinstance(score, (list, tuple)):
+            return [
+                fn(s, b, h, q_idx, kv, g, **kw) for s, kv, g in zip(score, kv_idx, grad)
+            ]
+        return fn(score, b, h, q_idx, kv_idx, grad, **kw)
+
+    wrapper.__name__ = getattr(fn, "__name__", "joint_mod")
+    return wrapper
+
+
+# Math helpers
 
 
 def tanh(x):
@@ -74,7 +95,7 @@ def tanh(x):
     return ArithValue(neg).select(-ArithValue(t), ArithValue(t))
 
 
-# ── score mods ────────────────────────────────────────────────────────────────
+# Score mods
 
 
 @elementwise
@@ -134,7 +155,7 @@ def make_aux_bias(scale=1.0):
     return aux_bias
 
 
-# ── mask mods (True keeps the element) ────────────────────────────────────────
+# Mask mods (True keeps the element)
 
 
 @elementwise_mask

@@ -1,24 +1,11 @@
 # mypy: allow-untyped-defs
 """FlexAttention additions to the FlyDSL template kernel.
 
-The generic FlyDSL backend (``flydsl_kernel.py`` / ``flydsl_template.py``) knows how to
-define a kernel, benchmark it, schedule it and compile it. What it does not have -- and
-does not need for a GEMM -- is a way to inline a *user subgraph* into the kernel body.
-That is what FlexAttention requires: a `score_mod` or `mask_mod` written in Python, traced
-by Dynamo and lowered by Inductor, has to end up as FlyDSL device-value source at the
-exact point in the attention inner loop where each score sits in a register.
-
-So everything here is the flex-specific delta on top of the generic backend:
-
-- :class:`FlyDSLFlexTemplateKernel` adds subgraph bodies, a CSE scope and
-  :meth:`~FlyDSLFlexTemplateKernel.modification`, which renders one lowered subgraph.
-- :class:`ModificationWrapperFlyDSL` resolves subgraph placeholders against the
-  template's own variables and turns captured-tensor reads into aux-slot reads.
-- :class:`FlyDSLFlexTemplate` binds the two together.
-
-The emitted source targets the vocabulary the hand-written mods in
-``flex_kernels/flex_mods.py`` use, because those were written as the contract this
-lowering has to hit.
+The FlyDSL analog of ``cutedsl_kernel.py``. The generic FlyDSL backend
+(``flydsl_kernel.py``, ``flydsl_template.py``) cannot inline a user subgraph into a kernel
+body, which is the one thing FlexAttention needs from it: a score_mod or mask_mod traced by
+Dynamo and lowered by Inductor has to become FlyDSL source at the point in the attention
+inner loop where the score sits in a register.
 """
 
 from __future__ import annotations
@@ -28,6 +15,7 @@ import copy
 import dataclasses
 import functools
 import hashlib
+import math
 from typing import Any, TYPE_CHECKING
 
 import sympy
@@ -102,7 +90,7 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             input_nodes=input_nodes,
             output_node=output_node,
         )
-        # Keyword-optional so the generic FlyDSLTemplate.generate(), which does not know
+        # Keyword-optional so the generic FlyDSLTemplate.generate(), which knows nothing
         # about subgraphs, can still construct this class.
         self.subgraphs = subgraphs
         self.subgraph_bodies: dict[str, FlyDSLSubgraphInfo] = {}
@@ -118,23 +106,18 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
                 input_node
             )
 
-        # Aux slots are handed out as the mods turn out to read them, so a capture no mod
-        # touches never becomes a slot and never gets converted at call time. The order is
-        # still an ABI -- slot i of the `aux` list, entry i of `aux_specs`, and entry i of
-        # `get_tensor_buffers()` are the same tensor -- but every side of it is derived
-        # from this one render, so they cannot disagree.
-        self._aux_slots: dict[str, int] = {}
+        # See Note [FlyDSL aux slots]. Slots are handed out as the mods turn out to read
+        # them, so a capture no mod touches never becomes a slot.
+        self._aux_slots: dict[tuple[str, tuple[int, ...]], int] = {}
         self._aux_arg_names: list[str] = []
         self._aux_specs: list[list[int]] = []
-
-    # ── captured-tensor bookkeeping ──────────────────────────────────────────
+        self._aux_numels: list[int] = []
 
     def resolve_extra_input(self, name: str) -> Buffer:
         """Look captures up in the graph's capture table before its buffers.
 
-        ``realize_captures_for_cutedsl`` gives a captured *view* a synthetic input name
-        and files the real ``ReinterpretView`` under it, so for those names there is no
-        graph buffer to find.
+        ``realize_captures_for_cutedsl`` files a captured *view* under a synthetic input
+        name, so for those names there is no graph buffer to find.
         """
         node = self._capture_node(name)
         return node if node is not None else V.graph.get_buffer(name)
@@ -147,48 +130,70 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
         """Kernel argument names of the captures the mods read, in aux-slot order."""
         return list(self._aux_arg_names)
 
-    def aux_slot(self, name: str, arg_name: str) -> int:
-        """Index of a captured tensor in the ``aux`` list the mods are handed.
+    def aux_slot(self, name: str, arg_name: str, spec: list[int], numel: int) -> int:
+        """Index of one captured-tensor *reading* in the ``aux`` list the mods are handed.
 
+        Note [FlyDSL aux slots]:
         score_mod and mask_mod receive the same ``aux`` list, so slots are numbered across
-        the whole kernel rather than per subgraph: a tensor read by both mods resolves to
-        one slot, not two.
+        the whole kernel rather than per subgraph: the same read from both mods resolves to
+        one slot, not two. The order is an ABI -- slot i of ``aux``, of ``aux_specs()`` and
+        of ``get_tensor_buffers()`` are the same tensor -- but every side of it is derived
+        from this one render, so they cannot disagree.
+
+        A slot is a *(tensor, stride spec)* pair rather than a tensor, so one capture read
+        with two index patterns takes two slots. Document masking is the case that needs
+        this: it reads its document-id table once by query row and once by key column, and
+        a reader carries one stride per coordinate, so those two readings cannot share a
+        spec. They can share the tensor -- both slots name the same kernel argument, and
+        the template converts it once.
         """
-        slot = self._aux_slots.get(name)
+        key = (name, tuple(spec))
+        slot = self._aux_slots.get(key)
         if slot is None:
             slot = len(self._aux_arg_names)
-            self._aux_slots[name] = slot
+            self._aux_slots[key] = slot
             self._aux_arg_names.append(arg_name)
-            self._aux_specs.append([0, 0, 0, 0])
+            self._aux_specs.append(list(spec))
+            self._aux_numels.append(numel)
         return slot
 
-    def record_aux_spec(self, name: str, dim_indices, dim_sizes, coord_positions) -> None:
-        """Record ``(stride_b, stride_h, stride_q, stride_kv)`` for one capture.
+    def aux_spec_for_read(
+        self, name: str, dim_indices, dim_sizes, coord_positions
+    ) -> tuple[list[int], int, dict[int, str]]:
+        """Resolve one read into a stride spec, a numel, and any computed indices.
 
-        Each axis of the capture is matched to the coordinate that indexes it, and that
-        axis's element stride is filed under that coordinate. ``coord_positions`` maps the
-        coordinate *variable names as they appear in the generated body* to their position
-        in the spec; the caller supplies it because the subgraph's placeholder names
-        (``m``, ``n``) and the template's variable names (``q_idx``, ``kv_idx``) differ.
+        The spec is ``(stride_b, stride_h, stride_q, stride_kv)``: each axis of the capture
+        is matched to the coordinate that indexes it, and that axis's element stride is
+        filed under that coordinate. ``coord_positions`` maps the coordinate names *as they
+        appear in the generated body* to their spec position; the caller supplies it
+        because the subgraph's placeholders (``m``, ``n``) and the template's variables
+        (``q_idx``, ``kv_idx``) differ.
 
-        Anything the reader cannot express -- an offset index, an axis indexed by
-        arithmetic on a coordinate, two axes indexed by the same coordinate -- is rejected
-        here rather than silently reading the wrong element, which is the failure mode
-        this addressing scheme has.
+        An axis may also be indexed by a *value* rather than a coordinate, which is what
+        ``offsets[document_id[q_idx]]`` is. The reader has no separate gather entry point,
+        but it does not need one: it sums ``stride * argument`` over four argument
+        positions, so a value passed in a position whose stride is the axis stride is
+        exactly that gather. Such an axis therefore claims a spare position, and the
+        returned dict says which position carries which expression. Positions are claimed
+        lowest-first, which keeps ``stride_kv`` free -- the vectorised reader treats
+        ``stride_kv == 1`` as a promise that ``kv`` is contiguous, and a gather is not.
+
+        Anything the reader cannot express is rejected here rather than silently reading
+        the wrong element, which is this addressing scheme's failure mode.
         """
-        slot = self._aux_slots[name]
         sizes = [V.graph.sizevars.guard_int(s) for s in dim_sizes]
-        # Strides of the contiguous f32 copy the template passes, which is what the
-        # kernel will actually read, not the buffer's own layout.
+        # Strides of the contiguous f32 copy the template passes, which is what the kernel
+        # will actually read, not the buffer's own layout.
         strides = [1] * len(sizes)
         for i in range(len(sizes) - 2, -1, -1):
             strides[i] = strides[i + 1] * sizes[i + 1]
 
         spec = [0, 0, 0, 0]
+        claimed: set[int] = set()
+        computed: list[tuple[int, sympy.Expr]] = []
         for axis_index, index_expr in enumerate(dim_indices):
             expr = self.rename_indexing(index_expr)
             if expr == sympy.Integer(0):
-                # A constant-0 index contributes nothing to the offset.
                 continue
             position = (
                 coord_positions.get(str(expr))
@@ -196,35 +201,47 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
                 else None
             )
             if position is None:
-                raise NotImplementedError(
-                    f"captured tensor {name} is indexed with {expr!r} on axis "
-                    f"{axis_index}; the aux reader resolves one element offset from "
-                    "per-axis strides, so each axis must be indexed by a bare "
-                    f"coordinate ({', '.join(coord_positions)})"
-                )
-            if spec[position] != 0:
+                # Not a coordinate, so it is a value the body computed. Held back until
+                # the coordinates have claimed their positions, since it can take any
+                # position they leave.
+                computed.append((axis_index, expr))
+                continue
+            if position in claimed:
                 raise NotImplementedError(
                     f"captured tensor {name} indexes two axes with {expr!r}; the aux "
                     "reader has one stride per coordinate"
                 )
+            claimed.add(position)
             spec[position] = strides[axis_index]
 
-        existing = self._aux_specs[slot]
-        if any(existing) and existing != spec:
-            raise NotImplementedError(
-                f"captured tensor {name} is read with two different index patterns "
-                f"({existing} and {spec}); it occupies one aux slot with one stride spec"
-            )
-        self._aux_specs[slot] = spec
+        overrides: dict[int, str] = {}
+        for axis_index, expr in computed:
+            position = next((p for p in range(4) if p not in claimed), None)
+            if position is None:
+                raise NotImplementedError(
+                    f"captured tensor {name} is indexed with {expr!r} on axis "
+                    f"{axis_index}, but its four reader positions are already taken by "
+                    f"coordinates ({', '.join(coord_positions)}); a computed index needs "
+                    "one of its own"
+                )
+            claimed.add(position)
+            spec[position] = strides[axis_index]
+            # Through the index printer, not str(): the expression reaches the body as
+            # source, and only the printer is guaranteed to render one that parses.
+            overrides[position] = self.kexpr(expr)
+
+        # The kernel bounds its buffer descriptor with this, so the padding lanes of the
+        # score tile read zero instead of off the end of the tensor. See Note [aux reads
+        # run past the logical extent] in flex_flash_generic.py.
+        return spec, math.prod(sizes), overrides
 
     def aux_specs(self) -> list[list[int]]:
-        """Stride spec per aux slot, in slot order.
-
-        Call from the template after the mods are rendered; before that there are no slots.
-        """
+        """Stride spec per aux slot, in slot order. Call after the mods are rendered."""
         return [list(spec) for spec in self._aux_specs]
 
-    # ── codegen plumbing ─────────────────────────────────────────────────────
+    def aux_numels(self) -> list[int]:
+        """Element count per aux slot, in slot order, for the kernel's buffer bounds."""
+        return list(self._aux_numels)
 
     def create_cse_var(self, *args, **kwargs):
         return FlyDSLCSEVariable(*args, **kwargs)
@@ -248,18 +265,15 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
     def mod_key(self, *extra: Any) -> str:
         """Cache-discriminating key over every mod body rendered so far, plus ``extra``.
 
-        FlyDSL's JIT cache keys on traced source plus recursively collected *scalar
-        closure values*. A constant a mod reads from anywhere else -- a module global, one
-        of the constexprs ``gen_defines()`` emits -- is invisible to that key, so two
-        generated mods differing only in such a constant collide and the second silently
-        reuses the first one's binary. Wrong numbers, no error.
-
-        The rendered subgraph bodies are the right thing to hash because they are what
-        FlyDSL will trace. ``extra`` is for build parameters that change the kernel
+        FlyDSL's JIT cache keys on traced source plus recursively collected *scalar closure
+        values*. A constant a mod reads from anywhere else -- a module global, one of the
+        constexprs ``gen_defines()`` emits -- is invisible to that key, so two generated
+        mods differing only in such a constant collide and the second silently reuses the
+        first one's binary. The rendered bodies are the right thing to hash because they
+        are what FlyDSL traces; ``extra`` covers build parameters that change the kernel
         without changing those bodies, the vectorization width being the one that does.
 
-        Call this from the template *after* the mods are defined; it sees only what has
-        been rendered by then.
+        Call from the template *after* the mods are defined.
         """
         bodies = [
             f"{name}\x00{info.body.getvalue()}"
@@ -276,9 +290,8 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
     def render(self, template, **kwargs):
         """Render with the flex hooks added.
 
-        This duplicates the shape of ``FlyDSLTemplateKernel.render`` because the base
-        class builds its ``template_env`` inline; there is no seam to extend. Worth
-        factoring out upstream if the flex template lands.
+        Duplicates the shape of ``FlyDSLTemplateKernel.render`` because the base class
+        builds its ``template_env`` inline; there is no seam to extend.
         """
         from ...select_algorithm import PartialRender
 
@@ -289,6 +302,7 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             "modification": self.modification,
             "mod_key": self.mod_key,
             "aux_specs": self.aux_specs,
+            "aux_numels": self.aux_numels,
             "get_tensor_buffers": self.get_tensor_buffers,
         }
         rendered_code = template.render(
@@ -299,8 +313,6 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             **kwargs,
         )
         return PartialRender(self.gen_imports() + rendered_code, self.render_hooks)
-
-    # ── subgraph bodies ──────────────────────────────────────────────────────
 
     @contextlib.contextmanager
     def set_subgraph_body(self, body_name: str):
@@ -369,13 +381,14 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
         mask: str | None = None,
         **fixed_inputs,
     ) -> str:
-        """Inline a lowered subgraph as FlyDSL source.
+        """Generate FlyDSL code for a subgraph modification.
 
         ``fixed_inputs`` maps subgraph placeholder names to the template's own variable
-        names (``score`` -> ``score``, ``m`` -> ``q_idx``, and so on), so the emitted
-        body reads the surrounding kernel's values directly instead of taking arguments.
-        Returns the body text, which the template splices in at the call site.
+        names (``m`` -> ``q_idx``, and so on), so the emitted body reads the surrounding
+        kernel's values directly instead of taking arguments.
         """
+        # Find a unique name to avoid collisions between multiple modifications of the
+        # same subgraph.
         num = 0
         while f"mod_{subgraph_number}_{num}" in self.subgraph_bodies:
             num += 1
@@ -391,10 +404,14 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
                         "Scatter graphs are not supported for FlyDSL (backward only)"
                     )
                 if not isinstance(subgraph, ComputedBuffer):
-                    raise AssertionError(f"Expected ComputedBuffer, got {type(subgraph)}")
+                    raise AssertionError(
+                        f"Expected ComputedBuffer, got {type(subgraph)}"
+                    )
                 if isinstance(subgraph.data, InputBuffer):
+                    # grad_score_mod can be an InputBuffer
                     out = subgraph.data.make_loader()(())
                 else:
+                    # Inline a pointwise lowering into the template
                     out = subgraph.data.inner_fn(())
 
             if output_name is None:
@@ -436,14 +453,14 @@ class ModificationWrapperFlyDSL(V.WrapperHandler):  # type: ignore[name-defined]
             return self.kernel.named_input_nodes[name].dtype
         return torch.int32 if name in ("b", "h", "m", "n") else torch.float32
 
-    def _add_kernel_input(self, name: str) -> str:
+    def _add_kernel_input(self, name: str, spec: list[int], numel: int) -> str:
         """Register a captured tensor as a kernel input and resolve its aux reader.
 
         The mod body only ever names a slot, never the kernel argument, so this can run
         part way through the render even though the mods are emitted above the kernel.
         """
         arg_name = self.kernel.args.input(name)
-        return f"aux[{self.kernel.aux_slot(name, arg_name)}]"
+        return f"aux[{self.kernel.aux_slot(name, arg_name, spec, numel)}]"
 
     def load(self, name: str, index: sympy.Expr):
         """Read a subgraph input: either a template value or a captured tensor."""
@@ -469,24 +486,21 @@ class ModificationWrapperFlyDSL(V.WrapperHandler):  # type: ignore[name-defined]
         """Emit a read from a captured tensor, and record its stride spec.
 
         An aux slot is a reader callable as ``reader(b, h, q_idx, kv_idx)`` that resolves
-        one i32 element offset from four per-axis strides -- which is why it wants
-        coordinates rather than a flattened offset, and why the index has to arrive as a
-        coordinate tuple. That is what ``HierarchicalIndex`` carries.
+        one element offset from four per-axis strides, which is why the index has to arrive
+        as a coordinate tuple -- what ``HierarchicalIndex`` carries.
 
         The reader is always handed the true four coordinates; which of them matter is
-        expressed entirely in the stride spec, where 0 means "broadcast over this axis".
-        So the spec is not derivable from the capture's shape alone -- an ``[H]`` table is
-        ``(0, 1, 0, 0)`` and an ``[S]`` table of the same length would be ``(0, 0, 1, 0)``
-        -- it depends on which coordinate the mod indexed each axis with. That is known
-        only here, while the subgraph is being lowered, so the spec is recorded now and
-        the template reads it back through :meth:`aux_specs`.
+        expressed in the stride spec, where 0 means "broadcast over this axis". So the spec
+        is not derivable from the capture's shape alone -- an ``[H]`` table is
+        ``(0, 1, 0, 0)`` and an ``[S]`` table of the same length is ``(0, 0, 1, 0)`` -- it
+        depends on which coordinate the mod indexed each axis with, which is known only
+        here, so the spec is recorded now and read back through :meth:`aux_specs`.
         """
         from ...kernel.flex.flex_flash_attention import HierarchicalIndex
 
-        var = self._add_kernel_input(name)
-        buffer = self.kernel.named_input_nodes.get(name) or self.kernel.resolve_extra_input(
+        buffer = self.kernel.named_input_nodes.get(
             name
-        )
+        ) or self.kernel.resolve_extra_input(name)
         var_dtype = buffer.get_dtype()
 
         dim_indices = index.args if isinstance(index, HierarchicalIndex) else (index,)
@@ -502,14 +516,22 @@ class ModificationWrapperFlyDSL(V.WrapperHandler):  # type: ignore[name-defined]
         # The subgraph names the coordinates b/h/m/n; the template binds them to its own
         # variables. Both the spec and the emitted call have to speak the latter.
         coord_names = [self.fixed_inputs[axis] for axis in ("b", "h", "m", "n")]
-        self.kernel.record_aux_spec(
+        # Resolved before the slot is claimed, because the spec is half of a slot's
+        # identity: the same tensor read two ways needs two of them.
+        spec, numel, overrides = self.kernel.aux_spec_for_read(
             name,
             dim_indices,
             dim_sizes,
             {coord: position for position, coord in enumerate(coord_names)},
         )
+        var = self._add_kernel_input(name, spec, numel)
 
-        expr = f"{var}({', '.join(coord_names)})"
+        reader_args = list(coord_names)
+        for position, index_expr in overrides.items():
+            # aux is f32, so a value read out of one capture arrives as a float even when
+            # it is a document id; the reader multiplies it by a stride and expects an int.
+            reader_args[position] = f"{RUNTIME_ALIAS}.to_i32({index_expr})"
+        expr = f"{var}({', '.join(reader_args)})"
 
         # Aux is f32 on the kernel side; anything narrower is widened on read so the mod
         # body only ever sees f32.
@@ -531,11 +553,10 @@ class ModificationWrapperFlyDSL(V.WrapperHandler):  # type: ignore[name-defined]
     def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
         """Turn a device value back into something usable as a tensor index.
 
-        This is what makes a capture indexed by the mod's own coordinates work --
-        ``bias[b, h, q_idx, kv_idx]`` or ``slopes[h]``. Inductor sees those coordinates as
-        *loaded values*, so using one as an index has to round-trip through here: we hand
-        back a sympy symbol named after the variable holding it, which the index printer
-        then renders as that same name in the generated body.
+        This is what makes ``bias[b, h, q_idx, kv_idx]`` or ``slopes[h]`` work: Inductor
+        sees those coordinates as *loaded values*, so using one as an index round-trips
+        through here into a sympy symbol named after the variable holding it, which the
+        index printer then renders as that same name.
         """
         from ...utils import sympy_index_symbol
 
@@ -562,9 +583,13 @@ class ModificationWrapperFlyDSL(V.WrapperHandler):  # type: ignore[name-defined]
             return sympy_index_symbol(str(wrapped))
 
         # Prefer the name the value was loaded from ("h", "q_idx"): it reads better in the
-        # generated body than the temporary that holds it, and both are in scope.
+        # generated body than the temporary that holds it, and both are in scope. Only when
+        # that name is a bare identifier, though -- a CSE key is the *expression* that
+        # produced the value, and for a captured-tensor read that is a whole reader call,
+        # which an index may be used in several places. Returning it there would re-emit
+        # the load at each use instead of reading the temporary once.
         for expr, var in self.kernel.cse._cache.items():
-            if var is index_var and isinstance(expr, str):
+            if var is index_var and isinstance(expr, str) and expr.isidentifier():
                 return sympy_index_symbol(expr)
         return sympy_index_symbol(str(index_var))
 
@@ -577,13 +602,12 @@ class FlyDSLFlexTemplate(FlyDSLTemplate):
     def generate(self, **kwargs: Any) -> Any:
         """Same as the base, but routes ``subgraphs`` to the kernel constructor.
 
-        The base ``generate()`` predates subgraphs and builds its kernel with
-        ``(kernel_name, input_nodes, output_node)``, in two places: once now, to
-        benchmark, and once inside ``make_kernel_render`` for the deferred render at
-        scheduling time. Both resolve ``self.kernel_type`` when they run, so temporarily
-        patching this instance would miss the deferred one. Binding the subgraphs onto a
-        shallow copy covers both without mutating the template registered under this
-        name, which is shared across lowerings.
+        The base ``generate()`` predates subgraphs and builds its kernel in two places:
+        once now, to benchmark, and once inside ``make_kernel_render`` for the deferred
+        render at scheduling time. Both resolve ``self.kernel_type`` when they run, so
+        patching this instance would miss the deferred one; binding the subgraphs onto a
+        shallow copy covers both without mutating the template registered under this name,
+        which is shared across lowerings.
 
         Keeping ``subgraphs`` out of ``kwargs`` also keeps it out of ``gen_defines()``,
         which would otherwise emit the buffer list into the generated source as a
@@ -604,9 +628,8 @@ class FlyDSLFlexTemplate(FlyDSLTemplate):
     ) -> tuple[FlyDSLFlexTemplateKernel, str]:
         """Render this template to FlyDSL source, outside the autotune path.
 
-        Returns the kernel alongside the source so callers can read back what the
-        lowering collected -- notably ``kernel.get_tensor_buffers()``, which fixes the
-        order of the ``aux`` tuple the kernel has to be called with.
+        Returns the kernel alongside the source so callers can read back what the lowering
+        collected, notably ``kernel.get_tensor_buffers()``.
         """
         kernel = self.kernel_type(
             kernel_name=kernel_name,
@@ -616,12 +639,3 @@ class FlyDSLFlexTemplate(FlyDSLTemplate):
         )
         partial = kernel.render(self.template, **kwargs)
         return kernel, partial.finalize_all()
-
-
-__all__ = [
-    "FlyDSLFlexTemplate",
-    "FlyDSLFlexTemplateKernel",
-    "FlyDSLSubgraphInfo",
-    "ModificationWrapperFlyDSL",
-    "flydsl_pexpr",
-]

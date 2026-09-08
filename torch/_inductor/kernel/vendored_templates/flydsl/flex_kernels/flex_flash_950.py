@@ -11,6 +11,10 @@ and (at runtime) seq_len >= 384. seq_len need NOT be a multiple of 256/64: a
 partial last q-block and a partial/odd kv-tile count are handled the same way as
 the hand-written reference asm (num_records bound on Q/K/V/O, tile count rounded
 up to even, and a kv padding-mask on the non-causal path).
+
+The FlexAttention hooks here carry the same contract as ``flex_flash_generic.py`` but have
+never been executed on hardware, so Inductor refuses gfx950 unless
+``config.flydsl.allow_unvalidated_arch`` is set.
 """
 
 import contextlib
@@ -22,7 +26,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, vector
 from flydsl._mlir.dialects import scf as _scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+
+# Not `from flydsl.expr import buffer_ops`: that module is gone in FlyDSL 0.3.1. See
+# the sibling `buffer_ops.py`.
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec

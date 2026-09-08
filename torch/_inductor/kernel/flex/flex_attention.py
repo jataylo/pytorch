@@ -56,7 +56,9 @@ from .flex_flash_attention import (
 )
 from .flydsl_flash_attention import (
     _use_flydsl_flash_attention,
+    _use_flydsl_flash_attention_backward,
     create_flex_flydsl_attention_kernel,
+    create_flydsl_flash_attention_backward_kernel,
 )
 
 
@@ -108,13 +110,14 @@ def _check_flash_supported_scalar_captures(
     mask_mod_other_buffers,
     *,
     backward: bool = False,
+    backend: str = "FLASH",
 ) -> None:
     if has_unsupported_cpu_scalar_tensor_captures(
         score_mod_other_buffers, mask_mod_other_buffers
     ):
         direction = " backward" if backward else ""
         raise RuntimeError(
-            f"BACKEND='FLASH' but flash attention{direction} cannot be used: "
+            f"BACKEND='{backend}' but flash attention{direction} cannot be used: "
             "NYI: score_mod or mask_mod captures a 0-dim CPU tensor scalar. "
             "Workarounds: use BACKEND='TRITON' or pass the value as a tensor "
             "on device instead of capturing a CPU scalar tensor."
@@ -233,14 +236,13 @@ def flex_attention(
 
     kernel_options, backend = _sanitize_kernel_options_for_triton(kernel_options)
 
-    # Early check for FLASH backend: reject scalar captures that cannot be
-    # represented by flash-attn aux_scalars before building subgraph buffers.
-    if backend == "FLASH":
-        _check_flash_supported_scalar_captures(
-            score_mod_other_buffers, mask_mod_other_buffers
-        )
-
+    # Early check: reject scalar captures that cannot be represented by flash-attn
+    # aux_scalars before building subgraph buffers. FLYDSL has no scalar-capture path at
+    # all, and passing a host pointer to its kernel faults the GPU rather than raising.
     if backend in ("FLASH", "FLYDSL"):
+        _check_flash_supported_scalar_captures(
+            score_mod_other_buffers, mask_mod_other_buffers, backend=backend
+        )
         # Both read captures as whole tensors at per-axis coordinates rather than through
         # Inductor's flattened indexing, so the captures have to be real buffers.
         score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
@@ -934,6 +936,44 @@ def flex_attention_backward(*args, **kwargs):
         mask_graph_placeholder_inps + list(mask_mod_other_buffers), mask_graph
     )
     freeze_irnodes(mask_graph_buffer)
+
+    if _use_flydsl_flash_attention_backward(
+        query,
+        key,
+        value,
+        joint_outputs=joint_outputs,
+        backend=backend,
+    ):
+        return create_flydsl_flash_attention_backward_kernel(
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            grad_out,
+            grad_logsumexp,
+            scale,
+            kernel_options,
+            # The three graphs the kernels evaluate: the forward score_mod (to recompute
+            # the score `lse` was written against), the joint graph (the chain rule
+            # through it, at the `ds` site) and the mask. Already lowered to buffers
+            # above, so this is the same work the Triton path does, not a second pass.
+            fw_subgraph_buffer=fw_subgraph_buffer,
+            joint_subgraph_buffer=joint_outputs.grad_input,
+            mask_graph_buffer=mask_graph_buffer,
+            has_score_mod=not is_trivial_score_graph(fw_graph.graph_module),
+            has_mask_mod=not is_trivial_mask_graph(mask_graph.graph_module),
+            # Both backward kernels can walk a block list instead of their axis densely,
+            # on opposite axes. The full lists are included because these kernels have one
+            # body per visited block and no fast path for unmasked ones, so the list they
+            # walk has to be the union.
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            full_kv_num_blocks=full_kv_num_blocks,
+            full_kv_indices=full_kv_indices,
+            sparse_q_block_size=SPARSE_Q_BLOCK_SIZE,
+            sparse_kv_block_size=SPARSE_KV_BLOCK_SIZE,
+        )
 
     if _use_flex_flash_attention_backward(
         fw_graph,

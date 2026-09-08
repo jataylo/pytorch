@@ -2595,8 +2595,7 @@ def flex_attention(
             max_scores,
             return_aux=return_aux,
             return_lse=return_lse,
-            stats_are_log2=kernel_options["BACKEND"]
-            not in _NATURAL_LOG_LSE_BACKENDS,
+            stats_are_log2=kernel_options["BACKEND"] not in _NATURAL_LOG_LSE_BACKENDS,
         )
 
     if not _FLEX_ATTENTION_DISABLE_COMPILE_DEBUG:

@@ -1,21 +1,14 @@
 # mypy: allow-untyped-defs
 """Runtime helpers that FlyDSL-generated FlexAttention mods call into.
 
-Generated kernels import this module (conventionally as ``fdu``), so it is the *only*
-file in the FlyDSL codegen package that may import ``flydsl``. Everything else emits
-source text and must stay importable without it.
+Generated kernels import this module (conventionally as ``fdu``), so it is the *only* file
+in the FlyDSL codegen package that may import ``flydsl``; everything else emits source text
+and must stay importable without it.
 
-Why a shim instead of emitting FlyDSL expressions inline:
-
-- **Type promotion.** A lowered ``score_mod`` freely mixes the f32 score with the i32
-  coordinates. Inductor inserts explicit casts in most places but not all, so operands
-  are promoted here rather than trusting the FX graph to have been tidy.
-- **Ops that do not lower.** ``math.tanh`` has no AMDGPU libcall in FlyDSL's pipeline
-  and fails at LLVM time with "no libcall available for ftanh". Soft-cap is one of the
-  most common score_mods there is, so the expansion has to live somewhere; putting it in
-  a normal Python module means it can be unit-tested instead of being a string template.
-- **Debuggability.** Generated code reads as ``fdu.mul(tmp0, tmp1)`` rather than three
-  nested constructor calls, which matters when inspecting a failing kernel.
+A shim rather than inline FlyDSL expressions because a lowered score_mod freely mixes the
+f32 score with i32 coordinates and Inductor does not cast every one of them, because some
+ops need expanding (``tanh`` has no AMDGPU libcall here), and because ``fdu.mul(tmp0,
+tmp1)`` is easier to read in a failing kernel than nested constructors.
 """
 
 from __future__ import annotations
@@ -27,15 +20,15 @@ from flydsl.expr import math as fmath
 from flydsl.expr.numeric import Float as _Float, Integer as _Integer
 from flydsl.expr.utils.arith import ArithValue
 
-from .flydsl_op_overrides import UNSUPPORTED_OPS as UNSUPPORTED_OPS
-
 
 _LOG2E = _math.log2(_math.e)
 _LN2 = 1.0 / _LOG2E
 _LN10 = _math.log(10.0)
+_PI = _math.pi
+_PI_2 = _math.pi / 2.0
 
 
-# ── type coercion ─────────────────────────────────────────────────────────────
+# Type coercion
 
 
 def const_f32(v):
@@ -56,12 +49,10 @@ def const_bool(v):
 def to_f32(x):
     """Convert anything a mod can hold to f32.
 
-    An integer needs a *typed wrapper* on the way, not just signedness on the
-    `ArithValue`: `fx.Float32` rejects a bare MLIR integer outright ("bare signless
-    integer cannot be promoted to float") because it cannot tell sitofp from uitofp, and
-    it reads signedness off `fx.Int32`'s class rather than off the value. Every operator
-    result comes back bare, so without the round trip through `fx.Int32` any arithmetic
-    on coordinates fails the moment it meets a float.
+    An integer needs the round trip through ``fx.Int32``, not just signedness on the
+    ``ArithValue``: ``fx.Float32`` rejects a bare MLIR integer ("bare signless integer
+    cannot be promoted to float") because it reads signedness off the class rather than the
+    value, and every operator result comes back bare.
     """
     if isinstance(x, (bool, int, float)):
         return fx.Float32(float(x))
@@ -126,9 +117,9 @@ def _both_bool(a, b) -> bool:
 def _promote2(a, b):
     """Bring two operands to a common arithmetic type (f32 if either is float).
 
-    Two i1 values are left alone. A mask_mod combines its clauses with ``&`` and ``|``,
-    which Inductor lowers to bitwise ops; widening those to i32 would make the mod return
-    an integer, and the kernel's ``select`` then rejects it as not bool-like.
+    Two i1 values are left alone: a mask_mod combines its clauses with ``&`` and ``|``, and
+    widening those to i32 would make the mod return an integer that the kernel's ``select``
+    then rejects as not bool-like.
     """
     if _both_bool(a, b):
         return ArithValue(a), ArithValue(b)
@@ -137,7 +128,7 @@ def _promote2(a, b):
     return ArithValue(to_i32(a)), ArithValue(to_i32(b))
 
 
-# ── binary arithmetic ─────────────────────────────────────────────────────────
+# Binary arithmetic
 
 
 def add(a, b):
@@ -176,7 +167,9 @@ def remainder(a, b):
     x, y = _promote2(a, b)
     r = ArithValue(x % y)
     zero = const_f32(0.0) if r.is_float else const_i32(0)
-    wrong_sign = ArithValue(ArithValue(r != zero) & ArithValue((r < zero) != (y < zero)))
+    wrong_sign = ArithValue(
+        ArithValue(r != zero) & ArithValue((r < zero) != (y < zero))
+    )
     return ArithValue(wrong_sign.select(ArithValue(r + y), r))
 
 
@@ -192,12 +185,12 @@ def minimum(a, b):
     return ArithValue(ArithValue(x < y).select(x, y))
 
 
-def pow(a, b):  # noqa: A001 - mirrors the ops-handler name
+def pow(a, b):  # shadows the builtin: the name is fixed by the ops handler
     x, y = ArithValue(to_f32(a)), ArithValue(to_f32(b))
     return ArithValue(fmath.powf(x, y))
 
 
-# ── comparison and logic ──────────────────────────────────────────────────────
+# Comparison and logic
 
 
 def lt(a, b):
@@ -280,7 +273,7 @@ def where(cond, a, b):
     return ArithValue(to_bool(cond).select(x, y))
 
 
-# ── unary ─────────────────────────────────────────────────────────────────────
+# Unary
 
 
 def neg(x):
@@ -288,7 +281,7 @@ def neg(x):
     return ArithValue(-av)
 
 
-def abs(x):  # noqa: A001 - mirrors the ops-handler name
+def abs(x):  # shadows the builtin: the name is fixed by the ops handler
     av = ArithValue(x)
     if av.is_float:
         return ArithValue(fmath.absf(av))
@@ -348,7 +341,7 @@ def trunc(x):
     return ArithValue(fmath.trunc(to_f32(x)))
 
 
-def round(x):  # noqa: A001 - mirrors the ops-handler name
+def round(x):  # shadows the builtin: the name is fixed by the ops handler
     return ArithValue(fmath.roundeven(to_f32(x)))
 
 
@@ -364,7 +357,7 @@ def tanh(x):
     """tanh expanded over exp2, because ftanh has no AMDGPU libcall here.
 
     Evaluated on |x| so the exponential cannot overflow, then the sign is restored:
-        tanh(x) = sign(x) * (1 - 2 / (exp2(2*|x|*log2e) + 1))
+    ``tanh(x) = sign(x) * (1 - 2 / (exp2(2*|x|*log2e) + 1))``.
     """
     av = ArithValue(to_f32(x))
     is_neg = ArithValue(av < const_f32(0.0))
@@ -380,6 +373,136 @@ def sigmoid(x):
     """1 / (1 + exp(-x)), via exp2 for the same reason as tanh."""
     e = exp2(mul(neg(x), const_f32(_LOG2E)))
     return ArithValue(const_f32(1.0) / ArithValue(ArithValue(e) + const_f32(1.0)))
+
+
+def _horner(z, coeffs):
+    """Evaluate a polynomial in ``z`` from the highest-order coefficient down."""
+    acc = const_f32(coeffs[0])
+    for c in coeffs[1:]:
+        acc = add(mul(acc, z), const_f32(c))
+    return acc
+
+
+def sinh(x):
+    """(e^|x| - e^-|x|) / 2, with the sign restored afterwards.
+
+    Folding to |x| first keeps the growing exponential the one that is evaluated, the
+    same reason ``tanh`` does it. sinh overflows f32 near |x| = 89 either way; that is
+    inherent to the function, not to this expansion.
+    """
+    e = exp(abs(x))
+    half = mul(sub(e, reciprocal(e)), const_f32(0.5))
+    return where(lt(x, const_f32(0.0)), neg(half), half)
+
+
+def cosh(x):
+    """(e^|x| + e^-|x|) / 2. Even, so no sign to restore."""
+    e = exp(abs(x))
+    return mul(add(e, reciprocal(e)), const_f32(0.5))
+
+
+def asinh(x):
+    """sign(x) * log(|x| + sqrt(x^2 + 1)).
+
+    Taken on |x| so the sum never cancels: for large negative x the direct form
+    ``log(x + sqrt(x*x + 1))`` subtracts two nearly equal numbers.
+    """
+    ax = abs(x)
+    r = log(add(ax, sqrt(add(mul(ax, ax), const_f32(1.0)))))
+    return where(lt(x, const_f32(0.0)), neg(r), r)
+
+
+def acosh(x):
+    """log(x + sqrt(x^2 - 1)), defined for x >= 1."""
+    return log(add(x, sqrt(sub(mul(x, x), const_f32(1.0)))))
+
+
+def atanh(x):
+    """0.5 * log((1 + x) / (1 - x)), defined for |x| < 1."""
+    return mul(
+        log(truediv(add(const_f32(1.0), x), sub(const_f32(1.0), x))), const_f32(0.5)
+    )
+
+
+# Hastings' odd minimax polynomial for atan on |x| <= 1, max abs error ~1e-5. Far tighter
+# than needed: a score_mod's result is consumed by an f32 softmax after a bf16 round trip,
+# so the function's own error is nowhere near the limiting term.
+_ATAN_COEFFS = (0.0208351, -0.0851330, 0.1801410, -0.3302995, 0.9998660)
+
+
+def _atan_unit(x):
+    """atan(x) for |x| <= 1."""
+    return mul(x, _horner(mul(x, x), _ATAN_COEFFS))
+
+
+def atan(x):
+    """atan over the full range, by reflecting |x| > 1 through atan(x) = pi/2 - atan(1/x)."""
+    ax = abs(x)
+    big = gt(ax, const_f32(1.0))
+    # Both branches are evaluated, so keep the reciprocal finite at x = 0 where it is
+    # not selected: the guarded argument is 1/max(|x|, 1) rather than 1/|x|.
+    inner = where(big, reciprocal(maximum(ax, const_f32(1.0))), ax)
+    r = _atan_unit(inner)
+    r = where(big, sub(const_f32(_PI_2), r), r)
+    return where(lt(x, const_f32(0.0)), neg(r), r)
+
+
+def atan2(y, x):
+    """Quadrant-correct atan(y/x).
+
+    ``atan(y/x)`` alone collapses the second and third quadrants onto the first and
+    fourth, so x < 0 needs +/-pi added back with the sign taken from y. x == 0 is
+    resolved to +/-pi/2 rather than left to the division.
+    """
+    ratio = truediv(y, where(eq(x, const_f32(0.0)), const_f32(1.0), x))
+    base = atan(ratio)
+    y_neg = lt(y, const_f32(0.0))
+    shifted = add(base, where(y_neg, const_f32(-_PI), const_f32(_PI)))
+    on_axis = where(y_neg, const_f32(-_PI_2), const_f32(_PI_2))
+    return where(
+        eq(x, const_f32(0.0)),
+        on_axis,
+        where(lt(x, const_f32(0.0)), shifted, base),
+    )
+
+
+def asin(x):
+    """atan2(x, sqrt(1 - x^2)), which stays finite at |x| = 1 where atan(x/0) would not."""
+    return atan2(x, sqrt(maximum(sub(const_f32(1.0), mul(x, x)), const_f32(0.0))))
+
+
+def acos(x):
+    """pi/2 - asin(x)."""
+    return sub(const_f32(_PI_2), asin(x))
+
+
+# Abramowitz & Stegun 7.1.26, max abs error 1.5e-7 on x >= 0.
+_ERF_P = 0.3275911
+_ERF_COEFFS = (1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592)
+
+
+def erf(x):
+    """A&S 7.1.26 on |x|, with erf(-x) = -erf(x).
+
+    ``1 - poly(t) * exp(-x^2)`` where ``t = 1 / (1 + p|x|)``. Evaluated on |x| because
+    the approximation is only valid for non-negative argument.
+    """
+    ax = abs(x)
+    t = reciprocal(add(const_f32(1.0), mul(const_f32(_ERF_P), ax)))
+    poly = mul(t, _horner(t, _ERF_COEFFS))
+    r = sub(const_f32(1.0), mul(poly, exp(neg(mul(ax, ax)))))
+    return where(lt(x, const_f32(0.0)), neg(r), r)
+
+
+def erfc(x):
+    """1 - erf(x).
+
+    Cancels in the right tail, where erf approaches 1 and erfc is the small quantity, so
+    this carries absolute rather than relative accuracy out there. Adequate for a
+    score_mod, which feeds a softmax that is itself shift-invariant; not adequate as a
+    general erfc.
+    """
+    return sub(const_f32(1.0), erf(x))
 
 
 def relu(x):

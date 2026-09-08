@@ -2796,8 +2796,11 @@ class mtia:
 class flydsl:
     """FlyDSL backend knobs. Currently only the FlexAttention path has any.
 
-    The FlexAttention backend is ROCm-only, experimental and forward only, and is
-    selected only by kernel_options={"BACKEND": "FLYDSL"}; never by AUTO.
+    The FlexAttention backend is ROCm-only and experimental, covers forward and backward,
+    and is selected only by kernel_options={"BACKEND": "FLYDSL"}; never by AUTO. Forward
+    and backward are chosen together: asking for FLYDSL on a graph whose backward it
+    cannot serve raises rather than falling back, because its forward writes LSE in
+    natural log where Triton's backward reads log2.
     """
 
     # Allow architectures whose flex kernel is written but has never been executed on
@@ -2813,6 +2816,58 @@ class flydsl:
     # one; worth it when the mod is expensive enough for the vectorization to matter.
     autotune_mod_vec_size: bool = (
         os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_MOD_VEC_SIZE", "1") == "1"
+    )
+
+    # Also offer QK prefetch depths 2, 3, 4 and 5, which decide how many K packs are read
+    # out of LDS before the MFMA chain starts. Off by default: it multiplies the build
+    # count by four and measures at only 0.6-2.1% even where it wins, with three of six
+    # shapes preferring the default 2. Worth turning on for a shape that will be compiled
+    # once and run a great many times.
+    autotune_qk_prefetch_depth: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_QK_PREFETCH_DEPTH") == "1"
+    )
+
+    # Offer three tile shapes for the backward's dk/dv kernel instead of one. On by
+    # default, unlike the prefetch depth above, because the spread is worth having: the
+    # best single default (KV tile 128, Q tile 32) measured 9% behind on a 32-head shape
+    # and 21% behind on a short one, against three builds rather than four. The dq
+    # kernel's tile is *not* offered -- its own sweep had one shape winning 6 of 7 and the
+    # losses to the alternatives were large and one-sided, so there is nothing to pick.
+    autotune_backward_tile: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_BACKWARD_TILE", "1") == "1"
+    )
+
+    # Offer the forward's Q tile as a choice on the shapes where it is live, rather than
+    # taking the 32-head default on faith. On by default: the tile it replaces a guess
+    # with is worth up to 2.5x, which is not a margin a heuristic should be deciding.
+    autotune_forward_block_m: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_FORWARD_BLOCK_M", "1") == "1"
+    )
+
+    # Offer both K staging strategies to the forward. On by default because the measurement
+    # splits by shape rather than favouring one: staging K through registers to overlap the
+    # next tile's global read wins 6-15% at most head_dims and loses at a few, and no cheap
+    # property of the shape predicts which. It also interacts with the Q tile instead of
+    # composing with it -- at head_dim 128 the best config is the 256-row tile *with*
+    # staging, which neither axis alone picks -- so the two are swept as a product.
+    # Numerics are identical either way, so this only trades speed.
+    autotune_kv_gpfetch: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_AUTOTUNE_KV_GPFETCH", "1") == "1"
+    )
+
+    # Worker processes used to compile autotune choices ahead of the benchmark loop; 0
+    # disables and compiles them serially where they are measured.
+    #
+    # Processes rather than threads, on measurement. A cold FlyDSL kernel costs ~1.54s to
+    # compile (0.40s emitting MLIR from Python, 1.14s in the MLIR pipeline and LLVM)
+    # against Triton's ~0.22s, and none of that overlaps on a thread pool -- eight compiles
+    # take 9.5s serially and *more* than that across eight threads, because the Python half
+    # holds the GIL and the native half does not release it either. Across eight processes
+    # the same eight take 1.9s. The parent still pays the 0.40s of Python per choice, but
+    # its launch drops from 1.14s to 0.07s, because FlyDSL's on-disk cache is shared across
+    # processes and a worker's compile is a cache hit here.
+    precompile_workers: int = int(
+        os.environ.get("TORCHINDUCTOR_FLYDSL_PRECOMPILE_WORKERS", "8")
     )
 
 
