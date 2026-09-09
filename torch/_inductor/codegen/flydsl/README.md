@@ -687,6 +687,13 @@ carries the measured gfx942 baseline against autotuned Triton and aten, and a ph
 for the BlockMask plumbing, head_dim 64, backward, and gfx950/gfx1201. It also records why
 rebasing onto the upstream `parity` FMHA family does not by itself close the gap.
 
+Two PRs are open against `main` doing overlapping work, AMD's gfx950 FlyDSL forward and
+backward. [`UPSTREAM_PR_COMPARISON.md`](UPSTREAM_PR_COMPARISON.md) is the comparison: what
+each side is better at, and the four things in them worth taking. The short version is that
+they accept only an identity `score_mod`, so they are a fast dense FlashAttention reached
+through the FlexAttention API rather than a competing backend — and that their decode path,
+which we do not have at all, is the one feature they have clearly tuned past us.
+
 Its §8 has since answered the question it opens with, and the answer for gfx942 is **no**.
 Every lead that moved the number turned out to be ours to take — the 512 B LDS overage, the
 layout copies, the block-skip plumbing — and each was assumed at some point to need parity.

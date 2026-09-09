@@ -274,7 +274,9 @@ class FlexKernelOptions(TypedDict, total=False):
         - "TRITON_DECODE": Triton flex_decoding kernel, only available for short sequence lengths with specific configurations
         - "FLASH": Experimental: Flash Attention kernel (cute-dsl), user needs to have flash installed
         - "FLYDSL": Experimental, ROCm only: FlyDSL flash attention kernel. Requires the
-          ``flydsl`` package and a supported AMD architecture. Forward only.
+          ``flydsl`` package and a supported AMD architecture. Serves forward and backward
+          together; the two cannot be mixed with another backend, because this forward
+          writes logsumexp in natural log where the Triton one writes log2.
 
     This option cannot be combined with legacy knobs such as ``FORCE_USE_FLEX_ATTENTION``.
     Raises an error if the requested backend cannot be used. Default: "AUTO"
