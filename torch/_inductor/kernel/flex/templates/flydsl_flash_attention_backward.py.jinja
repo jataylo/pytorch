@@ -127,13 +127,17 @@ def _launcher(which):
         if which == "dq":
             # dq's tile is not autotuned; its own sweep left nothing to pick between.
             _LAUNCHERS[which] = build_flex_flash_bwd_dq_module(
-                mod_vec_size=MOD_VEC_SIZE, block_mask=DQ_BLOCK_SKIP, **common
+                mod_vec_size=MOD_VEC_SIZE,
+                block_mask=DQ_BLOCK_SKIP,
+                has_dlse={{ HAS_DLSE }},
+                **common,
             )
         else:
             _LAUNCHERS[which] = build_flex_flash_bwd_dkdv_module(
                 block_n=DKDV_KV_TILE,
                 block_m=DKDV_Q_TILE,
                 block_mask=DKDV_BLOCK_SKIP,
+                has_dlse={{ HAS_DLSE }},
                 **common,
             )
     return _LAUNCHERS[which]
@@ -143,13 +147,16 @@ def _launcher(which):
    one autotune group have to agree on their inputs and dkdv's decision moves with the
    tile being swept. An unused declaration costs a kernarg. #}
 {% set skip_any = DQ_BLOCK_SKIP or DKDV_BLOCK_SKIP %}
-{% if skip_any and HAS_FULL_BLOCKS %}
-{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV", "KV_NUM_BLOCKS", "KV_INDICES", "FULL_KV_NUM_BLOCKS", "FULL_KV_INDICES")}}
-{% elif skip_any %}
-{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV", "KV_NUM_BLOCKS", "KV_INDICES")}}
-{% else %}
-{{def_kernel("Q", "K", "V", "DO", "LSE", "DELTA", "DK", "DV")}}
-{% endif %}
+{# Built as a list rather than as branches: the optional DLSE slot would otherwise double
+   the number of def_kernel arms. The order here is the order of `input_nodes` in the
+   lowering, and `input_gen_fns` indexes the list tensors by position, so the two move
+   together. #}
+{% set names = ["Q", "K", "V", "DO", "LSE", "DELTA"]
+   + (["DLSE"] if HAS_DLSE else [])
+   + ["DK", "DV"]
+   + (["KV_NUM_BLOCKS", "KV_INDICES"] if skip_any else [])
+   + (["FULL_KV_NUM_BLOCKS", "FULL_KV_INDICES"] if skip_any and HAS_FULL_BLOCKS else []) %}
+{{ def_kernel(*names) }}
     dq = {{get_output()}}
     # As in the forward: the kernel reads aux as flat contiguous f32, both calls are no-ops
     # when the capture already satisfies that, and the conversion is per distinct capture
@@ -181,10 +188,12 @@ def _launcher(which):
     flex_flash_bwd_dq_bhsd(
         _launcher("dq"), Q, K, V, DO, LSE, DELTA, dq=dq, aux=aux,
         block_mask={{ "block_mask" if DQ_BLOCK_SKIP else "None" }},
+        dlse={{ "DLSE" if HAS_DLSE else "None" }},
     )
     # GQA needs no reduction after this call: dk/dv for a kv head are the sum over the Q
     # heads sharing it, and the kernel accumulates that group in registers.
     flex_flash_bwd_dkdv_bhsd(
         _launcher("dkdv"), Q, K, V, DO, LSE, DELTA, dk=DK, dv=DV, aux=aux,
         block_mask={{ "block_mask" if DKDV_BLOCK_SKIP else "None" }},
+        dlse={{ "DLSE" if HAS_DLSE else "None" }},
     )

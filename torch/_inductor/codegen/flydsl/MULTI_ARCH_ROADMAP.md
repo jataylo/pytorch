@@ -60,13 +60,35 @@ made before any vendoring starts rather than discovered halfway through.
 
 ## Where we stand
 
-Two of six architecture-by-direction cells work.
+Four of six architecture-by-direction cells build. Two of them have been executed.
 
 | | forward | backward |
 |---|---|---|
 | **gfx942** (CDNA3) | **working** — `flex_flash_generic.py`, autotuned | **working** — `flex_flash_bwd_generic.py`, dq + dkdv, autotuned |
-| **gfx950** (CDNA4) | `flex_flash_950.py` vendored, never wired, never executed | upstream SDPA parity, not vendored — and further along than this plan assumed, see below |
-| **gfx1201** (RDNA4) | upstream, not vendored; arch rejected by the gate | upstream SDPA parity, not vendored |
+| **gfx950** (CDNA4) | **builds, unexecuted** — the same generic builder, selecting the CDNA4 paths off `arch_caps`. Admitted without a flag; ISA checked from a gfx942 host | **builds, unexecuted** — same, but takes *no* CDNA4 path: the four capability bits are read only by the forward |
+| **gfx1201** (RDNA4) | refused, and by capability rather than by name: the flex bodies emit MFMA, RDNA4 has WMMA. Reaching it is a second kernel body, not an entry in a table | same |
+
+The gfx950 row changed meaning when the name allowlist became a capability table. It used to
+say "`flex_flash_950.py` vendored, never wired, never executed", which conflated a hand-
+scheduled D=128 body with the architecture: the generic builder already selects every CDNA4
+instruction that file is written around, so gfx950 does not need it in order to be served.
+What `flex_flash_950.py` still offers is a hand-written schedule instead of the compiler's,
+which is a performance question and not an enablement one.
+
+The gfx1201 row needs one correction that changes what the donor is worth here. A survey of
+upstream's gfx1201 tree found a **mature** dense flash attention — ~12.2k lines plus ~1.4k of
+shared helpers, causal, sliding window, varlen, GQA, bias, dropout, LSE, head dims 16–512 by
+a compiled ladder with runtime round-up, a split backward (dQ and dK/dV separately) tested to
+head_dim 512, and a fused variant capped at 128 — under active development as recently as
+this August. But it has **no `score_mod` or `mask_mod` hook, and neither does its CDNA
+code**. Masking there is region-split loops emitting fixed `-inf` fills at build time.
+
+So the assumption below that "what parity is still for is gfx950 and gfx1201 reach" is only
+half right. Parity would supply the WMMA GEMM, softmax and LDS mechanics, which is real work
+we do not have; it would supply none of the mod-callback layer, which is the part that makes
+this a FlexAttention backend and the part upstream has never needed. Budget an RDNA4 cell as
+a port of the mechanics *plus* a from-scratch mod layer at every score site in the forward
+and all three backward bodies — not as vendoring.
 
 148 tests across both directions. The gfx942 forward covers score_mod, mask_mod, BlockMask
 skipping, GQA, bf16/f16, head_dim every multiple of 32 from 64 to 256, `return_lse`, ragged
@@ -432,8 +454,8 @@ building.
 
 The backward is behind Triton where the forward is well ahead, and that flips the combined
 picture. Forward **and** backward, bf16, both backends given `max_autotune`, every cell's
-gradients checked against eager before being tabulated (`bench/flydsl_vs_triton_autotune.py
---backward`), as `fly/tri` on TFLOP/s:
+gradients checked against eager before being tabulated
+(`benchmarks/transformer/flydsl/shape_ladder.py --backward`), as `fly/tri` on TFLOP/s:
 
 | head_dim | 1x8x4096 | 2x16x2048 | 4x8x4096 | 2x32x4096 |
 |---|---|---|---|---|
@@ -616,18 +638,28 @@ sweep — which matters because a sweep here would have doubled the backward's a
 and we are 5–7x more expensive per choice than Triton already (see the README). Numerics are
 bit-identical either way. P2d is now closed in both kernels.
 
-### P3 — decide the framework question, then wire gfx950 forward (not validatable)
+### P3 — decide the framework question, then wire a *faster* gfx950 forward (not validatable)
 
-D1 below has to be answered first. Then either wire the already-vendored
-`flex_flash_950.py` (the template currently hardcodes the generic builder) or vendor the
-parity forward per Phase 3 scoping.
+Enablement is done: gfx950 is served by the generic builder, which selects the CDNA4
+instructions off `arch_caps`, and the ISA is checked from a gfx942 host by
+`test_gfx950_builds_from_a_gfx942_host` and `isa_stats.py --arch gfx950`. What remains here
+is purely about speed — a hand-written schedule instead of the compiler's. D1 below has to be
+answered first: either wire the already-vendored `flex_flash_950.py` (the template hardcodes
+the generic builder) or vendor the parity forward per Phase 3 scoping.
 
-**Gate:** compiles and emits gfx950 ISA, stays behind `config.flydsl.allow_unvalidated_arch`,
-and the file header records that it has never been executed. It cannot be stood in for on
-gfx942 — the 16-byte DMA makes LLVM fail instruction selection with *"Do not know how to
-expand this operator's operand"*.
+**Gate:** compiles, emits gfx950 ISA, and beats what the generic builder already produces
+there — 242 VGPRs and no spill at D128 causal is the bar, not zero. There is no numerical
+gate available: it cannot be stood in for on gfx942, since the 16-byte DMA makes LLVM fail
+instruction selection with *"Do not know how to expand this operator's operand"*.
 
-### P4 — gfx950 backward (not validatable)
+### P4 — gfx950 backward specialization (not validatable)
+
+The backward builds for gfx950 today and takes none of its instructions: `mfma_k16`,
+`lds_transpose_read` and `permlane_o_store` are forward-only, and the ISA confirms it —
+`dkdv` at D128 lands on 256 VGPRs with 78 spilled on gfx942 and 256 with 76 on gfx950.
+Teaching it the CDNA4 paths is the largest single gfx950 gap, and the 2.5x LDS is the other
+half of it: the budget is already declared per arch, so the tile filter admits the wider Q
+tile at head_dim 256 (131072 B) there and nowhere else.
 
 Reuses P2's plumbing. ~3.4k code lines plus per-body flex hooks. Same gate as P3.
 
@@ -788,6 +820,51 @@ registers is the same overlap within what the part can actually do.
 - *`V_PERM_TR`.* Gated upstream on `vt_stride == block_n + 2` — the padded V layout we
   replaced with an XOR swizzle to reclaim LDS and hold 2 workgroups per CU. Taking it means
   giving that back.
+- *The XCD workgroup swizzle* (`cf1db2f`, "Swizzled Head-first Mapping", arXiv:2511.02132),
+  which keeps one head's Q blocks on one XCD so its K/V stays in that XCD's L2. This was the
+  last unported forward commit and the only donor lead for the dense deficit, so it was
+  implemented rather than reasoned about: two orderings, both bit-identical to the current
+  one, A/B'd against it kernel-only.
+
+  | | dense | causal |
+  |---|---|---|
+  | q_tile on the fast axis (upstream's own arithmetic) | 1.00–1.01x | 0.58–0.85x |
+  | full XCD remap, heads contiguous per XCD | 1.00–1.01x | 0.90–0.97x |
+
+  The first row *is* upstream's mechanism: it re-derives `(head, q_block)` from the linear
+  workgroup id with head as the slow axis, which is a relabelling and nothing more. The
+  second is a stronger version that also undoes gfx942's round-robin dispatch, so each XCD
+  owns a contiguous run of heads rather than a strided one — an option upstream does not
+  need, because gfx950 hands out contiguous ids already.
+
+  Dense does not move at all, over 4x16x4096, 2x8x4096, 2x32x4096 and 1x16x8192 at head_dim
+  64 and 128 — including inside upstream's own dispatch gate, which wants ≥64 Q blocks and a
+  head count divisible by the XCD count (1x16x8192 has exactly 64). Causal *loses*, and that
+  is the useful half of the result: it proves the remap changed placement, so the flat dense
+  column is an answer rather than a no-op. Upstream measured the same sign there — it costs
+  them 7.4% causal, which is why their gate is non-causal only — and the cause is the same:
+  the current order interleaves heads and so keeps neighbouring workgroups at similar
+  triangular depth, where ordering by Q tile puts the cheapest and costliest next to each
+  other.
+
+  **Why the gain does not transfer, quantitatively.** Worst case, assuming the `S/BLOCK_M`
+  Q tiles sharing a head re-read its K/V from DRAM every time, the traffic is
+  `B*H*S²*4*D/BLOCK_M` bytes against `4*B*H*S²*D` flops — so the demand is `1/BLOCK_M`
+  bytes per flop, **independent of sequence length**. Their headline is at S=65536, but
+  lengthening S cannot reproduce it, because the ratio does not move. What moves it is
+  throughput. At a 128-wide Q tile the kernel asks for one byte per 128 flops, so our
+  74 TFLOP/s wants 0.60 TB/s of a part that achieves **1.90 TB/s** (measured, large copy),
+  where their 1200–1318 TFLOP/s dualwave kernel on MI355X wants several TB/s of a part with
+  roughly 8 — the exact figure depending on their tile, but the same order as the part. They
+  are near the memory wall and we are at a third of ours, which is why their L2 hit rate
+  moving 2.4% → 93.6% is worth 9–20% to them and nothing to us.
+
+  Worth noting for anyone re-reading the donor: it is not on the parity path at all. Only
+  the production fp8 kernel builds it, chosen at runtime; parity bf16 and both backward
+  kernels leave `XCD_SWIZZLE` false.
+
+  Not kept as a knob: the stronger form needs the batch count as a kernel argument to
+  compute the remap, and neither form wins at any shape. The numbers above are the record.
 
 **The MFMA operand wait state does not apply, and this was checked rather than argued.**
 Upstream emits `s_nop 1` between a bf16 pack and the MFMA reading it, for documented

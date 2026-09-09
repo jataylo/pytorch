@@ -68,9 +68,11 @@ reading the generated code on every row; all outputs matched eager.
 | 2x32x4096 | score_mod | 62.9 TF | 80.8 TF | — | 0.78x |
 | 2x32x4096 | causal | 33.5 TF | 58.3 TF | 69.8 TF | 0.58x |
 
-Scripts: `/dockerx/bench/flydsl_flex_bench.py` (three-way, with backend
-verification), `/dockerx/bench/flydsl_vs_triton_autotune.py` (autotuned
-head-to-head).
+Script: `benchmarks/transformer/flydsl/shape_ladder.py`, the autotuned three-way
+head-to-head, which is in the tree rather than beside it as of the layout work.
+The older `flydsl_flex_bench.py` it superseded is not: that one pinned head_dim
+128 as "the only configuration the FlyDSL kernel computes correctly", which was
+true when it was written and has not been since P1.
 
 ### Three facts to carry forward
 
@@ -117,6 +119,32 @@ moved past our fork in four relevant commits:
 lines. Targets bit-level ABI equivalence with AOTriton `attn_fwd` so it can
 replace the Triton kernel inside AOTriton. Covers gfx950 and gfx1201, forward
 and backward.
+
+### Re-pull, 2026-09-09: nothing to vendor, one technique worth having
+
+Seven commits landed on `xinyazhang/sdpa-gfx950-feature-bwd` since our checkout
+(`72e8e75..74ec63e`). Every one is under `kernels/attention/parity/*_gfx950.py`
+and its tuning or tests: varlen decoding on by default, head_dim 256 re-tuned
+for it and then its overrides retired, either LSE layout served from one build, a
+test that stopped leaking its dump directory, and a handoff arguing that 44
+`test_irregulars` failures are a torch bf16 `bmm` bug rather than theirs. None
+touch `kernels/common/buffer_ops.py`, which is the one file we vendor verbatim,
+so `refresh_vendored.py --log` has nothing to do and `--check` is clean.
+
+The exception is a mechanism rather than code. `bf2faf8` recovers a third of
+their `dkdv` by rewriting `(row_base + T[r]) * pitch` as
+`row_base * pitch + T[r] * pitch`: the first makes all sixteen row offsets
+divergent, holding sixteen VGPRs live because the loads issue back to back, and
+that crossed 256 registers and cost them the second wave per SIMD. The second
+leaves a uniform base plus a scalar. Our LSE plane is contiguous in `S`, so we
+have no pitch to distribute and that exact rewrite does not apply — but the
+cliff does, and `isa_stats.py --backward` now shows us sitting on it: both
+head_dim 128 backward builds are at exactly 256 VGPRs, `dkdv` spilling 78. It is
+what caught the `dlse` plane costing 50% of `dkdv` when carried live to the `ds`
+site instead of folded on the load line. Their warning that `soffset` is not a
+safe home for the uniform term is worth keeping in mind for the same reason:
+CDNA range-checks a raw buffer on the voffset alone, and that bound is what makes
+an out-of-range row read zero rather than a neighbour's LSE.
 
 ### The D=64 bug is ours and the fix is two lines
 
@@ -281,9 +309,17 @@ designed for exactly this and currently hold one entry.
   (`_BY_ARCH = {"gfx950": Gfx950Knobs}` today, keyed on arch prefix). Shared
   derivations like `_with_widths` stay on the base *"so a second arch cannot
   accidentally decide `padded_head` by another rule."*
-- Replace our `_VALIDATED_ARCHS` / `_PORTED_ARCHS` allowlist with a capability
+- ~~Replace our `_VALIDATED_ARCHS` / `_PORTED_ARCHS` allowlist with a capability
   registry (has 16 B DMA-to-LDS? has LDS transpose read? MFMA K? LDS bytes?) so
-  a new arch declares what it has instead of being pattern-matched by name.
+  a new arch declares what it has instead of being pattern-matched by name.~~
+  **Done**, ahead of the rest of this plan, in
+  [`arch_caps.py`](../../kernel/vendored_templates/flydsl/arch_caps.py). It carries
+  exactly those four questions plus the matrix-core family, and the kernel builders
+  read it too, so the LDS budget is no longer duplicated between lowering and the
+  builders' own check. Two things fell out of doing it: gfx950 stopped needing a
+  flag, and the forward's DMA-to-LDS selection stopped being a negation
+  (`not startswith("gfx942")`) that handed the instruction to architectures which
+  do not have it.
 
 **Per-arch kernel bodies — permanently separate:**
 - gfx942/CDNA3, gfx950/CDNA4, gfx1201/RDNA4. No unification, in line with
@@ -698,9 +734,11 @@ row-confined XOR either), and **256** needs 66560 B of LDS against gfx942's 6553
 Package parity's bare imports into a module tree; vendor the closure from §B5;
 build the gfx950 forward inside the Phase 0 venv.
 
-**Gate:** it compiles and emits gfx950 ISA. It **cannot** be numerically
-validated here — record that explicitly in the file header, as we did for
-`flex_flash_950.py`, and keep it behind `config.flydsl.allow_unvalidated_arch`.
+**Gate:** it compiles, emits gfx950 ISA, and is faster than what the generic
+builder already emits there. That last clause is the part that changed: gfx950 is
+served today, so this phase no longer buys enablement and has to justify itself on
+speed. It **cannot** be numerically validated here — record that explicitly in the
+file header, as `flex_flash_950.py` does.
 
 #### Phase 3 scoping — what running parity on gfx942 actually costs
 

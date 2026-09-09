@@ -432,13 +432,14 @@ def _bwd_block_lists(
 
 
 def flex_flash_bwd_dq_bhsd(
-    launcher, q, k, v, do, lse, delta, *, dq, aux=None, block_mask=None
+    launcher, q, k, v, do, lse, delta, *, dq, aux=None, block_mask=None, dlse=None
 ):
     """Run the ``dq`` backward kernel on **BHSD** tensors, writing ``dq`` in place.
 
     ``lse`` must be the natural-log LSE our forward writes, and ``delta`` the
     ``rowsum(do * o)`` the lowering computes; both are ``[B, H_q, S]`` f32 in either
-    layout, since the kernel indexes them ``(b, h, s)`` regardless.
+    layout, since the kernel indexes them ``(b, h, s)`` regardless. ``dlse`` is the
+    cotangent of that ``lse``, shaped the same, and only for a launcher built for it.
 
     Everything else is passed flat, so it must be dense in the launcher's layout. Feeding
     a launcher built for the layout the caller's memory is already in is what keeps that
@@ -465,6 +466,7 @@ def flex_flash_bwd_dq_bhsd(
         _layout_view(launcher, do).contiguous().reshape(-1),
         lse.contiguous().reshape(-1),
         delta.contiguous().reshape(-1),
+        _bwd_dlse_arg(launcher, dlse, B, H, S, q.device),
         buf.reshape(-1),
         *_bwd_aux_args(launcher, aux, B, H, S, S_KV, q.device),
         # dq owns its Q rows and walks KV, so it wants a KV list per Q tile.
@@ -488,6 +490,27 @@ def flex_flash_bwd_dq_bhsd(
     return dq
 
 
+def _bwd_dlse_arg(launcher, dlse, B, H, S, device):
+    """Validate the LSE cotangent and fill the slot, which is fixed-arity like the aux ones.
+
+    The slot exists in every build so that one kernel signature serves both cases; a build
+    without it never reads the dummy. Passing one to such a build would therefore be
+    silently ignored, which is the one mistake here worth an exception.
+    """
+    if not getattr(launcher, "has_dlse", False):
+        if dlse is not None:
+            raise ValueError("launcher was not built for a dlse gradient")
+        return _dummy(device)
+    if dlse is None:
+        raise ValueError("launcher was built for a dlse gradient but none was passed")
+    if dlse.shape != (B, H, S) or dlse.dtype != torch.float32:
+        raise ValueError(
+            f"dlse must be a float32 tensor of shape {(B, H, S)}, "
+            f"got {tuple(dlse.shape)} {dlse.dtype}"
+        )
+    return dlse.contiguous().reshape(-1)
+
+
 def _bwd_aux_args(launcher, aux, B, H, S_q, S_kv, device):
     """Validate the captured tensors a backward kernel's mods read, and pad the slots.
 
@@ -505,7 +528,7 @@ def _bwd_aux_args(launcher, aux, B, H, S_q, S_kv, device):
 
 
 def flex_flash_bwd_dkdv_bhsd(
-    launcher, q, k, v, do, lse, delta, *, dk, dv, aux=None, block_mask=None
+    launcher, q, k, v, do, lse, delta, *, dk, dv, aux=None, block_mask=None, dlse=None
 ):
     """Run the ``dk``/``dv`` backward kernel on **BHSD** tensors, writing both in place.
 
@@ -536,6 +559,7 @@ def flex_flash_bwd_dkdv_bhsd(
         _layout_view(launcher, do).contiguous().reshape(-1),
         lse.contiguous().reshape(-1),
         delta.contiguous().reshape(-1),
+        _bwd_dlse_arg(launcher, dlse, B, H, S, q.device),
         dk_buf.reshape(-1),
         dv_buf.reshape(-1),
         *_bwd_aux_args(launcher, aux, B, H, S, S_KV, q.device),

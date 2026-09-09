@@ -96,7 +96,7 @@ diffing against upstream, not restyled.
 | File | Role |
 | --- | --- |
 | `flex_kernels/flex_flash_generic.py` | The forward kernel. gfx942-validated. Carries the score/mask hooks, LSE output, aux reads, mod vectorization, and a KV block-skip loop. |
-| `flex_kernels/flex_flash_950.py` | Mechanical gfx950 port of the same hooks. Never executed on hardware; gated behind `config.flydsl.allow_unvalidated_arch`. |
+| `flex_kernels/flex_flash_950.py` | A hand-scheduled gfx950 forward (dual-wave, software-pipelined, D=128 only) carrying the same hooks. Nothing dispatches to it: the template builds `flex_flash_generic` on every architecture, and on gfx950 that already selects the CDNA4 instructions this file is written around. What is unexercised here is therefore the schedule, not the architecture. |
 | `flex_kernels/flex_mods.py` | Reference mods, plus the `@elementwise` / `@elementwise_mask` decorators that lift a scalar mod body to the vectorized ABI. Doubles as the contract our codegen has to emit against. |
 | `flex_kernels/flex_interface.py` | Host side. `flex_flash_attn_bhsd()` adapts Inductor's `[B, H, S, D]` to the kernel's `[B, S, H, D]`, allocates, validates aux, and launches. |
 | `kernels/kernels_common.py` | Low-level FlyDSL/MLIR helpers shared by both kernels. |
@@ -163,6 +163,13 @@ mod is written for one score at a time, and the vectorized ABI is handled by lif
 whole mod (`@elementwise`), so each op is a plain call and all the type promotion lives in
 one shim.
 
+That width is 1, 2 or 4, and 4 is a ceiling of the MFMA fragment rather than a tuning
+choice: writing an accumulator element as `r = 4g + j`, its `kv_idx` sits at offset
+`8g + j`, so runs of 4 are contiguous and the groups are 8 apart. A wider call would need
+elements that are not adjacent in the score domain, which is not what the ABI promises.
+CuteDSL reaching 32 or 128 is therefore not a knob we have set lower — it is a different
+accumulator layout, and one gated on SM100 and up.
+
 **Captured tensors are addressed by per-axis stride specs.** CuteDSL materializes index
 fragments and loads through them. Here an aux slot is a reader `reader(b, h, q_idx, kv_idx)`
 that resolves one element offset from four strides, where `0` means "broadcast over this
@@ -196,20 +203,25 @@ is exposed. All three must produce identical results; the autotuner is free to p
 **LSE is natural log and a mutated input.** The kernel writes `ln(sum exp)` in place, so
 `FLYDSL` is listed in `_NATURAL_LOG_LSE_BACKENDS` in
 [`torch/nn/attention/flex_attention.py`](../../../nn/attention/flex_attention.py) alongside
-`FLASH` and the wrapper does not rescale it.
+`FLASH` and the wrapper does not rescale it. A loss may differentiate that LSE: the
+backward takes an optional `DLSE` plane, which is where the natural-log convention has to
+be believed rather than assumed, since a log2 `lse` would need the cotangent rescaled too.
 
 ## Supported configurations
 
 | | |
 | --- | --- |
 | Direction | Forward and backward (`dq` and `dk`/`dv`) |
-| Architecture | gfx942; gfx950 only with `config.flydsl.allow_unvalidated_arch` |
+| Architecture | gfx942 and gfx950, neither behind a flag. Declared as capabilities rather than names, so anything else is refused by naming what it is missing — see [GPU architectures](#gpu-architectures) |
 | dtype | bf16, f16 (all of q/k/v the same) |
 | head_dim | Multiples of 32 from 64 to 256, and `qk_head_dim == v_head_dim` |
 | Captures | At most 4 across both mods, rank ≤ 4, on device. A mod may *read* one; a gradient with respect to one is refused |
 | seq_len | Any, ragged tails included, and Q may differ from KV (cross attention). K and V must match each other |
 | GQA | Yes |
+| Batch | `Bq == Bkv`. A broadcast `Bkv=1` key/value is refused in both directions: the forward addresses k and v at the Q batch index, so it would read off the end of the allocation, and `dk`/`dv` would need summing back down to `Bkv` |
+| LSE | Returned in natural log and mutated in place, and differentiable: the backward takes an optional `DLSE` plane |
 | BlockMask | Blocks are skipped in all three kernels when a `mask_mod` is present; the backward additionally needs ≥2 workgroups per CU, else it walks densely |
+| Dynamic shapes | Yes on `seq_len`: `dynamic=True` over 512/1024/2048 autotunes once and launches that one kernel at all three, since the extents reach the kernel as arguments and only the block sizes are `guard_int`ed. CuteDSL's own indexer patch still carries a `TODO(dynamic shapes)` |
 
 Cross attention takes two extents rather than one, and which kernel uses which is not
 uniform: the forward and `dq` tile Q and walk KV, while `dkdv` tiles KV and walks Q, so each
@@ -237,6 +249,65 @@ a 64-wide row into the next one and returned ~44% relative error while building 
 happily. That is the failure mode the allowlist exists to prevent: a kernel returning
 plausible garbage rather than falling back to Triton.
 
+## GPU architectures
+
+What an architecture has is declared in
+[`arch_caps.py`](../../kernel/vendored_templates/flydsl/arch_caps.py), and both sides of the
+backend read that one table: the gate decides whether a graph can be served, and the kernel
+builders take their instruction selection and LDS budget from the same entry.
+
+| | gfx942 (CDNA3) | gfx950 (CDNA4) |
+| --- | --- | --- |
+| Matrix core | MFMA | MFMA |
+| LDS per workgroup | 65536 B | 163840 B |
+| DMA-to-LDS | 4 B only, so unused | 16 B (`buffer_load_dwordx4_lds`) |
+| Transposing LDS read | no, Vᵀ is staged in LDS | `ds_read_tr16_b64` |
+| MFMA32 K | 8 | 16 |
+| Fused O store | per-lane `dwordx2` | `permlane32_swap` + `cvt_pk_bf16_f32` |
+
+This replaced an allowlist of architecture *names*, and the reason is that the two questions
+it was answering are not the same question. "Which architectures have the instructions" is a
+fact about silicon; "which have we run" is a fact about our test coverage. Merging them meant
+gfx950 — which has every instruction the CDNA4 paths ask for — was refused by default, while
+a capability was simultaneously being handed out by *negation*: the forward selected its
+DMA-to-LDS prefetch on `not gpu_arch.startswith("gfx942")`, so any architecture that merely
+was not gfx942 claimed a 16 B instruction it might not have, and would have failed in the
+assembler rather than at a gate.
+
+So gfx950 is served without a flag, and what stands behind it is a codegen argument rather
+than a numerical one. `test_gfx950_builds_from_a_gfx942_host` drives the whole head-dim
+ladder through both directions' builders for a gfx950 target, and
+`isa_stats.py --arch gfx950` takes the same configs to ISA. Every one lowers, and the forward
+comes out *better*: at D128 causal, 242 VGPRs with no spill against gfx942's 256 with 22
+spilled, because MFMA K=16 halves the MFMA issues and the hardware transpose removes the
+staging registers. Read those numbers as "the CDNA4 paths are real and the compiler is happy
+with them", not as a correctness claim — nothing here has produced a number on CDNA4 silicon.
+
+Two gaps are worth knowing before trusting gfx950 in anger. **The backward has no CDNA4
+specialization at all**: `mfma_k16`, `lds_transpose_read` and `permlane_o_store` are read
+only by the forward, and the ISA says so — across every backward config the two architectures
+land within a few registers of each other (`dkdv` at D128: 256 VGPRs and 78 spilled on
+gfx942, 256 and 76 on gfx950), where the forward changed structurally. And **the K swizzle
+was derived against 32 LDS banks**, which CDNA4 doubles to 64. It is a permutation either
+way, so answers do not change, but its conflict-freedom has not been re-derived.
+
+Anything outside the table is refused by naming what is missing rather than its own name.
+gfx1201 has an entry for exactly that reason, and what it is missing is a kernel body, not a
+gate: the flex bodies emit MFMA and RDNA4 has WMMA. That is not one instruction apart.
+RDNA4's WMMA is 16×16×16 on wave32 against CDNA's 32×32×16 on wave64, so a lane holds 8
+accumulator elements instead of 16 columns of one row, and every score-site index — the
+softmax column mapping, the causal and window bounds, the bias and dropout offsets — is
+derived from that layout. Upstream's own gfx1201 forward computes `S = K Qᵀ` rather than
+`Q Kᵀ` for the same reason, because one WMMA's result has to land as the next one's operand.
+None of the MFMA glue here survives that, so reaching RDNA4 is a second body.
+
+Worth knowing before assuming upstream shortens that: upstream's gfx1201 flash attention is
+mature (a dense prototype with causal, window, varlen, GQA, bias, dropout, LSE, head dims
+16–512, and a split backward tested to 512) but it has **no `score_mod` or `mask_mod` hook
+on any architecture** — CDNA included. Its masking is region-split loops emitting fixed
+`-inf` fills at build time, so what would have to be built is the mod-callback layer itself,
+which is the part this backend already has and upstream does not.
+
 ## Template hooks
 
 Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output()}}`:
@@ -254,14 +325,13 @@ Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output(
 
 | Flag | Env | Default |
 | --- | --- | --- |
-| `flydsl.allow_unvalidated_arch` | `TORCHINDUCTOR_FLYDSL_ALLOW_UNVALIDATED_ARCH` | off |
 | `flydsl.autotune_mod_vec_size` | `TORCHINDUCTOR_FLYDSL_AUTOTUNE_MOD_VEC_SIZE` | on |
 | `flydsl.autotune_qk_prefetch_depth` | `TORCHINDUCTOR_FLYDSL_AUTOTUNE_QK_PREFETCH_DEPTH` | off |
 | `flydsl.autotune_backward_tile` | `TORCHINDUCTOR_FLYDSL_AUTOTUNE_BACKWARD_TILE` | on |
 | `flydsl.autotune_forward_block_m` | `TORCHINDUCTOR_FLYDSL_AUTOTUNE_FORWARD_BLOCK_M` | on |
 | `flydsl.autotune_kv_gpfetch` | `TORCHINDUCTOR_FLYDSL_AUTOTUNE_KV_GPFETCH` | on |
 
-`kernel_options={"MOD_VEC_SIZE": n}` pins the mod width and skips autotuning;
+`kernel_options={"MOD_VEC_SIZE": n}` pins the mod width (1, 2 or 4) and skips autotuning;
 `kernel_options={"DKDV_TILE": (kv, q)}` pins the backward's dk/dv tile;
 `kernel_options={"BLOCK_M": n}` pins the forward's Q tile;
 `kernel_options={"ENABLE_KV_GPFETCH": bool}` pins the forward's K staging;
@@ -376,17 +446,59 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
 ## Current limitations / TODOs
 
 - **No gradients for captured tensors.** A mod may *read* a captured tensor in the backward
-  as freely as in the forward, but a capture that itself requires grad is refused: its
-  gradient needs the joint graph's `zeros_and_scatter` outputs accumulated with atomics,
-  which the FlyDSL `modification()` path does not emit. So a learned bias tensor is out;
-  an ALiBi slope table is fine.
+  as freely as in the forward, but a capture that itself requires grad is refused: the joint
+  graph hands its gradient over as `zeros_and_scatter`, and the FlyDSL `modification()` path
+  does not emit scatter graphs. So a learned bias tensor is out; an ALiBi slope table is
+  fine to read. This one is parity with CuteDSL rather than a deficit against it -- its
+  backward refuses them too, `NYI: Flex Flash Attention bwd doesn't support captured grads
+  yet.` -- so Triton is the only backend that services a capture requiring grad.
+
+  ~~Its gradient needs atomics~~ — that reason, given here for a long time, is true of only
+  half the problem, and the donor survey settles which half. A dense `[B, H, Sq, Skv]`
+  capture needs no atomics at all: the `dq` grid is one workgroup per
+  `(batch, q_head, q_block)` — ours as much as upstream's, see `flex_flash_bwd_generic.py`
+  — so every element of it has exactly one writer and a plain store suffices. Upstream's
+  contract mandates that bias shape for precisely this reason — dense rank-4 only, no
+  broadcast strides, and it refuses bias combined with causal or a window at build time,
+  which is a restriction flex semantics could not adopt anyway. The expensive half is a
+  *broadcast* capture such as an `[H]` slope table, where every `(q, kv)` sums into one
+  element and atomics or a reduction pass come back. So the item splits, and the cheap half
+  is tractable whenever the scatter-graph codegen is.
+- ~~No gradient through the LSE~~ **Fixed, and it cost nothing per element.** A loss may
+  read the LSE that `return_lse=True` returns, and a non-`None` `grad_logsumexp` used to be
+  refused outright. It is now a `has_dlse` build flag on both backward kernels and an
+  optional `DLSE` plane beside `LSE` and `DELTA`.
+
+  Cheap in `dq`, and it has to be spelled carefully in `dkdv`. `isa_stats.py --backward`
+  puts both head_dim 128 backward builds exactly at the 256-VGPR cap, with `dq` spilling 4
+  and `dkdv` spilling 78 — asking for two waves per SIMD caps a wave at half of the 512 the
+  part has, and the compiler spills rather than exceed it. Loading the `dlse` plane into
+  four `v4f32` and carrying them to the `ds` site pushed that to 96 spills and cost 50% of
+  the kernel (4962 → 7432 µs). Subtracting into `delta` on the load line instead — one
+  vector `arith.subf`, after which the plane is dead — gives 80 spills and 5267 µs, within
+  6% of the build without it. `dq` is 256/4 either way, since its fold is one row scalar.
+
+  It is cheap because of where the term lands rather than because of any care taken. `lse`
+  is a log-sum-exp over the *post*-mod scores, so `d lse / d s = p`, and the kernels already
+  form `ds = p * (dp - delta)`: adding `dlse * p` gives `p * (dp - (delta - dlse))`, so the
+  whole thing folds into the row scalar the softmax derivative already subtracts. One load
+  and one subtract per row in `dq`, per element in `dkdv` where `delta` is already
+  per-element, and the elementwise loop is untouched. The fold has to happen *before* the
+  joint-graph site, since a `score_mod`'s chain rule is evaluated on that cotangent, which
+  is why the tests sweep both mods rather than the plain case alone.
+
+  CuteDSL is the reference here and refuses only head_dim 256 on SM100/SM110; we have no
+  such exclusion.
 - **Backward block skipping is gated on occupancy.** Both backward kernels can walk block
   lists — `dq` a KV list per Q tile, `dk`/`dv` the transpose — but only when the grid has at
   least 2 workgroups per CU. Causal work per tile is triangular, so below that they are all
   resident, the kernel finishes when the heaviest one does, and skipping the light ones buys
   nothing while still paying the index loads (measured 0.89–1.18x under the threshold
   against 1.54–2.39x over it). Small-batch causal shapes therefore still walk densely, on
-  purpose.
+  purpose. No donor for this one: upstream's kernels do bound the loop, but from causal and
+  window *arithmetic*, which it can do because causal is a build flag of known shape there.
+  Ours is a runtime BlockMask, so that math does not apply and the donor was our own
+  forward.
 - **BlockMask regridding is memoised, not eliminated.** The kernels want one block list on
   their own tile grid where FlexAttention supplies two on its own, so `regrid_block_mask`
   unions and converts them. The conversion is a fixed ~215 µs of tiny elementwise launches
@@ -403,6 +515,15 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   splitting the KV loop in two — declined on that ratio, see the migration plan §1d.
   Skipping is declined (and the dense walk used) without a `mask_mod`, since the
   builder requires one and there is nothing to skip.
+- **The `dq_write_order` fields are ignored on purpose.** `BlockMask` carries three optional
+  tensors -- `dq_write_order`, `dq_write_order_full`, `dq_kv_order` -- documented as
+  deterministic dQ metadata for the block-sparse FLASH backward, and the flex lowering hands
+  them to CuteDSL and not to us. They order accumulation where dQ has more than one writer.
+  Ours has exactly one, a workgroup per `(batch, q_head, q_block)`, so determinism is
+  structural here and there is nothing for the ordering to fix. Checked rather than assumed:
+  against a mask built with `compute_dq_write_order=True` the backward runs unchanged, its
+  gradients are bitwise identical across runs, and bitwise identical to the same mask built
+  without the metadata.
 - **V is XOR-swizzled rather than padded**, which removed 512 B of LDS and the
   `waves-per-eu` warning. The transposed V tile was strided `BLOCK_N + 2` to keep rows off
   one LDS bank, costing `HEAD_DIM × 2` elements and putting the head_dim 128 tile at
@@ -436,6 +557,36 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   dense head_dim 64/128 deficit and still unexplained. `document_mask` is the odd one out at
   0.91x/0.77x forward against 1.54x/1.28x backward.
 
+  One candidate for that deficit is now closed. Upstream's XCD workgroup swizzle
+  (`cf1db2f`) keeps a head's Q blocks on a single XCD so its K/V stays in that XCD's 4 MB
+  of L2, and it was the last unported forward commit. Implemented both ways — Q tile on the
+  fast axis, and the full remap that gives each XCD a contiguous run of heads — it measures
+  **1.00–1.01x on dense** across four shapes at both head_dims, and 0.90–0.97x on causal.
+  Causal moving is what makes the dense column trustworthy: placement demonstrably changed,
+  and dense did not care. It cannot care, because there is no bandwidth wall to remove —
+  assume the worst case where every Q tile re-reads its head's K/V from DRAM and the dense
+  forward still only asks 0.60 TB/s of a part that achieves 1.90. Whatever the deficit is,
+  it is not L2 locality.
+
+  What the sparse losses *are* made of is now measured, and it is not throughput. Fitting
+  time against blocks walked (`walk_cost.py`) puts our per-block rate ahead of Triton's at
+  both head_dims — 1080 against 1261 ns/block at 64, and 1947 against 2664 at 128 — while
+  our fixed per-call cost is 150 µs at head_dim 64 and 344 µs at 128 against Triton's 108 µs
+  and −26 µs. So the cost we pay once per Q tile roughly doubles with head_dim, which is
+  what a Q load plus an O and LSE write should do, and Triton hides its own behind the KV
+  walk where we do not: at head_dim 128 its per-block work doubled too, giving it more to
+  hide behind, and its intercept went to zero. A mask that walks few blocks has nothing to
+  amortise ours against, which is exactly the shape of the remaining forward losses
+  (`document_mask` 0.77x, `sliding_window` 0.91x at D128).
+
+  Worth being precise about where that cost is *not*: at one block per tile,
+  `profile_call.py` shows the whole call as a single kernel and nothing else, so this is
+  neither the layout copies (gone) nor the regrid launches (cached). It is inside the
+  kernel, and closing it means overlapping the prologue and epilogue with the walk rather
+  than removing any work. Note also that a fit taken under a mask does not extrapolate to
+  the dense column, since a dense walk evaluates no `mask_mod` at all — these numbers bound
+  the sparse story, not the dense one.
+
   ~~Sparse masks lose in the forward, and only in the forward~~ — they did, at 0.83x/0.71x
   for `sliding_window` and 0.86x/0.73x for `document_mask`, and the reading that a short KV
   walk was failing to amortise some per-tile setup cost was right about the shape of the
@@ -450,7 +601,9 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   costing 3.7x more than it does when left to autotune. Comparisons against it are worthless
   in both directions -- take Triton's options out before reading any `document_mask` number.
 - **No scalar captures.** CuteDSL supports them through `aux_scalars`; there is no
-  `AUX_SCALAR_SYMBOLS` machinery here. Device 0-d tensors work; CPU ones are rejected.
+  `AUX_SCALAR_SYMBOLS` machinery here. Device 0-d tensors work; CPU ones are rejected. No
+  donor either way: the parity kernels take a dense bias tensor and nothing scalar, and
+  their plans defer ALiBi as a computed bias they have not shipped.
 - **head_dim 96, 160, 192 and 224 needed two separate fixes, and are now fast.** The
   cooperative KV load gives each row `HEAD_DIM // VEC_WIDTH` lanes, and 512 is not a
   multiple of 12, 20, 24 or 28, so the last lane group is partial and the tile's rows no
@@ -500,7 +653,7 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   It was worth 574 µs per call against a 461 µs kernel at 4x16x4096x128 bf16 — four passes
   over q/k/v-sized memory, independent of what the mask does — and it is where the
   sparse-mask forward deficit went: a short KV walk has nothing to amortise it with. See
-  [Sparse masks](#sparse-masks-lose-in-the-forward-and-only-in-the-forward) below.
+  "What is left in the forward is dense, not sparse" above.
 
   Indexing BSHD in place is not free in the kernel: a BHSD `(batch, head)` slice is
   contiguous and a KV tile is one run, where BSHD strides each token row by
@@ -515,14 +668,33 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   `"bshd"` is still the default for standalone callers, and `test_layouts_agree` pins the
   two together. `flex_flash_950.py` has no `layout` parameter and is not wired into the
   flex path.
-- **No packed mask intervals**, the SM100+ optimization CuteDSL has.
+- **No packed mask intervals**, the SM100+ optimization CuteDSL has. Nothing to take from
+  parity here either: it has no packed or runtime block list at all, and bounds its tile
+  walk arithmetically from the causal, window and varlen parameters instead
+  (`decompose_causal_regions`). That works because those are build flags of known shape
+  there; a `mask_mod` is not, which is the same reason its backward skipping does not port.
 - **No fusion**, matching CuteDSL: no epilogue or prologue support.
-- **gfx950 is unvalidated.** The port is mechanical and has never been run.
+- **gfx950 is unexecuted, and its backward is unspecialized.** It is served without a flag
+  on codegen evidence — see [GPU architectures](#gpu-architectures) — but no number here
+  has come off CDNA4 silicon, and the backward reads none of the four CDNA4 capabilities.
+  Whether to carry *more* unexecuted code than this is the plan's open decision D3, and it
+  is a real one: its phases 3–5 would add roughly 10k lines that cannot be run here.
+- **gfx1201 is refused, and not for want of a gate.** The flex bodies emit MFMA; RDNA4 has
+  WMMA. Reaching it means a second kernel body, not a capability entry.
 
 [`PARITY_MIGRATION_PLAN.md`](PARITY_MIGRATION_PLAN.md) works through most of the above: it
 carries the measured gfx942 baseline against autotuned Triton and aten, and a phased plan
 for the BlockMask plumbing, head_dim 64, backward, and gfx950/gfx1201. It also records why
 rebasing onto the upstream `parity` FMHA family does not by itself close the gap.
+
+Its §8 has since answered the question it opens with, and the answer for gfx942 is **no**.
+Every lead that moved the number turned out to be ours to take — the 512 B LDS overage, the
+layout copies, the block-skip plumbing — and each was assumed at some point to need parity.
+The one item that genuinely needs parity's schedule needs CDNA4 features this part does not
+have. What parity is still for is gfx950 and gfx1201 reach, which turns on whether hardware
+appears. Individual techniques are still worth porting on their own merits, and the
+roadmap's donor survey tracks which ones landed, which were closed by measurement, and
+which do not apply.
 
 ## Extending
 

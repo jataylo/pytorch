@@ -1,12 +1,20 @@
 # Owner(s): ["module: inductor"]
 """End-to-end tests for BACKEND="FLYDSL" flex attention on ROCm.
 
-Forward only, and only where the kernel is known to be correct: bf16/f16 at head_dim 128 on
-a validated architecture. The rejection cases are as much of the contract as the numerical
-ones, because outside that range the kernel returns plausible-looking wrong numbers rather
-than failing. Skipped unless the optional FlyDSL compiler/runtime is installed.
+Forward and backward, over the head dims and dtypes the lowering admits. The rejection
+cases are as much of the contract as the numerical ones, because outside that range the
+kernel returns plausible-looking wrong numbers rather than failing -- so what is refused,
+and with which message, is tested as deliberately as what is computed.
+
+Everything numerical here runs on the GPU that is installed. The one exception is
+``test_gfx950_builds_from_a_gfx942_host``, which builds for another architecture and never
+launches; see its docstring for why that boundary is load-bearing. Skipped unless the
+optional FlyDSL compiler/runtime is installed.
 """
 
+import contextlib
+import io
+import os
 import unittest
 from unittest import mock
 
@@ -660,16 +668,110 @@ class TestFlyDSLFlexAttention(TestCase):
             _seq_lens(q, k, v, axis=2)
         self.assertEqual(_seq_lens(q, k, k, axis=2), (512, 256))
 
+    def test_rejects_a_broadcast_kv_batch_in_both_directions(self):
+        """A `Bkv=1` key/value broadcast across the Q batch, which neither kernel serves.
+
+        Checked at the gate, and asserted for the *forward* as well as the backward, since
+        the forward is the direction that used to reach the kernel: it addresses k and v at
+        the Q batch index, so `Bkv=1` reads off the end of the allocation and takes the
+        process down with a GPU memory fault. A refusal here is the whole fix -- there is
+        no wrong number to catch downstream, and a test that ran the kernel would abort the
+        run rather than fail.
+        """
+        for grad in (False, True):
+            q = torch.randn(
+                4, H, S, D, device="cuda", dtype=torch.bfloat16, requires_grad=grad
+            )
+            k, v = (
+                torch.randn(
+                    1, H, S, D, device="cuda", dtype=torch.bfloat16, requires_grad=grad
+                )
+                for _ in range(2)
+            )
+            block_mask = create_block_mask(_causal, 4, None, S, S, device="cuda")
+            with self.assertRaises(Exception):
+                out = self._run(q, k, v, block_mask=block_mask)
+                if grad:
+                    out.sum().backward()
+
     def test_rejects_head_dim_past_the_lds_budget(self):
         """head_dim 288 needs 73728 B of LDS against gfx942's 65536 B.
 
         The kernel does not check this itself -- it surfaces as a compile-time
         ``local memory (73728) exceeds limit`` from the backend -- so the allowlist is
         what keeps it from getting that far.
+
+        The allowlist is one list for every architecture, and gfx950's 163840 B would hold
+        this. Widening it there is a real opportunity and not this test's business: the
+        ladder's upper rungs are where the LDS-dependent bugs were, and none of them can be
+        caught without the hardware to run them on.
         """
         q, k, v = self._tensors(head_dim=288)
         with self.assertRaisesRegex(Exception, "head_dim"):
             self._run(q, k, v, score_mod=_alibi)
+
+    def test_gfx950_builds_from_a_gfx942_host(self):
+        """Every kernel we admit builds for gfx950, checked from a gfx942 host.
+
+        gfx950 is served without a flag but nothing here can run it, so this stands in for
+        hardware. The arch is a real input to the builders rather than a label: it decides
+        MFMA K=16, the transposing LDS read, the permlane O store, DMA-to-LDS and the LDS
+        budget, and `FLYDSL_GPU_ARCH` moves it without a device. What that buys is the
+        checks the builders make -- geometry, LDS, instruction selection -- across the
+        whole head-dim ladder in both directions.
+
+        Building is as far as this can go, and the line is not caution but containment.
+        FlyDSL has no compile-without-dispatch path: `flyc.compile` launches once on the
+        way to returning a callable, a gfx950 binary cannot be dispatched here, and the
+        attempt invalidates the HIP context so that every later GPU call in the process
+        fails with `invalid resource handle` -- one poisoned test would take the rest of
+        the file with it. Nothing below reaches a launch. `isa_stats.py --arch gfx950`
+        carries the same configs through to ISA, one subprocess per build.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _SUPPORTED_HEAD_DIMS,
+        )
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_bwd_generic import (
+            build_flex_flash_bwd_dkdv_module,
+            build_flex_flash_bwd_dq_module,
+        )
+
+        def build_all(head_dim):
+            """The forward launcher, having also built both backward kernels."""
+            with contextlib.redirect_stdout(io.StringIO()):
+                forward = build_flex_flash_generic_module(
+                    num_heads=H,
+                    head_dim=head_dim,
+                    causal=True,
+                    dtype_str="bf16",
+                    layout="bhsd",
+                )
+                for build in (
+                    build_flex_flash_bwd_dq_module,
+                    build_flex_flash_bwd_dkdv_module,
+                ):
+                    build(
+                        num_heads=H,
+                        head_dim=head_dim,
+                        dtype_str="bf16",
+                        layout="bhsd",
+                    )
+            return forward
+
+        host = build_all(D)
+        with mock.patch.dict(os.environ, {"FLYDSL_GPU_ARCH": "gfx950"}):
+            target = {dim: build_all(dim) for dim in sorted(_SUPPORTED_HEAD_DIMS)}
+
+        # Without this the test quietly degrades into building for gfx942 twice: the arch
+        # arrives through the environment, and nothing else here would notice if that
+        # stopped working. LDS is the cheapest published thing that moves with it -- the
+        # forward at D128 causal takes 32768 B on gfx942 and 49152 B on gfx950, because
+        # the CDNA4 path stages a third K buffer for the DMA prefetch.
+        self.assertNotEqual(
+            host.smem_bytes,
+            target[D].smem_bytes,
+            "gfx950 built the same LDS footprint as gfx942; FLYDSL_GPU_ARCH did not apply",
+        )
 
     def test_head_dim_256_rescales_every_o_chunk(self):
         """head_dim 256 has 8 O accumulator chunks but only 4 PV k-steps.
@@ -765,6 +867,69 @@ class TestFlyDSLFlexAttention(TestCase):
         with self.assertRaisesRegex(Exception, "LAYOUT must be"):
             self._run(q, k, v, kernel_options={"LAYOUT": "bsdh"}, score_mod=_alibi)
 
+    def test_bshd_strided_inputs_are_recognised_under_gqa(self):
+        """A GQA capture is still BSHD, at a different head count for k/v than for q.
+
+        Worth its own case because the strides are checked per tensor against that tensor's
+        own sizes: k and v carry `num_kv_heads`, so a check written against q's head count
+        would call them dense when they are not, or the reverse.
+        """
+        from torch._inductor.utils import run_and_get_code
+
+        num_kv_heads = H // 4
+        torch.manual_seed(0)
+        q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        k, v = (
+            torch.randn(B, S, num_kv_heads, D, device="cuda", dtype=torch.bfloat16)
+            .transpose(1, 2)
+            for _ in range(2)
+        )
+        with torch.no_grad():
+            expected = flex_attention(q, k, v, score_mod=_alibi, enable_gqa=True)
+            torch._dynamo.reset()
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            actual, (code,) = run_and_get_code(
+                compiled,
+                q,
+                k,
+                v,
+                score_mod=_alibi,
+                enable_gqa=True,
+                kernel_options={"BACKEND": "FLYDSL"},
+            )
+        self._assert_close(actual, expected)
+        self.assertIn('layout="bshd"', code)
+
+    def test_disagreeing_input_layouts_fall_back_to_bhsd(self):
+        """One launcher addresses all three, so a tensor that is not BSHD decides for them.
+
+        The fallback is BHSD, which costs the copies but is never wrong. Getting this
+        backwards would index k and v as though they were strided the way q is, which is
+        silently wrong numbers rather than a fault.
+        """
+        from torch._inductor.utils import run_and_get_code
+
+        torch.manual_seed(0)
+        q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        k, v = (
+            torch.randn(B, H, S, D, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        with torch.no_grad():
+            expected = flex_attention(q, k, v, score_mod=_alibi)
+            torch._dynamo.reset()
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            actual, (code,) = run_and_get_code(
+                compiled,
+                q,
+                k,
+                v,
+                score_mod=_alibi,
+                kernel_options={"BACKEND": "FLYDSL"},
+            )
+        self._assert_close(actual, expected)
+        self.assertIn('layout="bhsd"', code)
+
     def _grads(
         self,
         *,
@@ -831,6 +996,104 @@ class TestFlyDSLFlexAttention(TestCase):
         for name, a, b in zip(("dq", "dk", "dv"), actual, expected):
             self.assertIsNotNone(a, f"{name} was not produced")
             self._assert_close(a, b, f"for {name}, {msg}")
+
+    def _lse_grads(
+        self,
+        backend,
+        *,
+        score_mod=None,
+        mask_mod=None,
+        num_heads=H,
+        seq_len=S,
+        head_dim=D,
+    ):
+        """Gradients of a loss that reads the LSE as well as the output.
+
+        Both terms are in the loss, so a dropped `dlse` shows up as a wrong gradient
+        rather than as one that is merely scaled.
+        """
+        torch.manual_seed(0)
+        q, k, v = (
+            torch.randn(
+                B,
+                num_heads,
+                seq_len,
+                head_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            for _ in range(3)
+        )
+        kwargs = {
+            "score_mod": score_mod,
+            "block_mask": (
+                create_block_mask(
+                    mask_mod, None, None, seq_len, seq_len, device="cuda"
+                )
+                if mask_mod is not None
+                else None
+            ),
+        }
+        if backend is None:
+            out, lse = flex_attention(q, k, v, return_lse=True, **kwargs)
+        else:
+            torch._dynamo.reset()
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            out, lse = compiled(
+                q,
+                k,
+                v,
+                return_lse=True,
+                kernel_options={"BACKEND": backend},
+                **kwargs,
+            )
+        (out.float().sum() + lse.float().sum()).backward()
+        return q.grad, k.grad, v.grad
+
+    def _assert_lse_grads_match_eager(self, msg, **kwargs):
+        actual = self._lse_grads("FLYDSL", **kwargs)
+        expected = self._lse_grads(None, **kwargs)
+        for name, a, b in zip(("dq", "dk", "dv"), actual, expected):
+            self._assert_close(a, b, f"for {name}, {msg}")
+
+    @parametrize("score_mod", [None, _alibi])
+    @parametrize("mask_mod", [None, _causal])
+    def test_lse_gradient_matches_eager(self, score_mod, mask_mod):
+        """A loss that differentiates the returned LSE.
+
+        `lse` is a log-sum-exp over the *post*-mod scores, so `d lse / d s` is `p` and the
+        term folds into the row scalar the softmax derivative already subtracts. Both mods
+        are swept because that folding happens before the joint graph runs: get the sign or
+        the site wrong and a `score_mod` would push the wrong cotangent through its chain
+        rule, which the plain case cannot see.
+        """
+        self._assert_lse_grads_match_eager(
+            f"score_mod={score_mod is not None}, mask_mod={mask_mod is not None}",
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+        )
+
+    def test_lse_gradient_under_block_skipping(self):
+        """The LSE gradient where the loop bounds come from the block lists.
+
+        The `dlse` plane is an extra declared input, and both the kernel signature and the
+        positions `input_gen_fns` addresses shift by one when it is present -- so the list
+        tensors are exactly what a wrong offset would corrupt. Same shape and same gate
+        assertion as `test_backward_block_skipping_matches_the_dense_walk`, for the same
+        reason: at the module's default shape neither kernel skips and this covers nothing.
+        """
+        self.assertGreaterEqual(
+            B * -(-1024 // 128) * 16,
+            2 * torch.cuda.get_device_properties("cuda").multi_processor_count,
+            "shape no longer clears the occupancy gate, so this covers the dense walk",
+        )
+        self._assert_lse_grads_match_eager(
+            "with block skipping",
+            mask_mod=_causal,
+            num_heads=16,
+            seq_len=1024,
+        )
 
     @parametrize("num_kv_heads", [H, 2, 1])
     def test_backward_matches_eager(self, num_kv_heads):

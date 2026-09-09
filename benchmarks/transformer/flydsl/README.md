@@ -19,16 +19,18 @@ directly, so they will not run against a build where the vendored kernels are ab
 
 | Script | Question |
 | --- | --- |
-| `mod_matrix.py` | How does the backend do across the whole mod matrix, forward and backward? |
+| `mod_matrix.py` | How does the backend do across the whole mod matrix, forward and backward? `--flydsl-options K=V` pins one of our knobs on the FlyDSL side only, which is how the backward's `MOD_VEC_SIZE` question was settled. |
+| `shape_ladder.py` | How does it do across shapes and head_dims, against Triton *and* aten? |
 | `walk_cost.py` | How much of a call is fixed per Q tile, and how much is per KV block? |
 | `profile_call.py` | Which device kernels is a call actually spending its time in? |
 | `layout_ab.py` | For BSHD memory, is indexing it cheaper than copying it to BHSD? |
 | `kernel_only.py` | What does the kernel do per head_dim with the lowering taken out? |
-| `isa_stats.py` | What is the register pressure, and where does it spill? |
+| `isa_stats.py` | What is the register pressure, and where does it spill? `--backward` reads the two backward kernels, which is where the 256-VGPR cliff bites. `--arch gfx950` compiles for another GPU instead of this one, one subprocess per build, which is the only evidence a gfx942 host can produce about CDNA4. |
 
 `mod_matrix.py` is the headline number the README in
-`torch/_inductor/codegen/flydsl/` quotes. The other five exist because it was wrong once
-in an instructive way: sparse masks were reading 0.71-0.86x in the forward, `walk_cost.py`
+`torch/_inductor/codegen/flydsl/` quotes, and `shape_ladder.py` is where the TFLOP/s tables
+in `MULTI_ARCH_ROADMAP.md` come from. The other five exist because that headline was wrong
+once in an instructive way: sparse masks were reading 0.71-0.86x in the forward, `walk_cost.py`
 showed a fixed cost of 1075 us per call against Triton's 41 us while the per-block cost was
 1.6x *better*, and `profile_call.py` named it -- four `aten::copy_` kernels worth 574 us,
 converting BSHD inputs into the BHSD layout the launcher had been hardcoded to.
@@ -45,3 +47,8 @@ Timings take the best of three runs. These boxes are usually shared and interfer
 ever slows a run down, so the minimum is the closest thing to an uncontended number that a
 busy machine will give up. Even so, expect a few percent of drift between sessions, and do
 not read a 1.03x as a win without re-running it.
+
+`shape_ladder.py` is the exception: it reports a median of fifteen, which is what its
+already-published rows were measured with, and changing it now would cost the comparison
+against them. A median is the more pessimistic choice on a contended box, so its cells read
+slightly lower than the same cell would here.

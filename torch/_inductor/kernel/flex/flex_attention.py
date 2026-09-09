@@ -856,9 +856,15 @@ def flex_attention_backward(*args, **kwargs):
         )
 
     kernel_options, backend = _sanitize_kernel_options_for_triton(kernel_options)
-    if backend == "FLASH":
+    # Both branches for the same reasons as the forward, which is where the comment is.
+    # The forward rejects first in every path we know of, so this is a guard rather than a
+    # live check -- but the failure it guards against is a GPU fault, not an exception.
+    if backend in ("FLASH", "FLYDSL"):
         _check_flash_supported_scalar_captures(
-            score_mod_other_buffers, mask_mod_other_buffers, backward=True
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+            backward=True,
+            backend=backend,
         )
         score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
         mask_mod_other_buffers = realize_captures_for_cutedsl(mask_mod_other_buffers)

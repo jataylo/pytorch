@@ -7,6 +7,7 @@ difference between them. This is the number the README quotes as the geomean.
     python benchmarks/transformer/flydsl/mod_matrix.py            # forward
     python benchmarks/transformer/flydsl/mod_matrix.py --bwd      # backward
     python benchmarks/transformer/flydsl/mod_matrix.py --mods causal,alibi
+    python benchmarks/transformer/flydsl/mod_matrix.py --bwd --flydsl-options MOD_VEC_SIZE=2
 """
 
 import argparse
@@ -35,7 +36,23 @@ BATCH, HEADS_Q, HEADS_KV, SEQ_LEN = 4, 16, 16, 4096
 DTYPE = torch.bfloat16
 
 
-def measure(attn_type, head_dim, backward):
+def parse_options(text):
+    """`K=V,K=V` into a dict, ints where they parse as one.
+
+    Pinned on the FlyDSL side only: the point is to hold one of our knobs still while the
+    comparison stays honest, so Triton keeps autotuning either way.
+    """
+    options = {}
+    for item in (t.strip() for t in text.split(",") if t.strip()):
+        key, _, value = item.partition("=")
+        try:
+            options[key.strip()] = int(value)
+        except ValueError:
+            options[key.strip()] = value.strip()
+    return options
+
+
+def measure(attn_type, head_dim, backward, flydsl_options=None):
     shape = (BATCH, HEADS_Q, SEQ_LEN, HEADS_KV, SEQ_LEN, head_dim)
     q, k, v = sm.generate_inputs(
         *shape,
@@ -58,7 +75,9 @@ def measure(attn_type, head_dim, backward):
             score_mod=mod,
             block_mask=block_mask,
             enable_gqa=True,
-            kernel_options=backend_options(backend),
+            kernel_options=backend_options(
+                backend, **(flydsl_options or {} if backend == "flydsl" else {})
+            ),
         )
         if backward:
             out = compiled(q, k, v, **call)
@@ -96,7 +115,13 @@ def main():
     parser.add_argument(
         "--head-dims", default=",".join(str(d) for d in HEAD_DIMS), type=str
     )
+    parser.add_argument(
+        "--flydsl-options",
+        default="",
+        help="K=V,K=V pinned as kernel_options on the FlyDSL side, e.g. MOD_VEC_SIZE=2",
+    )
     args = parser.parse_args()
+    flydsl_options = parse_options(args.flydsl_options)
     mods = args.mods.split(",")
     head_dims = [int(d) for d in args.head_dims.split(",")]
 
@@ -108,7 +133,9 @@ def main():
     rows = []
     for attn_type, head_dim in itertools.product(mods, head_dims):
         try:
-            triton_us, flydsl_us, rel_err = measure(attn_type, head_dim, args.bwd)
+            triton_us, flydsl_us, rel_err = measure(
+                attn_type, head_dim, args.bwd, flydsl_options
+            )
         except Exception as e:  # a mod failing is a result, not a reason to stop
             print(
                 f"{attn_type:<16}{head_dim:>5}   FAILED {type(e).__name__}: "
@@ -130,6 +157,7 @@ def main():
         f"\ngeomean speedup over {len(rows)} cells: "
         f"{geomean([r[2] for r in rows]):.2f}x  (>1 = FlyDSL faster)   "
         f"direction={'bwd' if args.bwd else 'fwd'}"
+        + (f"   flydsl pins={flydsl_options}" if flydsl_options else "")
     )
     for name, cells in (
         ("wins", [r for r in rows if r[2] > 1]),

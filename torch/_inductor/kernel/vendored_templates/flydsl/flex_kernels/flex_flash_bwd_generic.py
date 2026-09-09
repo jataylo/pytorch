@@ -90,6 +90,7 @@ from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from torch._inductor.kernel.vendored_templates.flydsl import arch_caps
 from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
     _extract_aligned_pointer,
     _pointer_load,
@@ -105,9 +106,11 @@ _LOG2E = host_math.log2(host_math.e)
 _ROWS_PER_WAVE = 32
 _WARP_SIZE = 64
 
-# Per-workgroup LDS on gfx942/gfx950. What the three KV tiles (K row-major, Kᵀ, V) have
-# to fit inside, and what makes `block_n` the knob that matters here.
-_LDS_LIMIT = 65536
+# The LDS budget a workgroup may spend -- what the three KV tiles (K row-major, Kᵀ, V) have
+# to fit inside, and what makes `block_n` the knob that matters here -- is declared per arch
+# in `arch_caps` and read into `LDS_LIMIT` inside each builder. Inductor's lowering filters
+# its tile choices against the same table, so the two cannot disagree about which tiles
+# exist.
 
 # Aux (captured-tensor) slots, matching the forward's `MAX_AUX_TENSORS`. A kernel
 # signature is fixed-arity, so all four are declared unconditionally and unused ones are
@@ -249,14 +252,22 @@ def build_flex_flash_bwd_dq_module(
     aux_specs=None,
     aux_numels=None,
     block_mask=False,
+    has_dlse=False,
     enable_kv_gpfetch=None,
 ):
-    """Build the ``dq`` launcher: ``(Q, K, V, DO, LSE, DELTA, DQ, AUX0..3, KVNB, KVI, B, S)``.
+    """Build the ``dq`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DQ, AUX0..3, KVNB, KVI, B, S)``.
 
     ``LSE`` is ``[B, H_q, S]`` f32 in **natural** log -- what our forward writes, and not
     what the Triton backward reads (log2). ``DELTA`` is ``rowsum(do * o)``, ``[B, H_q, S]``
     f32, computed in the lowering so Inductor can fuse it. ``DQ`` is written, not
     accumulated into, so the caller need not zero it.
+
+    ``DLSE`` is the cotangent of that ``LSE``, present only when ``has_dlse``; the slot
+    takes a dummy otherwise and is never read. Since ``lse`` is a log-sum-exp over the
+    post-mod scores, ``d lse / d s_i`` is just ``p_i``, so the term it contributes is
+    ``dlse * p`` and folds into the row scalar the softmax derivative already subtracts:
+    ``p * (dp - delta) + dlse * p == p * (dp - (delta - dlse))``. It therefore costs one
+    load and one subtract per row and nothing per element.
 
     For GQA/MQA pass ``num_kv_heads < num_heads``: every ``num_heads // num_kv_heads``
     consecutive Q heads share one KV head, exactly as in the forward. ``dq`` needs no
@@ -300,6 +311,7 @@ def build_flex_flash_bwd_dq_module(
     ``regrid_block_mask(..., walk="kv")``.
     """
     gpu_arch = get_hip_arch()
+    LDS_LIMIT = arch_caps.require_caps(gpu_arch).lds_budget_bytes
 
     if layout not in ("bshd", "bhsd"):
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
@@ -407,10 +419,10 @@ def build_flex_flash_bwd_dq_module(
     LDS_V_BASE = LDS_K_TILE + LDS_KT_TILE
     LDS_TOTAL = LDS_K_TILE + LDS_KT_TILE + LDS_V_TILE
     LDS_BYTES = LDS_TOTAL * 2
-    if LDS_BYTES > _LDS_LIMIT:
+    if LDS_BYTES > LDS_LIMIT:
         raise ValueError(
             f"head_dim {HEAD_DIM} at block_n {BLOCK_N} needs {LDS_BYTES} B of LDS against "
-            f"the {_LDS_LIMIT} B limit (three KV tiles: K row-major, Kᵀ, V). Halve block_n."
+            f"the {LDS_LIMIT} B limit (three KV tiles: K row-major, Kᵀ, V). Halve block_n."
         )
 
     if waves_per_eu is None:
@@ -419,7 +431,7 @@ def build_flex_flash_bwd_dq_module(
         # tracks the footprint. This is also the knob block_n exists to move: three KV
         # tiles pass half of gfx942's 64 KB from head_dim 96 up at block_n 64, and
         # halving block_n halves the footprint.
-        waves_per_eu = 2 if LDS_BYTES * 2 <= _LDS_LIMIT else 1
+        waves_per_eu = 2 if LDS_BYTES * 2 <= LDS_LIMIT else 1
 
     SCORE_MOD = score_mod
     MASK_MOD = mask_mod
@@ -442,8 +454,12 @@ def build_flex_flash_bwd_dq_module(
         )
     MOD_TAG = f"_{mod_key}_v{MOD_VEC}_a{NUM_AUX}" if HAS_ANY_MOD else ""
     USE_BLOCK_MASK = bool(block_mask)
+    HAS_DLSE = bool(has_dlse)
 
-    PATH_TAG = f"m{BLOCK_M}_n{BLOCK_N}_d{HEAD_DIM}_{dtype_str}{MOD_TAG}{'_bm' if USE_BLOCK_MASK else ''}"
+    PATH_TAG = (
+        f"m{BLOCK_M}_n{BLOCK_N}_d{HEAD_DIM}_{dtype_str}{MOD_TAG}"
+        f"{'_bm' if USE_BLOCK_MASK else ''}{'_dlse' if HAS_DLSE else ''}"
+    )
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,
@@ -460,6 +476,7 @@ def build_flex_flash_bwd_dq_module(
         DO: fx.Tensor,
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
+        DLSE: fx.Tensor,
         DQ: fx.Tensor,
         AUX0: fx.Tensor,
         AUX1: fx.Tensor,
@@ -685,6 +702,21 @@ def build_flex_flash_bwd_dq_module(
         )
         lse_val = fx.Float32(buffer_ops.buffer_load(lse_rsrc, row_off, vec_width=1, dtype=T.f32))
         delta_val = fx.Float32(buffer_ops.buffer_load(delta_rsrc, row_off, vec_width=1, dtype=T.f32))
+        if const_expr(HAS_DLSE):
+            # `- dlse` here rather than `+ dlse` at the `ds` site: see the builder's
+            # docstring. The subtraction is on the row scalar, so the elementwise loop
+            # below is untouched and reads the same `delta_val` it always did.
+            dlse_rsrc = buffer_ops.create_buffer_resource(
+                DLSE, max_size=False, num_records_bytes=_row_nrec
+            )
+            delta_val = fx.Float32(
+                _fsub(
+                    delta_val,
+                    fx.Float32(
+                        buffer_ops.buffer_load(dlse_rsrc, row_off, vec_width=1, dtype=T.f32)
+                    ),
+                )
+            )
 
         # ---- Preload the Qᵀ and DOᵀ B-operand packs (register-resident) ----
         # B operand: j = lane % 32 (the row m), k-subblock = (lane//32)*MFMA_LANE_K. Both
@@ -975,6 +1007,7 @@ def build_flex_flash_bwd_dq_module(
         DO: fx.Tensor,
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
+        DLSE: fx.Tensor,
         DQ: fx.Tensor,
         AUX0: fx.Tensor,
         AUX1: fx.Tensor,
@@ -1013,6 +1046,7 @@ def build_flex_flash_bwd_dq_module(
             DO,
             LSE,
             DELTA,
+            DLSE,
             DQ,
             AUX0,
             AUX1,
@@ -1055,6 +1089,7 @@ def build_flex_flash_bwd_dq_module(
     _launch.aux_specs = AUX_SPECS
     _launch.max_aux_tensors = MAX_AUX_TENSORS
     _launch.use_block_mask = USE_BLOCK_MASK
+    _launch.has_dlse = HAS_DLSE
     return _launch
 
 
@@ -1079,9 +1114,10 @@ def build_flex_flash_bwd_dkdv_module(
     aux_specs=None,
     aux_numels=None,
     block_mask=False,
+    has_dlse=False,
     enable_q_gpfetch=None,
 ):
-    """Build the ``dk``/``dv`` launcher: ``(Q, K, V, DO, LSE, DELTA, DK, DV, AUX0..3, QNB, QI, B, S)``.
+    """Build the ``dk``/``dv`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DK, DV, AUX0..3, QNB, QI, B, S)``.
 
     Mirror image of the ``dq`` kernel: a workgroup owns a KV tile and reduces over the Q
     axis, so ``block_n`` is the *output* tile (32 rows per wave, as always) and ``block_m``
@@ -1109,9 +1145,10 @@ def build_flex_flash_bwd_dkdv_module(
     *transpose* of what ``dq`` and the forward walk, since this kernel reduces over the
     other axis. The list is per Q head, not per KV head, and that costs nothing here
     because the GQA group is already the outer loop: each Q head walks its own list into
-    the same accumulators. See ``regrid_block_mask(..., walk="q")``.
+    the same accumulators. See     ``regrid_block_mask(..., walk="q")``.
     """
     gpu_arch = get_hip_arch()
+    LDS_LIMIT = arch_caps.require_caps(gpu_arch).lds_budget_bytes
 
     if layout not in ("bshd", "bhsd"):
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
@@ -1209,14 +1246,14 @@ def build_flex_flash_bwd_dkdv_module(
     LDS_DOT_BASE = 2 * LDS_Q_TILE + LDS_QT_TILE
     LDS_TOTAL = 2 * LDS_Q_TILE + 2 * LDS_QT_TILE
     LDS_BYTES = LDS_TOTAL * 2
-    if LDS_BYTES > _LDS_LIMIT:
+    if LDS_BYTES > LDS_LIMIT:
         raise ValueError(
             f"head_dim {HEAD_DIM} at block_m {BLOCK_M} needs {LDS_BYTES} B of LDS against "
-            f"the {_LDS_LIMIT} B limit (four Q/DO tiles, each orientation). Halve block_m."
+            f"the {LDS_LIMIT} B limit (four Q/DO tiles, each orientation). Halve block_m."
         )
 
     if waves_per_eu is None:
-        waves_per_eu = 2 if LDS_BYTES * 2 <= _LDS_LIMIT else 1
+        waves_per_eu = 2 if LDS_BYTES * 2 <= LDS_LIMIT else 1
 
     SCORE_MOD = score_mod
     MASK_MOD = mask_mod
@@ -1233,8 +1270,12 @@ def build_flex_flash_bwd_dkdv_module(
         )
     MOD_TAG = f"_{mod_key}_a{NUM_AUX}" if HAS_ANY_MOD else ""
     USE_BLOCK_MASK = bool(block_mask)
+    HAS_DLSE = bool(has_dlse)
 
-    PATH_TAG = f"n{BLOCK_N}_m{BLOCK_M}_d{HEAD_DIM}_{dtype_str}{MOD_TAG}{'_bm' if USE_BLOCK_MASK else ''}"
+    PATH_TAG = (
+        f"n{BLOCK_N}_m{BLOCK_M}_d{HEAD_DIM}_{dtype_str}{MOD_TAG}"
+        f"{'_bm' if USE_BLOCK_MASK else ''}{'_dlse' if HAS_DLSE else ''}"
+    )
     allocator = SmemAllocator(
         None,
         arch=gpu_arch,
@@ -1251,6 +1292,7 @@ def build_flex_flash_bwd_dkdv_module(
         DO: fx.Tensor,
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
+        DLSE: fx.Tensor,
         DK: fx.Tensor,
         DV: fx.Tensor,
         AUX0: fx.Tensor,
@@ -1466,6 +1508,8 @@ def build_flex_flash_bwd_dkdv_module(
         # this kernel's reduction axis. See the mask at the score site.
         lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
         delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=True)
+        if const_expr(HAS_DLSE):
+            dlse_rsrc = buffer_ops.create_buffer_resource(DLSE, max_size=True)
 
         # ---- Preload K and V as B operands (register-resident for the whole Q walk) ----
         # B operand: j = n = lane % 32 (this wave's KV row), k-subblock = (lane//32)*4.
@@ -1644,7 +1688,18 @@ def build_flex_flash_bwd_dkdv_module(
                     for grp in range_constexpr(4):
                         off = lse_plane + m_base + fx.Index(grp * 8)
                         lse_vals.append(buffer_ops.buffer_load(lse_rsrc, off, vec_width=4, dtype=T.f32))
-                        delta_vals.append(buffer_ops.buffer_load(delta_rsrc, off, vec_width=4, dtype=T.f32))
+                        delta_grp = buffer_ops.buffer_load(delta_rsrc, off, vec_width=4, dtype=T.f32)
+                        if const_expr(HAS_DLSE):
+                            # Folded into `delta` here, not at the `ds` site: one vector
+                            # subtract, and the loaded plane dies on this line. Carrying
+                            # four more v4f32 as far as the element loop instead costs 18
+                            # spilled registers and 50% of the kernel -- at head_dim 128
+                            # this build is already pinned at the 256-VGPR cap.
+                            delta_grp = _fsub(
+                                delta_grp,
+                                buffer_ops.buffer_load(dlse_rsrc, off, vec_width=4, dtype=T.f32),
+                            )
+                        delta_vals.append(delta_grp)
 
                     # ==== Elementwise: ds[m, n] = joint(p * (dp - delta[m])) * σ ====
                     # Element -> coordinate map, the mirror of the dq kernel's: here it is
@@ -1686,6 +1741,9 @@ def build_flex_flash_bwd_dkdv_module(
                     for r in range_constexpr(16):
                         grp, sub = r // 4, r % 4
                         lse_r = fx.Float32(Vec(lse_vals[grp])[sub])
+                        # Already carries `- dlse` where the build has one: `d lse / d s` is
+                        # `p`, so the LSE cotangent joins the row term the softmax
+                        # derivative subtracts. See the dq builder's docstring.
                         delta_r = fx.Float32(Vec(delta_vals[grp])[sub])
                         exponent = fmath.fma(
                             fx.Float32(post_mod[r]),
@@ -1779,6 +1837,7 @@ def build_flex_flash_bwd_dkdv_module(
         DO: fx.Tensor,
         LSE: fx.Tensor,
         DELTA: fx.Tensor,
+        DLSE: fx.Tensor,
         DK: fx.Tensor,
         DV: fx.Tensor,
         AUX0: fx.Tensor,
@@ -1818,6 +1877,7 @@ def build_flex_flash_bwd_dkdv_module(
             DO,
             LSE,
             DELTA,
+            DLSE,
             DK,
             DV,
             AUX0,
@@ -1861,4 +1921,5 @@ def build_flex_flash_bwd_dkdv_module(
     _launch.aux_specs = AUX_SPECS
     _launch.max_aux_tensors = MAX_AUX_TENSORS
     _launch.use_block_mask = USE_BLOCK_MASK
+    _launch.has_dlse = HAS_DLSE
     return _launch

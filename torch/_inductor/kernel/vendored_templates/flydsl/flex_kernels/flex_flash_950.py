@@ -13,8 +13,11 @@ the hand-written reference asm (num_records bound on Q/K/V/O, tile count rounded
 up to even, and a kv padding-mask on the non-causal path).
 
 The FlexAttention hooks here carry the same contract as ``flex_flash_generic.py`` but have
-never been executed on hardware, so Inductor refuses gfx950 unless
-``config.flydsl.allow_unvalidated_arch`` is set.
+never been executed on hardware, and nothing dispatches to this file: Inductor's template
+builds ``flex_flash_generic`` for every architecture, which on gfx950 selects the same
+CDNA4 instructions this file is built around, just on the compiler's schedule rather than a
+hand-written one. What is untested here is therefore the schedule, not the arch. Wiring it
+up means teaching the template to choose between two builders -- see ``MULTI_ARCH_ROADMAP``.
 """
 
 import contextlib
@@ -37,6 +40,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+from torch._inductor.kernel.vendored_templates.flydsl import arch_caps
 from torch._inductor.kernel.vendored_templates.flydsl.kernels.kernels_common import (
     _if_then,
     dtype_to_elem_type,
@@ -167,8 +171,16 @@ def build_flex_flash_950_module(
     if return_lse and varlen:
         raise NotImplementedError("return_lse is not implemented for the varlen path (LSE row indexing differs)")
 
-    if not gpu_arch.startswith("gfx950"):
-        raise RuntimeError(f"flex_flash_950 requires gfx950+ (uses ds_read_tr16_b64), got {gpu_arch}")
+    # Asked as a capability rather than a name so this body can never be built for an arch
+    # that lacks the instruction it is written around. `ds_read_tr16_b64` is the whole
+    # reason this file is separate from `flex_flash_generic`: gfx942 would have to stage Vᵀ
+    # in LDS instead, which is a different LDS layout and a different pipeline, not a
+    # fallback this schedule can take.
+    if not arch_caps.require_caps(gpu_arch).lds_transpose_read:
+        raise RuntimeError(
+            f"flex_flash_950 needs a transposing LDS read (ds_read_tr16_b64), which "
+            f"{gpu_arch} does not have"
+        )
     if head_dim != 128:
         raise RuntimeError(f"flex_flash_950 is D=128 only, got head_dim={head_dim}")
     if dtype_str not in ("bf16", "f16"):

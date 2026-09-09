@@ -66,6 +66,7 @@ from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from torch._inductor.kernel.vendored_templates.flydsl import arch_caps
 from torch._inductor.kernel.vendored_templates.flydsl.kernels.kernels_common import (
     dtype_to_elem_type,
 )
@@ -206,6 +207,7 @@ def build_flex_flash_generic_module(
     run instead of one strided by ``num_heads * head_dim``.
     """
     gpu_arch = get_hip_arch()
+    CAPS = arch_caps.require_caps(gpu_arch)
 
     if mod_vec_size not in (1, 2, 4):
         raise ValueError(f"mod_vec_size must be 1, 2 or 4 (4 contiguous KV cols per lane), got {mod_vec_size}")
@@ -295,7 +297,11 @@ def build_flex_flash_generic_module(
     N_SUBTILES = BLOCK_N_OUT // BLOCK_N
     ENABLE_PREFETCH_3BUF = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
     # buffer_load_dwordx4_lds (16B DMA-to-LDS) requires gfx950+; gfx94x only has dword (4B).
-    _has_lds_load_b128 = not gpu_arch.startswith("gfx942")
+    # Declared per arch rather than tested here: this used to read `not
+    # gpu_arch.startswith("gfx942")`, which handed the instruction to every arch that
+    # merely was not gfx942, so an RDNA part with no such instruction would have claimed
+    # it and failed in the assembler instead of at the gate.
+    _has_lds_load_b128 = CAPS.dma_to_lds_b128
     ENABLE_DMA = _has_lds_load_b128 and (
         PATH_TAG == "N128" or (os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_DMA", "0") == "1")
     )
@@ -317,14 +323,14 @@ def build_flex_flash_generic_module(
     CK_LDS_SEQ = (1, 2, 0, 1, 0, 1, 2, 0) if ENABLE_PREFETCH_3BUF else (0,)
 
     # gfx950+ has ds_read_tr16_b64 (HW transpose LDS read); gfx942 needs V^T stored in LDS.
-    USE_HW_TR = gpu_arch.startswith("gfx950")
+    USE_HW_TR = CAPS.lds_transpose_read
 
     # MFMA32 K-dimension: 16 on gfx950+ (CDNA4) for both GEMMs.
-    USE_K16 = gpu_arch.startswith("gfx950")
+    USE_K16 = CAPS.mfma_k16
 
     # 128-bit permlane-fused O-store needs gfx950 (permlane32_swap + cvt_pk_bf16_f32,
     # both CDNA4-only); gfx942 falls back to a per-lane dwordx2 store via .to(elem_dtype).
-    USE_PERMLANE_OSTORE = gpu_arch.startswith("gfx950")
+    USE_PERMLANE_OSTORE = CAPS.permlane_o_store
     K_STEP_QK = 16 if USE_K16 else 8
     K_STEPS_QK = head_dim // K_STEP_QK
     D_CHUNK = 32

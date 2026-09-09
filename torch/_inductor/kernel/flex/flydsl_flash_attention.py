@@ -6,8 +6,11 @@ under ``torch._inductor.kernel.vendored_templates.flydsl.flex_kernels``: derived
 of FlyDSL's flash kernels carrying ``score_mod`` / ``mask_mod`` hooks, a log-sum-exp
 output, a BlockMask-driven KV-block-skip loop, and captured-tensor reads.
 
-Forward only. There is no FlyDSL flash-attention backward kernel for any configuration,
-so a graph that needs gradients must fall back to Triton.
+Forward and backward, and the two are chosen together: the log-sum-exp this forward
+writes is a natural log where Triton's backward reads log2, so serving one side and
+falling back on the other would hand the fallback an LSE in the wrong base. FlyDSL ships
+no flash-attention backward for any architecture, so ours is written against this
+forward -- see ``flex_flash_bwd_generic``.
 """
 
 from __future__ import annotations
@@ -26,6 +29,11 @@ from ...codegen.flydsl.flydsl_utils import (
 )
 from ...ir import FixedLayout
 from ...lowering import empty_strided, lowerings
+
+# Safe to import eagerly, unlike everything else under `vendored_templates.flydsl`: it is
+# a plain table with no FlyDSL imports, and this module has to stay importable where
+# FlyDSL is not installed.
+from ..vendored_templates.flydsl import arch_caps
 from .common import (
     create_indices_fake,
     create_num_blocks_fake_generator,
@@ -41,11 +49,16 @@ if TYPE_CHECKING:
     from ...ir import Subgraph
 
 
-# Architectures the flex kernels are known to build for. gfx942 is the validated one;
-# gfx950 carries the same hooks but has never been executed, so it is opt-in through
-# config.flydsl.allow_unvalidated_arch rather than silently trusted.
-_VALIDATED_ARCHS = frozenset({"gfx942"})
-_PORTED_ARCHS = frozenset({"gfx950"})
+# Which architectures can be served is derived from `arch_caps`, not listed here: an arch
+# declares its matrix core there and the flex bodies emit MFMA, so admitting one is a
+# statement about the silicon rather than about our confidence in it. gfx950 is admitted on
+# that basis without a flag even though nothing here has run it, because the alternative --
+# an allowlist of archs we have *executed* -- refuses hardware that has every instruction
+# the CDNA4 paths ask for. What stands in for a numerics check there is a codegen one:
+# `test_gfx950_builds_from_a_gfx942_host` drives every admitted head dim through the builder
+# for a gfx950 target and `benchmarks/transformer/flydsl/cross_arch_isa.py` takes them the
+# rest of the way to ISA. Every one lowers, and the forward comes out with less register
+# pressure than on gfx942 (D128 causal: 242 VGPRs and no spill, against 256 and 22 spilled).
 
 # Head dims the kernel is *correct* for, which is narrower than what it accepts. The
 # vendored kernel documents "head_dim % 32 == 0, head_dim >= 64" and that claim does not
@@ -79,8 +92,16 @@ _SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 160, 192, 224, 256})
 # 65536 B from head_dim 160 up. Its KV tile is 32 instead, which fits the whole ladder and
 # was independently the faster choice (see `block_n` in flex_flash_bwd_generic).
 
-# Per-workgroup LDS on gfx942/gfx950, which is what bounds a backward tile choice.
-_LDS_LIMIT = 65536
+
+def _lds_budget(arch: str | None) -> int:
+    """LDS a workgroup may spend here, which is what bounds a backward tile choice.
+
+    Declared per arch in ``arch_caps``, which is also where the builders read it, because
+    a lowering that disagreed would offer a tile the builder then refuses.
+    """
+    caps = arch_caps.caps_for(arch)
+    # Unknown archs never reach a tile choice; `_arch_supported` has already refused them.
+    return caps.lds_budget_bytes if caps else arch_caps.caps_for("gfx942").lds_budget_bytes  # type: ignore[union-attr]
 
 _SUPPORTED_DTYPES = frozenset({torch.bfloat16, torch.float16})
 
@@ -132,20 +153,26 @@ def _current_arch() -> str | None:
 def _arch_supported(arch: str | None) -> tuple[bool, str]:
     if arch is None:
         return False, "FlyDSL flex kernels require a ROCm build with a visible device"
-    if arch in _VALIDATED_ARCHS:
-        return True, ""
-    if arch in _PORTED_ARCHS:
-        # The gfx950 kernel is a mechanical port that has never been run. Treat "written"
-        # as "unsupported" until someone validates it, rather than shipping unexecuted
-        # code to users by default.
-        if torch._inductor.config.flydsl.allow_unvalidated_arch:
-            return True, ""
+    caps = arch_caps.caps_for(arch)
+    if caps is None:
         return (
             False,
-            f"FlyDSL flex kernel for {arch} has not been validated on hardware; set "
-            "torch._inductor.config.flydsl.allow_unvalidated_arch=True to try it anyway",
+            f"FlyDSL flex kernels have no capability entry for {arch} (known: "
+            f"{', '.join(arch_caps.known_archs())}); add one to "
+            "vendored_templates/flydsl/arch_caps.py",
         )
-    return False, f"FlyDSL flex kernels do not support {arch}"
+    # The refusal names the body rather than the arch, because that is what is missing.
+    # RDNA parts reach here with a matrix core the flex bodies do not emit: the donor has
+    # a WMMA flash attention for gfx1201, but it is a dense kernel with no score_mod or
+    # mask_mod site, so there is nothing to dispatch to yet.
+    if caps.matrix_core != arch_caps.MFMA:
+        return (
+            False,
+            f"the FlyDSL flex kernels are {arch_caps.MFMA.upper()} bodies and {arch} has "
+            f"{caps.matrix_core.upper()}; no {caps.matrix_core.upper()} flex body is "
+            "vendored",
+        )
+    return True, ""
 
 
 def _head_dim_supported(query, value) -> tuple[bool, str]:
@@ -237,7 +264,9 @@ def _kv_seq_lens_agree(key, value) -> tuple[bool, str]:
 
 
 def _can_use_flydsl_shapes_and_arch(query, key, value) -> tuple[bool, str]:
-    """The checks both directions share: availability, architecture, dtype, head_dim."""
+    """The checks both directions share: availability, architecture, dtype, batch, head_dim."""
+    from ...virtualized import V
+
     unavailable = flydsl_unavailable_reason()
     if unavailable is not None:
         return False, f"FlyDSL flex kernels are unavailable: {unavailable}"
@@ -259,6 +288,20 @@ def _can_use_flydsl_shapes_and_arch(query, key, value) -> tuple[bool, str]:
     seq_ok, seq_reason = _kv_seq_lens_agree(key, value)
     if not seq_ok:
         return False, seq_reason
+
+    # FlexAttention broadcasts a `Bkv=1` key/value across the Q batch, and neither
+    # direction is built for it: the forward addresses k and v at the *Q* batch index and
+    # so reads off the end of the allocation, which faults the GPU rather than returning
+    # anything, and `dk`/`dv` would need summing back down to Bkv after the kernel. Shared
+    # rather than per-direction because the two must agree -- see Note [FlyDSL forward and
+    # backward must be chosen together].
+    batch_q = query.get_size()[0]
+    batch_kv = key.get_size()[0]
+    if not V.graph.sizevars.statically_known_equals(batch_q, batch_kv):
+        return (
+            False,
+            f"a broadcast KV batch is not supported (Bq={batch_q}, Bkv={batch_kv})",
+        )
 
     return _head_dim_supported(query, value)
 
@@ -367,8 +410,6 @@ def _can_use_flydsl_flash_attention_backward(
     the template renders, exactly as it does on the forward path, and duplicating that
     knowledge in the gate is how the two drift apart.
     """
-    from ...virtualized import V
-
     shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(query, key, value)
     if not shared_ok:
         return False, shared_reason
@@ -379,16 +420,6 @@ def _can_use_flydsl_flash_attention_backward(
     )
     if not features_ok:
         return False, features_reason
-
-    # A broadcast KV batch would need dk/dv summed back down to Bkv after the kernel.
-    # The forward has no such case to handle, so it is refused here rather than half-done.
-    batch_q = query.get_size()[0]
-    batch_kv = key.get_size()[0]
-    if not V.graph.sizevars.statically_known_equals(batch_q, batch_kv):
-        return (
-            False,
-            f"a broadcast KV batch is not supported (Bq={batch_q}, Bkv={batch_kv})",
-        )
 
     return True, ""
 
@@ -692,11 +723,6 @@ def create_flydsl_flash_attention_backward_kernel(
     if device is None:
         raise AssertionError("Device must be specified")
 
-    if grad_logsumexp is not None:
-        raise RuntimeError(
-            "BACKEND='FLYDSL' backward does not support a logsumexp gradient"
-        )
-
     # `do` joins q/k/v in the vote: it is read like them, and the gradients below take
     # their permutation from their references, so agreeing here means nothing is copied.
     layout_str = _kernel_layout(kernel_options, query, key, value, grad_out)
@@ -726,6 +752,17 @@ def create_flydsl_flash_attention_backward_kernel(
     delta = lowerings[torch.ops.prims.convert_element_type](delta, torch.float32)
     (delta,) = maybe_realize([delta])
 
+    # A loss may read the LSE as well as the output. `lse` is a log-sum-exp over the
+    # post-mod scores, so `d lse / d s = p` and the kernels fold `dlse * p` into the row
+    # term they already subtract -- see `build_flex_flash_bwd_dq_module`. Realized and
+    # cast for the same reason `delta` is: the kernels read these two planes as f32.
+    has_dlse = grad_logsumexp is not None
+    if has_dlse:
+        grad_logsumexp = lowerings[torch.ops.prims.convert_element_type](
+            grad_logsumexp, torch.float32
+        )
+        (grad_logsumexp,) = maybe_realize([grad_logsumexp])
+
     # dq is the choice's output; dk and dv are filled in place.
     output_layout = FixedLayout(
         device=device,
@@ -737,6 +774,8 @@ def create_flydsl_flash_attention_backward_kernel(
     # Captures are absent here for the same reason as on the forward path: they are
     # discovered while a mod is lowered and registered as kernel inputs then, so
     # `generate()` appends them afterwards.
+    # Order matters twice over: the template's `def_kernel` declares these names in this
+    # order, and `input_gen_fns` below addresses the block lists by position.
     input_nodes = [
         query,
         key,
@@ -744,6 +783,7 @@ def create_flydsl_flash_attention_backward_kernel(
         grad_out,
         logsumexp,
         delta,
+        *([grad_logsumexp] if has_dlse else []),
         grad_key,
         grad_value,
     ]
@@ -816,6 +856,7 @@ def create_flydsl_flash_attention_backward_kernel(
                 HAS_MASK_MOD=has_mask_mod,
                 MOD_VEC_SIZE=mod_vec_size,
                 LAYOUT=layout_str,
+                HAS_DLSE=has_dlse,
                 DKDV_KV_TILE=dkdv_kv_tile,
                 DKDV_Q_TILE=dkdv_q_tile,
                 DQ_BLOCK_SKIP=block_skip,
@@ -851,13 +892,18 @@ def create_flydsl_flash_attention_backward_kernel(
     # runs at. The generators fill in plausible counts and in-range indices instead.
     input_gen_fns: dict[int, Any] | None = None
     if block_skip:
+        # First list position: the eight declared tensors, plus the dlse plane when it is
+        # there. Computed rather than written out, so the two orderings cannot drift.
+        first_list = 8 + (1 if has_dlse else 0)
         input_gen_fns = {
-            8: create_num_blocks_fake_generator(kv_indices),
-            9: create_indices_fake,
+            first_list: create_num_blocks_fake_generator(kv_indices),
+            first_list + 1: create_indices_fake,
         }
         if has_full_blocks:
-            input_gen_fns[10] = create_num_blocks_fake_generator(full_kv_indices)
-            input_gen_fns[11] = create_indices_fake
+            input_gen_fns[first_list + 2] = create_num_blocks_fake_generator(
+                full_kv_indices
+            )
+            input_gen_fns[first_list + 3] = create_indices_fake
 
     template_output, _ = autotune_select_algorithm(
         "flydsl_flash_attention_backward",
@@ -958,8 +1004,9 @@ def _backward_tiles(kernel_options: dict[str, Any], head_dim: int) -> list[tuple
         tiles += [(256, 32), (128, 64)]
     # A q tile of 64 does not fit past head_dim 128, so past there the sweep is over the
     # kv tile alone. The default (128, 32) fits the whole ladder: at head_dim 256 it lands
-    # on exactly 65536 B.
-    return [t for t in tiles if _dkdv_lds_bytes(t[1], head_dim) <= _LDS_LIMIT]
+    # on exactly the 65536 B both current arches budget.
+    budget = _lds_budget(_current_arch())
+    return [t for t in tiles if _dkdv_lds_bytes(t[1], head_dim) <= budget]
 
 
 # Workgroups per compute unit below which backward block skipping stops paying, and can
@@ -1027,8 +1074,14 @@ def _backward_mod_vec_size(kernel_options: dict[str, Any]) -> int:
     ``dk``/``dv`` kernel cannot: there ``kv_idx`` is the per-lane constant and it is
     ``q_idx`` that runs contiguously, so the vectorized ABI does not apply and the mods
     are always called one element at a time. So the reachable win is at most half the
-    forward's 0.6-2.1%, against multiplying the tile sweep by three. Available as
-    ``kernel_options={"MOD_VEC_SIZE": n}`` for anyone who wants to measure it.
+    forward's 0.6-2.1%, against multiplying the tile sweep by three.
+
+    Since measured, and there is nothing there: the 18-cell mod matrix at 4x16x4096 gives a
+    backward geomean of 1.18x, 1.18x and 1.19x at widths 1, 2 and 4, which is inside
+    run-to-run noise. The largest single cell moved +1.7% (causal/D128) and another went
+    1.8% the other way (alibi/D128), so this stays pinned at 1. Reproduce with
+    ``mod_matrix.py --bwd --flydsl-options MOD_VEC_SIZE=n``; pin it per call with
+    ``kernel_options={"MOD_VEC_SIZE": n}``.
     """
     requested = kernel_options.get("MOD_VEC_SIZE")
     if requested is None:
