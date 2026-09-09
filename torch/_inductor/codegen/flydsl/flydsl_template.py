@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
 import itertools
+import logging
 from collections.abc import Iterable
 from typing import Any
 from unittest.mock import patch
@@ -12,10 +13,12 @@ from torch._logging import getArtifactLogger
 from ...autotune_process import FlyDSLBenchmarkRequest, TensorMeta
 from ...ir import Buffer, ChoiceCaller, FlyDSLTemplateBuffer, IRNode, Layout, TensorBox
 from ..common import KernelTemplate
+from . import flydsl_utils
 from .flydsl_kernel import FlyDSLTemplateKernel
 
 
-log = getArtifactLogger(__name__, "output_code")
+log = logging.getLogger(__name__)
+output_code_log = getArtifactLogger(__name__, "output_code")
 
 
 class FlyDSLTemplate(KernelTemplate):
@@ -44,6 +47,14 @@ class FlyDSLTemplate(KernelTemplate):
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
+        # These kernels are JIT-compiled through the FlyDSL runtime at first call, so
+        # there is nothing for an ahead-of-time wrapper to emit.
+        if getattr(V.graph, "cpp_wrapper", False) or getattr(
+            V.graph, "aot_mode", False
+        ):
+            return NotImplementedError("FlyDSL does not support AOT wrappers")
+        if not flydsl_utils.runtime_available():
+            return NotImplementedError("FlyDSL runtime is unavailable")
         try:
             choices.append(self.generate(**kwargs))
             return None
@@ -74,7 +85,7 @@ class FlyDSLTemplate(KernelTemplate):
                 output_node=output_node,
             )
             code = kernel.render(self.template, **kwargs)
-            log.debug("Generated FlyDSL Code:\n%s", code)
+            output_code_log.debug("Generated FlyDSL Code:\n%s", code)
 
             input_call_args = tuple(kernel.args.input_buffers.keys())
             declared_input_args = tuple(x.get_name() for x in input_nodes)
@@ -84,6 +95,16 @@ class FlyDSLTemplate(KernelTemplate):
                     f"FlyDSL template never registered its declared inputs {missing}; "
                     f"registered {input_call_args}."
                 )
+
+            # Note [registration order is not signature order]
+            #
+            # Presence is all this can check. It is tempting to also require the declared
+            # inputs to be the prefix of `input_call_args`, and for a template with no
+            # captures that holds, but a flex mod registers the tensors it captures when
+            # its subgraph is lowered, which can be before the template calls def_kernel:
+            # the backward renders with its captures registered first. The positional ABI
+            # is checked below against `python_argdefs`, which is the order that actually
+            # reaches the kernel.
 
             # Whatever else got registered was discovered while rendering -- a tensor
             # captured by a flex mod, say. The kernel signature already picks those up

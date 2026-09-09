@@ -1,73 +1,65 @@
 import functools
-import importlib.machinery
-import importlib.util
 import logging
-import platform
-import subprocess
-from pathlib import Path
+from importlib.machinery import PathFinder
+from importlib.util import find_spec
 
+from torch._native.common_utils import _available_version
 from torch.backends import cuda as _cuda
 
 
 log = logging.getLogger(__name__)
+_pathfinder_find_spec = PathFinder.find_spec
+
+# Note [the FlyDSL release these kernels are validated against]
+#
+# The GEMM templates require 0.3.x, because ``@fx.struct`` values only expose
+# ``__cache_signature__()`` from that release. The flex kernels in this tree have only
+# ever been built and measured against 0.2.x, so that is what they claim. Widening this
+# to accept 0.3.x is a revalidation, not an edit: the kernels have to be run against it
+# before the gate says they work on it.
+_FLYDSL_SUPPORTED_RELEASE = (0, 2)
 
 
 def _flydsl_runtime_unavailable_reason() -> str | None:
-    flydsl_spec = importlib.util.find_spec("flydsl")
+    try:
+        flydsl_spec = find_spec("flydsl")
+    except (ImportError, ValueError):
+        flydsl_spec = None
     if flydsl_spec is None or flydsl_spec.submodule_search_locations is None:
         return "missing optional dependency `flydsl`"
 
     # Query the package paths directly so this availability check does not
     # import flydsl as a side effect during regular torch imports.
-    mlir_spec = importlib.machinery.PathFinder.find_spec(
-        "_mlir",
-        list(flydsl_spec.submodule_search_locations),
-    )
+    try:
+        mlir_spec = _pathfinder_find_spec(
+            "_mlir",
+            list(flydsl_spec.submodule_search_locations),
+        )
+    except (ImportError, ValueError):
+        mlir_spec = None
     if mlir_spec is None:
-        return "missing optional dependency `flydsl._mlir`"
+        return "missing optional dependency `flydsl._mlir` (runtime is not built)"
 
-    runtime_so = (
-        Path(next(iter(flydsl_spec.submodule_search_locations)))
-        / "_mlir"
-        / "_mlir_libs"
-        / "libfly_jit_runtime.so"
-    )
-    if not runtime_so.exists():
-        return f"missing FlyDSL runtime shared library `{runtime_so}`"
-
-    if platform.system() == "Linux":
-        try:
-            ldd = subprocess.run(
-                ["ldd", str(runtime_so)],
-                capture_output=True,
-                check=False,
-                text=True,
-            )
-        except OSError as e:
-            return f"could not inspect FlyDSL runtime shared library dependencies: {e}"
-
-        ldd_output = f"{ldd.stdout}\n{ldd.stderr}"
-        if ldd.returncode != 0 or "not found" in ldd_output:
-            return (
-                "unresolved FlyDSL runtime shared library dependencies: "
-                + "; ".join(
-                    line.strip()
-                    for line in ldd_output.splitlines()
-                    if "not found" in line
-                )
-            )
+    flydsl_version = _available_version("flydsl")
+    if flydsl_version is None:
+        return "missing or invalid FlyDSL version metadata"
+    if flydsl_version.release[:2] != _FLYDSL_SUPPORTED_RELEASE:
+        supported = ".".join(map(str, _FLYDSL_SUPPORTED_RELEASE))
+        return (
+            f"unsupported FlyDSL version `{flydsl_version}` (expected `{supported}.x`)"
+        )
 
     return None
 
 
 @functools.cache
-def runtime_available() -> bool:
+def _check_runtime_available() -> bool:
     import torch
 
-    if torch.version.hip is None:
+    if not _cuda.is_built():
         return False
 
-    if not _cuda.is_built():
+    if torch.version.hip is None:
         return False
 
     reason = _flydsl_runtime_unavailable_reason()
@@ -76,3 +68,7 @@ def runtime_available() -> bool:
         return False
 
     return True
+
+
+def runtime_available() -> bool:
+    return _check_runtime_available()
