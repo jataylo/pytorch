@@ -150,6 +150,7 @@ _AUX_SLOT_NAMES = tuple(f"AUX{i}" for i in range(MAX_AUX_TENSORS))
 def build_flex_flash_generic_module(
     num_heads,
     head_dim,
+    head_dim_v=None,
     causal=True,
     dtype_str="f16",
     sm_scale=None,
@@ -182,6 +183,16 @@ def build_flex_flash_generic_module(
     ``num_heads % num_kv_heads == 0``. Default ``num_kv_heads = num_heads`` (MHA).
     Q/O still have ``num_heads`` heads; K/V have ``num_kv_heads`` heads, with
     every ``num_heads // num_kv_heads`` consecutive Q heads sharing one KV head.
+
+    ``head_dim`` is the QK extent -- the head dim of Q and K, which is GEMM1's reduction
+    axis. ``head_dim_v`` is the V/O extent, the free axis of GEMM2, and defaults to
+    ``head_dim``. The two are independent because the score tile sits between them: GEMM1
+    contracts over ``head_dim`` to produce it and GEMM2 contracts over the KV axis to
+    consume it, so neither loop bound is shared. Everything K-side (its LDS stride, XOR
+    swizzle, row padding, load geometry, DMA lane count) sizes to ``head_dim`` and
+    everything V/O-side to ``head_dim_v``; where a constant previously served both -- the
+    KV token stride, the KV global index, the cooperative load geometry -- there are now
+    two. With the two equal the build is identical to before this was split.
 
     FlexAttention hooks (all evaluated at build time with FlyDSL device values):
 
@@ -255,6 +266,9 @@ def build_flex_flash_generic_module(
     if num_kv_heads is None:
         num_kv_heads = num_heads
     assert num_heads % num_kv_heads == 0, f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+
+    if head_dim_v is None:
+        head_dim_v = head_dim
 
     BLOCK_N = 64
     K_SUB_N = 32
@@ -357,16 +371,20 @@ def build_flex_flash_generic_module(
     # 128-bit permlane-fused O-store needs gfx950 (permlane32_swap + cvt_pk_bf16_f32,
     # both CDNA4-only); gfx942 falls back to a per-lane dwordx2 store via .to(elem_dtype).
     USE_PERMLANE_OSTORE = CAPS.permlane_o_store
+    # GEMM1 contracts over the QK extent; GEMM2's free axis is the V extent. Neither
+    # loop bound is shared, which is what makes the two independent -- see the docstring.
     K_STEP_QK = 16 if USE_K16 else 8
     K_STEPS_QK = head_dim // K_STEP_QK
     D_CHUNK = 32
-    D_CHUNKS = head_dim // D_CHUNK
+    D_CHUNKS = head_dim_v // D_CHUNK
+    # GEMM2 reduces over the KV axis, not over either head dim, so this is untouched.
     PV_K_STEP = 16 if USE_K16 else 8
     PV_K_STEPS = K_SUB_N // PV_K_STEP  # 2 steps per sub-tile (K=16) or 4 (K=8)
 
     assert BLOCK_M % NUM_WAVES == 0
-    assert head_dim % 32 == 0, f"head_dim ({head_dim}) must be divisible by 32"
-    assert head_dim >= 64, f"head_dim ({head_dim}) must be >= 64"
+    for _name, _dim in (("head_dim", head_dim), ("head_dim_v", head_dim_v)):
+        assert _dim % 32 == 0, f"{_name} ({_dim}) must be divisible by 32"
+        assert _dim >= 64, f"{_name} ({_dim}) must be >= 64"
     assert flat_work_group_size in (
         128,
         256,
@@ -437,7 +455,12 @@ def build_flex_flash_generic_module(
     NUM_HEADS_Q = num_heads
     NUM_HEADS_KV = num_kv_heads
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
+    # HEAD_DIM is the QK extent throughout: it sizes Q, K, the GEMM1 contraction and every
+    # K-side LDS constant. HEAD_DIM_V is the V/O extent. Read a use of either as a claim
+    # about which tensor it addresses.
     HEAD_DIM = head_dim
+    HEAD_DIM_V = head_dim_v
+    ASYMMETRIC_D = HEAD_DIM_V != HEAD_DIM
     CAUSAL = causal
     SCORE_MOD = score_mod
     MASK_MOD = mask_mod
@@ -456,8 +479,12 @@ def build_flex_flash_generic_module(
     # interleaved, so stepping a token steps over every head; in BHSD a head's tokens are
     # contiguous, so it is just the head width. The other two coefficients (per-head and
     # per-batch) depend on seq_len and so are formed at launch time, not here.
+    # Q and O do not share a stride once the two head dims differ: Q is HEAD_DIM wide and
+    # O is HEAD_DIM_V wide. K and V likewise.
     STRIDE_TOKEN_Q = HEAD_DIM if BHSD else NUM_HEADS_Q * HEAD_DIM
-    STRIDE_TOKEN_KV = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_O = HEAD_DIM_V if BHSD else NUM_HEADS_Q * HEAD_DIM_V
+    STRIDE_TOKEN_K = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_V = HEAD_DIM_V if BHSD else NUM_HEADS_KV * HEAD_DIM_V
 
     # Mixed into generated symbol names so two builds differing only in a mod cannot
     # collide in the JIT cache (see the mod_key contract in the docstring).
@@ -498,9 +525,9 @@ def build_flex_flash_generic_module(
     K_PAD = 8 if not K_SWZ_POW2 and not ENABLE_DMA else 0
     K_STRIDE = HEAD_DIM + K_PAD
     if USE_HW_TR:
-        V_STRIDE = HEAD_DIM if ENABLE_DMA else HEAD_DIM + 4
+        V_STRIDE = HEAD_DIM_V if ENABLE_DMA else HEAD_DIM_V + 4
     else:
-        # V is held transposed, [HEAD_DIM][BLOCK_N]. A plain BLOCK_N stride puts every
+        # V is held transposed, [HEAD_DIM_V][BLOCK_N]. A plain BLOCK_N stride puts every
         # row of it in the same LDS bank -- the read is one v4f16 per lane at a fixed
         # column, so 128 B between lanes lands them all on the same bank pair. Padding
         # to BLOCK_N + 2 was the fix, and it cost `HEAD_DIM * 2` elements: 512 B at
@@ -521,6 +548,7 @@ def build_flex_flash_generic_module(
 
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
     assert HEAD_DIM % VEC_WIDTH == 0
+    assert HEAD_DIM_V % VEC_WIDTH == 0
 
     if not USE_HW_TR:
         # Granule is the 4 elements a v4f16 read wants contiguous, so the XOR moves
@@ -531,32 +559,50 @@ def build_flex_flash_generic_module(
         # bits alone would be constant across the store's lanes. Folding d's high bits
         # in with `d ^ (d >> log2(VEC_WIDTH))` makes it vary under both.
         V_SWZ_DSHIFT = VEC_WIDTH.bit_length() - 1
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    # A row of the tile is loaded by THREADS_PER_ROW_LOAD lanes, so the workgroup covers
+    # The cooperative load geometry is per tensor, because it is derived from the row
+    # width and K's rows are HEAD_DIM wide where V's are HEAD_DIM_V. With the two equal
+    # both tuples come out identical, which is why a symmetric build is unchanged.
+    #
+    # A row of the tile is loaded by `threads_per_row` lanes, so the workgroup covers
     # whole rows only when it divides evenly. It does for power-of-two head_dims and does
     # not for 96 / 160 / 224 (512 % 12, % 20, % 28), where the last lane group is partial.
     # Rounding down and idling the remainder costs those lanes one load each -- 8 of 512
     # at head_dim 96 -- which is cheaper than the alternatives (a second geometry, or
     # padding the tile) and is what makes those head_dims representable at all.
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-    LOAD_HAS_IDLE_LANES = BLOCK_SIZE % THREADS_PER_ROW_LOAD != 0
+    def _load_geometry(row_width):
+        threads_per_row = row_width // VEC_WIDTH
+        rows_per_batch = BLOCK_SIZE // threads_per_row
+        has_idle_lanes = BLOCK_SIZE % threads_per_row != 0
+        # Ceiling, so a tile whose rows do not divide into batches gets a short final
+        # batch rather than dropping its tail.
+        num_batches = max(1, -(-BLOCK_N // rows_per_batch))
+        # One predicate covers both partial cases: idle lanes sit at row >= rows_per_batch
+        # within their batch, and a short final batch runs past BLOCK_N. Both reduce to
+        # bounding the LDS row, so the guard is needed unless the geometry is exact.
+        needs_guard = has_idle_lanes or (num_batches * rows_per_batch != BLOCK_N)
+        return threads_per_row, rows_per_batch, has_idle_lanes, num_batches, needs_guard
 
-    # Ceiling, so a tile whose rows do not divide into batches gets a short final batch
-    # rather than dropping its tail.
-    NUM_BATCHES_KV = max(1, -(-BLOCK_N // ROWS_PER_BATCH_LOAD))
-    # One predicate covers both partial cases: idle lanes sit at row >= ROWS_PER_BATCH_LOAD
-    # within their batch, and a short final batch runs past BLOCK_N. Both reduce to
-    # bounding the LDS row, so the guard is needed unless the geometry is exact.
-    KV_NEEDS_GUARD = LOAD_HAS_IDLE_LANES or (
-        NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N
-    )
+    (
+        THREADS_PER_ROW_LOAD_K,
+        ROWS_PER_BATCH_LOAD_K,
+        LOAD_HAS_IDLE_LANES_K,
+        NUM_BATCHES_K,
+        K_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM)
+    (
+        THREADS_PER_ROW_LOAD_V,
+        ROWS_PER_BATCH_LOAD_V,
+        LOAD_HAS_IDLE_LANES_V,
+        NUM_BATCHES_V,
+        V_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM_V)
 
     # K/V circular buffers; defaults to 1/1, optional 3/3 with CK-like LDS sequence.
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     if USE_HW_TR:
         LDS_V_TILE_SIZE = BLOCK_N * V_STRIDE
     else:
-        LDS_V_TILE_SIZE = HEAD_DIM * VT_STRIDE
+        LDS_V_TILE_SIZE = HEAD_DIM_V * VT_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
     LDS_V_BASE = LDS_K_TOTAL_SIZE
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
@@ -696,25 +742,39 @@ def build_flex_flash_generic_module(
         kv_head_idx = q_head_idx if GQA_GROUP_SIZE == 1 else q_head_idx // GQA_GROUP_SIZE
 
         # ---- Cooperative load decomposition ----
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
+        # Per tensor, since the lane-to-(row, col) map is a function of the row width.
+        load_row_in_batch_k = tid // THREADS_PER_ROW_LOAD_K
+        load_col_base_k = (tid % THREADS_PER_ROW_LOAD_K) * VEC_WIDTH
+        if const_expr(ASYMMETRIC_D):
+            load_row_in_batch_v = tid // THREADS_PER_ROW_LOAD_V
+            load_col_base_v = (tid % THREADS_PER_ROW_LOAD_V) * VEC_WIDTH
+        else:
+            load_row_in_batch_v = load_row_in_batch_k
+            load_col_base_v = load_col_base_k
 
-        def _kv_row_valid(lds_row):
-            """Whether this lane's row of the KV tile is one it should store.
+        def _row_valid(lds_row, load_row, has_idle_lanes, rows_per_batch):
+            """Whether this lane's row of the tile is one it should store.
 
             Two ways it is not. The row can sit past the tile, when the tile's rows do
             not divide into whole batches. Or the lane can belong to a partial row group,
             which happens when the workgroup does not divide into whole rows: those lanes
-            all land on row ROWS_PER_BATCH_LOAD of their batch, since their `tid`
-            remainder is below THREADS_PER_ROW_LOAD, so one bound excludes the group.
+            all land on row `rows_per_batch` of their batch, since their `tid` remainder
+            is below `threads_per_row`, so one bound excludes the group.
             """
             row_valid = lds_row < fx.Index(BLOCK_N)
-            if const_expr(LOAD_HAS_IDLE_LANES):
-                row_valid = row_valid & (
-                    load_row_in_batch < fx.Index(ROWS_PER_BATCH_LOAD)
-                )
+            if const_expr(has_idle_lanes):
+                row_valid = row_valid & (load_row < fx.Index(rows_per_batch))
             return row_valid
+
+        def _k_row_valid(lds_row):
+            return _row_valid(
+                lds_row, load_row_in_batch_k, LOAD_HAS_IDLE_LANES_K, ROWS_PER_BATCH_LOAD_K
+            )
+
+        def _v_row_valid(lds_row):
+            return _row_valid(
+                lds_row, load_row_in_batch_v, LOAD_HAS_IDLE_LANES_V, ROWS_PER_BATCH_LOAD_V
+            )
 
         # ---- Helper: global flat indices ----
         # Q/O are laid out with NUM_HEADS_Q heads; K/V with NUM_HEADS_KV.
@@ -731,14 +791,29 @@ def build_flex_flash_generic_module(
             slice_q = (batch_idx * NUM_HEADS_Q + q_head_idx) * seq_len_q_v
             slice_kv = (batch_idx * NUM_HEADS_KV + kv_head_idx) * seq_len_kv_v
 
+            slice_o = (
+                slice_q
+                if const_expr(not ASYMMETRIC_D)
+                else (batch_idx * NUM_HEADS_Q + q_head_idx) * seq_len_q_v
+            )
+
             def global_idx_q(token_idx, col):
                 return (slice_q + token_idx) * STRIDE_TOKEN_Q + col
 
-            def global_idx_kv(token_idx, col):
-                return (slice_kv + token_idx) * STRIDE_TOKEN_KV + col
+            def global_idx_o(token_idx, col):
+                return (slice_o + token_idx) * STRIDE_TOKEN_O + col
 
-            def global_byte_kv(token_idx, col_byte):
-                return (slice_kv + token_idx) * fx.Index(STRIDE_TOKEN_KV * 2) + col_byte
+            def global_idx_k(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_K + col
+
+            def global_idx_v(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_V + col
+
+            def global_byte_k(token_idx, col_byte):
+                return (slice_kv + token_idx) * fx.Index(STRIDE_TOKEN_K * 2) + col_byte
+
+            def global_byte_v(token_idx, col_byte):
+                return (slice_kv + token_idx) * fx.Index(STRIDE_TOKEN_V * 2) + col_byte
 
         else:
 
@@ -746,15 +821,31 @@ def build_flex_flash_generic_module(
                 token = batch_idx * seq_len_q_v + token_idx
                 return token * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
 
-            def global_idx_kv(token_idx, col):
-                token = batch_idx * seq_len_kv_v + token_idx
-                return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+            def global_idx_o(token_idx, col):
+                token = batch_idx * seq_len_q_v + token_idx
+                return token * STRIDE_TOKEN_O + q_head_idx * HEAD_DIM_V + col
 
-            def global_byte_kv(token_idx, col_byte):
+            def global_idx_k(token_idx, col):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return token * STRIDE_TOKEN_K + kv_head_idx * HEAD_DIM + col
+
+            def global_idx_v(token_idx, col):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return token * STRIDE_TOKEN_V + kv_head_idx * HEAD_DIM_V + col
+
+            def global_byte_k(token_idx, col_byte):
                 token = batch_idx * seq_len_kv_v + token_idx
                 return (
-                    token * fx.Index(STRIDE_TOKEN_KV * 2)
+                    token * fx.Index(STRIDE_TOKEN_K * 2)
                     + kv_head_idx * fx.Index(HEAD_DIM * 2)
+                    + col_byte
+                )
+
+            def global_byte_v(token_idx, col_byte):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return (
+                    token * fx.Index(STRIDE_TOKEN_V * 2)
+                    + kv_head_idx * fx.Index(HEAD_DIM_V * 2)
                     + col_byte
                 )
 
@@ -836,27 +927,27 @@ def build_flex_flash_generic_module(
         # latency directly in front of the barrier that GEMM1 waits on. Splitting it lets
         # the loop issue tile i+1's global read before computing tile i (see `_pipe_k`).
         #
-        # The load is unconditional even under KV_NEEDS_GUARD: `_kv_row_clamp` already
+        # The load is unconditional even under K_NEEDS_GUARD: `_kv_row_clamp` already
         # holds the address on the last real row, so an idle lane re-reads a valid row
         # rather than running off the tensor. Only the *store* is guarded, which is what
         # keeps the padding rows out of LDS.
         def coop_load_k_global(tile_start):
             vecs = []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
-                g_idx = global_idx_kv(row_idx, load_col_base)
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_K
+                row_idx = _kv_row_clamp(tile_start + load_row_in_batch_k + row_offset)
+                g_idx = global_idx_k(row_idx, load_col_base_k)
                 vecs.append(load_global_f16xN(k_ptr, g_idx))
             return vecs
 
         def coop_store_k_lds(vecs, buf_id=0):
             k_base = k_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                lds_row = load_row_in_batch + row_offset
-                lds_idx = k_base + lds_row * K_STRIDE + _k_swizzle(lds_row, load_col_base)
-                if const_expr(KV_NEEDS_GUARD):
-                    if _kv_row_valid(lds_row):
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_K
+                lds_row = load_row_in_batch_k + row_offset
+                lds_idx = k_base + lds_row * K_STRIDE + _k_swizzle(lds_row, load_col_base_k)
+                if const_expr(K_NEEDS_GUARD):
+                    if _k_row_valid(lds_row):
                         Vec(vecs[batch]).store(lds_kv, [lds_idx])
                 else:
                     Vec(vecs[batch]).store(lds_kv, [lds_idx])
@@ -864,34 +955,34 @@ def build_flex_flash_generic_module(
         # ---- Cooperative K load (row-major, XOR-swizzled) ----
         def coop_load_k(tile_start, buf_id=0):
             k_base = k_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                lds_row = load_row_in_batch + row_offset
+            for batch in range_constexpr(NUM_BATCHES_K):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_K
+                lds_row = load_row_in_batch_k + row_offset
                 row_idx = _kv_row_clamp(tile_start + lds_row)
-                if const_expr(KV_NEEDS_GUARD):
-                    row_valid = _kv_row_valid(lds_row)
+                if const_expr(K_NEEDS_GUARD):
+                    row_valid = _k_row_valid(lds_row)
                     if row_valid:
-                        g_idx = global_idx_kv(row_idx, load_col_base)
-                        swz_col = _k_swizzle(lds_row, load_col_base)
+                        g_idx = global_idx_k(row_idx, load_col_base_k)
+                        swz_col = _k_swizzle(lds_row, load_col_base_k)
                         lds_idx = k_base + lds_row * K_STRIDE + swz_col
                         vec = load_global_f16xN(k_ptr, g_idx)
                         Vec(vec).store(lds_kv, [lds_idx])
                 else:
-                    g_idx = global_idx_kv(row_idx, load_col_base)
-                    swz_col = _k_swizzle(lds_row, load_col_base)
+                    g_idx = global_idx_k(row_idx, load_col_base_k)
+                    swz_col = _k_swizzle(lds_row, load_col_base_k)
                     lds_idx = k_base + lds_row * K_STRIDE + swz_col
                     vec = load_global_f16xN(k_ptr, g_idx)
                     Vec(vec).store(lds_kv, [lds_idx])
 
         # ---- Cooperative V load ----
         def _v_store_row_major(v_base, lds_row, vec):
-            lds_idx = v_base + lds_row * V_STRIDE + load_col_base
+            lds_idx = v_base + lds_row * V_STRIDE + load_col_base_v
             Vec(vec).store(lds_kv, [lds_idx])
 
         def _v_store_transposed(v_base, lds_row, vec):
             for _e in range_constexpr(VEC_WIDTH):
                 elem = Vec(vec)[_e]
-                vt_d = load_col_base + _e
+                vt_d = load_col_base_v + _e
                 vt_idx = v_base + vt_d * VT_STRIDE + _v_swizzle_t(vt_d, lds_row)
                 v1 = Vec.from_elements([elem], elem_dtype)
                 v1.store(lds_kv, [vt_idx])
@@ -900,39 +991,39 @@ def build_flex_flash_generic_module(
 
         def coop_load_v(tile_start, buf_id=0):
             v_base = v_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                lds_row = load_row_in_batch + row_offset
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_V
+                lds_row = load_row_in_batch_v + row_offset
                 row_idx = _kv_row_clamp(tile_start + lds_row)
-                if const_expr(KV_NEEDS_GUARD):
-                    row_valid = _kv_row_valid(lds_row)
+                if const_expr(V_NEEDS_GUARD):
+                    row_valid = _v_row_valid(lds_row)
                     if row_valid:
-                        g_idx = global_idx_kv(row_idx, load_col_base)
+                        g_idx = global_idx_v(row_idx, load_col_base_v)
                         vec = load_global_f16xN(v_ptr, g_idx)
                         _v_store_to_lds(v_base, lds_row, vec)
                 else:
-                    g_idx = global_idx_kv(row_idx, load_col_base)
+                    g_idx = global_idx_v(row_idx, load_col_base_v)
                     vec = load_global_f16xN(v_ptr, g_idx)
                     _v_store_to_lds(v_base, lds_row, vec)
 
         def coop_load_v_global(tile_start):
             """Issue global loads for V, return vectors (non-blocking)."""
             vecs = []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = _kv_row_clamp(tile_start + load_row_in_batch + row_offset)
-                g_idx = global_idx_kv(row_idx, load_col_base)
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_V
+                row_idx = _kv_row_clamp(tile_start + load_row_in_batch_v + row_offset)
+                g_idx = global_idx_v(row_idx, load_col_base_v)
                 vecs.append(load_global_f16xN(v_ptr, g_idx))
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
             """Write previously-loaded V vectors to LDS."""
             v_base = v_buf_base(buf_id)
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                lds_row = load_row_in_batch + row_offset
-                if const_expr(KV_NEEDS_GUARD):
-                    row_valid = _kv_row_valid(lds_row)
+            for batch in range_constexpr(NUM_BATCHES_V):
+                row_offset = batch * ROWS_PER_BATCH_LOAD_V
+                lds_row = load_row_in_batch_v + row_offset
+                if const_expr(V_NEEDS_GUARD):
+                    row_valid = _v_row_valid(lds_row)
                     if row_valid:
                         _v_store_to_lds(v_base, lds_row, vecs[batch])
                 else:
@@ -947,18 +1038,25 @@ def build_flex_flash_generic_module(
         # and whose tail this block would run into: the batch in BSHD, and the tighter
         # (batch, head) plane in BHSD, where a row past seq_len would otherwise land in
         # the next head's tokens rather than past the end of the tensor.
+        #
+        # One bound per tensor rather than per axis pair, because the byte offset of the
+        # same token differs between K and V, and between Q and O, once the head dims do.
         if const_expr(BHSD):
-            _kv_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_KV * 2))
+            _k_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_K * 2))
+            _v_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_V * 2))
             _q_nrec_bytes = _raw((slice_q + seq_len_q_v) * fx.Index(STRIDE_TOKEN_Q * 2))
+            _o_nrec_bytes = _raw((slice_o + seq_len_q_v) * fx.Index(STRIDE_TOKEN_O * 2))
         else:
-            _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_KV * 2))
+            _k_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_K * 2))
+            _v_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_V * 2))
             _q_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
+            _o_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_q_v * fx.Index(STRIDE_TOKEN_O * 2))
         q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=False, num_records_bytes=_q_nrec_bytes)
-        o_rsrc = buffer_ops.create_buffer_resource(O, max_size=False, num_records_bytes=_q_nrec_bytes)
+        o_rsrc = buffer_ops.create_buffer_resource(O, max_size=False, num_records_bytes=_o_nrec_bytes)
 
         # ---- DMA loading for K (buffer_load_dwordx4 ... lds) ----
         if const_expr(ENABLE_DMA):
-            k_rsrc = buffer_ops.create_buffer_resource(K, max_size=False, num_records_bytes=_kv_nrec_bytes)
+            k_rsrc = buffer_ops.create_buffer_resource(K, max_size=False, num_records_bytes=_k_nrec_bytes)
             DMA_BYTES = 16  # buffer_load_dwordx4 = 16 bytes per lane
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
             K_TILE_BYTES = BLOCK_N * K_STRIDE * 2
@@ -992,7 +1090,7 @@ def build_flex_flash_generic_module(
                     xor_mask = (row_in_tile & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_byte = global_byte_kv(tile_start + row_in_tile, col_byte)
+                    global_byte = global_byte_k(tile_start + row_in_tile, col_byte)
                     voffset = fx.Int32(global_byte)
 
                     rocdl.raw_ptr_buffer_load_lds(
@@ -1012,11 +1110,11 @@ def build_flex_flash_generic_module(
 
         # ---- DMA loading for V (buffer_load_dwordx4 ... lds) ----
         if const_expr(ENABLE_DMA):
-            v_rsrc = buffer_ops.create_buffer_resource(V, max_size=False, num_records_bytes=_kv_nrec_bytes)
+            v_rsrc = buffer_ops.create_buffer_resource(V, max_size=False, num_records_bytes=_v_nrec_bytes)
             V_TILE_BYTES = BLOCK_N * V_STRIDE * 2
             NUM_DMA_V = V_TILE_BYTES // DMA_BATCH_BYTES
-            LANES_PER_V_ROW = HEAD_DIM * 2 // DMA_BYTES
-            ROWS_PER_DMA_BATCH_V = DMA_BATCH_BYTES // (HEAD_DIM * 2)
+            LANES_PER_V_ROW = HEAD_DIM_V * 2 // DMA_BYTES
+            ROWS_PER_DMA_BATCH_V = DMA_BATCH_BYTES // (HEAD_DIM_V * 2)
 
             def coop_dma_v(tile_start, buf_id=0):
                 """Load V tile via DMA with XOR-swizzled global fetch."""
@@ -1034,7 +1132,7 @@ def build_flex_flash_generic_module(
                     xor_mask = (row_in_tile & fx.Index(0x3)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_byte = global_byte_kv(tile_start + row_in_tile, col_byte)
+                    global_byte = global_byte_v(tile_start + row_in_tile, col_byte)
                     voffset = fx.Int32(global_byte)
 
                     rocdl.raw_ptr_buffer_load_lds(
@@ -1267,7 +1365,7 @@ def build_flex_flash_generic_module(
             # first tile is whatever the index list names, not 0, so read it from the list
             # rather than assuming the dense walk's start.
             _k0_vecs = coop_load_k_global(_kv_prefetch_tile_start(fx.Index(_kv_lo)))
-            for _kb in range_constexpr(NUM_BATCHES_KV):
+            for _kb in range_constexpr(NUM_BATCHES_K):
                 init_args.append(_k0_vecs[_kb])
 
         loop_results = init_args
@@ -1281,7 +1379,7 @@ def build_flex_flash_generic_module(
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
             _cur_buf_id = inner_iter_args[2 + D_CHUNKS] if _use_dma_dbuf else None
             _carried_k_vecs = (
-                [inner_iter_args[2 + D_CHUNKS + _kb] for _kb in range_constexpr(NUM_BATCHES_KV)]
+                [inner_iter_args[2 + D_CHUNKS + _kb] for _kb in range_constexpr(NUM_BATCHES_K)]
                 if _pipe_k
                 else None
             )
@@ -1857,7 +1955,7 @@ def build_flex_flash_generic_module(
                 else:
                     _yield_args.append(_cur_buf_id)
             if const_expr(_pipe_k):
-                for _kb in range_constexpr(NUM_BATCHES_KV):
+                for _kb in range_constexpr(NUM_BATCHES_K):
                     _yield_args.append(_next_k_vecs[_kb])
             loop_results = yield _yield_args
 
@@ -1938,7 +2036,7 @@ def build_flex_flash_generic_module(
                     w3 = is_hi_half.select(_raw(d1_b), y1_a)
                     o_pack = Vec.from_elements([fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32)
                     d_col = fx.Index(dc * D_CHUNK) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
-                    o_global = global_idx_q(q_row, d_col)
+                    o_global = global_idx_o(q_row, d_col)
                     buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
         else:
             # gfx942 fallback (no permlane32_swap / cvt_pk_bf16_f32): each lane stores
@@ -1951,7 +2049,7 @@ def build_flex_flash_generic_module(
                     pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
                     o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
                     d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                    o_global = global_idx_q(q_row, d_col)
+                    o_global = global_idx_o(q_row, d_col)
                     buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
 
     @flyc.jit

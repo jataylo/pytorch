@@ -106,7 +106,7 @@ lowering; that is not in the pushed head.
 | **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **nothing**: `flex_decoding` is deferred and reaches no architecture |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
-| Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class | refused; open P1 item |
+| Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **forward: any admitted pair, either order**; backward refuses |
 | Upstreaming | in the review queue with `albanD` / `drisspg` requested | a local branch |
 | Backward CDNA4 | their backward is written for gfx950 throughout | ours reads **none** of the four CDNA4 capabilities; ISA confirms it (`dkdv` D128: 256 VGPR / 78 spilled on gfx942, 256 / 76 on gfx950) |
 
@@ -132,8 +132,11 @@ admitted head dim lowers and the CDNA4 paths engage"*, which is strictly weaker 
 2. **Their `Sq != Sk` handling is a spec worth reading**, since the forward supports separate
    extents cleanly. Ours works, but it was a bug fix (we returned 0.97 and 1.57 relative error
    silently before it), so a second design to check against has value.
-3. **Asymmetric `qk_head_dim != v_head_dim`** is on our open list and they have shipped one
-   pair of it. Their crossed loader masks are the reference.
+3. ~~**Asymmetric `qk_head_dim != v_head_dim`**~~ **Done for the forward, which now covers
+   more of this than they do**: any admitted pair in either order, against their one
+   `(192, 128)`. Their crossed loader masks were the reference. The backward still refuses
+   it, and does so loudly, so an asymmetric training step stops rather than pairing our
+   natural-log LSE with Triton's log2 backward.
 4. **The precompile hook.** Both warm FlyDSL's disk cache through `FakeTensorMode` proxies
    under `FLYDSL_COMPILE_ONLY=1`. We have a precompile pool already, but note the version
    hazard a reviewer raised: the env var is `COMPILE_ONLY` rather than `FLYDSL_COMPILE_ONLY`

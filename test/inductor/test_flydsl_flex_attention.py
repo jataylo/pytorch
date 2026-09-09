@@ -694,6 +694,81 @@ class TestFlyDSLFlexAttention(TestCase):
                 if grad:
                     out.sum().backward()
 
+    @parametrize(
+        "qk_head_dim,v_head_dim",
+        [(192, 128), (128, 64), (256, 128), (96, 64), (64, 128), (128, 256)],
+    )
+    def test_asymmetric_head_dims_forward(self, qk_head_dim, v_head_dim):
+        """`qk_head_dim != v_head_dim`, which the forward serves and the backward does not.
+
+        The two extents are independent because the score tile sits between the GEMMs:
+        GEMM1 contracts over the QK extent to produce it and GEMM2 contracts over the *KV*
+        axis to consume it, so the V extent only ever appears as GEMM2's free axis. What
+        had to be split to get here was not the loop structure but everything that had been
+        sized once and used for both tensors -- the KV token stride, the KV global index,
+        the num_records bound, and the cooperative load geometry, whose lane-to-(row, col)
+        map is a function of the row width.
+
+        Both orders are covered deliberately. `qk > v` is the MLA-shaped case and the one
+        upstream supports, but `qk < v` exercises the opposite side of every bound, and a
+        constant left un-split shows up in only one of the two.
+        """
+        torch.manual_seed(0)
+        q = torch.randn(B, H, S, qk_head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, H, S, qk_head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, H, S, v_head_dim, device="cuda", dtype=torch.bfloat16)
+
+        actual, expected = self._run(q, k, v)
+        # The output takes its width from V, not from Q.
+        self.assertEqual(tuple(actual.shape), (B, H, S, v_head_dim))
+        self._assert_close(actual, expected, f"for qk={qk_head_dim} v={v_head_dim}")
+
+    def test_asymmetric_head_dims_with_a_mod_and_a_block_mask(self):
+        """The asymmetric path with the mod machinery live, not just the plain GEMMs.
+
+        A score_mod reads the score tile and a mask_mod drives the block walk, and both sit
+        on the seam between the two extents, so this is where a mod site that had picked up
+        the wrong width would show. Sharing `_run` with the symmetric tests is the point:
+        nothing about a mod should know the two dims differ.
+        """
+        torch.manual_seed(0)
+        q = torch.randn(B, H, S, 192, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, H, S, 192, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, H, S, 128, device="cuda", dtype=torch.bfloat16)
+
+        actual, expected = self._run(q, k, v, score_mod=_alibi)
+        self._assert_close(actual, expected, "for an asymmetric score_mod")
+
+        torch._dynamo.reset()
+        block_mask = create_block_mask(_causal, B, H, S, S, device="cuda")
+        actual, expected = self._run(q, k, v, block_mask=block_mask)
+        self._assert_close(actual, expected, "for an asymmetric block mask")
+
+    def test_backward_refuses_asymmetric_head_dims_rather_than_falling_through(self):
+        """The asymmetric split is only safe because this refusal is loud.
+
+        The forward serves `qk != v` and the backward does not, which is exactly the
+        forward/backward mismatch that Note [FlyDSL forward and backward must be chosen
+        together] exists to prevent: this forward writes LSE in natural log, so a silent
+        fall-through would hand Triton's log2 backward the wrong base and return *wrong
+        gradients* rather than slow ones. So what is asserted here is not that the shape is
+        unsupported -- it is that asking for it raises, and names the direction.
+        """
+        torch.manual_seed(0)
+        q = torch.randn(
+            B, H, S, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        k = torch.randn(
+            B, H, S, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        v = torch.randn(
+            B, H, S, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+        with self.assertRaisesRegex(Exception, "backward"):
+            out = compiled(q, k, v, kernel_options={"BACKEND": "FLYDSL"})
+            out.sum().backward()
+
     def test_rejects_head_dim_past_the_lds_budget(self):
         """head_dim 288 needs 73728 B of LDS against gfx942's 65536 B.
 

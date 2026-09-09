@@ -214,7 +214,7 @@ be believed rather than assumed, since a log2 `lse` would need the cotangent res
 | Direction | Forward and backward (`dq` and `dk`/`dv`) |
 | Architecture | gfx942 and gfx950, neither behind a flag. Declared as capabilities rather than names, so anything else is refused by naming what it is missing — see [GPU architectures](#gpu-architectures) |
 | dtype | bf16, f16 (all of q/k/v the same) |
-| head_dim | Multiples of 32 from 64 to 256, and `qk_head_dim == v_head_dim` |
+| head_dim | Multiples of 32 from 64 to 256. The forward serves `qk_head_dim != v_head_dim` in either order; the backward requires them equal and raises when they are not — see [Asymmetric head dims](#asymmetric-head-dims) |
 | Captures | At most 4 across both mods, rank ≤ 4, on device. A mod may *read* one; a gradient with respect to one is refused |
 | seq_len | Any, ragged tails included, and Q may differ from KV (cross attention). K and V must match each other |
 | GQA | Yes |
@@ -248,6 +248,52 @@ that is not a contiguous mask); with the mask hardcoded to 7 the XOR walked off 
 a 64-wide row into the next one and returned ~44% relative error while building perfectly
 happily. That is the failure mode the allowlist exists to prevent: a kernel returning
 plausible garbage rather than falling back to Triton.
+
+## Asymmetric head dims
+
+The forward serves `qk_head_dim != v_head_dim` — any pair from the admitted set, in either
+order. The backward does not, and refuses it by name.
+
+The two extents are independent because the score tile sits between the two GEMMs. GEMM1
+contracts over the QK extent to *produce* the score tile; GEMM2 contracts over the **KV
+axis** to consume it, so the V extent only ever appears as GEMM2's free axis. Neither loop
+bound is shared, which is why `K_STEPS_QK` and `D_CHUNKS` could simply be pointed at
+different dims, and why `PV_K_STEPS` did not move at all. The deferred O-accumulator rescale
+keys off `si + 1 < D_CHUNKS`, so it follows the V extent for free.
+
+What actually had to change was everything that had been sized *once* and used for both
+tensors, none of which is a loop bound:
+
+| Was one thing | Became two | Because |
+|---|---|---|
+| `STRIDE_TOKEN_KV` | `STRIDE_TOKEN_K`, `STRIDE_TOKEN_V` | the same token sits at different byte offsets in K and in V |
+| `global_idx_kv`, `global_byte_kv` | `_k` / `_v` pairs | same, per element and per byte |
+| `global_idx_q` for the O store | `global_idx_o` | O is `head_dim_v` wide, Q is not |
+| `_kv_nrec_bytes` | `_k_`, `_v_`, `_q_`, `_o_` | the `num_records` bound is per tensor |
+| `THREADS_PER_ROW_LOAD` and its geometry | `_K` / `_V` tuples via `_load_geometry` | the lane-to-(row, col) map is a function of the row width, so K's rows and V's need different lane groupings, batch counts and partial-lane guards |
+
+That last one is the substantive part: the cooperative load's whole geometry — lane
+grouping, `ROWS_PER_BATCH_LOAD`, the batch count, the idle-lane predicate — is derived from
+how wide a row is, so two widths need two of it. `NUM_BATCHES_K` also sizes the main loop's
+register-staging iter_args, which carry K vectors only.
+
+With the two dims equal, `_load_geometry` returns identical tuples and every split constant
+collapses to its old value, so **a symmetric build is unchanged** — confirmed by LDS
+(D128 still exactly 32768 B, D256 still exactly 65536 B) and by kernel-only timing across
+the whole ladder, which moved by less than run-to-run noise.
+
+The tests cover six pairs in **both** orders rather than just the MLA-shaped `qk > v`. That
+is deliberate, and it is the donor's own warning: the two extents coincide in every
+symmetric build, so a constant left un-split is invisible until something differs, and it
+shows up on only one side of `qk > v` / `qk < v`.
+
+**The backward refusing this is load-bearing, not a gap left carelessly.** It is exactly the
+forward/backward mismatch that the "chosen together" rule exists to prevent — this forward
+writes LSE in natural log, so a silent fall-through to Triton's log2 backward would return
+wrong gradients rather than slow ones. The backward raises instead, which is safe because it
+*always* raises when FLYDSL was asked for and cannot be served. Closing the gap is a bigger
+job than the forward was: `dkdv` stages Q at the QK extent and DO at the V extent in the
+same kernel, so the backward mixes the two in more places than the forward does.
 
 ## Why `AUTO` cannot pick this backend, and where it would pay if it could
 

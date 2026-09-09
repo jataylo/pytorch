@@ -213,7 +213,7 @@ later architecture inherits them.
 | head_dim 96 / 160 / 192 / 224 | **done** | load guard plus K swizzle off; correct, 25-55% off the power-of-two dims |
 | `erfinv`, `lgamma`, `digamma` | won't do for now | long rational fits, implausible in a score_mod |
 | fp32 q/k/v | **won't do** | doubles the tile (256 impossible, 128 at the limit) and 8x the MFMAs; Triton covers it |
-| `qk_head_dim != v_head_dim` | open | upstream parity supports asymmetric `head_dim_v` |
+| `qk_head_dim != v_head_dim` | **forward done**, backward open | forward serves either order; backward raises |
 | more than 4 captures | **done to 4** | slots widened 2 to 4; past that is signature width again |
 | `BACKEND=AUTO` | **answered: blocked, and for the same reason as FLASH** | see below |
 
@@ -740,10 +740,14 @@ Item by item against what is still open here:
   learnable-bias shape cheaply. It does *not* cover a broadcast capture such as an `[H]`
   ALiBi slope table, where every `(q,k)` sums into one element and atomics or a reduction
   pass return. **So that item splits into a cheap half and an expensive half.**
-- **Asymmetric `qk_head_dim != v_head_dim` — strong donor as a spec.** First-class
-  `hdim_qk`/`hdim_vo` with crossed loader masks, and a warning worth keeping: the two
-  extents coincide in every symmetric build, so only a dedicated asymmetric test can tell
-  the fix from its absence.
+- ~~**Asymmetric `qk_head_dim != v_head_dim` — strong donor as a spec.**~~ **Forward done;
+  the warning was the useful part.** The donor's first-class `hdim_qk`/`hdim_vo` was the
+  spec, and its warning -- that the two extents coincide in every symmetric build, so only
+  a dedicated asymmetric test can tell the fix from its absence -- is why the forward split
+  is tested at six pairs in *both* orders rather than at the one MLA-shaped pair. A
+  constant left un-split shows up on only one side of `qk > v` / `qk < v`. The backward is
+  still open and refuses the shape loudly; it mixes the two extents in more places than the
+  forward, since `dkdv` stages Q at the QK extent and DO at the V extent.
 - **Backward block skipping — weak donor, and it did not end up mattering.** Its kernels do
   bound the loop, but from causal/window *arithmetic*, which works because causal is a build
   flag of known shape. Ours is a runtime BlockMask, so that math does not apply; the actual
