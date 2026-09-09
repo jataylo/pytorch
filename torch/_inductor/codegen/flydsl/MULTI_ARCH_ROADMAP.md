@@ -232,9 +232,17 @@ score_mod cell. No shape or variant term is needed. The table is in
 
 The blocker is that `AUTO` *cannot* select a natural-log-LSE backend at all. `stats_are_log2`
 is decided in the eager wrapper from the literal `BACKEND` string at Dynamo trace time,
-before Inductor chooses anything, and the wrapper never learns what it chose. `FLASH` is
-gated identically for the same reason; `TRITON_DECODE`, which *is* AUTO-selectable, is a
-log2 backend. So this was never a flip waiting on evidence.
+before Inductor chooses anything, and the wrapper never learns what it chose. So this was
+never a flip waiting on evidence.
+
+**And this is the parity design, not our constraint.** The parity branch does not know
+`FLYDSL`; its `_Backend` is `["AUTO", "TRITON", "FLASH", "TRITON_DECODE"]`, so its analogue
+of this backend is `FLASH` — gated `backend != "FLASH"` at two sites, natural-log via
+`stats_are_log2 = BACKEND != "FLASH"`, and never `AUTO`-selectable. `AUTO` there picks only
+between Triton and Triton-decode, both log2. Our one change was widening that string
+comparison into `_NATURAL_LOG_LSE_BACKENDS` so it could hold a second member: same layer,
+same timing, same shape. Enabling `AUTO` here would therefore *diverge* from parity rather
+than catch up to it.
 
 Unblocking it is a real piece of work with a decision in it — write log2 LSE like Triton,
 which reverses the choice recorded in P2's plumbing section and moves the backward's

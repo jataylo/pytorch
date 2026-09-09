@@ -304,10 +304,20 @@ at Dynamo trace time, which is *before* Inductor lowers anything and therefore b
 `AUTO` decision exists. The frontend has no way to learn what Inductor went on to choose. A
 backend whose LSE base differs from Triton's therefore cannot be selected later.
 
-The precedent confirms this is the intended shape and not our omission: `FLASH`, the other
-natural-log backend, is gated the same way (`backend != "FLASH"`), while `TRITON_DECODE`
-*is* `AUTO`-selectable — and it is a log2 backend. `AUTO` can only choose among backends
-that agree with Triton about the base.
+This is not our constraint, it is the parity design, and we follow it rather than work
+around it. The parity branch does not know `FLYDSL` at all — its `_Backend` is
+`["AUTO", "TRITON", "FLASH", "TRITON_DECODE"]` — so its analogue of this backend is `FLASH`,
+and `FLASH` there is gated `backend != "FLASH"` at two sites, forward and backward, exactly
+as we gate on `FLYDSL`; it is natural-log, via `stats_are_log2 = BACKEND != "FLASH"`; and it
+is never `AUTO`-selectable. The only thing `AUTO` picks in the parity branch is Triton
+versus Triton-decode, and both are log2.
+
+Our single change to that mechanism was widening their string comparison into
+`_NATURAL_LOG_LSE_BACKENDS` so it could hold a second member. Same layer, same trace-time
+timing, same shape, generalised from one natural-log backend to two. So `AUTO` declining
+this backend is the parity behaviour applied to a second backend that obeys the same rule —
+and making it `AUTO`-selectable would move *away* from parity, since it would break the
+invariant that the LSE base is a function of the literal `BACKEND` string.
 
 Unblocking it means one of: writing log2 LSE like Triton (which reverses the deliberate
 choice recorded in the roadmap, and moves the `exp`/`exp2` and `grad_logsumexp` handling in
