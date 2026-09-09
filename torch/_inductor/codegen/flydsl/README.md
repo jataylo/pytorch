@@ -282,10 +282,31 @@ collapses to its old value, so **a symmetric build is unchanged** — confirmed 
 (D128 still exactly 32768 B, D256 still exactly 65536 B) and by kernel-only timing across
 the whole ladder, which moved by less than run-to-run noise.
 
-The tests cover six pairs in **both** orders rather than just the MLA-shaped `qk > v`. That
-is deliberate, and it is the donor's own warning: the two extents coincide in every
-symmetric build, so a constant left un-split is invisible until something differs, and it
-shows up on only one side of `qk > v` / `qk < v`.
+The tests cover nine pairs, and they are chosen for the *load geometry* rather than for
+plausibility, because that is the part with two states. A head_dim whose lane count divides
+the workgroup loads whole rows; 96, 160, 192 and 224 do not and idle their remainder. So the
+cases that matter are the combinations — partial K against exact V, exact K against partial
+V, and the one nothing else reaches, two *different* partial geometries in the same kernel
+(`(96, 160)`, where 96 idles 8 lanes of 512 and 160 idles 12, so K's idle-lane predicate and
+V's disagree about which lanes are live). Both orders are covered for the donor's own reason:
+the two extents coincide in every symmetric build, so a constant left un-split is invisible
+until something differs, and shows up on only one side of `qk > v` / `qk < v`.
+
+**Speed: the asymmetric path inherits the symmetric profile rather than paying a penalty for
+being asymmetric.** Forward only, dense, B=2 H=8 S=4096, both backends `max_autotune`:
+
+| pair | fly/tri |
+|---|---|
+| qk 192 / v 128 | 1.19x |
+| qk 96 / v 64 | 0.94x |
+| qk 128 / v 256 | 0.89x |
+| qk 256 / v 128 | 0.88x |
+| qk 128 / v 64 | 0.77x |
+
+That is the same shape as the symmetric forward at the same *QK* dim — a win at 192, a
+deficit at 128 and 256 — which is what you would expect given the QK extent owns the swizzle
+and padding story. There is no asymmetric-specific cliff; closing these is the same
+head_dim work as closing the symmetric ones.
 
 **The backward refusing this is load-bearing, not a gap left carelessly.** It is exactly the
 forward/backward mismatch that the "chosen together" rule exists to prevent — this forward

@@ -608,6 +608,25 @@ def build_flex_flash_generic_module(
     LDS_V_TOTAL_SIZE = NUM_PREFETCH_V * LDS_V_TILE_SIZE
     LDS_KV_TOTAL_SIZE = LDS_K_TOTAL_SIZE + LDS_V_TOTAL_SIZE
 
+    # The backward has always checked this; the forward used to leave it to the lowering's
+    # head_dim allowlist and, failing that, to the backend's own "local memory (N) exceeds
+    # limit". Two reasons it belongs here now. The allowlist admits each head dim
+    # *independently*, so once the two can differ it is the pair that has to fit and nothing
+    # was checking the pair -- it happens to be safe, since the footprint is monotonic in
+    # both dims and the largest admitted pair is the symmetric 256/256 at exactly the
+    # gfx942 budget, but that is a coincidence of where the allowlist stops rather than
+    # something enforced. And the budget is per arch, so the question is not answerable at
+    # the allowlist at all.
+    LDS_KV_BYTES = LDS_KV_TOTAL_SIZE * 2
+    _lds_limit = CAPS.lds_budget_bytes
+    if LDS_KV_BYTES > _lds_limit:
+        raise ValueError(
+            f"qk head_dim {HEAD_DIM} with v head_dim {HEAD_DIM_V} at block_n {BLOCK_N} "
+            f"needs {LDS_KV_BYTES} B of LDS against the {_lds_limit} B limit on "
+            f"{gpu_arch} (K tile {LDS_K_TOTAL_SIZE * 2} B + V tile "
+            f"{LDS_V_TOTAL_SIZE * 2} B)."
+        )
+
     # Distinct from the vendored kernel's symbol, and per-variant: both modules can be
     # imported into one process, and two flex builds differing only in a mod would
     # otherwise share an LDS global.
@@ -2124,6 +2143,28 @@ def build_flex_flash_generic_module(
     # Other LLVM revisions can compile/run this kernel, but usually leave a
     # few percent of peak throughput on the table.
     _fmha_compile_hints = {
+        # Note [the ambient fastmath hint is the third channel]
+        #
+        # `fast_fp_math` makes FlyDSL wrap the *whole traced body* in an ambient `"fast"`
+        # scope, which every op that does not pass an explicit flag inherits: the f32<->bf16
+        # conversions, the operator overloads on ArithValue and Vec, every `fmath` call, and
+        # every float comparison -- including the `l == 0` guard that stops `o * rcp(0)`
+        # becoming a NaN. Since `fastmath` takes priority over `fast_fp_math` in FlyDSL's
+        # resolution, setting it here makes the ambient the same honest subset as the
+        # explicit sites. See Note [the fast-math flags stop short of nnan and ninf].
+        #
+        # This is hardening, not the fix for the denormal-LSE bug: that path runs entirely
+        # through this file's arithmetic helpers, which pass `fastmath=` explicitly, and it
+        # is *not* reproducible through the ambient alone -- checked by reverting only this
+        # key, which leaves the fully-masked-row test passing. What it buys is making the
+        # claim in the other note true everywhere rather than only where the helpers are
+        # used, at no measured cost.
+        #
+        # `fast_fp_math` itself stays: it selects the fast OCML transcendental variants,
+        # which is an accuracy trade in the spirit of `afn` rather than a claim that some
+        # value never occurs. It does not set `finite-only` or `daz`, which FlyDSL pins to
+        # false independently.
+        "fastmath": FASTMATH,
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {

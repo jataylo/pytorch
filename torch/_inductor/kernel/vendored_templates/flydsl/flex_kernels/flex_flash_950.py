@@ -2071,6 +2071,10 @@ def build_flex_flash_950_module(
             )
 
     _dualwave_swp_compile_hints = {
+        # See Note [the ambient fastmath hint is the third channel] in flex_flash_generic:
+        # the explicit `fastmath=` on this file's helpers does not cover ops that inherit
+        # the ambient scope `fast_fp_math` installs.
+        "fastmath": FASTMATH,
         "fast_fp_math": True,
         "unsafe_fp_math": True,
         "llvm_options": {

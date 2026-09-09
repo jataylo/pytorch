@@ -696,7 +696,21 @@ class TestFlyDSLFlexAttention(TestCase):
 
     @parametrize(
         "qk_head_dim,v_head_dim",
-        [(192, 128), (128, 64), (256, 128), (96, 64), (64, 128), (128, 256)],
+        [
+            # exact / exact lane geometry, both orders
+            (128, 64),
+            (64, 128),
+            (256, 128),
+            (128, 256),
+            # partial K / exact V
+            (192, 128),
+            (96, 64),
+            # exact K / partial V -- the opposite asymmetry of the guard state
+            (128, 96),
+            # two *different* partial geometries in one kernel: 96 idles 8 lanes of 512,
+            # 160 idles 12, so K's guard and V's disagree about which lanes are live
+            (96, 160),
+        ],
     )
     def test_asymmetric_head_dims_forward(self, qk_head_dim, v_head_dim):
         """`qk_head_dim != v_head_dim`, which the forward serves and the backward does not.
@@ -709,9 +723,17 @@ class TestFlyDSLFlexAttention(TestCase):
         the num_records bound, and the cooperative load geometry, whose lane-to-(row, col)
         map is a function of the row width.
 
-        Both orders are covered deliberately. `qk > v` is the MLA-shaped case and the one
-        upstream supports, but `qk < v` exercises the opposite side of every bound, and a
-        constant left un-split shows up in only one of the two.
+        The pairs are chosen for the load geometry rather than for plausibility, because
+        that is the part with two states. A head_dim whose lane count divides the workgroup
+        loads whole rows; 96, 160, 192 and 224 do not, and idle their remainder. So the
+        cases that matter are the *combinations*: partial K against exact V, exact K against
+        partial V, and -- the one nothing else reaches -- two different partial geometries
+        in the same kernel, where K's idle-lane predicate and V's disagree about which
+        lanes are live. `(96, 160)` is that case.
+
+        Both orders are covered for the same reason. `qk > v` is the MLA-shaped case and the
+        one upstream supports, but `qk < v` exercises the opposite side of every bound, and
+        a constant left un-split shows up in only one of the two.
         """
         torch.manual_seed(0)
         q = torch.randn(B, H, S, qk_head_dim, device="cuda", dtype=torch.bfloat16)

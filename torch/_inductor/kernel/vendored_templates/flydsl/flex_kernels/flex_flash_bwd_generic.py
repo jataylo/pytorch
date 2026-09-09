@@ -1069,6 +1069,10 @@ def build_flex_flash_bwd_dq_module(
         )
 
     _compile_hints = {
+        # See Note [the ambient fastmath hint is the third channel] in
+        # flex_flash_generic: the explicit `fastmath=` on this file's helpers does not
+        # cover ops that inherit the ambient scope `fast_fp_math` installs.
+        "fastmath": FASTMATH,
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {
@@ -1901,6 +1905,10 @@ def build_flex_flash_bwd_dkdv_module(
         )
 
     _compile_hints = {
+        # See Note [the ambient fastmath hint is the third channel] in
+        # flex_flash_generic: the explicit `fastmath=` on this file's helpers does not
+        # cover ops that inherit the ambient scope `fast_fp_math` installs.
+        "fastmath": FASTMATH,
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {
