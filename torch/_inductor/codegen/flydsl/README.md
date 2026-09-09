@@ -249,6 +249,58 @@ a 64-wide row into the next one and returned ~44% relative error while building 
 happily. That is the failure mode the allowlist exists to prevent: a kernel returning
 plausible garbage rather than falling back to Triton.
 
+## Why `AUTO` cannot pick this backend, and where it would pay if it could
+
+`AUTO` never selects FlyDSL, and the reason is structural rather than a missing feature or
+an untested claim. `stats_are_log2` — whether the wrapper multiplies the returned LSE by
+`ln2` — is decided in the eager frontend from the literal `kernel_options["BACKEND"]` string
+at Dynamo trace time, which is *before* Inductor lowers anything and therefore before any
+`AUTO` decision exists. The frontend has no way to learn what Inductor went on to choose. A
+backend whose LSE base differs from Triton's therefore cannot be selected later.
+
+The precedent confirms this is the intended shape and not our omission: `FLASH`, the other
+natural-log backend, is gated the same way (`backend != "FLASH"`), while `TRITON_DECODE`
+*is* `AUTO`-selectable — and it is a log2 backend. `AUTO` can only choose among backends
+that agree with Triton about the base.
+
+Unblocking it means one of: writing log2 LSE like Triton (which reverses the deliberate
+choice recorded in the roadmap, and moves the `exp`/`exp2` and `grad_logsumexp` handling in
+the backward), or plumbing the convention back out of Inductor to the wrapper. Neither is a
+gate change. There is also a safety argument for the current shape: under `AUTO` a forward
+that was served here and a backward that declined would pair natural-log LSE with Triton's
+log2 backward and produce *wrong* gradients, and the forward gate cannot fully predict the
+backward's eligibility because it does not yet know whether a capture will need a gradient.
+
+**The performance argument, since it is the other half of the question.** Forward and
+backward, bf16, both backends `max_autotune`, every cell's gradients checked against eager,
+as `fly/tri` on TFLOP/s over four shapes (1x8x4096, 2x16x2048, 4x8x4096, 2x32x4096) — the
+range is across those shapes (`shape_ladder.py --backward`):
+
+| head_dim | plain | score_mod | causal | verdict |
+|---|---|---|---|---|
+| 64 | 0.63–0.90x | 0.79–0.98x | 0.78–1.15x | Triton |
+| 96 | 1.16–1.47x | 1.19–1.50x | 1.22–1.73x | **FlyDSL** |
+| 128 | 0.75–0.92x | 0.75–0.88x | 0.96–1.12x | Triton |
+| 160 | 1.82–2.16x | 1.76–2.20x | 1.88–2.16x | **FlyDSL** |
+| 192 | 1.51–1.83x | 1.45–1.64x | 1.78–2.00x | **FlyDSL** |
+| 224 | 1.43–1.67x | 1.40–1.60x | 1.61–1.86x | **FlyDSL** |
+| 256 | 0.91–1.16x | 0.95–1.07x | 1.11–1.26x | a wash, causal aside |
+
+The rule that falls out is clean and cuts by head_dim rather than by shape or by mod: **96,
+160, 192 and 224 win every single cell**, worst case 1.16x and typically 1.4–2.2x. **64 and
+128 lose every dense and every score_mod cell** and only reach parity on causal. 256 is a
+wash outside causal.
+
+That split is not arbitrary, and it is the same one the deficit analysis below arrives at
+from the other direction: 64 and 128 are exactly the head_dims whose granule count is a
+power of two, so they already had a working XOR swizzle and gained nothing from the row
+padding that lifted 96/160/192/224 — and they are the sizes Triton itself is most heavily
+tuned for. So if `AUTO` is ever unblocked, `head_dim in {96, 160, 192, 224}` is the
+condition to select on, and it needs no shape or variant term.
+
+Until then the practical advice is the same rule stated the other way: ask for
+`BACKEND="FLYDSL"` by name at those four head_dims, and do not bother at 64 or 128.
+
 ## Fast-math, and the two flags these kernels cannot assert
 
 All three kernels run their fp arithmetic under a fast-math flag set, but **not** the full

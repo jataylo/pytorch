@@ -215,10 +215,34 @@ later architecture inherits them.
 | fp32 q/k/v | **won't do** | doubles the tile (256 impossible, 128 at the limit) and 8x the MFMAs; Triton covers it |
 | `qk_head_dim != v_head_dim` | open | upstream parity supports asymmetric `head_dim_v` |
 | more than 4 captures | **done to 4** | slots widened 2 to 4; past that is signature width again |
-| `BACKEND=AUTO` | open | must be asked for by name, so nobody gets it by default |
+| `BACKEND=AUTO` | **answered: blocked, and for the same reason as FLASH** | see below |
 
 **Gate:** each gate removed comes with tests against eager, and the AUTO change comes with a
 performance argument per shape class rather than being flipped on.
+
+#### AUTO: the performance argument holds, and the blocker is not a gate
+
+The gate above asked for a per-shape-class argument rather than a flip. Both halves are now
+answered, and they point opposite ways.
+
+The argument is strong and cuts purely by head_dim: 96, 160, 192 and 224 win every cell
+measured, worst case 1.16x and typically 1.4–2.2x, while 64 and 128 lose every dense and
+score_mod cell. No shape or variant term is needed. The table is in
+[`README.md`](README.md#why-auto-cannot-pick-this-backend-and-where-it-would-pay-if-it-could).
+
+The blocker is that `AUTO` *cannot* select a natural-log-LSE backend at all. `stats_are_log2`
+is decided in the eager wrapper from the literal `BACKEND` string at Dynamo trace time,
+before Inductor chooses anything, and the wrapper never learns what it chose. `FLASH` is
+gated identically for the same reason; `TRITON_DECODE`, which *is* AUTO-selectable, is a
+log2 backend. So this was never a flip waiting on evidence.
+
+Unblocking it is a real piece of work with a decision in it — write log2 LSE like Triton,
+which reverses the choice recorded in P2's plumbing section and moves the backward's
+`exp`/`exp2` and `grad_logsumexp` handling, or plumb the convention back out of Inductor.
+There is also a safety argument for leaving it: under `AUTO`, a forward served here with a
+backward that declined would pair our natural-log LSE against Triton's log2 backward and
+compute wrong gradients, and the forward gate cannot fully predict the backward's
+eligibility, since it does not yet know whether a capture will need a gradient.
 
 #### head_dim 256: two bugs stacked, and the first hid the second
 
