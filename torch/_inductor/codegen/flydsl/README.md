@@ -763,10 +763,24 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   the Triton kernel built from it disagrees with eager by 5.0e-01 at head_dim 64 while
   costing 3.7x more than it does when left to autotune. Comparisons against it are worthless
   in both directions -- take Triton's options out before reading any `document_mask` number.
-- **No scalar captures.** CuteDSL supports them through `aux_scalars`; there is no
-  `AUX_SCALAR_SYMBOLS` machinery here. Device 0-d tensors work; CPU ones are rejected. No
-  donor either way: the parity kernels take a dense bias tensor and nothing scalar, and
-  their plans defer ALiBi as a computed bias they have not shipped.
+- **Symbolic captures work, by specializing on the value.** A mod closing over a value
+  derived from a dynamic shape — a window of `seq_len // 4` — arrives as a sympy
+  expression rather than a tensor, and `rename_indexing` turns it into a kernel argument
+  name at the use site. That name cannot resolve, because the mod bodies are built at
+  *module* level while the name is a parameter of the kernel function, and the result was
+  `name 'ks0' is not defined` after an earlier `'FloorDiv' object has no attribute
+  'get_size'` from the capture gate counting it as a tensor. Both are fixed: such a
+  capture costs no aux slot, and its value is guarded to an int and emitted as a
+  module-level constant. The guard is what makes that sound — a different value
+  recompiles rather than reusing a module with the old constant baked in, which the test
+  checks by running three sequence lengths, each implying a different window, in one
+  process. The cost is that such a mod gives up dynamic sharing on that axis; CuteDSL
+  instead threads an `aux_scalars` tuple through the mod ABI, which here would mean
+  changing the mod call site in all three vendored kernels.
+- **Device 0-d tensor captures work; CPU ones are rejected**, in `flex_attention()`
+  rather than here, since by the time this backend sees them they have been realized and
+  no longer look like scalars. Worth noting the Triton path *crashes* on that shape
+  (`RuntimeError: unbacked_bindings`) where this one declines it.
 - **head_dim 96, 160, 192 and 224 needed two separate fixes, and are now fast.** The
   cooperative KV load gives each row `HEAD_DIM // VEC_WIDTH` lanes, and 512 is not a
   multiple of 12, 20, 24 or 28, so the last lane group is partial and the tile's rows no

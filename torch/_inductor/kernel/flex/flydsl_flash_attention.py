@@ -263,14 +263,29 @@ def _kv_seq_lens_agree(key, value) -> tuple[bool, str]:
     from ...virtualized import V
 
     seq_len_kv = key.get_size()[-2]
-    if not V.graph.sizevars.statically_known_true(
-        sympy.Eq(seq_len_kv, value.get_size()[-2])
-    ):
+    seq_len_v = value.get_size()[-2]
+    if V.graph.sizevars.statically_known_equals(seq_len_kv, seq_len_v):
+        return True, ""
+
+    # Note [k and v agreeing is asserted, not proven]
+    #
+    # Under dynamic shapes these two often arrive as *different symbols* -- k as s69 and
+    # v as s49 -- because nothing upstream unified them, not because they can differ.
+    # Refusing on that is a false refusal: it costs the backend every dynamic-shape call
+    # where a mod is present, which is how this was found.
+    #
+    # So an unproven pair is asserted rather than declined. `check_equals` installs a
+    # guard, or a deferred runtime assert where it cannot, which is the property that
+    # makes this sound: a pair that genuinely differs fails the assert instead of being
+    # read with one column index for both, which is the wrong-numbers outcome. A pair
+    # known to differ is still refused below.
+    if V.graph.sizevars.statically_known_true(sympy.Ne(seq_len_kv, seq_len_v)):
         return (
             False,
             "FlyDSL flex kernels require key and value to share a sequence length, got "
-            f"{seq_len_kv} and {value.get_size()[-2]}",
+            f"{seq_len_kv} and {seq_len_v}",
         )
+    V.graph.sizevars.check_equals(seq_len_kv, seq_len_v)
     return True, ""
 
 
@@ -1249,14 +1264,26 @@ def _reject_unsupported_captures(
     they have been realized and no longer look like scalars.
     """
     captures = list(score_mod_other_buffers) + list(mask_mod_other_buffers)
+
+    # Note [a symbolic capture is not a tensor capture]
+    #
+    # A mod that closes over a value derived from a dynamic shape -- a window of
+    # `seq_len // 4`, say -- reaches here as a sympy expression rather than a TensorBox.
+    # Those cost no aux slot and have no rank to check: they are dynamic scalars, and
+    # they reach the kernel the way every other dynamic extent does, as an argument
+    # named by `rename_indexing` and printed by the sympy printer at the use site.
+    # Counting them against the tensor budget, or asking them for a size, is what made
+    # this raise `'FloorDiv' object has no attribute 'get_size'`.
+    tensors = [buf for buf in captures if not isinstance(buf, sympy.Expr)]
+
     # Aux slots are a hard limit rather than a tuning choice: the kernel's signature
     # carries a fixed number, so a capture past the last one has nowhere to go.
-    if len(captures) > _MAX_AUX_TENSORS:
+    if len(tensors) > _MAX_AUX_TENSORS:
         raise RuntimeError(
             f"BACKEND='FLYDSL' supports at most {_MAX_AUX_TENSORS} captured tensors "
-            f"across score_mod and mask_mod, got {len(captures)}"
+            f"across score_mod and mask_mod, got {len(tensors)}"
         )
-    for buf in captures:
+    for buf in tensors:
         rank = len(buf.get_size())
         if rank > 4:
             raise RuntimeError(

@@ -113,6 +113,12 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
         self._aux_specs: list[list[int]] = []
         self._aux_numels: list[int] = []
 
+        # See Note [a symbolic capture specializes the kernel]. Filled by `modification`
+        # with only the size symbols a mod body turned out to reference, which is why it
+        # is recorded there rather than read off `self.args.sizevars` -- that holds every
+        # symbol the kernel references, and specializing all of them would pin `seq_len`.
+        self._mod_scalars: dict[str, sympy.Expr] = {}
+
     def resolve_extra_input(self, name: str) -> Buffer:
         """Look captures up in the graph's capture table before its buffers.
 
@@ -243,6 +249,23 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
         """Element count per aux slot, in slot order, for the kernel's buffer bounds."""
         return list(self._aux_numels)
 
+    def scalar_defines(self) -> str:
+        """Bind the symbolic scalars the mods read, at module level.
+
+        See Note [a symbolic capture specializes the kernel]. Call after the mods are
+        rendered, since which symbols they reference is only known then.
+        """
+        if not self._mod_scalars:
+            return ""
+        lines = [
+            "# Symbolic captures, specialized. See Note [a symbolic capture specializes",
+            "# the kernel] -- guard_int has pinned each of these, so a different value",
+            "# recompiles rather than reusing this module.",
+        ]
+        for arg_name, expr in self._mod_scalars.items():
+            lines.append(f"{arg_name} = {V.graph.sizevars.guard_int(expr)}")
+        return "\n".join(lines)
+
     def create_cse_var(self, *args, **kwargs):
         return FlyDSLCSEVariable(*args, **kwargs)
 
@@ -303,6 +326,7 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             "mod_key": self.mod_key,
             "aux_specs": self.aux_specs,
             "aux_numels": self.aux_numels,
+            "scalar_defines": self.scalar_defines,
             "get_tensor_buffers": self.get_tensor_buffers,
         }
         rendered_code = template.render(
@@ -398,6 +422,23 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             handler = ModificationWrapperFlyDSL(
                 self, subgraph_number, fixed_inputs, mask
             )
+            # Note [a symbolic capture specializes the kernel]
+            #
+            # A mod that closes over a value derived from a dynamic shape -- a window of
+            # `seq_len // 4`, say -- arrives as a sympy expression, and `rename_indexing`
+            # turns it into a kernel argument name like `ks0` at the use site. That name
+            # cannot resolve: the mod bodies are built at *module* level, because a FlyDSL
+            # launcher traces its mods once at build time, while `ks0` is a parameter of
+            # the kernel function. Left alone it raises `name 'ks0' is not defined`.
+            #
+            # So the value is guarded to an int and emitted as a module-level constant by
+            # `scalar_defines`. The guard is what makes that sound -- it specializes the
+            # graph on this value, so a different one recompiles rather than reusing a
+            # kernel with the old constant baked in. The cost is that such a mod gives up
+            # dynamic sharing on that axis; the alternative is threading a scalars tuple
+            # through the mod ABI in all three vendored kernels, the way flash's
+            # `aux_scalars` does.
+            sizevars_before = set(self.args.sizevars)
             with V.set_kernel_handler(self), V.set_ops_handler(handler):
                 if isinstance(subgraph, list):
                     raise NotImplementedError(
@@ -413,6 +454,10 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
                 else:
                     # Inline a pointwise lowering into the template
                     out = subgraph.data.inner_fn(())
+
+            for expr, arg_name in self.args.sizevars.items():
+                if expr not in sizevars_before:
+                    self._mod_scalars[arg_name] = expr
 
             if output_name is None:
                 raise NotImplementedError(

@@ -668,6 +668,52 @@ class TestFlyDSLFlexAttention(TestCase):
             _seq_lens(q, k, v, axis=2)
         self.assertEqual(_seq_lens(q, k, k, axis=2), (512, 256))
 
+    def test_a_mod_capturing_a_dynamic_shape_value_stays_correct_across_values(self):
+        """A score_mod closing over `seq_len // 4` -- a sympy capture, not a tensor.
+
+        The value is baked into the generated module as a constant, so one length proves
+        nothing: the question is whether a *second* length recompiles or silently reuses
+        the module with the old window in it. See Note [a symbolic capture specializes
+        the kernel]. Three lengths, each implying a different window, in one process.
+
+        This also covers Note [k and v agreeing is asserted, not proven]: dynamic=True
+        gives k and v unrelated symbols, and the gate used to refuse that pair. Reaching
+        an answer at all proves it did not, since BACKEND="FLYDSL" raises rather than
+        falling through when it cannot serve a graph.
+        """
+
+        def fn(q, k, v):
+            window = q.shape[-2] // 4
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                return torch.where(
+                    q_idx - kv_idx < window,
+                    score,
+                    torch.full_like(score, -float("inf")),
+                )
+
+            return flex_attention(
+                q, k, v, score_mod=score_mod, kernel_options={"BACKEND": "FLYDSL"}
+            )
+
+        compiled = torch.compile(fn, dynamic=True)
+        with torch.no_grad():
+            for seq_len in (512, 1024, 256):
+                q, k, v = self._tensors(seq_len=seq_len)
+                window = seq_len // 4
+
+                def reference(score, b, h, q_idx, kv_idx, window=window):
+                    return torch.where(
+                        q_idx - kv_idx < window,
+                        score,
+                        torch.full_like(score, -float("inf")),
+                    )
+
+                expected = flex_attention(q, k, v, score_mod=reference)
+                self._assert_close(
+                    compiled(q, k, v), expected, f"for seq_len={seq_len}"
+                )
+
     def test_rejects_a_broadcast_kv_batch_in_both_directions(self):
         """A `Bkv=1` key/value broadcast across the Q batch, which neither kernel serves.
 
