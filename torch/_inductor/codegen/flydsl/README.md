@@ -886,14 +886,38 @@ patches to port by hand rather than something to merge. Read the upstream log fo
 `829c7b4` (#850) was found, six weeks after it landed and after we had already concluded
 that no portable gfx942 schedule work existed.
 
-**Two FlyDSL versions.** `flydsl.expr.buffer_ops` exists in 0.2.4 and was removed in 0.3.1,
-where those helpers moved kernel-side; import `flex_kernels.buffer_ops`, which picks
-whichever is present. Importing the library path directly makes the whole flex suite *skip*
-under 0.3.1 rather than fail, which is easy to mistake for green. To test against 0.3.1:
+**Two FlyDSL versions, both validated.** `flydsl.expr.buffer_ops` exists in 0.2.4 and was
+removed in 0.3.x, where those helpers moved kernel-side; import `flex_kernels.buffer_ops`,
+which picks whichever is present. Importing the library path directly makes the whole flex
+suite *skip* rather than fail, which is easy to mistake for green.
+
+The suite passes 168/168 on gfx942 against both 0.2.4 and 0.3.2, and
+`_FLYDSL_SUPPORTED_RELEASES` in `flydsl_utils.py` admits exactly those two, since a
+release that has not been run is not a release we can claim. **0.3.2 is the faster of the
+two**, by 10–22% on the forward — kernel-only, `B=2 H=8 S=4096` bhsd causal, run-to-run
+spread under 1%:
+
+| head_dim | 0.2.4 | 0.3.2 | 0.3.2 speedup |
+| --- | --- | --- | --- |
+| 64 | 593 us | 525 us | 1.13x |
+| 96 | 817 us | 670 us | 1.22x |
+| 128 | 1031 us | 877 us | 1.18x |
+| 160 | 1502 us | 1338 us | 1.12x |
+| 192 | 1773 us | 1604 us | 1.11x |
+| 224 | 1984 us | 1806 us | 1.10x |
+| 256 | 2694 us | 2223 us | 1.21x |
+
+Every other performance figure in this document was measured on 0.2.4, so read them as a
+floor rather than as the number a 0.3.2 user sees. The suite is *slower* in wall clock on
+0.3.2 (752 s against 463 s) while every kernel is faster, so that gap is compile time, not
+kernel time.
+
+Testing against another release does not need a second interpreter — install it beside the
+one in use and shadow it on the path, which leaves the working install untouched:
 
 ```
-PYTHONPATH=/dockerx/xinya-flydsl/build-fly/python_packages \
-    /dockerx/flydsl-build/venv/bin/python -m pytest test/inductor/test_flydsl_flex_attention.py
+pip install --no-deps --target /tmp/fly032/site flydsl==0.3.2
+PYTHONPATH=/tmp/fly032/site python -m pytest test/inductor/test_flydsl_flex_attention.py
 ```
 
 Note: requires the optional `flydsl` package and a ROCm build of PyTorch.
