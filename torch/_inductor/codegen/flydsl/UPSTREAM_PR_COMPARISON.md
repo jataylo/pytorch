@@ -120,15 +120,15 @@ admitted head dim lowers and the CDNA4 paths engage"*, which is strictly weaker 
 
 ## Four things worth taking
 
-1. **The fast-math objection applies to us too.** A reviewer flagged that
-   `_FWD_COMPILE_HINTS = {"fast_fp_math": True}` plus `no-nans-fp-math` / `unsafe-fp-math`
-   lets the optimizer discard exactly the behaviour the kernel depends on — the `-1.0e30`
-   sentinel, the `final_sum > 0` guard, and storing `-inf` into LSE — and that it working
-   today is *"an LLVM-version-dependent guarantee for a correctness-critical path"*. We set
-   all three of those flags (`flex_flash_bwd_generic.py:244, 1036-1037`) and we use both
-   sentinels (`flex_flash_generic.py:1038, 1057`). We are partly insulated by having already
-   hit this: `init_args` picks `-1.0e30` over `-inf` whenever a mod is present. But that is
-   one site, chosen empirically, not an audit. **This is the most actionable item here.**
+1. ~~**The fast-math objection applies to us too.**~~ **Taken, and it was a live bug rather
+   than a risk.** A reviewer flagged that their `fast_fp_math` plus `no-nans-fp-math` /
+   `unsafe-fp-math` lets the optimizer discard exactly the behaviour the kernel depends on —
+   the `-1.0e30` sentinel, the `final_sum > 0` guard, storing `-inf` into LSE — and that it
+   working today is *"an LLVM-version-dependent guarantee for a correctness-critical path"*.
+   We set the same flags. Auditing ours found the guarantee already broken: a fully-masked
+   row's LSE was denormal garbage instead of `-inf`, because `nnan|ninf` let `log2(0)` fold
+   away. The flag set is now the honest subset and there is a test with a negative control;
+   see the README's fast-math section. **The reviewer was right, and about our kernel too.**
 2. **Their `Sq != Sk` handling is a spec worth reading**, since the forward supports separate
    extents cleanly. Ours works, but it was a bug fix (we returned 0.97 and 1.57 relative error
    silently before it), so a second design to check against has value.

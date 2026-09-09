@@ -92,6 +92,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from torch._inductor.kernel.vendored_templates.flydsl import arch_caps
 from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
+    FASTMATH,
     _extract_aligned_pointer,
     _pointer_load,
 )
@@ -492,7 +493,8 @@ def build_flex_flash_bwd_dq_module(
         k_ptr = _extract_aligned_pointer(K)
         v_ptr = _extract_aligned_pointer(V)
 
-        fm_fast = fx.arith.FastMathFlags.fast
+        # See Note [the fast-math flags stop short of nnan and ninf].
+        fm_fast = FASTMATH
         v4f16_type = Vec.make_type(4, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
         mfma_pack_type = v4f16_type
@@ -1033,7 +1035,6 @@ def build_flex_flash_bwd_dq_module(
         passthrough_entries = (
             [
                 ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
             if const_expr(daz)
@@ -1309,7 +1310,8 @@ def build_flex_flash_bwd_dkdv_module(
         q_ptr = _extract_aligned_pointer(Q)
         do_ptr = _extract_aligned_pointer(DO)
 
-        fm_fast = fx.arith.FastMathFlags.fast
+        # See Note [the fast-math flags stop short of nnan and ninf].
+        fm_fast = FASTMATH
         v4f16_type = Vec.make_type(4, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
         mfma_pack_type = v4f16_type
@@ -1864,7 +1866,6 @@ def build_flex_flash_bwd_dkdv_module(
         passthrough_entries = (
             [
                 ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
             if const_expr(daz)

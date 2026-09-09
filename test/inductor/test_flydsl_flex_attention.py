@@ -710,6 +710,63 @@ class TestFlyDSLFlexAttention(TestCase):
         with self.assertRaisesRegex(Exception, "head_dim"):
             self._run(q, k, v, score_mod=_alibi)
 
+    def test_a_fully_masked_row_gives_zero_output_and_minus_inf_lse(self):
+        """The values the fast-math flags could otherwise be allowed to discard.
+
+        A row whose every KV column is masked has no valid score, so flex_attention is
+        defined to return 0 for it and -inf for its LSE. Getting there depends on two
+        guards that only exist to keep an infinity from becoming a NaN: the running max is
+        seeded at a finite floor rather than -inf, because (-inf) - (-inf) is NaN and would
+        poison the row's accumulator for the rest of the walk; and the final reciprocal is
+        skipped when l == 0, because o * rcp(0) is 0 * inf, also NaN.
+
+        Both guards are dead code to a compiler that has been told infinities do not occur,
+        which `FastMathFlags.nnan|ninf` and `no-nans-fp-math` do say -- see Note [the
+        fast-math flags stop short of nnan and ninf]. So this test is not really about
+        masking, it is the thing that fails if those flags come back: without the seed the
+        output is NaN rather than 0, and without the l == 0 check it is NaN rather than 0
+        again. A tolerance check on a whole tensor would not catch either, since a NaN in
+        one row is not a large relative error, which is why the assertions here are exact.
+        """
+        # Row 0 attends to nothing; every other row attends to column 0 only. Keeping the
+        # rest of the tile alive matters -- a kernel that got this right only by way of an
+        # entirely empty walk would still be wrong for the mixed case, which is the one a
+        # document mask or a sliding window actually produces.
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (q_idx > 0) & (kv_idx == 0)
+
+        q, k, v = self._tensors(seq_len=128)
+        block_mask = create_block_mask(mask_mod, B, H, 128, 128, device="cuda")
+        with torch.no_grad():
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            out, lse = compiled(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                return_lse=True,
+                kernel_options={"BACKEND": "FLYDSL"},
+            )
+
+        self.assertFalse(torch.isnan(out.float()).any(), "NaN anywhere in the output")
+        self.assertFalse(torch.isnan(lse.float()).any(), "NaN anywhere in the LSE")
+        # The masked row: exactly zero, and -inf rather than a large finite number.
+        self.assertEqual(
+            out[:, :, 0].float().abs().max().item(), 0.0, "masked row is not exactly zero"
+        )
+        self.assertTrue(
+            torch.isneginf(lse[:, :, 0]).all(), f"masked row LSE is {lse[:, :, 0]}"
+        )
+        # The live rows attend to column 0 alone, so O is V's first row and the LSE is the
+        # single score. Both finite, which is what rules out the guards having been applied
+        # too widely.
+        self.assertTrue(torch.isfinite(lse[:, :, 1:]).all(), "live rows lost their LSE")
+        self._assert_close(
+            out[:, :, 1:],
+            v[:, :, 0:1].expand(-1, -1, 127, -1),
+            "live rows should equal V's first row",
+        )
+
     def test_gfx950_builds_from_a_gfx942_host(self):
         """Every kernel we admit builds for gfx950, checked from a gfx942 host.
 

@@ -41,6 +41,9 @@ from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from torch._inductor.kernel.vendored_templates.flydsl import arch_caps
+from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
+    FASTMATH,
+)
 from torch._inductor.kernel.vendored_templates.flydsl.kernels.kernels_common import (
     _if_then,
     dtype_to_elem_type,
@@ -316,7 +319,8 @@ def build_flex_flash_950_module(
         head_dim_runtime: fx.Int32,
     ):
         elem_dtype = dtype_to_elem_type(dtype_str)
-        fm_fast = fx.arith.FastMathFlags.fast
+        # See Note [the fast-math flags stop short of nnan and ninf].
+        fm_fast = FASTMATH
         v4i32_type = Vec.make_type(4, fx.Int32)
         v4f16_type = Vec.make_type(4, elem_dtype)
         v8f16_type = Vec.make_type(8, elem_dtype)
@@ -1901,7 +1905,8 @@ def build_flex_flash_950_module(
         stride_q_n: fx.Int32,
     ):
         elem_dtype = dtype_to_elem_type(dtype_str)
-        fm_fast = fx.arith.FastMathFlags.fast
+        # See Note [the fast-math flags stop short of nnan and ninf].
+        fm_fast = FASTMATH
         seq_v = fx.Index(seq_len)
         stride_v = fx.Index(stride_q_n)
         bs_v = fx.Index(batch_size)
@@ -2028,7 +2033,6 @@ def build_flex_flash_950_module(
         passthrough_entries = (
             [
                 ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
             if const_expr(daz)

@@ -249,6 +249,40 @@ a 64-wide row into the next one and returned ~44% relative error while building 
 happily. That is the failure mode the allowlist exists to prevent: a kernel returning
 plausible garbage rather than falling back to Triton.
 
+## Fast-math, and the two flags these kernels cannot assert
+
+All three kernels run their fp arithmetic under a fast-math flag set, but **not** the full
+one. `FastMathFlags.fast` is all seven flags, and two of them — `nnan` and `ninf` — promise
+the optimizer that no operand or result is ever a NaN or an infinity. That is false here by
+design. A masked element *is* `-inf`, both at the `mask_mod` site and in the causal fold,
+and a fully-masked row's LSE *is* `log2(0) = -inf`, which is the value `flex_attention` is
+defined to return. Asserting those two turns every guard that keeps such a value from
+becoming a NaN into dead code the optimizer may delete: the finite running-max seed (because
+`(-inf) - (-inf)` is NaN and would poison the row's accumulator for the rest of the walk),
+and the `l == 0` check before the reciprocal (because `o * rcp(0)` is `0 * inf`).
+
+This was **not** a latent risk. Measured on the build these kernels shipped on, a fully
+masked row's LSE came back as denormal garbage — `0.0`, `1.79e-43`, `3.59e-43`, ... — rather
+than `-inf`, because `log2(0)` had been folded away entirely. Any row masked in full was
+returning a wrong LSE, and since the backward reads LSE to rebuild `p`, it was feeding that
+into the gradients too. The mechanism is worth stating plainly, because it is the reason the
+bug survived a 157-test suite: a NaN or a denormal in one row of a tensor is not a large
+relative error, so every tolerance-based assertion passed.
+
+What is kept is the part that pays — `contract` for the softmax multiply-adds, `reassoc` and
+`arcp` for the scale folding and the reciprocal, `nsz`, `afn` — and the function-level
+`no-nans-fp-math` is dropped for the same reason as `nnan`, while `unsafe-fp-math` stays,
+since it buys reassociation without claiming a value never occurs.
+
+**Dropping the two is free.** Kernel-only forward, B=2 H=8 S=4096 causal, against the full
+set: 589.2 vs 587.5 µs at D=64, 1033.4 vs 1032.5 at 128, 1777.9 vs 1781.7 at 192, 2701.6 vs
+2699.3 at 256 — a 0.4% spread in both directions, which is run-to-run. Backward register
+pressure is unmoved (`dq` at D=128 still 256 VGPRs and 4 spilled, `dkdv` still 256 and 78).
+
+`test_a_fully_masked_row_gives_zero_output_and_minus_inf_lse` pins it, with exact assertions
+rather than a tolerance for the reason above. Its negative control is to put
+`FastMathFlags.fast` back, which reproduces the denormal LSE.
+
 ## GPU architectures
 
 What an architecture has is declared in

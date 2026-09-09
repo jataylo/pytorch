@@ -72,6 +72,32 @@ from torch._inductor.kernel.vendored_templates.flydsl.kernels.kernels_common imp
 )
 
 _LOG2E = host_math.log2(host_math.e)  # 1.4426950408889634
+
+# Note [the fast-math flags stop short of nnan and ninf]
+#
+# `FastMathFlags.fast` is all seven flags, and two of them would be lies here. `nnan` and
+# `ninf` promise the optimizer that no operand or result is ever a NaN or an infinity, and
+# these kernels *deliberately* make infinities: a masked element is `-inf`, both at the
+# mask_mod site and in the causal fold, and a fully-masked row's LSE is `log2(0) = -inf`,
+# which is the value flex_attention is defined to return. Under those two flags every guard
+# that keeps such a value from becoming a NaN -- the finite running-max seed, the
+# `l == 0` check before the reciprocal -- is dead code the optimizer is entitled to delete.
+# The kernel would then be correct only for as long as it happened to be, which is a
+# property of the LLVM version rather than of the kernel.
+#
+# What is left is the part that pays: `contract` fuses the softmax multiply-adds, `reassoc`
+# and `arcp` let the scale folding and the reciprocal through, `nsz` frees the sign of zero,
+# `afn` allows the cheaper transcendental lowerings. Dropping the two measures as free, so
+# this is not a trade. `no-nans-fp-math` is the function-level twin of `nnan` and is not
+# asserted either; `unsafe-fp-math` stays, since it buys the reassociation and does not
+# claim a value never occurs.
+FASTMATH = (
+    fx.arith.FastMathFlags.reassoc
+    | fx.arith.FastMathFlags.nsz
+    | fx.arith.FastMathFlags.arcp
+    | fx.arith.FastMathFlags.contract
+    | fx.arith.FastMathFlags.afn
+)
 _VMCNT_LO_MASK = 0xF
 _LGKMCNT_EXPCNT_BASE = 0x3F70
 _VMCNT_HI_SHIFT = 14
@@ -573,9 +599,7 @@ def build_flex_flash_generic_module(
         k_ptr = _extract_aligned_pointer(K)
         v_ptr = _extract_aligned_pointer(V)
 
-        # All FP operations use aggressive fast-math (no NaN/Inf checks, reassociation).
-        # The unsafe_fp_math/fast_fp_math builder params control LLVM-level attributes only.
-        fm_fast = fx.arith.FastMathFlags.fast
+        fm_fast = FASTMATH
         v4f16_type = Vec.make_type(4, elem_dtype)
         v8f16_type = Vec.make_type(8, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
@@ -1958,10 +1982,11 @@ def build_flex_flash_generic_module(
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
         grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
 
+        # No `no-nans-fp-math` here; see Note [the fast-math flags stop short of nnan and
+        # ninf].
         passthrough_entries = (
             [
                 ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
-                ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
             if const_expr(daz)
