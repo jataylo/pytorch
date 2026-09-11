@@ -341,7 +341,7 @@ property, so it is taken at the last head of the group to stay uniform. It also 
 block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot describe a tile
 spanning heads. Another 2.4x on the GQA rows, bit-identical to the unpacked kernel, and
 measured never to lose across six grid sizes — so it is a rule rather than an autotune
-choice.
+choice (`b5358946953`).
 
 What is left is the KV split, which is what their `SPLIT_KV` mode is for. The residual's
 shape says so: `Skv` 4096 is *worse* (1.47x) than 8192 (1.27x), because the packed grid is
@@ -455,6 +455,7 @@ aligned. Documented above, not forgotten.
 | `6315ac61cfb` | Serve `qk_head_dim != v_head_dim` in the backward |
 | `eb417cec30a` | Stop padding a decode shape into a 128-row Q tile |
 | `1dcfca379e8` | Copy a 0-d CPU capture instead of refusing it |
+| `b5358946953` | Give the GQA group one Q tile instead of one each |
 
 ## Further reading
 
