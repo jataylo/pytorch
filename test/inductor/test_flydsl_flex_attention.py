@@ -1741,29 +1741,50 @@ class TestFlyDSLFlexAttention(TestCase):
         """
         from torch._inductor.kernel.flex.flydsl_flash_attention import _forward_block_ms
 
+        def tiles(opts=None, *, num_heads=32, seq_len_q=S):
+            return _forward_block_ms(
+                opts or {}, num_heads=num_heads, seq_len_q=seq_len_q
+            )
+
         with config.patch({"flydsl.autotune_forward_block_m": True}):
-            self.assertEqual(_forward_block_ms({}, num_heads=32), [128, 256])
-            self.assertEqual(_forward_block_ms({}, num_heads=64), [128, 256])
-            self.assertEqual(_forward_block_ms({}, num_heads=8), [128])
+            self.assertEqual(tiles(num_heads=32), [128, 256])
+            self.assertEqual(tiles(num_heads=64), [128, 256])
+            self.assertEqual(tiles(num_heads=8), [128])
         # Off, both sides must reproduce the kernel's own default exactly, or an
         # autotune-off build silently changes tile.
         with config.patch({"flydsl.autotune_forward_block_m": False}):
-            self.assertEqual(_forward_block_ms({}, num_heads=32), [256])
-            self.assertEqual(_forward_block_ms({}, num_heads=8), [128])
+            self.assertEqual(tiles(num_heads=32), [256])
+            self.assertEqual(tiles(num_heads=8), [128])
         # An explicit request wins over either, including below 32 heads.
         with config.patch({"flydsl.autotune_forward_block_m": True}):
-            self.assertEqual(_forward_block_ms({"BLOCK_M": 256}, num_heads=8), [256])
+            self.assertEqual(tiles({"BLOCK_M": 256}, num_heads=8), [256])
         for bad in (0, -128, 100, 1.5, "128"):
             with self.assertRaises(RuntimeError):
-                _forward_block_ms({"BLOCK_M": bad}, num_heads=32)
+                tiles({"BLOCK_M": bad})
 
-    @parametrize("block_m", [128, 256])
+        # A short Q sequence takes the shortest expressible tile instead, at any head
+        # count and with the sweep either way: there is no KV walk to amortise over rows
+        # that do not exist, so the padding is the cost. 64 rather than 32 because a wave
+        # owns 32 rows and FlyDSL will not take a 64-thread workgroup.
+        for autotune in (True, False):
+            with config.patch({"flydsl.autotune_forward_block_m": autotune}):
+                for heads in (8, 32):
+                    for sq in (1, 4, 64):
+                        self.assertEqual(tiles(num_heads=heads, seq_len_q=sq), [64])
+                # 65 rows is past the floor and back on the normal rule.
+                self.assertNotEqual(tiles(num_heads=32, seq_len_q=65), [64])
+        # Still overridable there, or the knob would be a lie on decode shapes.
+        self.assertEqual(tiles({"BLOCK_M": 128}, seq_len_q=1), [128])
+
+    @parametrize("block_m", [64, 128, 256])
     def test_forward_agrees_with_eager_at_either_q_tile(self, block_m):
-        """Both swept tiles have to be answers, not just timings.
+        """Every offered tile has to be an answer, not just a timing.
 
         The tile changes the grid, the LSE rows a workgroup owns, and the workgroup size
-        (256 threads at 128 rows, 512 at 256), so a tile-dependent indexing bug would show
-        up here as a wrong answer rather than as a slow one.
+        (128 threads at 64 rows, 256 at 128, 512 at 256), so a tile-dependent indexing bug
+        would show up here as a wrong answer rather than as a slow one. 64 is here because
+        a decode shape now selects it, and it is the one height whose workgroup the builder
+        had never been asked to derive.
         """
         q, k, v = self._tensors()
         launcher = build_flex_flash_generic_module(

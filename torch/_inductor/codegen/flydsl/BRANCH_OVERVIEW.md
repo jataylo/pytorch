@@ -315,16 +315,28 @@ Roughly in value order. Two of these are closed rather than pending — they are
 because "we decided not to" and "we have not got to it" are different states and the
 difference is easy to lose.
 
-**1. A decode kernel.** The largest remaining gap, and now the only item here that is both
-implementable and fully validatable on this hardware. It is a measured gap rather than an
-asserted one: see [the decode section](UPSTREAM_PR_COMPARISON.md) and
-`benchmarks/transformer/flydsl/decode_gap.py`. Decode shapes are served correctly today by
-the prefill kernel, at 2.0–6.5x Triton decode's time and 3.6x faster than Triton prefill.
-The work is GQA packing into the M tile first — FlyDSL's time is flat across `Sq` 1, 4 and
-8 because a single query row is padded into a `BLOCK_M=128` tile — then a KV split for
-parallelism. The MHA row prices the first half on its own: it is the one shape where the
-group cannot be packed, and it is also where the deficit is smallest. This is a new kernel
-body, not plumbing, and it is fully validatable here.
+**1. A decode kernel** — specifically, GQA packing. The largest remaining gap, and the
+only item here that is both implementable and fully validatable on this hardware. It is
+also now half closed by accident: see [the decode section](UPSTREAM_PR_COMPARISON.md) and
+`benchmarks/transformer/flydsl/decode_gap.py`.
+
+Measuring it found that the deficit was mostly a *padded M tile* rather than a missing
+kernel. The autotuner picked a 128-row tile for a 1-row Q sequence, and since the MFMA
+issue count follows the tile rather than the rows in it, the padding was the cost. The
+workgroup size had been written as "256 below 128 rows, else 512", which excludes every
+height but those two; written as the relation it always was, a 64-row tile is expressible
+and the lowering now takes it whenever `Sq <= 64`. Uniform 1.6x, and MHA decode went from
+2.04x off Triton's dedicated decode kernel to **1.20x**.
+
+What remains is the GQA half, and the MHA row is the control that isolates it: with a group
+size of 1 there is nothing to pack and we are nearly level, while the GQA rows sit at ~3x
+because the same KV tile is streamed by four workgroups that could be one. Packing the group
+into the M tile is a 4x cut in total padded work, which would put those rows under Triton
+decode. It is a new grid mapping rather than a new kernel body — rows become
+`(q_head_in_group, q_token)` pairs, so `q_head_idx` stops being workgroup-uniform, which is
+free at the mod site because `_mod_h` is already a value and `q_row` is already per-lane. The
+cost is the block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot describe
+a tile spanning heads. Then the KV split, for parallelism.
 
 **2. ~~Asymmetric head dims in the backward.~~ Done** as of `6315ac61cfb`. Both directions
 now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients

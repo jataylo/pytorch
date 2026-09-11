@@ -320,10 +320,12 @@ def build_flex_flash_generic_module(
         BLOCK_M = 256 if num_heads >= 32 else 128
 
     if flat_work_group_size is None:
-        if BLOCK_M <= 128:
-            flat_work_group_size = 256
-        else:
-            flat_work_group_size = 512
+        # One MFMA row per lane over `lane % 32` means a wave owns exactly 32 Q rows, so
+        # the workgroup is pinned to the tile height rather than chosen: BLOCK_M // 32
+        # waves of WARP_SIZE. That is what the old `256 below 128, else 512` spelled for
+        # the two heights that existed; writing the relation instead also admits 64, which
+        # is the height a decode shape wants (see `_forward_block_ms`).
+        flat_work_group_size = (BLOCK_M // 32) * WARP_SIZE
     NUM_WAVES = flat_work_group_size // WARP_SIZE
     BLOCK_SIZE = flat_work_group_size
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
@@ -382,6 +384,13 @@ def build_flex_flash_generic_module(
     PV_K_STEPS = K_SUB_N // PV_K_STEP  # 2 steps per sub-tile (K=16) or 4 (K=8)
 
     assert BLOCK_M % NUM_WAVES == 0
+    # Not a tuning choice: the mod site, the causal compare and the O/LSE stores all read
+    # the Q row as `wave_id * ROWS_PER_WAVE + lane % 32`, one row per lane.
+    assert ROWS_PER_WAVE == 32, (
+        f"a wave owns 32 Q rows, so block_m ({BLOCK_M}) and flat_work_group_size "
+        f"({flat_work_group_size}) must satisfy block_m == 32 * waves, got "
+        f"{ROWS_PER_WAVE} rows per wave"
+    )
     for _name, _dim in (("head_dim", head_dim), ("head_dim_v", head_dim_v)):
         assert _dim % 32 == 0, f"{_name} ({_dim}) must be divisible by 32"
         assert _dim >= 64, f"{_name} ({_dim}) must be >= 64"

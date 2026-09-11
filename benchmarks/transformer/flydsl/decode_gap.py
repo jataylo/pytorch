@@ -8,10 +8,17 @@ hole. The deficit is against Triton's *decode* kernel; against Triton's prefill 
 the same shape, FlyDSL is still well ahead, and quoting only the first number would be as
 misleading as quoting only the second.
 
-The column that matters is FlyDSL against `Sq`. It is flat from 1 to 8 while Triton decode
-rises, because the autotuner picks `BLOCK_M=128` and a single query row is padded into a
-128-row tile. That is the shape of the missing work: pack the GQA group into the M tile,
-and split the KV axis for parallelism.
+This script is what found the first half of the answer. The FlyDSL column used to be *flat*
+from `Sq` 1 to 8 while Triton decode rose, because the autotuner picked `BLOCK_M=128` and a
+single query row was padded into a 128-row tile; the MFMA issue count follows the tile and
+not the rows in it, so the padding was the cost. A 64-row tile is now selected for `Sq <= 64`
+and the whole column moved 1.6x.
+
+The column that matters now is the MHA row against the GQA ones. MHA is the shape with no
+group to pack, and it is nearly level with Triton decode (1.20x); the GQA rows sit at ~3x
+because a group of 4 streams the same KV tile from 4 workgroups that could be 1. That
+difference is the remaining work: pack the GQA group into the M tile, then split the KV axis
+for parallelism.
 
 `--check` verifies the prefill kernel against eager at these shapes with a `score_mod`
 before timing anything, since a fast wrong answer is not a baseline.

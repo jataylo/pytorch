@@ -592,7 +592,13 @@ def create_flex_flydsl_attention_kernel(
     error: NotImplementedError | None = None
     vec_sizes = _mod_vec_sizes(kernel_options, has_mod=has_score_mod or has_mask_mod)
     prefetch_depths = _qk_prefetch_depths(kernel_options)
-    block_ms = _forward_block_ms(kernel_options, num_heads=num_heads)
+    block_ms = _forward_block_ms(
+        kernel_options,
+        num_heads=num_heads,
+        # Hinted: the tile height is a compile-time constant, so a sympy extent here would
+        # make the short-sequence test a symbolic Boolean.
+        seq_len_q=V.graph.sizevars.optimization_hint(seq_len_q),
+    )
     kv_gpfetches = _forward_kv_gpfetch(kernel_options)
     for mod_vec_size, qk_prefetch_depth, block_m, kv_gpfetch in itertools.product(
         vec_sizes, prefetch_depths, block_ms, kv_gpfetches
@@ -1149,7 +1155,9 @@ def _qk_prefetch_depths(kernel_options: dict[str, Any]) -> list[int]:
     return [2, 3, 4, 5]
 
 
-def _forward_block_ms(kernel_options: dict[str, Any], *, num_heads: int) -> list[int]:
+def _forward_block_ms(
+    kernel_options: dict[str, Any], *, num_heads: int, seq_len_q: int
+) -> list[int]:
     """Q tile heights to offer the forward as autotune choices.
 
     The kernel's own default is 256 rows once there are 32 heads and 128 below that, on the
@@ -1163,6 +1171,16 @@ def _forward_block_ms(kernel_options: dict[str, Any], *, num_heads: int) -> list
     Below 32 heads there is nothing to sweep: both the default and every measurement agree
     on 128, and offering a second point there would double the builds of the common case to
     re-answer a settled question.
+
+    A short Q sequence inverts the reasoning. There is no KV walk to amortise over rows
+    that do not exist: a decode shape has one Q row and the tile pads the other 127, and
+    since the MFMA issue count is a function of the tile rather than of the rows in it, the
+    padding is the cost. So below 64 rows the shortest expressible tile is offered instead.
+    64 is that floor, not 32 -- a wave owns 32 rows, one per lane, and FlyDSL will not take
+    a 64-thread workgroup, so one wave is not a thing this kernel can be. Measured on
+    8x32x(1, 8192) D128 GQA, kernel-only: 2196 us at 128 rows against 1376 us at 64, with
+    identical results. That is the padding, not a tuning artefact, and the rest of the
+    decode deficit is the workgroup count -- see the decode entry in BRANCH_OVERVIEW.md.
     """
     requested = kernel_options.get("BLOCK_M")
     if requested is not None:
@@ -1171,6 +1189,8 @@ def _forward_block_ms(kernel_options: dict[str, Any], *, num_heads: int) -> list
                 f"BLOCK_M must be a positive multiple of 64, got {requested!r}"
             )
         return [int(requested)]
+    if seq_len_q <= 64:
+        return [64]
     if num_heads < 32 or not torch._inductor.config.flydsl.autotune_forward_block_m:
         # Matches flex_flash_generic's own default, so an autotune-off build is unchanged.
         return [256 if num_heads >= 32 else 128]

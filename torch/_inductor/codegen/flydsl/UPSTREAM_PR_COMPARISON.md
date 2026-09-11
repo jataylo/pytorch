@@ -103,7 +103,7 @@ lowering; that is not in the pushed head.
 
 | | theirs | ours |
 |---|---|---|
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but decode shapes are served correctly by the prefill kernel — 2.0–6.5x slower than Triton decode, and 3.6x *faster* than Triton prefill. See below |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but decode shapes are served correctly by the prefill kernel — 1.2x off Triton decode at MHA and ~3x under GQA, and 5.9x *faster* than Triton prefill. See below |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **any admitted pair, either order, in both directions** |
@@ -124,29 +124,48 @@ routes to `flex_decoding` at all — a decode shape is served by the ordinary pr
 mods and all, and it is correct there (checked against eager at `Sq ∈ {1, 4}` with a
 `score_mod`, GQA and MHA, rel err ≤ 8e-3).
 
-bf16, D128, gfx942, microseconds per call:
+bf16, D128, gfx942, microseconds per call. The FlyDSL column is *after* the tile fix below;
+the "was" column is what a `BLOCK_M=128` tile cost:
 
-| B, Hq, Hkv, Sq, Skv | Triton | Triton decode | FlyDSL | FlyDSL / decode |
-|---|---|---|---|---|
-| 8, 32, 8, 1, 4096 | 4059 | 228 | 1130 | 4.96x |
-| 8, 32, 8, 1, 8192 | 8093 | 439 | 2227 | 5.08x |
-| 8, 32, 32, 1, 8192 (MHA) | 8178 | 1101 | 2249 | 2.04x |
-| 8, 32, 8, 4, 8192 | 8094 | 447 | 2227 | 4.98x |
-| 8, 32, 8, 8, 8192 | 8091 | 596 | 2228 | 3.74x |
-| 32, 32, 8, 1, 8192 | 26378 | 1106 | 7150 | 6.46x |
+| B, Hq, Hkv, Sq, Skv | Triton | Triton decode | FlyDSL | was | FlyDSL / decode |
+|---|---|---|---|---|---|
+| 8, 32, 8, 1, 4096 | 4051 | 229 | 689 | 1130 | 3.01x |
+| 8, 32, 8, 1, 8192 | 8080 | 449 | 1364 | 2227 | 3.03x |
+| 8, 32, 32, 1, 8192 (MHA) | 8171 | 1101 | 1319 | 2249 | **1.20x** |
+| 8, 32, 8, 4, 8192 | 8085 | 448 | 1363 | 2227 | 3.05x |
+| 8, 32, 8, 8, 8192 | 8087 | 593 | 1365 | 2228 | 2.30x |
+| 32, 32, 8, 1, 8192 | 26315 | 1104 | 4637 | 7150 | 4.20x |
 
-Two things fall out of that table. The FlyDSL column is *flat* at 2227 for `Sq` of 1, 4 and 8
-while Triton decode rises from 439 to 596, and the autotuner's own log says why: it picks
-`BLOCK_M=128`, so a single query row is padded into a 128-row tile and `Sq ≤ 128` all costs
-the same. And FlyDSL is still 3.6x faster than Triton's *prefill* kernel on the same shape,
-which is the part "reaches no architecture" obscured — the deficit is against a specialized
+The first version of this table had a flat FlyDSL column — 2227 µs for `Sq` of 1, 4 *and* 8,
+while Triton decode rose from 439 to 596 — and the autotuner's own log said why: it picked
+`BLOCK_M=128`, so a single query row was padded into a 128-row tile and every `Sq ≤ 128` cost
+the same. Since the MFMA issue count is a function of the tile and not of the rows in it, that
+padding *was* the cost, and the fix was not a kernel but a tile: the workgroup size had been
+written as "256 below 128 rows, else 512", which pins `ROWS_PER_WAVE` to 32 for the two
+heights that existed and quietly excludes every other. Written as the relation it always was
+— `BLOCK_M // 32` waves — a 64-row tile becomes expressible, and the lowering now picks it
+whenever `Sq <= 64`. That is 1.6x, uniformly, for a constant.
+
+64 is the floor rather than 32 because a wave owns 32 rows, one per lane, and FlyDSL rejects
+a 64-thread workgroup, so a one-wave kernel is not a thing this body can be.
+
+FlyDSL is also still 5.9x faster than Triton's *prefill* kernel on the same shape, which is
+the part "reaches no architecture" obscured — the remaining deficit is against a specialized
 decode kernel, not against the general path.
 
-So the missing work is a decode kernel, not decode plumbing: pack the GQA group into the M
-tile so the row is not wasted, and split the KV axis for parallelism, which is what their
-`SPLIT_KV` mode is for. The MHA row is the tell that the GQA packing is the larger half —
-it is the one shape where the group cannot be packed, and it is also the one where our
-deficit is smallest (2.04x rather than ~5x).
+What is left is a decode kernel rather than decode plumbing, and the table now says exactly
+which half of one. MHA — where the GQA group is a single head and so there is nothing to pack
+— is down to **1.20x**, so the parallelism half is nearly closed by the smaller tile alone.
+The GQA rows sit at ~3x, and the gap between those two numbers is the packing: at group size
+4 the same KV tile is streamed by four workgroups that could be one, which is a 4x reduction
+in total padded work and would put these rows at roughly 340 µs, under Triton decode's 449.
+After that comes the KV split for parallelism, which is what their `SPLIT_KV` mode is for.
+
+Packing is a new grid mapping rather than a new kernel: rows of the M tile become
+`(q_head_in_group, q_token)` pairs, so `q_head_idx` stops being workgroup-uniform and becomes
+a per-lane value — which is free at the mod site, since `_mod_h` is already passed as a value
+and `q_row` is already per-lane. It does cost the block-mask path, whose regrid is indexed per
+`(b, h, q_tile)` and cannot describe a tile spanning heads.
 
 ---
 

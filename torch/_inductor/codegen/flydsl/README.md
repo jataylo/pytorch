@@ -574,6 +574,16 @@ the tile on total work (`batch * seq * heads`); measured here the taller tile lo
 every shape below 32 heads we tried, including large-batch and 16k-sequence ones, so the
 head count is the better gate.
 
+A short Q sequence is the exception, and takes a 64-row tile at any head count. There is no
+KV walk to amortise over rows that do not exist: a decode shape has one Q row, and because
+the MFMA issue count follows the tile rather than the rows in it, the 127 padding rows *are*
+the cost. This was worth 1.6x uniformly on decode shapes, and it needed one thing unlocked —
+the workgroup size had been written as "256 below 128 rows, else 512", which happens to pin
+`ROWS_PER_WAVE` to 32 for exactly those two heights and quietly excludes every other. Written
+as the relation it always was, `BLOCK_M // 32` waves, 64 becomes expressible. 64 is the floor
+rather than 32 because a wave owns 32 rows, one per lane, and FlyDSL rejects a 64-thread
+workgroup, so a one-wave kernel is not a thing this body can be.
+
 ## Staging KV through registers
 
 Both the forward and the `dq` backward can stage a KV tile global → registers → LDS rather
