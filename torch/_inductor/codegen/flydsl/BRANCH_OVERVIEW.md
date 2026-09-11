@@ -350,15 +350,41 @@ been re-derived for CDNA4's 64 LDS banks (it stays a permutation, so answers do 
 Build- and ISA-validatable only.
 
 **4. RDNA4 (gfx1201).** Refused by capability, and what is missing is a kernel body rather
-than a gate. RDNA4's WMMA is 16×16×16 on wave32 against CDNA's 32×32×16 on wave64, so a lane
-holds 8 accumulator elements instead of 16 columns of one row, and every score-site index —
-the softmax column mapping, causal and window bounds, bias and dropout offsets — derives
-from that layout. The donor tree has a substantial dense gfx1201 implementation to borrow
-fragment and index derivations from, but it has no `score_mod`/`mask_mod` anywhere, so the
-mod-callback layer is new work against an unfamiliar layout rather than a port. Nothing here
-can run it, and unlike gfx950 — which runs the same validated MFMA bodies with different
-instructions selected — a successful RDNA4 build would check almost nothing, because the
-index derivation is the part that is new and the part a build cannot test.
+than a gate: `require_caps` demands MFMA, and the lowering declines WMMA before a build is
+attempted. RDNA4's WMMA is 16×16×16 on wave32 against CDNA's 32×32×16 on wave64, so a lane
+holds 8 accumulator elements rather than 16 columns of one row.
+
+The donor tree has a production gfx1201 forward (`flash_attn_func_gfx1201_aiw.py`, ~2.3k
+lines) plus three backward kernels (~4k), and it has no `score_mod`/`mask_mod` anywhere —
+the only `mask_mod` match in it is a dropout bitmask builder. So the mod layer is new work.
+It is less new than it first looks, though, and the reason is worth recording because it
+changes the recommendation. The donor computes `S = K Qᵀ` rather than `Q Kᵀ`, but it absorbs
+that transpose into its index derivation rather than into a layout pass: it already reads
+scores as `S[q_idx, kv_idx]`, with `q_idx` from `lane16` and `kv_idx` from
+`acc_elem_column(i) + klane * 8`, and it already unpacks to a flat `s_raw[]` at exactly the
+site where its causal, KV-tail, bias and dropout logic runs. That is a real graft point, not
+a hypothetical one — the donor's own comment notes four call sites had open-coded that
+column map before it was factored out.
+
+The sharpest concrete mismatch is small and checkable: `acc_elem_column` makes **eight**
+contiguous KV columns per group, while our mod site is built around four and
+`build_flex_flash_generic_module` rejects any `mod_vec_size` outside `(1, 2, 4)` — "4
+contiguous KV cols per lane". A WMMA mod site wants 8. Add to that up to 2 Q row subtiles per
+wave, and up to 128 scores per wave against MFMA's 32.
+
+So the recommendation, if this is ever picked up, is to port the donor wholesale and graft
+the flex mod and joint layer onto its existing score site — not to write a WMMA body in the
+shape of `flex_flash_generic.py`, which would discard the donor's tuning while still owing
+the same index re-derivation. The backward is where the genuine work is: the donor's three
+kernels have no mod infrastructure at all, and `joint_mod` on 8-wide fragments is the
+hardest single sub-problem.
+
+Validation is the reason not to start now. There is no gfx1201 silicon here — all eight GPUs
+are MI308X. FlyDSL does expose the RDNA4 WMMA intrinsics on both 0.2.4 and 0.3.2, and the
+donor does cross-build under `FLYDSL_GPU_ARCH=gfx1201`, so a port would be build-checkable.
+But unlike gfx950, which runs the same validated MFMA bodies with different instructions
+selected, a successful RDNA4 build would check almost nothing: the index derivation is both
+the new part and the part a build cannot test.
 
 **5. gfx950 on silicon.** Hardware-blocked: every GPU in this environment is MI308X
 (gfx942). Everything claimed for CDNA4 is build- and ISA-level, which is strictly weaker

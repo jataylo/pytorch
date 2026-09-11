@@ -485,6 +485,16 @@ on any architecture** — CDNA included. Its masking is region-split loops emitt
 `-inf` fills at build time, so what would have to be built is the mod-callback layer itself,
 which is the part this backend already has and upstream does not.
 
+That layer would not start from nothing, though. Their forward absorbs the `K Qᵀ` transpose
+into its index derivation rather than into a layout pass — it already reads scores as
+`S[q_idx, kv_idx]` and already unpacks them to a flat array at the site where its causal,
+KV-tail, bias and dropout logic runs, which is where a mod site would go. The sharpest
+concrete mismatch is small enough to state exactly: their accumulator gives **eight**
+contiguous KV columns per group, where the MFMA site here is built around four and
+`build_flex_flash_generic_module` rejects any `mod_vec_size` outside `(1, 2, 4)`. Their
+backward is the harder half — three kernels with no mod infrastructure at all, and a
+`joint_mod` over 8-wide fragments.
+
 ## Template hooks
 
 Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output()}}`:
