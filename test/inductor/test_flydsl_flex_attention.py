@@ -759,7 +759,7 @@ class TestFlyDSLFlexAttention(TestCase):
         ],
     )
     def test_asymmetric_head_dims_forward(self, qk_head_dim, v_head_dim):
-        """`qk_head_dim != v_head_dim`, which the forward serves and the backward does not.
+        """`qk_head_dim != v_head_dim` through the forward.
 
         The two extents are independent because the score tile sits between the GEMMs:
         GEMM1 contracts over the QK extent to produce it and GEMM2 contracts over the *KV*
@@ -812,30 +812,61 @@ class TestFlyDSLFlexAttention(TestCase):
         actual, expected = self._run(q, k, v, block_mask=block_mask)
         self._assert_close(actual, expected, "for an asymmetric block mask")
 
-    def test_backward_refuses_asymmetric_head_dims_rather_than_falling_through(self):
-        """The asymmetric split is only safe because this refusal is loud.
+    @parametrize(
+        "qk_head_dim,v_head_dim",
+        [
+            # exact / exact lane geometry, both orders
+            (128, 64),
+            (64, 128),
+            (256, 128),
+            # partial one side, exact the other, and the reverse
+            (192, 128),
+            (128, 96),
+            # two different partial geometries at once, as in the forward test
+            (96, 160),
+        ],
+    )
+    def test_asymmetric_head_dims_backward(self, qk_head_dim, v_head_dim):
+        """`qk_head_dim != v_head_dim` through both backward kernels.
 
-        The forward serves `qk != v` and the backward does not, which is exactly the
-        forward/backward mismatch that Note [FlyDSL forward and backward must be chosen
-        together] exists to prevent: this forward writes LSE in natural log, so a silent
-        fall-through would hand Triton's log2 backward the wrong base and return *wrong
-        gradients* rather than slow ones. So what is asserted here is not that the shape is
-        unsupported -- it is that asking for it raises, and names the direction.
+        The backward holds the same property as the forward -- the two extents are
+        independent loop bounds -- but spread over four GEMMs rather than two, so there are
+        four places to get it wrong rather than one. In `dq`, `sᵀ = k qᵀ` reduces over the
+        QK extent while `dpᵀ = v doᵀ` reduces over the V extent; in `dkdv`, `dv` and `dk`
+        take the two extents as their *free* axes. Each pair had been one loop with one
+        bound. See Note [the two head dims are two independent loop bounds here too].
+
+        Checking the gradients rather than the forward output is the point: `dk` is written
+        at the QK extent and `dv` at the V extent, out of accumulator banks that are no
+        longer the same length, so a mixed-up bound lands in a gradient and nowhere else.
+
+        The pairs mirror the forward test's, and for the same reason -- the interesting
+        variable is the cooperative load geometry, whose lane-to-(row, col) map is a
+        function of the row width, so what matters is the combinations of exact and partial
+        rather than the head dims themselves.
         """
-        torch.manual_seed(0)
-        q = torch.randn(
-            B, H, S, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        self._assert_grads_match_eager(
+            f"qk={qk_head_dim} v={v_head_dim}",
+            head_dim=qk_head_dim,
+            v_head_dim=v_head_dim,
         )
-        k = torch.randn(
-            B, H, S, 192, device="cuda", dtype=torch.bfloat16, requires_grad=True
+
+    def test_asymmetric_head_dims_backward_with_a_mod_and_gqa(self):
+        """The asymmetric backward with the mod machinery and the GQA group both live.
+
+        `dkdv` folds the GQA group into an unrolled loop around the Q walk, accumulating
+        into one set of registers, and that loop now reloads two tiles of *different*
+        widths per Q head. A `score_mod` puts the joint-mod site on the seam between the
+        two extents at the same time.
+        """
+        self._assert_grads_match_eager(
+            "an asymmetric score_mod under GQA",
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=192,
+            v_head_dim=128,
+            score_mod=_alibi,
         )
-        v = torch.randn(
-            B, H, S, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
-        )
-        compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
-        with self.assertRaisesRegex(Exception, "backward"):
-            out = compiled(q, k, v, kernel_options={"BACKEND": "FLYDSL"})
-            out.sum().backward()
 
     def test_rejects_head_dim_past_the_lds_budget(self):
         """head_dim 288 needs 73728 B of LDS against gfx942's 65536 B.
@@ -1138,6 +1169,7 @@ class TestFlyDSLFlexAttention(TestCase):
         seq_len=S,
         seq_len_kv=None,
         head_dim=D,
+        v_head_dim=None,
         score_mod=None,
         mask_mod=None,
         backend="FLYDSL",
@@ -1147,13 +1179,15 @@ class TestFlyDSLFlexAttention(TestCase):
         torch.manual_seed(0)
         gqa = num_q_heads != num_kv_heads
         seq_len_kv = seq_len if seq_len_kv is None else seq_len_kv
+        # V and grad_out take the V extent; Q, K and grad_q take the QK extent.
+        v_head_dim = head_dim if v_head_dim is None else v_head_dim
 
-        def _rand(heads, grad, rows=seq_len):
+        def _rand(heads, grad, rows=seq_len, width=head_dim):
             return torch.randn(
                 B,
                 heads,
                 rows,
-                head_dim,
+                width,
                 device="cuda",
                 dtype=torch.bfloat16,
                 requires_grad=grad,
@@ -1161,8 +1195,8 @@ class TestFlyDSLFlexAttention(TestCase):
 
         q = _rand(num_q_heads, True)
         k = _rand(num_kv_heads, True, seq_len_kv)
-        v = _rand(num_kv_heads, True, seq_len_kv)
-        grad_out = _rand(num_q_heads, False)
+        v = _rand(num_kv_heads, True, seq_len_kv, width=v_head_dim)
+        grad_out = _rand(num_q_heads, False, width=v_head_dim)
 
         block_mask = (
             create_block_mask(mask_mod, None, None, seq_len, seq_len_kv, device="cuda")

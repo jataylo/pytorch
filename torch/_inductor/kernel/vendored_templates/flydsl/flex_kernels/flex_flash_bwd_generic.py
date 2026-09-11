@@ -234,6 +234,7 @@ def _validate_mod_args(
 def build_flex_flash_bwd_dq_module(
     num_heads,
     head_dim,
+    head_dim_v=None,
     dtype_str="bf16",
     sm_scale=None,
     num_kv_heads=None,
@@ -322,8 +323,11 @@ def build_flex_flash_bwd_dq_module(
     # Floor matches the forward, which cannot produce an LSE below 64 in the first place.
     # There is no ceiling here: what bounds head_dim is the LDS budget, checked below
     # once BLOCK_N is known, because a narrower KV tile buys head_dim back.
-    if head_dim % 32 != 0 or head_dim < 64:
-        raise ValueError(f"head_dim must be a multiple of 32 and at least 64, got {head_dim}")
+    if head_dim_v is None:
+        head_dim_v = head_dim
+    for _name, _dim in (("head_dim", head_dim), ("head_dim_v", head_dim_v)):
+        if _dim % 32 != 0 or _dim < 64:
+            raise ValueError(f"{_name} must be a multiple of 32 and at least 64, got {_dim}")
     if num_kv_heads is None:
         num_kv_heads = num_heads
     if num_heads % num_kv_heads != 0:
@@ -368,7 +372,24 @@ def build_flex_flash_bwd_dq_module(
     USE_K16 = CAPS.mfma_k16
     MFMA_LANE_K = 8 if USE_K16 else 4
     K_STEP = 16 if USE_K16 else 8
+    # Note [the two head dims are two independent loop bounds here too]
+    #
+    # The forward serves `qk_head_dim != v_head_dim` because the score tile sits between
+    # its two GEMMs. The backward has the same property, just spread over more GEMMs, and
+    # the split is the same one: read a use of HEAD_DIM as a claim about Q/K/dQ and a use
+    # of HEAD_DIM_V as a claim about V/dO.
+    #
+    #   GEMM1a  sᵀ = k qᵀ    reduces over HEAD_DIM    -> K_STEPS
+    #   GEMM1b  dpᵀ = v doᵀ  reduces over HEAD_DIM_V  -> V_STEPS
+    #   GEMM2   dq = dsᵀᵀ k   free axis HEAD_DIM       -> D_CHUNKS
+    #
+    # The two GEMM1 halves ran in one loop while the bounds were equal. They cannot, so
+    # the loop is split. What that costs is the interleaving of the two MFMA chains, which
+    # the scheduler was free to overlap; what it buys is the asymmetric case working at
+    # all. Symmetric builds keep the old bounds exactly, which is what makes the existing
+    # suite a regression net for this.
     K_STEPS = head_dim // K_STEP
+    V_STEPS = head_dim_v // K_STEP
     D_CHUNK = 32
     D_CHUNKS = head_dim // D_CHUNK
     DS_K_STEP = 8
@@ -381,33 +402,70 @@ def build_flex_flash_bwd_dq_module(
     NUM_HEADS_KV = num_kv_heads
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
     HEAD_DIM = head_dim
+    HEAD_DIM_V = head_dim_v
     LAYOUT = layout
     BHSD = LAYOUT == "bhsd"
+    # Q and dQ are HEAD_DIM wide, dO is HEAD_DIM_V wide, and they no longer share a token
+    # stride. K and V likewise.
     STRIDE_TOKEN_Q = HEAD_DIM if BHSD else NUM_HEADS_Q * HEAD_DIM
-    STRIDE_TOKEN_KV = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_DO = HEAD_DIM_V if BHSD else NUM_HEADS_Q * HEAD_DIM_V
+    STRIDE_TOKEN_K = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_V = HEAD_DIM_V if BHSD else NUM_HEADS_KV * HEAD_DIM_V
 
     # ---- LDS geometry ----
     # K and V row-major share the forward's XOR swizzle (identical access pattern: one
-    # vector per lane at a fixed row). Kᵀ shares the forward's *transposed* V swizzle,
-    # for the same reason -- the tile has the same [HEAD_DIM][BLOCK_N] shape and the same
-    # two access patterns, a strided scalar store and a 4-contiguous vector read.
+    # vector per lane at a fixed row), but not its *parameters* once the widths differ:
+    # the swizzle is derived from the row width, so each side gets its own. Kᵀ shares the
+    # forward's *transposed* V swizzle, for the same reason -- the tile has the same
+    # [HEAD_DIM][BLOCK_N] shape and the same two access patterns, a strided scalar store
+    # and a 4-contiguous vector read.
     KT_STRIDE = BLOCK_N
-    K_GRANULES = HEAD_DIM // 16
-    K_SWZ_POW2 = K_GRANULES & (K_GRANULES - 1) == 0
-    K_SWZ_ROWMASK = (K_GRANULES - 1) if K_SWZ_POW2 else 0
-    # And where the swizzle cannot be expressed -- head_dim 96 / 160 / 192 / 224, whose
-    # granule count is not a power of two -- the row is padded instead. See the forward's
-    # K_PAD for the bank arithmetic; there is no DMA path here, so the padding is
-    # unconditional on the head_dims that need it.
-    K_PAD = 0 if K_SWZ_POW2 else 8
-    K_STRIDE = HEAD_DIM + K_PAD
+
+    def _row_swizzle(row_width):
+        """Swizzle parameters and padding for a row-major tile this many elements wide.
+
+        Where the swizzle cannot be expressed -- head_dim 96 / 160 / 192 / 224, whose
+        granule count is not a power of two -- the row is padded instead. See the
+        forward's K_PAD for the bank arithmetic; there is no DMA path here, so the
+        padding is unconditional on the head_dims that need it.
+        """
+        granules = row_width // 16
+        pow2 = granules & (granules - 1) == 0
+        rowmask = (granules - 1) if pow2 else 0
+        pad = 0 if pow2 else 8
+        return rowmask, row_width + pad
+
+    K_SWZ_ROWMASK, K_STRIDE = _row_swizzle(HEAD_DIM)
+    V_SWZ_ROWMASK, V_STRIDE = _row_swizzle(HEAD_DIM_V)
 
     VEC_WIDTH = 8
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-    LOAD_HAS_IDLE_LANES = BLOCK_SIZE % THREADS_PER_ROW_LOAD != 0
-    NUM_BATCHES_KV = max(1, -(-BLOCK_N // ROWS_PER_BATCH_LOAD))
-    KV_NEEDS_GUARD = LOAD_HAS_IDLE_LANES or (NUM_BATCHES_KV * ROWS_PER_BATCH_LOAD != BLOCK_N)
+
+    def _load_geometry(row_width):
+        """How a cooperative tile load of this row width divides across the block.
+
+        The same helper the forward carries, for the same reason: K and V rows are no
+        longer the same width, so the lane -> (row, column) map is no longer the same
+        map. With the two widths equal every constant below is what it was.
+        """
+        threads_per_row = row_width // VEC_WIDTH
+        rows_per_batch = BLOCK_SIZE // threads_per_row
+        has_idle_lanes = BLOCK_SIZE % threads_per_row != 0
+        num_batches = max(1, -(-BLOCK_N // rows_per_batch))
+        needs_guard = has_idle_lanes or (num_batches * rows_per_batch != BLOCK_N)
+        return threads_per_row, rows_per_batch, num_batches, needs_guard
+
+    (
+        THREADS_PER_ROW_LOAD_K,
+        ROWS_PER_BATCH_LOAD_K,
+        NUM_BATCHES_K,
+        K_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM)
+    (
+        THREADS_PER_ROW_LOAD_V,
+        ROWS_PER_BATCH_LOAD_V,
+        NUM_BATCHES_V,
+        V_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM_V)
 
     # Hold the next KV tile in registers so its global read overlaps this tile's GEMMs.
     # This is the gfx942 form of the pipelining the gfx950 backward gets from a DMA into a
@@ -430,15 +488,16 @@ def build_flex_flash_bwd_dq_module(
 
     LDS_K_TILE = BLOCK_N * K_STRIDE
     LDS_KT_TILE = HEAD_DIM * KT_STRIDE
-    LDS_V_TILE = BLOCK_N * K_STRIDE
+    LDS_V_TILE = BLOCK_N * V_STRIDE
     LDS_KT_BASE = LDS_K_TILE
     LDS_V_BASE = LDS_K_TILE + LDS_KT_TILE
     LDS_TOTAL = LDS_K_TILE + LDS_KT_TILE + LDS_V_TILE
     LDS_BYTES = LDS_TOTAL * 2
     if LDS_BYTES > LDS_LIMIT:
         raise ValueError(
-            f"head_dim {HEAD_DIM} at block_n {BLOCK_N} needs {LDS_BYTES} B of LDS against "
-            f"the {LDS_LIMIT} B limit (three KV tiles: K row-major, Kᵀ, V). Halve block_n."
+            f"qk head_dim {HEAD_DIM} with v head_dim {HEAD_DIM_V} at block_n {BLOCK_N} "
+            f"needs {LDS_BYTES} B of LDS against the {LDS_LIMIT} B limit (three KV tiles: "
+            "K row-major, Kᵀ, V). Halve block_n."
         )
 
     if waves_per_eu is None:
@@ -567,17 +626,22 @@ def build_flex_flash_bwd_dq_module(
         kv_head_idx = q_head_idx if GQA_GROUP_SIZE == 1 else q_head_idx // GQA_GROUP_SIZE
 
         # ---- Cooperative load decomposition ----
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
+        # One decomposition per row width. They are the same lane map whenever the two
+        # head dims agree, which is every build that existed before this was split.
+        load_row_in_batch_k = tid // THREADS_PER_ROW_LOAD_K
+        load_col_base_k = (tid % THREADS_PER_ROW_LOAD_K) * VEC_WIDTH
+        load_row_in_batch_v = tid // THREADS_PER_ROW_LOAD_V
+        load_col_base_v = (tid % THREADS_PER_ROW_LOAD_V) * VEC_WIDTH
 
-        def _kv_row_valid(lds_row):
-            row_valid = lds_row < fx.Index(BLOCK_N)
-            if const_expr(LOAD_HAS_IDLE_LANES):
-                row_valid = row_valid & (load_row_in_batch < fx.Index(ROWS_PER_BATCH_LOAD))
-            return row_valid
+        def _row_valid(lds_row, row_in_batch, rows_per_batch):
+            return (lds_row < fx.Index(BLOCK_N)) & (
+                row_in_batch < fx.Index(rows_per_batch)
+            )
 
         # ---- Global flat indices ----
+        # Four rather than two: Q and dQ are HEAD_DIM wide while dO is HEAD_DIM_V, and K
+        # is HEAD_DIM wide while V is HEAD_DIM_V. Sharing one index per side is exactly
+        # the assumption that made the backward symmetric-only.
         if const_expr(BHSD):
             slice_q = (batch_idx * NUM_HEADS_Q + q_head_idx) * seq_len_q_v
             slice_kv = (batch_idx * NUM_HEADS_KV + kv_head_idx) * seq_len_kv_v
@@ -585,8 +649,14 @@ def build_flex_flash_bwd_dq_module(
             def global_idx_q(token_idx, col):
                 return (slice_q + token_idx) * STRIDE_TOKEN_Q + col
 
-            def global_idx_kv(token_idx, col):
-                return (slice_kv + token_idx) * STRIDE_TOKEN_KV + col
+            def global_idx_do(token_idx, col):
+                return (slice_q + token_idx) * STRIDE_TOKEN_DO + col
+
+            def global_idx_k(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_K + col
+
+            def global_idx_v(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_V + col
 
         else:
 
@@ -594,9 +664,17 @@ def build_flex_flash_bwd_dq_module(
                 token = batch_idx * seq_len_q_v + token_idx
                 return token * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
 
-            def global_idx_kv(token_idx, col):
+            def global_idx_do(token_idx, col):
+                token = batch_idx * seq_len_q_v + token_idx
+                return token * STRIDE_TOKEN_DO + q_head_idx * HEAD_DIM_V + col
+
+            def global_idx_k(token_idx, col):
                 token = batch_idx * seq_len_kv_v + token_idx
-                return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+                return token * STRIDE_TOKEN_K + kv_head_idx * HEAD_DIM + col
+
+            def global_idx_v(token_idx, col):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return token * STRIDE_TOKEN_V + kv_head_idx * HEAD_DIM_V + col
 
         def _kv_row_clamp(row_idx):
             # KV comes in through raw pointers (no hardware bounds), so a partial tile's
@@ -632,6 +710,10 @@ def build_flex_flash_bwd_dq_module(
             mask = (row_idx & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
             return col_idx ^ mask
 
+        def _v_swizzle(row_idx, col_idx):
+            mask = (row_idx & fx.Index(V_SWZ_ROWMASK)) << fx.Index(4)
+            return col_idx ^ mask
+
         def _kt_swizzle(d_idx, n_idx):
             m = (d_idx ^ (d_idx >> fx.Index(KT_SWZ_DSHIFT))) & fx.Index(KT_SWZ_MASK)
             return (((n_idx >> fx.Index(2)) ^ m) << fx.Index(2)) | (n_idx & fx.Index(3))
@@ -642,60 +724,99 @@ def build_flex_flash_bwd_dq_module(
         # has neither the 16-byte `buffer_load_lds` that needs nor the LDS to spare for a
         # second buffer. What it can do is hold the next tile in registers, which is the
         # same overlap without the extra LDS -- see `_pipe_kv` at the loop.
-        def coop_load_kv_global(tile_start):
-            k_vecs, v_vecs = [], []
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+        #
+        # K and V walk separately because their rows are no longer the same width, so the
+        # lane -> (row, column) map differs. Each keeps the batch count, guard and swizzle
+        # of its own width; with the widths equal the two walks are the one walk that was
+        # here before.
+        def coop_load_k_global(tile_start):
+            vecs = []
+            for batch in range_constexpr(NUM_BATCHES_K):
+                lds_row = load_row_in_batch_k + fx.Index(batch * ROWS_PER_BATCH_LOAD_K)
                 row_idx = _kv_row_clamp(tile_start + lds_row)
-                g_idx = global_idx_kv(row_idx, load_col_base)
-                k_vecs.append(load_global_vec(k_ptr, g_idx, VEC_WIDTH))
-                v_vecs.append(load_global_vec(v_ptr, g_idx, VEC_WIDTH))
-            return k_vecs, v_vecs
+                g_idx = global_idx_k(row_idx, load_col_base_k)
+                vecs.append(load_global_vec(k_ptr, g_idx, VEC_WIDTH))
+            return vecs
+
+        def coop_load_v_global(tile_start):
+            vecs = []
+            for batch in range_constexpr(NUM_BATCHES_V):
+                lds_row = load_row_in_batch_v + fx.Index(batch * ROWS_PER_BATCH_LOAD_V)
+                row_idx = _kv_row_clamp(tile_start + lds_row)
+                g_idx = global_idx_v(row_idx, load_col_base_v)
+                vecs.append(load_global_vec(v_ptr, g_idx, VEC_WIDTH))
+            return vecs
+
+        def _store_k_row(lds_row, k_vec):
+            """K into both orientations: row-major, and Kᵀ one element at a time.
+
+            Kᵀ: scalar stores, VEC_WIDTH of them, once per tile. The alternative is a
+            strided scalar *read* per GEMM2 step, which happens D_CHUNKS * DS_K_STEPS
+            times as often.
+            """
+            swz = _k_swizzle(lds_row, load_col_base_k)
+            Vec(k_vec).store(lds, [fx.Index(0) + lds_row * K_STRIDE + swz])
+            for _e in range_constexpr(VEC_WIDTH):
+                kt_d = load_col_base_k + fx.Index(_e)
+                kt_idx = fx.Index(LDS_KT_BASE) + kt_d * KT_STRIDE + _kt_swizzle(kt_d, lds_row)
+                Vec.from_elements([Vec(k_vec)[_e]], elem_dtype).store(lds, [kt_idx])
+
+        def _store_v_row(lds_row, v_vec):
+            swz = _v_swizzle(lds_row, load_col_base_v)
+            Vec(v_vec).store(lds, [fx.Index(LDS_V_BASE) + lds_row * V_STRIDE + swz])
 
         def coop_store_kv_lds(k_vecs, v_vecs):
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+            for batch in range_constexpr(NUM_BATCHES_K):
+                lds_row = load_row_in_batch_k + fx.Index(batch * ROWS_PER_BATCH_LOAD_K)
                 k_vec = k_vecs[batch]
+
+                def _store(lds_row=lds_row, k_vec=k_vec):
+                    _store_k_row(lds_row, k_vec)
+
+                if const_expr(K_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_k, ROWS_PER_BATCH_LOAD_K):
+                        _store()
+                else:
+                    _store()
+
+            for batch in range_constexpr(NUM_BATCHES_V):
+                lds_row = load_row_in_batch_v + fx.Index(batch * ROWS_PER_BATCH_LOAD_V)
                 v_vec = v_vecs[batch]
 
-                def _store(lds_row=lds_row, k_vec=k_vec, v_vec=v_vec):
-                    swz = _k_swizzle(lds_row, load_col_base)
-                    Vec(k_vec).store(lds, [fx.Index(0) + lds_row * K_STRIDE + swz])
-                    Vec(v_vec).store(lds, [fx.Index(LDS_V_BASE) + lds_row * K_STRIDE + swz])
-                    for _e in range_constexpr(VEC_WIDTH):
-                        kt_d = load_col_base + fx.Index(_e)
-                        kt_idx = fx.Index(LDS_KT_BASE) + kt_d * KT_STRIDE + _kt_swizzle(kt_d, lds_row)
-                        Vec.from_elements([Vec(k_vec)[_e]], elem_dtype).store(lds, [kt_idx])
+                def _store(lds_row=lds_row, v_vec=v_vec):
+                    _store_v_row(lds_row, v_vec)
 
-                if const_expr(KV_NEEDS_GUARD):
-                    if _kv_row_valid(lds_row):
+                if const_expr(V_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_v, ROWS_PER_BATCH_LOAD_V):
                         _store()
                 else:
                     _store()
 
         def coop_load_kv(tile_start):
-            for batch in range_constexpr(NUM_BATCHES_KV):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+            for batch in range_constexpr(NUM_BATCHES_K):
+                lds_row = load_row_in_batch_k + fx.Index(batch * ROWS_PER_BATCH_LOAD_K)
                 row_idx = _kv_row_clamp(tile_start + lds_row)
-                g_idx = global_idx_kv(row_idx, load_col_base)
+                g_idx = global_idx_k(row_idx, load_col_base_k)
 
                 def _store(lds_row=lds_row, g_idx=g_idx):
-                    k_vec = load_global_vec(k_ptr, g_idx, VEC_WIDTH)
-                    v_vec = load_global_vec(v_ptr, g_idx, VEC_WIDTH)
-                    Vec(k_vec).store(lds, [fx.Index(0) + lds_row * K_STRIDE + _k_swizzle(lds_row, load_col_base)])
-                    Vec(v_vec).store(
-                        lds, [fx.Index(LDS_V_BASE) + lds_row * K_STRIDE + _k_swizzle(lds_row, load_col_base)]
-                    )
-                    # Kᵀ: scalar stores, VEC_WIDTH of them, once per tile. The alternative
-                    # is a strided scalar *read* per GEMM2 step, which happens
-                    # D_CHUNKS * DS_K_STEPS times as often.
-                    for _e in range_constexpr(VEC_WIDTH):
-                        kt_d = load_col_base + fx.Index(_e)
-                        kt_idx = fx.Index(LDS_KT_BASE) + kt_d * KT_STRIDE + _kt_swizzle(kt_d, lds_row)
-                        Vec.from_elements([Vec(k_vec)[_e]], elem_dtype).store(lds, [kt_idx])
+                    _store_k_row(lds_row, load_global_vec(k_ptr, g_idx, VEC_WIDTH))
 
-                if const_expr(KV_NEEDS_GUARD):
-                    if _kv_row_valid(lds_row):
+                if const_expr(K_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_k, ROWS_PER_BATCH_LOAD_K):
+                        _store()
+                else:
+                    _store()
+
+            for batch in range_constexpr(NUM_BATCHES_V):
+                lds_row = load_row_in_batch_v + fx.Index(batch * ROWS_PER_BATCH_LOAD_V)
+                row_idx = _kv_row_clamp(tile_start + lds_row)
+                g_idx = global_idx_v(row_idx, load_col_base_v)
+
+                def _store(lds_row=lds_row, g_idx=g_idx):
+                    _store_v_row(lds_row, load_global_vec(v_ptr, g_idx, VEC_WIDTH))
+
+                if const_expr(V_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_v, ROWS_PER_BATCH_LOAD_V):
                         _store()
                 else:
                     _store()
@@ -705,14 +826,16 @@ def build_flex_flash_bwd_dq_module(
         # innermost region contiguous in the layout whose tail this block could run into.
         if const_expr(BHSD):
             _q_nrec_bytes = _raw((slice_q + seq_len_q_v) * fx.Index(STRIDE_TOKEN_Q * 2))
+            _do_nrec_bytes = _raw((slice_q + seq_len_q_v) * fx.Index(STRIDE_TOKEN_DO * 2))
             _row_nrec = _raw((slice_q + seq_len_q_v) * fx.Index(4))
         else:
             _q_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_q_v * fx.Index(STRIDE_TOKEN_Q * 2))
+            _do_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_q_v * fx.Index(STRIDE_TOKEN_DO * 2))
             _row_nrec = _raw(
                 (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx + fx.Index(1)) * seq_len_q_v * fx.Index(4)
             )
         q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=False, num_records_bytes=_q_nrec_bytes)
-        do_rsrc = buffer_ops.create_buffer_resource(DO, max_size=False, num_records_bytes=_q_nrec_bytes)
+        do_rsrc = buffer_ops.create_buffer_resource(DO, max_size=False, num_records_bytes=_do_nrec_bytes)
         dq_rsrc = buffer_ops.create_buffer_resource(DQ, max_size=False, num_records_bytes=_q_nrec_bytes)
         lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=False, num_records_bytes=_row_nrec)
         delta_rsrc = buffer_ops.create_buffer_resource(DELTA, max_size=False, num_records_bytes=_row_nrec)
@@ -748,12 +871,18 @@ def build_flex_flash_bwd_dq_module(
         # ---- Preload the Qᵀ and DOᵀ B-operand packs (register-resident) ----
         # B operand: j = lane % 32 (the row m), k-subblock = (lane//32)*MFMA_LANE_K. Both
         # tensors are num_records-bounded, so OOB rows read 0.
+        # Separate walks: Q reduces over HEAD_DIM and dO over HEAD_DIM_V, so they have
+        # different step counts and different token strides.
         q_b_packs = []
-        do_b_packs = []
         for ks in range_constexpr(K_STEPS):
             col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
             g_idx = global_idx_q(q_row, col)
             q_b_packs.append(buffer_ops.buffer_load(q_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype))
+
+        do_b_packs = []
+        for ks in range_constexpr(V_STEPS):
+            col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
+            g_idx = global_idx_do(q_row, col)
             do_b_packs.append(buffer_ops.buffer_load(do_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype))
 
         # ---- Captured aux tensors, and the mod ABI ----
@@ -786,12 +915,17 @@ def build_flex_flash_bwd_dq_module(
         neg_lse_log2e = fx.Float32(_fmul(lse_val, fx.Float32(-_LOG2E)))
 
         k_swz_mask = (lane_mod_32 & fx.Index(K_SWZ_ROWMASK)) << fx.Index(4)
+        v_swz_mask = (lane_mod_32 & fx.Index(V_SWZ_ROWMASK)) << fx.Index(4)
 
-        def _row_major_idx(region_base, ks, strip):
-            """A-operand address in a row-major KV tile: i = n, k = d."""
+        def _row_major_idx(region_base, ks, strip, row_stride, swz_mask):
+            """A-operand address in a row-major KV tile: i = n, k = d.
+
+            The stride and swizzle mask are arguments because K's row is HEAD_DIM wide
+            and V's is HEAD_DIM_V, and the swizzle is derived from the row width.
+            """
             col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
             row = lane_mod_32 + fx.Index(strip * K_SUB_N)
-            return fx.Index(region_base) + row * K_STRIDE + (col ^ k_swz_mask)
+            return fx.Index(region_base) + row * row_stride + (col ^ swz_mask)
 
         def _kt_pack_idx(dc, ks, strip):
             """A-operand address in the Kᵀ tile: i = d, k = n (4 contiguous)."""
@@ -860,10 +994,12 @@ def build_flex_flash_bwd_dq_module(
 
         init_args = [c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
         if const_expr(_pipe_kv):
-            _kv0_k, _kv0_v = coop_load_kv_global(_kv_prefetch_tile_start(fx.Index(_kv_lo)))
-            for _b in range_constexpr(NUM_BATCHES_KV):
+            _kv0_start = _kv_prefetch_tile_start(fx.Index(_kv_lo))
+            _kv0_k = coop_load_k_global(_kv0_start)
+            _kv0_v = coop_load_v_global(_kv0_start)
+            for _b in range_constexpr(NUM_BATCHES_K):
                 init_args.append(_kv0_k[_b])
-            for _b in range_constexpr(NUM_BATCHES_KV):
+            for _b in range_constexpr(NUM_BATCHES_V):
                 init_args.append(_kv0_v[_b])
         loop_results = init_args
         for kv_iv, inner_iter_args in range(_kv_lo, _kv_hi, _kv_step, init=init_args):
@@ -876,18 +1012,18 @@ def build_flex_flash_bwd_dq_module(
                 # This tile's rows have been in flight since the previous iteration, so
                 # only the LDS write is left to do here; the next tile's global read is
                 # issued straight after and overlaps the GEMMs below.
-                _cur_k = [inner_iter_args[D_CHUNKS + _b] for _b in range_constexpr(NUM_BATCHES_KV)]
+                _cur_k = [inner_iter_args[D_CHUNKS + _b] for _b in range_constexpr(NUM_BATCHES_K)]
                 _cur_v = [
-                    inner_iter_args[D_CHUNKS + NUM_BATCHES_KV + _b]
-                    for _b in range_constexpr(NUM_BATCHES_KV)
+                    inner_iter_args[D_CHUNKS + NUM_BATCHES_K + _b]
+                    for _b in range_constexpr(NUM_BATCHES_V)
                 ]
                 gpu.barrier()
                 _waitcnt_vm_n(0)
                 coop_store_kv_lds(_cur_k, _cur_v)
                 rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
-                _next_k, _next_v = coop_load_kv_global(
-                    _kv_prefetch_tile_start(kv_iv + fx.Index(_kv_step))
-                )
+                _next_start = _kv_prefetch_tile_start(kv_iv + fx.Index(_kv_step))
+                _next_k = coop_load_k_global(_next_start)
+                _next_v = coop_load_v_global(_next_start)
                 gpu.barrier()
             else:
                 gpu.barrier()
@@ -898,10 +1034,20 @@ def build_flex_flash_bwd_dq_module(
                 # ==== GEMM1: sᵀ[n, m] = k @ qᵀ, and dpᵀ[n, m] = v @ doᵀ ====
                 s_acc = c_zero_v16f32
                 dp_acc = c_zero_v16f32
+                # Two loops rather than one interleaved pair: the reductions have
+                # different extents. See Note [the two head dims are two independent loop
+                # bounds here too].
                 for ks in range_constexpr(K_STEPS):
-                    k_pack = Vec.load(mfma_pack_type, lds, [_row_major_idx(0, ks, strip)])
-                    v_pack = Vec.load(mfma_pack_type, lds, [_row_major_idx(LDS_V_BASE, ks, strip)])
+                    k_pack = Vec.load(
+                        mfma_pack_type, lds, [_row_major_idx(0, ks, strip, K_STRIDE, k_swz_mask)]
+                    )
                     s_acc = mfma_acc(k_pack, q_b_packs[ks], s_acc)
+                for ks in range_constexpr(V_STEPS):
+                    v_pack = Vec.load(
+                        mfma_pack_type,
+                        lds,
+                        [_row_major_idx(LDS_V_BASE, ks, strip, V_STRIDE, v_swz_mask)],
+                    )
                     dp_acc = mfma_acc(v_pack, do_b_packs[ks], dp_acc)
 
                 # ==== Elementwise: dsᵀ = joint(p * (dpᵀ - delta)) * σ ====
@@ -1007,9 +1153,9 @@ def build_flex_flash_bwd_dq_module(
 
             _yield_args = list(dq_accs)
             if const_expr(_pipe_kv):
-                for _b in range_constexpr(NUM_BATCHES_KV):
+                for _b in range_constexpr(NUM_BATCHES_K):
                     _yield_args.append(_next_k[_b])
-                for _b in range_constexpr(NUM_BATCHES_KV):
+                for _b in range_constexpr(NUM_BATCHES_V):
                     _yield_args.append(_next_v[_b])
             loop_results = yield _yield_args
 
@@ -1129,6 +1275,7 @@ def build_flex_flash_bwd_dq_module(
 def build_flex_flash_bwd_dkdv_module(
     num_heads,
     head_dim,
+    head_dim_v=None,
     dtype_str="bf16",
     sm_scale=None,
     num_kv_heads=None,
@@ -1188,8 +1335,11 @@ def build_flex_flash_bwd_dkdv_module(
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
     if dtype_str not in ("f16", "bf16"):
         raise ValueError(f"flex_flash_bwd_generic supports f16 and bf16, got {dtype_str!r}")
-    if head_dim % 32 != 0 or head_dim < 64:
-        raise ValueError(f"head_dim must be a multiple of 32 and at least 64, got {head_dim}")
+    if head_dim_v is None:
+        head_dim_v = head_dim
+    for _name, _dim in (("head_dim", head_dim), ("head_dim_v", head_dim_v)):
+        if _dim % 32 != 0 or _dim < 64:
+            raise ValueError(f"{_name} must be a multiple of 32 and at least 64, got {_dim}")
     if num_kv_heads is None:
         num_kv_heads = num_heads
     if num_heads % num_kv_heads != 0:
@@ -1219,9 +1369,18 @@ def build_flex_flash_bwd_dkdv_module(
     USE_K16 = CAPS.mfma_k16
     MFMA_LANE_K = 8 if USE_K16 else 4
     K_STEP = 16 if USE_K16 else 8
+    # See Note [the two head dims are two independent loop bounds here too] in the dq
+    # builder. Here the split runs:
+    #
+    #   GEMM1a  s = q kᵀ     reduces over HEAD_DIM    -> K_STEPS
+    #   GEMM1b  dp = do vᵀ   reduces over HEAD_DIM_V  -> V_STEPS
+    #   GEMM2a  dv = doᵀ p   free axis HEAD_DIM_V     -> D_CHUNKS_V
+    #   GEMM2b  dk = qᵀ ds   free axis HEAD_DIM       -> D_CHUNKS
     K_STEPS = head_dim // K_STEP
+    V_STEPS = head_dim_v // K_STEP
     D_CHUNK = 32
     D_CHUNKS = head_dim // D_CHUNK
+    D_CHUNKS_V = head_dim_v // D_CHUNK
     MS_K_STEP = 8
     MS_K_STEPS = 32 // MS_K_STEP
 
@@ -1232,27 +1391,57 @@ def build_flex_flash_bwd_dkdv_module(
     NUM_HEADS_KV = num_kv_heads
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
     HEAD_DIM = head_dim
+    HEAD_DIM_V = head_dim_v
     LAYOUT = layout
     BHSD = LAYOUT == "bhsd"
     STRIDE_TOKEN_Q = HEAD_DIM if BHSD else NUM_HEADS_Q * HEAD_DIM
-    STRIDE_TOKEN_KV = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_DO = HEAD_DIM_V if BHSD else NUM_HEADS_Q * HEAD_DIM_V
+    STRIDE_TOKEN_K = HEAD_DIM if BHSD else NUM_HEADS_KV * HEAD_DIM
+    STRIDE_TOKEN_V = HEAD_DIM_V if BHSD else NUM_HEADS_KV * HEAD_DIM_V
 
     # ---- LDS geometry: Q and DO, each row-major and transposed ----
+    # Q and DO no longer share a stride: Q's row is HEAD_DIM wide and DO's is HEAD_DIM_V,
+    # and the swizzle is derived from the row width.
     QT_STRIDE = BLOCK_M
-    Q_GRANULES = HEAD_DIM // 16
-    Q_SWZ_POW2 = Q_GRANULES & (Q_GRANULES - 1) == 0
-    Q_SWZ_ROWMASK = (Q_GRANULES - 1) if Q_SWZ_POW2 else 0
-    # Padded on the head_dims the swizzle cannot express, as in the forward and the dq
-    # kernel. Q and DO share this stride, so both tiles get it.
-    Q_PAD = 0 if Q_SWZ_POW2 else 8
-    Q_STRIDE = HEAD_DIM + Q_PAD
+
+    def _row_swizzle(row_width):
+        """Swizzle mask and padded stride for a row-major tile this wide.
+
+        Padded on the head_dims the swizzle cannot express, as in the forward and the dq
+        kernel.
+        """
+        granules = row_width // 16
+        pow2 = granules & (granules - 1) == 0
+        rowmask = (granules - 1) if pow2 else 0
+        pad = 0 if pow2 else 8
+        return rowmask, row_width + pad
+
+    Q_SWZ_ROWMASK, Q_STRIDE = _row_swizzle(HEAD_DIM)
+    DO_SWZ_ROWMASK, DO_STRIDE = _row_swizzle(HEAD_DIM_V)
 
     VEC_WIDTH = 8
-    THREADS_PER_ROW_LOAD = HEAD_DIM // VEC_WIDTH
-    ROWS_PER_BATCH_LOAD = BLOCK_SIZE // THREADS_PER_ROW_LOAD
-    LOAD_HAS_IDLE_LANES = BLOCK_SIZE % THREADS_PER_ROW_LOAD != 0
-    NUM_BATCHES_Q = max(1, -(-BLOCK_M // ROWS_PER_BATCH_LOAD))
-    Q_NEEDS_GUARD = LOAD_HAS_IDLE_LANES or (NUM_BATCHES_Q * ROWS_PER_BATCH_LOAD != BLOCK_M)
+
+    def _load_geometry(row_width):
+        """Lane -> (row, column) for a cooperative tile load of this row width."""
+        threads_per_row = row_width // VEC_WIDTH
+        rows_per_batch = BLOCK_SIZE // threads_per_row
+        has_idle_lanes = BLOCK_SIZE % threads_per_row != 0
+        num_batches = max(1, -(-BLOCK_M // rows_per_batch))
+        needs_guard = has_idle_lanes or (num_batches * rows_per_batch != BLOCK_M)
+        return threads_per_row, rows_per_batch, num_batches, needs_guard
+
+    (
+        THREADS_PER_ROW_LOAD_Q,
+        ROWS_PER_BATCH_LOAD_Q,
+        NUM_BATCHES_Q,
+        Q_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM)
+    (
+        THREADS_PER_ROW_LOAD_DO,
+        ROWS_PER_BATCH_LOAD_DO,
+        NUM_BATCHES_DO,
+        DO_NEEDS_GUARD,
+    ) = _load_geometry(HEAD_DIM_V)
 
     # Stage Q/DO through registers so tile i+1's global read overlaps tile i's compute, as
     # `dq` does with KV. Unlike `dq`, where it wins everywhere, here it splits by head_dim,
@@ -1277,16 +1466,19 @@ def build_flex_flash_bwd_dkdv_module(
     QT_SWZ_DSHIFT = VEC_WIDTH.bit_length() - 1
 
     LDS_Q_TILE = BLOCK_M * Q_STRIDE
+    LDS_DO_TILE = BLOCK_M * DO_STRIDE
     LDS_QT_TILE = HEAD_DIM * QT_STRIDE
+    LDS_DOT_TILE = HEAD_DIM_V * QT_STRIDE
     LDS_Q_BASE = 0
     LDS_DO_BASE = LDS_Q_TILE
-    LDS_QT_BASE = 2 * LDS_Q_TILE
-    LDS_DOT_BASE = 2 * LDS_Q_TILE + LDS_QT_TILE
-    LDS_TOTAL = 2 * LDS_Q_TILE + 2 * LDS_QT_TILE
+    LDS_QT_BASE = LDS_Q_TILE + LDS_DO_TILE
+    LDS_DOT_BASE = LDS_Q_TILE + LDS_DO_TILE + LDS_QT_TILE
+    LDS_TOTAL = LDS_Q_TILE + LDS_DO_TILE + LDS_QT_TILE + LDS_DOT_TILE
     LDS_BYTES = LDS_TOTAL * 2
     if LDS_BYTES > LDS_LIMIT:
         raise ValueError(
-            f"head_dim {HEAD_DIM} at block_m {BLOCK_M} needs {LDS_BYTES} B of LDS against "
+            f"qk head_dim {HEAD_DIM} with v head_dim {HEAD_DIM_V} at block_m {BLOCK_M} "
+            f"needs {LDS_BYTES} B of LDS against "
             f"the {LDS_LIMIT} B limit (four Q/DO tiles, each orientation). Halve block_m."
         )
 
@@ -1398,18 +1590,20 @@ def build_flex_flash_bwd_dkdv_module(
         kv_start = kv_tile_idx * BLOCK_N
         q_head_base = kv_head_idx * fx.Index(GQA_GROUP_SIZE)
 
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
+        # One cooperative decomposition per row width; identical when the dims agree.
+        load_row_in_batch_q = tid // THREADS_PER_ROW_LOAD_Q
+        load_col_base_q = (tid % THREADS_PER_ROW_LOAD_Q) * VEC_WIDTH
+        load_row_in_batch_do = tid // THREADS_PER_ROW_LOAD_DO
+        load_col_base_do = (tid % THREADS_PER_ROW_LOAD_DO) * VEC_WIDTH
 
-        def _q_row_valid(lds_row):
-            row_valid = lds_row < fx.Index(BLOCK_M)
-            if const_expr(LOAD_HAS_IDLE_LANES):
-                row_valid = row_valid & (load_row_in_batch < fx.Index(ROWS_PER_BATCH_LOAD))
-            return row_valid
+        def _row_valid(lds_row, row_in_batch, rows_per_batch):
+            return (lds_row < fx.Index(BLOCK_M)) & (
+                row_in_batch < fx.Index(rows_per_batch)
+            )
 
         # ---- Global flat indices. Q/DO are indexed per Q head, which varies over the
-        # GQA group, so their slice is a function rather than a constant. ----
+        # GQA group, so their slice is a function rather than a constant. Four of them,
+        # because Q/dK are HEAD_DIM wide and DO/dV are HEAD_DIM_V. ----
         if const_expr(BHSD):
             slice_kv = (batch_idx * NUM_HEADS_KV + kv_head_idx) * seq_len_kv_v
 
@@ -1419,8 +1613,14 @@ def build_flex_flash_bwd_dkdv_module(
             def global_idx_q(q_head, token_idx, col):
                 return (q_plane(q_head) + token_idx) * STRIDE_TOKEN_Q + col
 
-            def global_idx_kv(token_idx, col):
-                return (slice_kv + token_idx) * STRIDE_TOKEN_KV + col
+            def global_idx_do(q_head, token_idx, col):
+                return (q_plane(q_head) + token_idx) * STRIDE_TOKEN_DO + col
+
+            def global_idx_k(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_K + col
+
+            def global_idx_v(token_idx, col):
+                return (slice_kv + token_idx) * STRIDE_TOKEN_V + col
 
         else:
 
@@ -1431,9 +1631,17 @@ def build_flex_flash_bwd_dkdv_module(
                 token = batch_idx * seq_len_q_v + token_idx
                 return token * STRIDE_TOKEN_Q + q_head * HEAD_DIM + col
 
-            def global_idx_kv(token_idx, col):
+            def global_idx_do(q_head, token_idx, col):
+                token = batch_idx * seq_len_q_v + token_idx
+                return token * STRIDE_TOKEN_DO + q_head * HEAD_DIM_V + col
+
+            def global_idx_k(token_idx, col):
                 token = batch_idx * seq_len_kv_v + token_idx
-                return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+                return token * STRIDE_TOKEN_K + kv_head_idx * HEAD_DIM + col
+
+            def global_idx_v(token_idx, col):
+                token = batch_idx * seq_len_kv_v + token_idx
+                return token * STRIDE_TOKEN_V + kv_head_idx * HEAD_DIM_V + col
 
         def _row_clamp(row_idx):
             last = seq_len_q_v - fx.Index(1)
@@ -1465,6 +1673,10 @@ def build_flex_flash_bwd_dkdv_module(
             mask = (row_idx & fx.Index(Q_SWZ_ROWMASK)) << fx.Index(4)
             return col_idx ^ mask
 
+        def _do_swizzle(row_idx, col_idx):
+            mask = (row_idx & fx.Index(DO_SWZ_ROWMASK)) << fx.Index(4)
+            return col_idx ^ mask
+
         def _qt_swizzle(d_idx, m_idx):
             m = (d_idx ^ (d_idx >> fx.Index(QT_SWZ_DSHIFT))) & fx.Index(QT_SWZ_MASK)
             return (((m_idx >> fx.Index(2)) ^ m) << fx.Index(2)) | (m_idx & fx.Index(3))
@@ -1473,68 +1685,105 @@ def build_flex_flash_bwd_dkdv_module(
         # Split into the global read and the LDS write, so `_pipe_q` can put a tile's read
         # an iteration ahead of its use. The read is unconditional and row-clamped; the
         # guard belongs to the write, which is the half that must not touch a padding row.
-        def coop_load_q_do_global(q_head, tile_start):
-            q_vecs, do_vecs = [], []
+        #
+        # Q and DO walk separately: their rows are no longer the same width, so neither
+        # the lane map nor the swizzle is shared. With the widths equal these are the one
+        # fused walk that was here before.
+        def coop_load_q_global(q_head, tile_start):
+            vecs = []
             for batch in range_constexpr(NUM_BATCHES_Q):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+                lds_row = load_row_in_batch_q + fx.Index(batch * ROWS_PER_BATCH_LOAD_Q)
                 row_idx = _row_clamp(tile_start + lds_row)
-                g_idx = global_idx_q(q_head, row_idx, load_col_base)
-                q_vecs.append(load_global_vec(q_ptr, g_idx, VEC_WIDTH))
-                do_vecs.append(load_global_vec(do_ptr, g_idx, VEC_WIDTH))
-            return q_vecs, do_vecs
+                g_idx = global_idx_q(q_head, row_idx, load_col_base_q)
+                vecs.append(load_global_vec(q_ptr, g_idx, VEC_WIDTH))
+            return vecs
+
+        def coop_load_do_global(q_head, tile_start):
+            vecs = []
+            for batch in range_constexpr(NUM_BATCHES_DO):
+                lds_row = load_row_in_batch_do + fx.Index(batch * ROWS_PER_BATCH_LOAD_DO)
+                row_idx = _row_clamp(tile_start + lds_row)
+                g_idx = global_idx_do(q_head, row_idx, load_col_base_do)
+                vecs.append(load_global_vec(do_ptr, g_idx, VEC_WIDTH))
+            return vecs
+
+        def _store_q_row(lds_row, q_vec):
+            """Q into both orientations.
+
+            The transposed copy is VEC_WIDTH scalar stores, once per tile, against a
+            strided scalar read per GEMM2 step if we skipped it.
+            """
+            swz = _q_swizzle(lds_row, load_col_base_q)
+            Vec(q_vec).store(lds, [fx.Index(LDS_Q_BASE) + lds_row * Q_STRIDE + swz])
+            for _e in range_constexpr(VEC_WIDTH):
+                t_d = load_col_base_q + fx.Index(_e)
+                t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
+                Vec.from_elements([Vec(q_vec)[_e]], elem_dtype).store(
+                    lds, [fx.Index(LDS_QT_BASE) + t_off]
+                )
+
+        def _store_do_row(lds_row, do_vec):
+            swz = _do_swizzle(lds_row, load_col_base_do)
+            Vec(do_vec).store(lds, [fx.Index(LDS_DO_BASE) + lds_row * DO_STRIDE + swz])
+            for _e in range_constexpr(VEC_WIDTH):
+                t_d = load_col_base_do + fx.Index(_e)
+                t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
+                Vec.from_elements([Vec(do_vec)[_e]], elem_dtype).store(
+                    lds, [fx.Index(LDS_DOT_BASE) + t_off]
+                )
 
         def coop_store_q_do_lds(q_vecs, do_vecs):
             for batch in range_constexpr(NUM_BATCHES_Q):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+                lds_row = load_row_in_batch_q + fx.Index(batch * ROWS_PER_BATCH_LOAD_Q)
                 q_vec = q_vecs[batch]
-                do_vec = do_vecs[batch]
 
-                def _store(lds_row=lds_row, q_vec=q_vec, do_vec=do_vec):
-                    swz = _q_swizzle(lds_row, load_col_base)
-                    Vec(q_vec).store(lds, [fx.Index(LDS_Q_BASE) + lds_row * Q_STRIDE + swz])
-                    Vec(do_vec).store(lds, [fx.Index(LDS_DO_BASE) + lds_row * Q_STRIDE + swz])
-                    for _e in range_constexpr(VEC_WIDTH):
-                        t_d = load_col_base + fx.Index(_e)
-                        t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
-                        Vec.from_elements([Vec(q_vec)[_e]], elem_dtype).store(
-                            lds, [fx.Index(LDS_QT_BASE) + t_off]
-                        )
-                        Vec.from_elements([Vec(do_vec)[_e]], elem_dtype).store(
-                            lds, [fx.Index(LDS_DOT_BASE) + t_off]
-                        )
+                def _store(lds_row=lds_row, q_vec=q_vec):
+                    _store_q_row(lds_row, q_vec)
 
                 if const_expr(Q_NEEDS_GUARD):
-                    if _q_row_valid(lds_row):
+                    if _row_valid(lds_row, load_row_in_batch_q, ROWS_PER_BATCH_LOAD_Q):
+                        _store()
+                else:
+                    _store()
+
+            for batch in range_constexpr(NUM_BATCHES_DO):
+                lds_row = load_row_in_batch_do + fx.Index(batch * ROWS_PER_BATCH_LOAD_DO)
+                do_vec = do_vecs[batch]
+
+                def _store(lds_row=lds_row, do_vec=do_vec):
+                    _store_do_row(lds_row, do_vec)
+
+                if const_expr(DO_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_do, ROWS_PER_BATCH_LOAD_DO):
                         _store()
                 else:
                     _store()
 
         def coop_load_q_do(q_head, tile_start):
             for batch in range_constexpr(NUM_BATCHES_Q):
-                lds_row = load_row_in_batch + fx.Index(batch * ROWS_PER_BATCH_LOAD)
+                lds_row = load_row_in_batch_q + fx.Index(batch * ROWS_PER_BATCH_LOAD_Q)
                 row_idx = _row_clamp(tile_start + lds_row)
-                g_idx = global_idx_q(q_head, row_idx, load_col_base)
+                g_idx = global_idx_q(q_head, row_idx, load_col_base_q)
 
                 def _store(lds_row=lds_row, g_idx=g_idx):
-                    q_vec = load_global_vec(q_ptr, g_idx, VEC_WIDTH)
-                    do_vec = load_global_vec(do_ptr, g_idx, VEC_WIDTH)
-                    swz = _q_swizzle(lds_row, load_col_base)
-                    Vec(q_vec).store(lds, [fx.Index(LDS_Q_BASE) + lds_row * Q_STRIDE + swz])
-                    Vec(do_vec).store(lds, [fx.Index(LDS_DO_BASE) + lds_row * Q_STRIDE + swz])
-                    # Transposed copies: VEC_WIDTH scalar stores each, once per tile,
-                    # against a strided scalar read per GEMM2 step if we skipped them.
-                    for _e in range_constexpr(VEC_WIDTH):
-                        t_d = load_col_base + fx.Index(_e)
-                        t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
-                        Vec.from_elements([Vec(q_vec)[_e]], elem_dtype).store(
-                            lds, [fx.Index(LDS_QT_BASE) + t_off]
-                        )
-                        Vec.from_elements([Vec(do_vec)[_e]], elem_dtype).store(
-                            lds, [fx.Index(LDS_DOT_BASE) + t_off]
-                        )
+                    _store_q_row(lds_row, load_global_vec(q_ptr, g_idx, VEC_WIDTH))
 
                 if const_expr(Q_NEEDS_GUARD):
-                    if _q_row_valid(lds_row):
+                    if _row_valid(lds_row, load_row_in_batch_q, ROWS_PER_BATCH_LOAD_Q):
+                        _store()
+                else:
+                    _store()
+
+            for batch in range_constexpr(NUM_BATCHES_DO):
+                lds_row = load_row_in_batch_do + fx.Index(batch * ROWS_PER_BATCH_LOAD_DO)
+                row_idx = _row_clamp(tile_start + lds_row)
+                g_idx = global_idx_do(q_head, row_idx, load_col_base_do)
+
+                def _store(lds_row=lds_row, g_idx=g_idx):
+                    _store_do_row(lds_row, load_global_vec(do_ptr, g_idx, VEC_WIDTH))
+
+                if const_expr(DO_NEEDS_GUARD):
+                    if _row_valid(lds_row, load_row_in_batch_do, ROWS_PER_BATCH_LOAD_DO):
                         _store()
                 else:
                     _store()
@@ -1543,13 +1792,15 @@ def build_flex_flash_bwd_dkdv_module(
         # num_records bound serves them: the end of the innermost region contiguous in the
         # layout whose tail this block could run into.
         if const_expr(BHSD):
-            _kv_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_KV * 2))
+            _kv_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_K * 2))
+            _v_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_V * 2))
         else:
-            _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_KV * 2))
+            _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_K * 2))
+            _v_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_V * 2))
         k_rsrc = buffer_ops.create_buffer_resource(K, max_size=False, num_records_bytes=_kv_nrec_bytes)
-        v_rsrc = buffer_ops.create_buffer_resource(V, max_size=False, num_records_bytes=_kv_nrec_bytes)
+        v_rsrc = buffer_ops.create_buffer_resource(V, max_size=False, num_records_bytes=_v_nrec_bytes)
         dk_rsrc = buffer_ops.create_buffer_resource(DK, max_size=False, num_records_bytes=_kv_nrec_bytes)
-        dv_rsrc = buffer_ops.create_buffer_resource(DV, max_size=False, num_records_bytes=_kv_nrec_bytes)
+        dv_rsrc = buffer_ops.create_buffer_resource(DV, max_size=False, num_records_bytes=_v_nrec_bytes)
         # LSE/DELTA are bounded by the whole tensor rather than per Q head: the head
         # varies over the GQA group, and a resource cannot. An out-of-range row can then
         # read the next head's value, which is why `p` is masked to 0 there rather than
@@ -1563,12 +1814,17 @@ def build_flex_flash_bwd_dkdv_module(
         # ---- Preload K and V as B operands (register-resident for the whole Q walk) ----
         # B operand: j = n = lane % 32 (this wave's KV row), k-subblock = (lane//32)*4.
         kv_row = kv_start + wave_n_offset + lane_mod_32
+        # Separate walks: K reduces over HEAD_DIM and V over HEAD_DIM_V.
         k_b_packs = []
-        v_b_packs = []
         for ks in range_constexpr(K_STEPS):
             col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
-            g_idx = global_idx_kv(kv_row, col)
+            g_idx = global_idx_k(kv_row, col)
             k_b_packs.append(buffer_ops.buffer_load(k_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype))
+
+        v_b_packs = []
+        for ks in range_constexpr(V_STEPS):
+            col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
+            g_idx = global_idx_v(kv_row, col)
             v_b_packs.append(buffer_ops.buffer_load(v_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype))
 
         # ---- Captured aux tensors, and the mod ABI (mod_vec is always 1 here) ----
@@ -1599,12 +1855,17 @@ def build_flex_flash_bwd_dkdv_module(
         c_neg_log2e = fx.Float32(-_LOG2E)
 
         q_swz_mask = (lane_mod_32 & fx.Index(Q_SWZ_ROWMASK)) << fx.Index(4)
+        do_swz_mask = (lane_mod_32 & fx.Index(DO_SWZ_ROWMASK)) << fx.Index(4)
 
-        def _row_major_idx(region_base, ks, m_sub):
-            """GEMM1 A operand in a row-major Q/DO tile: i = m, k = d."""
+        def _row_major_idx(region_base, ks, m_sub, row_stride, swz_mask):
+            """GEMM1 A operand in a row-major Q/DO tile: i = m, k = d.
+
+            Stride and swizzle mask are arguments because Q's row is HEAD_DIM wide and
+            DO's is HEAD_DIM_V.
+            """
             col = fx.Index(ks * K_STEP) + lane_div_32 * MFMA_LANE_K
             row = lane_mod_32 + fx.Index(m_sub * 32)
-            return fx.Index(region_base) + row * Q_STRIDE + (col ^ q_swz_mask)
+            return fx.Index(region_base) + row * row_stride + (col ^ swz_mask)
 
         def _transposed_idx(region_base, dc, ks, m_sub):
             """GEMM2 A operand in a transposed Q/DO tile: i = d, k = m (4 contiguous)."""
@@ -1615,7 +1876,10 @@ def build_flex_flash_bwd_dkdv_module(
         # ---- Q loop, wrapped in the GQA group ----
         # dk/dv for one KV head is the sum over every Q head sharing it, so the group is
         # unrolled around the Q walk and accumulates into the same registers.
-        init_args = [c_zero_v16f32 for _ in range_constexpr(2 * D_CHUNKS)]
+        # dk is HEAD_DIM wide and dv is HEAD_DIM_V, so the two accumulator banks are not
+        # the same length: dk occupies [0, D_CHUNKS) and dv [D_CHUNKS, D_CHUNKS+D_CHUNKS_V).
+        _N_ACCS = D_CHUNKS + D_CHUNKS_V
+        init_args = [c_zero_v16f32 for _ in range_constexpr(_N_ACCS)]
         carried = init_args
         if const_expr(USE_BLOCK_MASK):
             # Q_NUM_BLOCKS [B, H_q, num_kv_tiles] i32
@@ -1681,37 +1945,37 @@ def build_flex_flash_bwd_dkdv_module(
             # its own pipeline rather than inheriting the previous head's in-flight tile.
             _loop_init = list(carried)
             if const_expr(_pipe_q):
-                _q0, _do0 = coop_load_q_do_global(
-                    q_head, _q_prefetch_tile_start(fx.Index(_m_lo))
-                )
+                _prime_start = _q_prefetch_tile_start(fx.Index(_m_lo))
+                _q0 = coop_load_q_global(q_head, _prime_start)
+                _do0 = coop_load_do_global(q_head, _prime_start)
                 for _b in range_constexpr(NUM_BATCHES_Q):
                     _loop_init.append(_q0[_b])
-                for _b in range_constexpr(NUM_BATCHES_Q):
+                for _b in range_constexpr(NUM_BATCHES_DO):
                     _loop_init.append(_do0[_b])
             for m_iv, inner_iter_args in range(_m_lo, _m_hi, _m_step, init=_loop_init):
                 m_tile = _q_tile_start(m_iv)
                 dk_accs = [inner_iter_args[i] for i in range_constexpr(D_CHUNKS)]
-                dv_accs = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS)]
+                dv_accs = [inner_iter_args[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS_V)]
 
                 if const_expr(_pipe_q):
                     # This tile's rows have been in flight since the previous iteration,
                     # so only the LDS write is left; the next tile's read is issued
                     # straight after and overlaps the GEMMs below.
                     _cur_q = [
-                        inner_iter_args[2 * D_CHUNKS + _b]
+                        inner_iter_args[_N_ACCS + _b]
                         for _b in range_constexpr(NUM_BATCHES_Q)
                     ]
                     _cur_do = [
-                        inner_iter_args[2 * D_CHUNKS + NUM_BATCHES_Q + _b]
-                        for _b in range_constexpr(NUM_BATCHES_Q)
+                        inner_iter_args[_N_ACCS + NUM_BATCHES_Q + _b]
+                        for _b in range_constexpr(NUM_BATCHES_DO)
                     ]
                     gpu.barrier()
                     _waitcnt_vm_n(0)
                     coop_store_q_do_lds(_cur_q, _cur_do)
                     rocdl.sched_group_barrier(rocdl.mask_dswr, 1, 0)
-                    _next_q, _next_do = coop_load_q_do_global(
-                        q_head, _q_prefetch_tile_start(m_iv + fx.Index(_m_step))
-                    )
+                    _next_start = _q_prefetch_tile_start(m_iv + fx.Index(_m_step))
+                    _next_q = coop_load_q_global(q_head, _next_start)
+                    _next_do = coop_load_do_global(q_head, _next_start)
                     gpu.barrier()
                 else:
                     gpu.barrier()
@@ -1724,10 +1988,21 @@ def build_flex_flash_bwd_dkdv_module(
                     # over m, so the accumulator must have m on its slot axis.
                     s_acc = c_zero_v16f32
                     dp_acc = c_zero_v16f32
+                    # Two loops: the reductions have different extents. See Note [the two
+                    # head dims are two independent loop bounds here too].
                     for ks in range_constexpr(K_STEPS):
-                        q_pack = Vec.load(mfma_pack_type, lds, [_row_major_idx(LDS_Q_BASE, ks, m_sub)])
-                        do_pack = Vec.load(mfma_pack_type, lds, [_row_major_idx(LDS_DO_BASE, ks, m_sub)])
+                        q_pack = Vec.load(
+                            mfma_pack_type,
+                            lds,
+                            [_row_major_idx(LDS_Q_BASE, ks, m_sub, Q_STRIDE, q_swz_mask)],
+                        )
                         s_acc = mfma_acc(q_pack, k_b_packs[ks], s_acc)
+                    for ks in range_constexpr(V_STEPS):
+                        do_pack = Vec.load(
+                            mfma_pack_type,
+                            lds,
+                            [_row_major_idx(LDS_DO_BASE, ks, m_sub, DO_STRIDE, do_swz_mask)],
+                        )
                         dp_acc = mfma_acc(do_pack, v_b_packs[ks], dp_acc)
 
                     # ==== Per-row lse/delta: 16 slots, 4 groups of 4 consecutive m ====
@@ -1835,40 +2110,48 @@ def build_flex_flash_bwd_dkdv_module(
                     ds_packs = [pack_v4(ds_vals[p * 4 : p * 4 + 4]) for p in range_constexpr(MS_K_STEPS)]
 
                     # ==== GEMM2: dvᵀ[d, n] += doᵀ @ p, dkᵀ[d, n] += qᵀ @ ds ====
-                    for dc in range_constexpr(D_CHUNKS):
+                    # Separate chunk loops: dv's free axis is HEAD_DIM_V and dk's is
+                    # HEAD_DIM. v4, not mfma_pack_type: these GEMMs stay at 32x32x8 even
+                    # on CDNA4. See Note [the backward runs two MFMA shapes, and only
+                    # GEMM1 moves].
+                    for dc in range_constexpr(D_CHUNKS_V):
                         for ks in range_constexpr(MS_K_STEPS):
-                            # v4, not mfma_pack_type: these GEMMs stay at 32x32x8 even on
-                            # CDNA4. See Note [the backward runs two MFMA shapes, and
-                            # only GEMM1 moves].
                             dot_pack = Vec.load(
                                 v4f16_type, lds, [_transposed_idx(LDS_DOT_BASE, dc, ks, m_sub)]
                             )
+                            dv_accs[dc] = mfma_acc_k8(dot_pack, p_packs[ks], dv_accs[dc])
+                    for dc in range_constexpr(D_CHUNKS):
+                        for ks in range_constexpr(MS_K_STEPS):
                             qt_pack = Vec.load(
                                 v4f16_type, lds, [_transposed_idx(LDS_QT_BASE, dc, ks, m_sub)]
                             )
-                            dv_accs[dc] = mfma_acc_k8(dot_pack, p_packs[ks], dv_accs[dc])
                             dk_accs[dc] = mfma_acc_k8(qt_pack, ds_packs[ks], dk_accs[dc])
 
                 _yielded = dk_accs + dv_accs
                 if const_expr(_pipe_q):
                     for _b in range_constexpr(NUM_BATCHES_Q):
                         _yielded = _yielded + [_next_q[_b]]
-                    for _b in range_constexpr(NUM_BATCHES_Q):
+                    for _b in range_constexpr(NUM_BATCHES_DO):
                         _yielded = _yielded + [_next_do[_b]]
                 carried = yield _yielded
             if const_expr(_pipe_q):
                 # Drop the in-flight tile: the next Q head primes its own, and the store
                 # below wants only the accumulators.
-                carried = [carried[i] for i in range_constexpr(2 * D_CHUNKS)]
+                carried = [carried[i] for i in range_constexpr(_N_ACCS)]
 
         # ---- Store dk and dv ----
         # Accumulators are dkᵀ/dvᵀ[d, n]: j = n = lane % 32, 16 slots walking d as
         # `(lane//32)*4 + (s//4)*8 + s%4`, so each group of 4 slots is 4 contiguous d and
         # goes out as one dwordx2. Rows past seq_len_q drop on the num_records bound.
         dk_finals = [carried[i] for i in range_constexpr(D_CHUNKS)]
-        dv_finals = [carried[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS)]
-        for acc_list, rsrc in ((dk_finals, dk_rsrc), (dv_finals, dv_rsrc)):
-            for dc in range_constexpr(D_CHUNKS):
+        dv_finals = [carried[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS_V)]
+        # dk is written at the QK extent and dv at the V extent, so each gets its own
+        # chunk count and its own index function.
+        for acc_list, rsrc, n_chunks, idx_fn in (
+            (dk_finals, dk_rsrc, D_CHUNKS, global_idx_k),
+            (dv_finals, dv_rsrc, D_CHUNKS_V, global_idx_v),
+        ):
+            for dc in range_constexpr(n_chunks):
                 for grp in range_constexpr(4):
                     r0 = grp * 4
                     vals = [
@@ -1878,7 +2161,7 @@ def build_flex_flash_bwd_dkdv_module(
                     pack = Vec.from_elements(vals, elem_dtype).bitcast(fx.Int32)
                     out2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
                     d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                    g_idx = global_idx_kv(kv_row, d_col)
+                    g_idx = idx_fn(kv_row, d_col)
                     buffer_ops.buffer_store(out2, rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
 
     @flyc.jit

@@ -106,7 +106,7 @@ lowering; that is not in the pushed head.
 | **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but decode shapes are served correctly by the prefill kernel — 2.0–6.5x slower than Triton decode, and 3.6x *faster* than Triton prefill. See below |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
-| Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **forward: any admitted pair, either order**; backward refuses |
+| Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **any admitted pair, either order, in both directions** |
 | Upstreaming | in the review queue with `albanD` / `drisspg` requested | a local branch |
 | Backward CDNA4 | their backward is written for gfx950 throughout | ours takes `mfma_k16` in GEMM1 only; `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are still forward-only |
 
@@ -164,11 +164,11 @@ deficit is smallest (2.04x rather than ~5x).
 2. **Their `Sq != Sk` handling is a spec worth reading**, since the forward supports separate
    extents cleanly. Ours works, but it was a bug fix (we returned 0.97 and 1.57 relative error
    silently before it), so a second design to check against has value.
-3. ~~**Asymmetric `qk_head_dim != v_head_dim`**~~ **Done for the forward, which now covers
-   more of this than they do**: any admitted pair in either order, against their one
-   `(192, 128)`. Their crossed loader masks were the reference. The backward still refuses
-   it, and does so loudly, so an asymmetric training step stops rather than pairing our
-   natural-log LSE with Triton's log2 backward.
+3. ~~**Asymmetric `qk_head_dim != v_head_dim`**~~ **Done, and now covers more of this than
+   they do**: any admitted pair in either order, forward *and* backward, against their one
+   `(192, 128)` pair. Their crossed loader masks were the reference for the forward. The
+   backward went further than the forward had to, because there the two extents are four
+   loop bounds rather than none — see the README.
 4. **The precompile hook.** Both warm FlyDSL's disk cache through `FakeTensorMode` proxies
    under `FLYDSL_COMPILE_ONLY=1`. We have a precompile pool already, but note the version
    hazard a reviewer raised: the env var is `COMPILE_ONLY` rather than `FLYDSL_COMPILE_ONLY`

@@ -17,7 +17,7 @@ FlexAttention API.
 | Direction | Forward and backward (`dq`, `dkdv`) in one lowering, chosen together |
 | Architecture | gfx942 (CDNA3) and gfx950 (CDNA4), neither behind a flag, off a capability table |
 | dtype | bf16 and f16 |
-| head_dim | Every multiple of 32 from 64 to 256; the forward also serves `qk_head_dim != v_head_dim` |
+| head_dim | Every multiple of 32 from 64 to 256, and `qk_head_dim != v_head_dim` in either order, forward and backward |
 | Captures | 4 slots, f32, rank ≤ 4, either mod |
 | seq_len | Any, ragged tails included, and cross attention (`Sq != Sk`) |
 | GQA | MHA / GQA / MQA, both directions, no atomics |
@@ -206,12 +206,12 @@ denormal LSE. A third channel was found later — `fast_fp_math` wraps the whole
 an ambient fast scope that every op without an explicit `fastmath=` inherits — and all four
 compile-hint dicts now set the same subset.
 
-Also added: **asymmetric head dims** in the forward (`qk_head_dim != v_head_dim`, any admitted
-pair in either order), which required splitting the cooperative load geometry, since K and V
-rows have different widths and so need separate lane groupings, batch counts and partial-lane
-guards. The backward **refuses** it loudly rather than pairing our natural-log LSE with
-Triton's log2 backward. Measured at 1.19x (qk192/v128) down to 0.77x (qk128/v64) — the
-symmetric profile at the same QK dim, not an asymmetric penalty.
+Also added: **asymmetric head dims** (`qk_head_dim != v_head_dim`, any admitted pair in either
+order), in the forward first and later in both backward kernels. The forward's work was
+splitting the cooperative load geometry, since K and V rows have different widths and so need
+separate lane groupings, batch counts and partial-lane guards; the backward's was that, twice
+over, plus four GEMM loops whose bounds had coincided. Forward speed is 1.19x (qk192/v128) down
+to 0.77x (qk128/v64) — the symmetric profile at the same QK dim, not an asymmetric penalty.
 
 ## FlyDSL release support
 
@@ -315,7 +315,8 @@ Roughly in value order. Two of these are closed rather than pending — they are
 because "we decided not to" and "we have not got to it" are different states and the
 difference is easy to lose.
 
-**1. A decode kernel.** The largest remaining gap, and now a measured one rather than an
+**1. A decode kernel.** The largest remaining gap, and now the only item here that is both
+implementable and fully validatable on this hardware. It is a measured gap rather than an
 asserted one: see [the decode section](UPSTREAM_PR_COMPARISON.md) and
 `benchmarks/transformer/flydsl/decode_gap.py`. Decode shapes are served correctly today by
 the prefill kernel, at 2.0–6.5x Triton decode's time and 3.6x faster than Triton prefill.
@@ -325,19 +326,15 @@ parallelism. The MHA row prices the first half on its own: it is the one shape w
 group cannot be packed, and it is also where the deficit is smallest. This is a new kernel
 body, not plumbing, and it is fully validatable here.
 
-**2. Asymmetric head dims in the backward.** The forward serves any admitted
-`qk_head_dim != v_head_dim` pair in either order; the backward refuses. Scoped and
-de-risked but not written. The concrete work is splitting the V side away from the QK side:
-`STRIDE_TOKEN_KV`, the V padding and stride, the load geometry, and the index functions
-across `k`/`v`/`do`/`dq`/`dk`/`dv`. The forward already has the shape of the answer in its
-`_load_geometry` closure, which is applied twice to yield the `_K` and `_V` constants.
-
-LDS was the thing that could have made this need new machinery, and it does not. Across all
-49 admitted pairs the `dq` footprint (K row-major, plus Kᵀ, plus V) fits gfx942 at
-`block_n=32` in 49 cases out of 49, and at `block_n=64` in 27; gfx950 fits all 49 at 64.
-Symmetric pairs that fit at 64 today are only 64/96/128/160, so wide pairs would land on
-`block_n=32` exactly the way symmetric 192+ already does, through the existing per-arch tile
-filter. Fully validatable here.
+**2. ~~Asymmetric head dims in the backward.~~ Done** as of `1e8ce52f31e`. Both directions
+now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients
+across six pairs plus one under GQA with a `score_mod`. The backward turned out to need more
+than the forward had: there the two extents were never loop bounds, while here they are four
+— `dq`'s `sᵀ = k qᵀ` against `dpᵀ = v doᵀ`, and `dkdv`'s `dv` against `dk` — each of which had
+been one loop with one bound. LDS was never the obstacle it might have been, as predicted:
+all 49 admitted pairs fit gfx942 at `block_n=32`. What did bite was the autotuner's `dkdv`
+LDS filter, which computed its footprint from one head dim and so offered a `block_m` the
+builder then rejected. See the README's asymmetric section.
 
 **3. The three remaining CDNA4 capabilities in the backward.** `mfma_k16` is taken in GEMM1
 as of `158ac9c0685`. `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are
@@ -425,6 +422,9 @@ aligned. Documented above, not forgotten.
 | `9ce495f6605` | Serve symbolic scalar captures, and stop refusing unproven kv pairs |
 | `158ac9c0685` | Take MFMA K=16 in the backward on CDNA4 |
 | `2338af8cfa6` | Price the decode gap instead of calling it nothing |
+| `2762d65cd8d` | Rewrite "what is not done" as an ordered account of what is left |
+| `c3f9806b140` | Ground the RDNA4 assessment in the donor's actual layout |
+| `1e8ce52f31e` | Serve `qk_head_dim != v_head_dim` in the backward |
 
 ## Further reading
 

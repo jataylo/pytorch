@@ -214,7 +214,7 @@ be believed rather than assumed, since a log2 `lse` would need the cotangent res
 | Direction | Forward and backward (`dq` and `dk`/`dv`) |
 | Architecture | gfx942 and gfx950, neither behind a flag. Declared as capabilities rather than names, so anything else is refused by naming what it is missing — see [GPU architectures](#gpu-architectures) |
 | dtype | bf16, f16 (all of q/k/v the same) |
-| head_dim | Multiples of 32 from 64 to 256. The forward serves `qk_head_dim != v_head_dim` in either order; the backward requires them equal and raises when they are not — see [Asymmetric head dims](#asymmetric-head-dims) |
+| head_dim | Multiples of 32 from 64 to 256, and `qk_head_dim != v_head_dim` in either order in both directions — see [Asymmetric head dims](#asymmetric-head-dims) |
 | Captures | At most 4 across both mods, rank ≤ 4, on device. A mod may *read* one; a gradient with respect to one is refused |
 | seq_len | Any, ragged tails included, and Q may differ from KV (cross attention). K and V must match each other |
 | GQA | Yes |
@@ -251,8 +251,10 @@ plausible garbage rather than falling back to Triton.
 
 ## Asymmetric head dims
 
-The forward serves `qk_head_dim != v_head_dim` — any pair from the admitted set, in either
-order. The backward does not, and refuses it by name.
+`qk_head_dim != v_head_dim` is served in **both directions** — any pair from the admitted
+set, in either order.
+
+### The forward
 
 The two extents are independent because the score tile sits between the two GEMMs. GEMM1
 contracts over the QK extent to *produce* the score tile; GEMM2 contracts over the **KV
@@ -282,7 +284,7 @@ collapses to its old value, so **a symmetric build is unchanged** — confirmed 
 (D128 still exactly 32768 B, D256 still exactly 65536 B) and by kernel-only timing across
 the whole ladder, which moved by less than run-to-run noise.
 
-The tests cover nine pairs, and they are chosen for the *load geometry* rather than for
+The forward's tests cover nine pairs, and they are chosen for the *load geometry* rather than for
 plausibility, because that is the part with two states. A head_dim whose lane count divides
 the workgroup loads whole rows; 96, 160, 192 and 224 do not and idle their remainder. So the
 cases that matter are the combinations — partial K against exact V, exact K against partial
@@ -308,13 +310,52 @@ deficit at 128 and 256 — which is what you would expect given the QK extent ow
 and padding story. There is no asymmetric-specific cliff; closing these is the same
 head_dim work as closing the symmetric ones.
 
-**The backward refusing this is load-bearing, not a gap left carelessly.** It is exactly the
-forward/backward mismatch that the "chosen together" rule exists to prevent — this forward
-writes LSE in natural log, so a silent fall-through to Triton's log2 backward would return
-wrong gradients rather than slow ones. The backward raises instead, which is safe because it
-*always* raises when FLYDSL was asked for and cannot be served. Closing the gap is a bigger
-job than the forward was: `dkdv` stages Q at the QK extent and DO at the V extent in the
-same kernel, so the backward mixes the two in more places than the forward does.
+### The backward
+
+The backward holds the same property, spread over four GEMMs rather than two. Writing the
+GEMMs out by which extent each one touches is the whole argument:
+
+| GEMM | reduces over | free axis | bound |
+|---|---|---|---|
+| `dq`: `sᵀ = k qᵀ` | QK | — | `K_STEPS` |
+| `dq`: `dpᵀ = v doᵀ` | **V** | — | `V_STEPS` |
+| `dq`: `dq = dsᵀᵀ k` | KV | QK | `D_CHUNKS` |
+| `dkdv`: `s = q kᵀ` | QK | — | `K_STEPS` |
+| `dkdv`: `dp = do vᵀ` | **V** | — | `V_STEPS` |
+| `dkdv`: `dv = doᵀ p` | M | **V** | `D_CHUNKS_V` |
+| `dkdv`: `dk = qᵀ ds` | M | QK | `D_CHUNKS` |
+
+Each of those pairs had been *one loop with one bound*, because the bounds coincided. So
+unlike the forward — where no loop bound moved at all and the work was entirely in constants
+that had been sized once — here the loops themselves split. That costs the interleaving of
+the two MFMA chains, which the scheduler had been free to overlap; a symmetric build is
+unaffected because the two loops keep their old trip counts.
+
+Everything else is the forward's change again, twice over: `STRIDE_TOKEN_KV` became
+`_K`/`_V`, `global_idx_q`/`global_idx_kv` became four functions (Q and dQ at the QK extent,
+dO at the V extent; K and dK against V and dV), the `num_records` bounds went per tensor, and
+each row-major LDS tile got its own swizzle and padding derived from its own width — `dq`'s K
+and V tiles, and `dkdv`'s Q and DO tiles in both orientations. The cooperative loads, which
+had read K and V (and Q and DO) through *one* geometry and one `g_idx`, are now two
+independent walks; `_load_geometry` is the same helper the forward carries, for the same
+reason. `dkdv`'s two accumulator banks are also no longer the same length, since `dk` is
+`D_CHUNKS` wide and `dv` is `D_CHUNKS_V`, which the register-staging iter_args had to learn.
+
+With the dims equal every split constant collapses to its old value, confirmed by LDS
+footprint: `dq` at D128 is still exactly 24576 B and `dkdv` still exactly 32768 B, and the
+existing 169 tests pass unchanged. The asymmetric case is checked on *gradients* rather than
+on the forward output, because `dk` is written at the QK extent and `dv` at the V extent out
+of those different-length banks, so a mixed-up bound lands in a gradient and nowhere else.
+
+One knock-on: the autotuner's `dkdv` LDS filter had computed a footprint from one head dim,
+so it offered a `block_m` of 64 that the builder then rejected for a wide pair. It now sums
+the two extents, which is what the kernel actually spends.
+
+This also retires a refusal that used to be load-bearing. The forward/backward mismatch the
+"chosen together" rule exists to prevent was real — this forward writes LSE in natural log,
+so a silent fall-through to Triton's log2 backward would have returned wrong gradients rather
+than slow ones — but with both directions serving the shape there is no longer a mismatch to
+guard, and `_head_dim_supported` no longer asks which direction is calling.
 
 ## Why `AUTO` cannot pick this backend, and where it would pay if it could
 

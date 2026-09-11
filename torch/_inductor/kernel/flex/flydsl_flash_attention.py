@@ -175,16 +175,15 @@ def _arch_supported(arch: str | None) -> tuple[bool, str]:
     return True, ""
 
 
-def _head_dim_supported(query, value, *, allow_asymmetric: bool) -> tuple[bool, str]:
-    """Whether both head dims are admitted, and whether they are allowed to differ.
+def _head_dim_supported(query, value) -> tuple[bool, str]:
+    """Whether both head dims are admitted. They are free to differ.
 
-    The forward serves ``qk_head_dim != v_head_dim``: the score tile sits between the two
-    GEMMs, so GEMM1's contraction over the QK extent and GEMM2's free V extent are
-    independent loop bounds. The backward does not, which is why this asks. That split is
-    safe rather than a trap only because the backward *raises* when FLYDSL was asked for
-    and cannot be served -- see Note [FlyDSL forward and backward must be chosen together]
-    -- so an asymmetric training step stops with a reason instead of pairing this forward
-    with Triton's backward.
+    ``qk_head_dim != v_head_dim`` is served in both directions. The forward reads
+    straightforwardly: the score tile sits between the two GEMMs, so GEMM1's contraction
+    over the QK extent and GEMM2's free V extent are independent loop bounds. The backward
+    has the same property spread over more GEMMs -- see Note [the two head dims are two
+    independent loop bounds here too] in ``flex_flash_bwd_generic.py`` -- so this no longer
+    asks which direction is calling.
     """
     from ...virtualized import V
 
@@ -198,13 +197,6 @@ def _head_dim_supported(query, value, *, allow_asymmetric: bool) -> tuple[bool, 
                 f"{name} head_dim {dim} is not supported by the FlyDSL flex kernels "
                 f"(supported: {supported})",
             )
-    if qk_head_dim != v_head_dim and not allow_asymmetric:
-        return (
-            False,
-            f"the FlyDSL flex backward requires matching qk/v head_dim, got "
-            f"{qk_head_dim} and {v_head_dim} (the forward serves this shape; the "
-            f"backward does not yet)",
-        )
     return True, ""
 
 
@@ -289,9 +281,7 @@ def _kv_seq_lens_agree(key, value) -> tuple[bool, str]:
     return True, ""
 
 
-def _can_use_flydsl_shapes_and_arch(
-    query, key, value, *, allow_asymmetric_head_dim: bool
-) -> tuple[bool, str]:
+def _can_use_flydsl_shapes_and_arch(query, key, value) -> tuple[bool, str]:
     """The checks both directions share: availability, architecture, dtype, batch, head_dim."""
     from ...virtualized import V
 
@@ -332,7 +322,7 @@ def _can_use_flydsl_shapes_and_arch(
         )
 
     return _head_dim_supported(
-        query, value, allow_asymmetric=allow_asymmetric_head_dim
+        query, value
     )
 
 
@@ -351,7 +341,7 @@ def _can_use_flydsl_flash_attention(
     from .flex_flash_attention import input_buffers_require_grads
 
     shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(
-        query, key, value, allow_asymmetric_head_dim=True
+        query, key, value
     )
     if not shared_ok:
         return False, shared_reason
@@ -443,7 +433,7 @@ def _can_use_flydsl_flash_attention_backward(
     knowledge in the gate is how the two drift apart.
     """
     shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(
-        query, key, value, allow_asymmetric_head_dim=False
+        query, key, value
     )
     if not shared_ok:
         return False, shared_reason
@@ -828,7 +818,9 @@ def create_flydsl_flash_attention_backward_kernel(
     # Hinted to an int: `_backward_tiles` compares an LDS footprint against a limit, and a
     # sympy expression there would make that comparison a symbolic Boolean.
     tiles = _backward_tiles(
-        kernel_options, V.graph.sizevars.optimization_hint(qk_head_dim)
+        kernel_options,
+        V.graph.sizevars.optimization_hint(qk_head_dim),
+        V.graph.sizevars.optimization_hint(v_head_dim),
     )
     mod_vec_size = _backward_mod_vec_size(kernel_options)
 
@@ -886,6 +878,7 @@ def create_flydsl_flash_attention_backward_kernel(
                 NUM_HEADS=num_heads,
                 NUM_KV_HEADS=num_kv_heads,
                 HEAD_DIM=qk_head_dim,
+                HEAD_DIM_V=v_head_dim,
                 DTYPE_STR=_FLYDSL_DTYPE_STR[dtype],
                 HAS_SCORE_MOD=has_score_mod,
                 HAS_MASK_MOD=has_mask_mod,
@@ -1008,13 +1001,21 @@ def _mod_vec_sizes(kernel_options: dict[str, Any], *, has_mod: bool) -> list[int
 # The two row-major tiles carry the same 8-element row padding the kernel adds wherever
 # the XOR swizzle cannot be expressed, so this has to know the same rule: undercounting
 # would offer a tile the builder then rejects.
-def _dkdv_lds_bytes(q_tile: int, head_dim: int) -> int:
-    granules = head_dim // 16
-    pad = 0 if granules & (granules - 1) == 0 else 8
-    return 2 * q_tile * (head_dim + pad) * 2 + 2 * q_tile * head_dim * 2
+def _dkdv_lds_bytes(q_tile: int, qk_head_dim: int, v_head_dim: int) -> int:
+    def _padded(width: int) -> int:
+        granules = width // 16
+        return width + (0 if granules & (granules - 1) == 0 else 8)
+
+    # Q and DO are sized independently: Q's rows are the QK extent and DO's the V extent,
+    # in both orientations. Equal dims give the same total as the symmetric form did.
+    row_major = q_tile * (_padded(qk_head_dim) + _padded(v_head_dim))
+    transposed = q_tile * (qk_head_dim + v_head_dim)
+    return 2 * (row_major + transposed)
 
 
-def _backward_tiles(kernel_options: dict[str, Any], head_dim: int) -> list[tuple[int, int]]:
+def _backward_tiles(
+    kernel_options: dict[str, Any], qk_head_dim: int, v_head_dim: int
+) -> list[tuple[int, int]]:
     """``(kv_tile, q_tile)`` shapes to offer the dk/dv kernel as autotune choices.
 
     The KV tile is the output tile (32 rows per wave, so 128 is 4 waves) and the Q tile is
@@ -1039,9 +1040,10 @@ def _backward_tiles(kernel_options: dict[str, Any], head_dim: int) -> list[tuple
         tiles += [(256, 32), (128, 64)]
     # A q tile of 64 does not fit past head_dim 128, so past there the sweep is over the
     # kv tile alone. The default (128, 32) fits the whole ladder: at head_dim 256 it lands
-    # on exactly the 65536 B both current arches budget.
+    # on exactly the 65536 B both current arches budget. An asymmetric pair is filtered on
+    # the sum of the two extents, which is what the kernel actually spends.
     budget = _lds_budget(_current_arch())
-    return [t for t in tiles if _dkdv_lds_bytes(t[1], head_dim) <= budget]
+    return [t for t in tiles if _dkdv_lds_bytes(t[1], qk_head_dim, v_head_dim) <= budget]
 
 
 # Workgroups per compute unit below which backward block skipping stops paying, and can
