@@ -446,13 +446,27 @@ spilled, because MFMA K=16 halves the MFMA issues and the hardware transpose rem
 staging registers. Read those numbers as "the CDNA4 paths are real and the compiler is happy
 with them", not as a correctness claim — nothing here has produced a number on CDNA4 silicon.
 
-Two gaps are worth knowing before trusting gfx950 in anger. **The backward has no CDNA4
-specialization at all**: `mfma_k16`, `lds_transpose_read` and `permlane_o_store` are read
-only by the forward, and the ISA says so — across every backward config the two architectures
-land within a few registers of each other (`dkdv` at D128: 256 VGPRs and 78 spilled on
-gfx942, 256 and 76 on gfx950), where the forward changed structurally. And **the K swizzle
-was derived against 32 LDS banks**, which CDNA4 doubles to 64. It is a permutation either
-way, so answers do not change, but its conflict-freedom has not been re-derived.
+**The backward now takes `mfma_k16`, and only there.** Its GEMM1 — `sᵀ = k qᵀ` and
+`dpᵀ = v doᵀ` in `dq`, the matching pair in `dkdv` — reduces over head_dim out of a
+row-major tile, which is the one operand path whose address is already parameterized on the
+step width. The other three GEMMs (`ds → dq`, and `dv`/`dk`) build their packs four at a
+time out of computed values and read the Kᵀ/Qᵀ tiles through a swizzle derived for that
+width, so widening them is a re-derivation rather than a constant change; they stay at
+32×32×8. The ISA shows both shapes in one kernel, and `dq` at D128 goes from 48 MFMA issues
+to 32 (16 `v_mfma_f32_32x32x16_bf16` plus 16 `v_mfma_f32_32x32x8_bf16`), 256 VGPRs to 238
+with no spill. `dkdv` at D128 keeps 256 VGPRs but drops from 76 spilled to 56. One config
+moves the wrong way — `dkdv` at D64 goes 216 to 244 VGPRs — and it still does not spill.
+
+The remaining backward gaps are `lds_transpose_read`, `permlane_o_store` and
+`dma_to_lds_b128`, all of which are LDS-layout changes rather than instruction selection:
+the transposing read would retire the Kᵀ and Qᵀ tiles outright, which is the largest single
+win left on CDNA4 and also the one that most changes the fragment maps.
+
+And **the K swizzle was derived against 32 LDS banks**, which CDNA4 doubles to 64. It is a
+permutation either way, so answers do not change, but its conflict-freedom has not been
+re-derived. This applies to the wider read too: the XOR permutes 16-element granules and
+never touches the low four bits of the column, so an 8-element read stays contiguous, but
+"contiguous" is not "conflict-free".
 
 Anything outside the table is refused by naming what is missing rather than its own name.
 gfx1201 has an entry for exactly that reason, and what it is missing is a kernel body, not a

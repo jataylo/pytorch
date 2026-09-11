@@ -312,7 +312,8 @@ def build_flex_flash_bwd_dq_module(
     ``regrid_block_mask(..., walk="kv")``.
     """
     gpu_arch = get_hip_arch()
-    LDS_LIMIT = arch_caps.require_caps(gpu_arch).lds_budget_bytes
+    CAPS = arch_caps.require_caps(gpu_arch)
+    LDS_LIMIT = CAPS.lds_budget_bytes
 
     if layout not in ("bshd", "bhsd"):
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
@@ -347,12 +348,26 @@ def build_flex_flash_bwd_dq_module(
     NUM_WAVES = BLOCK_M // _ROWS_PER_WAVE
     BLOCK_SIZE = NUM_WAVES * _WARP_SIZE
 
-    # MFMA 32x32x8 throughout, i.e. the gfx942 shape. gfx950's 32x32x16 and its
-    # hardware-transposing LDS read (`ds_read_tr16_b64`, which would retire the Kᵀ tile)
-    # are both left for later: this is a correctness-first build, and one MFMA shape
-    # keeps the fragment maps in the module docstring true on every arch it runs on.
-    MFMA_LANE_K = 4
-    K_STEP = 8
+    # Note [the backward runs two MFMA shapes, and only GEMM1 moves]
+    #
+    # GEMM1 reduces over head_dim out of a row-major tile, and its address is
+    # `ks * K_STEP + lane_div_32 * MFMA_LANE_K` under a swizzle of
+    # `col ^ ((row & K_SWZ_ROWMASK) << 4)`. That `<< 4` is what makes the wider shape
+    # safe: the XOR permutes 16-element granules and never touches the low four bits of
+    # col, so an 8-element read at 16k or 16k+8 stays inside one granule and stays
+    # contiguous. This is the same swizzle the forward reuses for both widths.
+    #
+    # The ds -> dq GEMM does not move, and is why `mfma_acc_k8` still exists. It reduces
+    # over the KV sub-block out of the Kᵀ tile, whose address hardcodes four contiguous
+    # elements per lane group and whose swizzle was derived for that width. Widening it
+    # is a re-derivation of `_kt_swizzle`, not a constant change, so the two GEMMs now
+    # run different MFMA shapes on CDNA4.
+    #
+    # The docstring's fragment maps describe the 32x32x8 shape, which is what gfx942
+    # runs and therefore what every measured number here came from.
+    USE_K16 = CAPS.mfma_k16
+    MFMA_LANE_K = 8 if USE_K16 else 4
+    K_STEP = 16 if USE_K16 else 8
     K_STEPS = head_dim // K_STEP
     D_CHUNK = 32
     D_CHUNKS = head_dim // D_CHUNK
@@ -496,8 +511,9 @@ def build_flex_flash_bwd_dq_module(
         # See Note [the fast-math flags stop short of nnan and ninf].
         fm_fast = FASTMATH
         v4f16_type = Vec.make_type(4, elem_dtype)
+        v8f16_type = Vec.make_type(8, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
-        mfma_pack_type = v4f16_type
+        mfma_pack_type = v8f16_type if USE_K16 else v4f16_type
 
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
@@ -508,12 +524,21 @@ def build_flex_flash_bwd_dq_module(
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
 
-        def mfma_acc(a, b, c):
+        def mfma_acc_k8(a, b, c):
+            """32x32x8, for operands packed four at a time."""
             if const_expr(dtype_str == "bf16"):
                 a = Vec(a).bitcast(fx.Int16)
                 b = Vec(b).bitcast(fx.Int16)
                 return rocdl.mfma_f32_32x32x8bf16_1k(v16f32_type, [a, b, c])
             return rocdl.mfma_f32_32x32x8f16(v16f32_type, [a, b, c])
+
+        def mfma_acc(a, b, c):
+            """GEMM1's shape: 32x32x16 on CDNA4, 32x32x8 elsewhere."""
+            if const_expr(not USE_K16):
+                return mfma_acc_k8(a, b, c)
+            if const_expr(dtype_str == "bf16"):
+                return rocdl.mfma_f32_32x32x16_bf16(v16f32_type, [a, b, c])
+            return rocdl.mfma_f32_32x32x16_f16(v16f32_type, [a, b, c])
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_kv_v = fx.Index(seq_len_kv)
@@ -974,8 +999,11 @@ def build_flex_flash_bwd_dq_module(
                 # ==== GEMM2: dqᵀ[d, m] += kᵀ @ dsᵀ ====
                 for dc in range_constexpr(D_CHUNKS):
                     for ks in range_constexpr(DS_K_STEPS):
-                        kt_pack = Vec.load(mfma_pack_type, lds, [_kt_pack_idx(dc, ks, strip)])
-                        dq_accs[dc] = mfma_acc(kt_pack, ds_packs[ks], dq_accs[dc])
+                        # v4, not mfma_pack_type: this GEMM stays at 32x32x8 even on
+                        # CDNA4. See Note [the backward runs two MFMA shapes, and only
+                        # GEMM1 moves].
+                        kt_pack = Vec.load(v4f16_type, lds, [_kt_pack_idx(dc, ks, strip)])
+                        dq_accs[dc] = mfma_acc_k8(kt_pack, ds_packs[ks], dq_accs[dc])
 
             _yield_args = list(dq_accs)
             if const_expr(_pipe_kv):
@@ -1153,7 +1181,8 @@ def build_flex_flash_bwd_dkdv_module(
     the same accumulators. See     ``regrid_block_mask(..., walk="q")``.
     """
     gpu_arch = get_hip_arch()
-    LDS_LIMIT = arch_caps.require_caps(gpu_arch).lds_budget_bytes
+    CAPS = arch_caps.require_caps(gpu_arch)
+    LDS_LIMIT = CAPS.lds_budget_bytes
 
     if layout not in ("bshd", "bhsd"):
         raise ValueError(f"layout must be 'bshd' or 'bhsd', got {layout!r}")
@@ -1184,8 +1213,12 @@ def build_flex_flash_bwd_dkdv_module(
     BLOCK_SIZE = NUM_WAVES * _WARP_SIZE
     M_SUBTILES = BLOCK_M // 32
 
-    MFMA_LANE_K = 4
-    K_STEP = 8
+    # GEMM1 takes the wider CDNA4 shape; the p/ds GEMMs keep 32x32x8 because their packs
+    # are built four-at-a-time out of computed values. See Note [the backward runs two
+    # MFMA shapes, and only GEMM1 moves] in the dq builder above.
+    USE_K16 = CAPS.mfma_k16
+    MFMA_LANE_K = 8 if USE_K16 else 4
+    K_STEP = 16 if USE_K16 else 8
     K_STEPS = head_dim // K_STEP
     D_CHUNK = 32
     D_CHUNKS = head_dim // D_CHUNK
@@ -1317,8 +1350,9 @@ def build_flex_flash_bwd_dkdv_module(
         # See Note [the fast-math flags stop short of nnan and ninf].
         fm_fast = FASTMATH
         v4f16_type = Vec.make_type(4, elem_dtype)
+        v8f16_type = Vec.make_type(8, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
-        mfma_pack_type = v4f16_type
+        mfma_pack_type = v8f16_type if USE_K16 else v4f16_type
 
         def _fsub(a, b):
             return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
@@ -1326,12 +1360,21 @@ def build_flex_flash_bwd_dkdv_module(
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
 
-        def mfma_acc(a, b, c):
+        def mfma_acc_k8(a, b, c):
+            """32x32x8, for operands packed four at a time."""
             if const_expr(dtype_str == "bf16"):
                 a = Vec(a).bitcast(fx.Int16)
                 b = Vec(b).bitcast(fx.Int16)
                 return rocdl.mfma_f32_32x32x8bf16_1k(v16f32_type, [a, b, c])
             return rocdl.mfma_f32_32x32x8f16(v16f32_type, [a, b, c])
+
+        def mfma_acc(a, b, c):
+            """GEMM1's shape: 32x32x16 on CDNA4, 32x32x8 elsewhere."""
+            if const_expr(not USE_K16):
+                return mfma_acc_k8(a, b, c)
+            if const_expr(dtype_str == "bf16"):
+                return rocdl.mfma_f32_32x32x16_bf16(v16f32_type, [a, b, c])
+            return rocdl.mfma_f32_32x32x16_f16(v16f32_type, [a, b, c])
 
         seq_len_q_v = fx.Index(seq_len_q)
         seq_len_kv_v = fx.Index(seq_len_kv)
@@ -1794,14 +1837,17 @@ def build_flex_flash_bwd_dkdv_module(
                     # ==== GEMM2: dvᵀ[d, n] += doᵀ @ p, dkᵀ[d, n] += qᵀ @ ds ====
                     for dc in range_constexpr(D_CHUNKS):
                         for ks in range_constexpr(MS_K_STEPS):
+                            # v4, not mfma_pack_type: these GEMMs stay at 32x32x8 even on
+                            # CDNA4. See Note [the backward runs two MFMA shapes, and
+                            # only GEMM1 moves].
                             dot_pack = Vec.load(
-                                mfma_pack_type, lds, [_transposed_idx(LDS_DOT_BASE, dc, ks, m_sub)]
+                                v4f16_type, lds, [_transposed_idx(LDS_DOT_BASE, dc, ks, m_sub)]
                             )
                             qt_pack = Vec.load(
-                                mfma_pack_type, lds, [_transposed_idx(LDS_QT_BASE, dc, ks, m_sub)]
+                                v4f16_type, lds, [_transposed_idx(LDS_QT_BASE, dc, ks, m_sub)]
                             )
-                            dv_accs[dc] = mfma_acc(dot_pack, p_packs[ks], dv_accs[dc])
-                            dk_accs[dc] = mfma_acc(qt_pack, ds_packs[ks], dk_accs[dc])
+                            dv_accs[dc] = mfma_acc_k8(dot_pack, p_packs[ks], dv_accs[dc])
+                            dk_accs[dc] = mfma_acc_k8(qt_pack, ds_packs[ks], dk_accs[dc])
 
                 _yielded = dk_accs + dv_accs
                 if const_expr(_pipe_q):
