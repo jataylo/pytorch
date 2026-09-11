@@ -367,14 +367,28 @@ stays affordable across the whole head-dim ladder instead of stopping at head_di
 the ISA shows fewer VGPRs in `dq` and fewer spills at head_dim 256. The derivation came
 over from the forward's V operand unchanged, which is what made it tractable.
 
-`permlane_o_store` and `dma_to_lds_b128` are still forward-only. The store is the same
-derivation again — a lane and `lane ^ 32` hold adjacent four-element groups of the same
-output row in both directions — while the DMA is not: it is a loop restructuring with a
-second LDS buffer and its own barriers, where a race shows up as a wrong gradient on
-hardware we cannot run. Two narrower pieces sit here too: widening the `ds`/`p` GEMMs to
-K=16 needs `_kt_swizzle` re-derived for eight contiguous elements, and the K swizzle's
-conflict-freedom has never been re-derived for CDNA4's 64 LDS banks (it stays a permutation,
-so answers do not change). Build- and ISA-validatable only.
+`permlane_o_store` is written and **declined on evidence** rather than missing. The
+derivation came over from the forward again — a lane and `lane ^ 32` hold adjacent
+four-element groups of the same output row in both directions — and it halves the store
+count, but the ISA says it also costs 4–9 VGPRs and more spilling in the two kernels that
+already spill (`dkdv` at head_dim 256 goes 394 → 436 spilled). That trades a
+once-per-workgroup store against scratch traffic inside the loop, so it sits behind
+`enable_permlane_store`, default off, with both states build-tested; one measurement on a
+CDNA4 part settles it.
+
+`dma_to_lds_b128` is the one still open, and its blocker has *moved*. It used to be LDS —
+a DMA prefetch needs a second buffer per tile and four Q/DO orientations left `dkdv` nothing
+to double — which the transposing read has now freed. What blocks it now is verification:
+in the forward the DMA is a pipelining rewrite across sixteen interacting sites, including
+the row stride, the swizzle and the barrier placement, and a misplaced barrier there is a
+race that shows up as a wrong gradient on hardware we cannot run. It is also an optimisation
+over an overlap that already works, since `_pipe_kv` stages the next tile in registers and
+wins at every head dim.
+
+Two narrower pieces sit here too: widening the `ds`/`p` GEMMs to K=16 needs `_kt_swizzle`
+re-derived for eight contiguous elements, and the K swizzle's conflict-freedom has never
+been re-derived for CDNA4's 64 LDS banks (it stays a permutation, so answers do not change).
+Build- and ISA-validatable only.
 
 **4. RDNA4 (gfx1201).** Refused by capability, and what is missing is a kernel body rather
 than a gate: `require_caps` demands MFMA, and the lowering declines WMMA before a build is

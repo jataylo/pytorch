@@ -77,6 +77,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 
@@ -231,6 +232,92 @@ def _validate_mod_args(
         )
 
 
+def _make_acc_row_store(
+    *, dtype_str, elem_dtype, d_chunk, lane_div_32, permlane, buffer_ops
+):
+    """Write a [d, row] accumulator bank out to a row-major [row, d] tensor.
+
+    All three backward outputs share one accumulator map -- `j = row = lane % 32` and 16
+    slots walking d as `(lane // 32) * 4 + (s // 4) * 8 + s % 4` -- which is also the
+    forward's O map, so the store is written once here for dq, dk and dv rather than three
+    times. See the forward's copy for the lane algebra; the two must agree, because they
+    read the same accumulator layout out of the same MFMA shape.
+
+    Per-lane, a `dwordx2` covers four slots and takes four stores per 32-wide chunk. With
+    `permlane_o_store` a lane and its `lane ^ 32` partner hold two *adjacent* four-element
+    groups of the same output row, so one `permlane32_swap` per dword gathers 16 contiguous
+    d across the pair and each lane writes 8 of them as a single 128-bit store: half the
+    stores, with the bf16 conversion folded into `cvt_pk_bf16_f32`.
+    """
+    if not permlane:
+
+        def store(acc, chunk, row, idx_fn, rsrc):
+            for grp in range_constexpr(4):
+                r0 = grp * 4
+                vals = [
+                    fx.Float32(Vec(acc)[r0 + i]).to(elem_dtype)
+                    for i in range_constexpr(4)
+                ]
+                pack = Vec.from_elements(vals, elem_dtype).bitcast(fx.Int32)
+                out2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
+                d_col = (
+                    fx.Index(chunk * d_chunk)
+                    + lane_div_32 * fx.Index(4)
+                    + fx.Index(grp * 8)
+                )
+                buffer_ops.buffer_store(
+                    out2, rsrc, idx_fn(row, d_col) * fx.Index(2), offset_is_bytes=True
+                )
+
+        return store
+
+    pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    is_hi_half = ArithValue(lane_div_32 != fx.Index(0))
+
+    def _pack_2dw(acc, store_group):
+        # Four f32 slots -> two packed-16-bit dwords (lo = cols 0,1; hi = cols 2,3).
+        r_base = store_group * 4
+        if dtype_str == "bf16":
+            lo = rocdl.cvt_pk_bf16_f32(Vec(acc)[r_base], Vec(acc)[r_base + 1])
+            hi = rocdl.cvt_pk_bf16_f32(Vec(acc)[r_base + 2], Vec(acc)[r_base + 3])
+            return lo, hi
+        halves = [
+            fx.Float32(Vec(acc)[r_base + i]).to(elem_dtype) for i in range_constexpr(4)
+        ]
+        pack = Vec.from_elements(halves, elem_dtype).bitcast(fx.Int32)
+        return _raw(pack[0]), _raw(pack[1])
+
+    def _swap_halves(dw):
+        # permlane32_swap(a, b) -> (a.lo|b.lo, a.hi|b.hi); with a = b = dw the partner
+        # dword dw[lane ^ 32] is result[1] on low lanes and result[0] on high ones.
+        swapped = rocdl.permlane32_swap(pair_i32_ty, _raw(dw), _raw(dw), False, False)
+        lo_res = llvm.extractvalue(T.i32, swapped, [0])
+        hi_res = llvm.extractvalue(T.i32, swapped, [1])
+        return is_hi_half.select(lo_res, hi_res)
+
+    def store(acc, chunk, row, idx_fn, rsrc):
+        for g in range_constexpr(2):
+            d0_a, d1_a = _pack_2dw(acc, 2 * g)
+            d0_b, d1_b = _pack_2dw(acc, 2 * g + 1)
+            # low lanes: own group-2g cols 0-3 ++ partner's cols 4-7;
+            # high lanes: partner's group-(2g+1) cols 0-3 ++ own cols 4-7.
+            y0_a, y1_a = _swap_halves(d0_a), _swap_halves(d1_a)
+            y0_b, y1_b = _swap_halves(d0_b), _swap_halves(d1_b)
+            w0 = is_hi_half.select(y0_b, _raw(d0_a))
+            w1 = is_hi_half.select(y1_b, _raw(d1_a))
+            w2 = is_hi_half.select(_raw(d0_b), y0_a)
+            w3 = is_hi_half.select(_raw(d1_b), y1_a)
+            out4 = Vec.from_elements(
+                [fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32
+            )
+            d_col = fx.Index(chunk * d_chunk) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
+            buffer_ops.buffer_store(
+                out4, rsrc, idx_fn(row, d_col) * fx.Index(2), offset_is_bytes=True
+            )
+
+    return store
+
+
 def build_flex_flash_bwd_dq_module(
     num_heads,
     head_dim,
@@ -256,6 +343,7 @@ def build_flex_flash_bwd_dq_module(
     block_mask=False,
     has_dlse=False,
     enable_kv_gpfetch=None,
+    enable_permlane_store=None,
 ):
     """Build the ``dq`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DQ, AUX0..3, KVNB, KVI, B, S)``.
 
@@ -506,6 +594,30 @@ def build_flex_flash_bwd_dq_module(
     # against CDNA4's 64 banks, which is open for every LDS access here and not specific
     # to this one.
     USE_HW_TR = CAPS.lds_transpose_read
+    # Note [the fused output store is written but not taken]
+    #
+    # Both backward outputs read the same accumulator map as the forward's O store, so the
+    # forward's `permlane32_swap` + `cvt_pk_bf16_f32` form applies verbatim and halves the
+    # store count. It is off by default anyway, and the ISA is why. Against the
+    # transposing-read build on gfx950 it costs 4-9 VGPRs and *more* spilling in the two
+    # kernels that already spill: `dkdv` at head_dim 128 goes 60 -> 66 spilled, `dq` at 256
+    # 141 -> 157, `dkdv` at 256 394 -> 436. The fused form needs the lane's own two dwords
+    # and its partner's live at once, and these kernels have no registers to spare.
+    #
+    # What that trades is a store that happens once per workgroup, after the loop, against
+    # scratch traffic inside it -- which on its face is the wrong direction, and the ISA is
+    # the only instrument available here because nothing runs on CDNA4. So the derivation
+    # is kept, build-verified, and behind a switch: one measurement on a CDNA4 part settles
+    # it, and until then "measured and declined" is a more useful state than either a blind
+    # landing or an empty gap.
+    USE_PERMLANE_STORE = (
+        CAPS.permlane_o_store
+        and (
+            os.getenv("FLYDSL_FLASH_ATTN_BWD_PERMLANE_STORE", "0") == "1"
+            if enable_permlane_store is None
+            else bool(enable_permlane_store)
+        )
+    )
 
     LDS_K_TILE = BLOCK_N * K_STRIDE
     LDS_KT_TILE = 0 if USE_HW_TR else HEAD_DIM * KT_STRIDE
@@ -1233,18 +1345,20 @@ def build_flex_flash_bwd_dq_module(
         # ---- Store dq ----
         # Accumulator is dqᵀ[d, m]: j = m = lane % 32, and the 16 slots walk d as
         # `(lane//32)*4 + (s//4)*8 + s%4`, so each group of 4 slots is 4 contiguous d and
-        # goes out as one dwordx2. Same map as the forward's O store; OOB rows drop on
-        # the num_records bound.
+        # goes out as one dwordx2 -- or, where `permlane_o_store` exists, as one 128-bit
+        # store per lane pair. Same map as the forward's O store; OOB rows drop on the
+        # num_records bound.
         dq_finals = [loop_results[dc] for dc in range_constexpr(D_CHUNKS)]
+        _store_row = _make_acc_row_store(
+            dtype_str=dtype_str,
+            elem_dtype=elem_dtype,
+            d_chunk=D_CHUNK,
+            lane_div_32=lane_div_32,
+            permlane=USE_PERMLANE_STORE,
+            buffer_ops=buffer_ops,
+        )
         for dc in range_constexpr(D_CHUNKS):
-            for grp in range_constexpr(4):
-                r0 = grp * 4
-                vals = [fx.Float32(Vec(dq_finals[dc])[r0 + i]).to(elem_dtype) for i in range_constexpr(4)]
-                pack = Vec.from_elements(vals, elem_dtype).bitcast(fx.Int32)
-                out2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
-                d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                g_idx = global_idx_q(q_row, d_col)
-                buffer_ops.buffer_store(out2, dq_rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
+            _store_row(dq_finals[dc], dc, q_row, global_idx_q, dq_rsrc)
 
     @flyc.jit
     def launch_flex_flash_bwd_dq(
@@ -1367,6 +1481,7 @@ def build_flex_flash_bwd_dkdv_module(
     block_mask=False,
     has_dlse=False,
     enable_q_gpfetch=None,
+    enable_permlane_store=None,
 ):
     """Build the ``dk``/``dv`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DK, DV, AUX0..3, QNB, QI, B, S)``.
 
@@ -1543,6 +1658,15 @@ def build_flex_flash_bwd_dkdv_module(
     # one, and it is why `_pipe_q` is off below head_dim 160 and why head_dim 256 runs at
     # one workgroup per CU.
     USE_HW_TR = CAPS.lds_transpose_read
+    # See Note [the fused output store is written but not taken] in the dq builder.
+    USE_PERMLANE_STORE = (
+        CAPS.permlane_o_store
+        and (
+            os.getenv("FLYDSL_FLASH_ATTN_BWD_PERMLANE_STORE", "0") == "1"
+            if enable_permlane_store is None
+            else bool(enable_permlane_store)
+        )
+    )
 
     LDS_Q_TILE = BLOCK_M * Q_STRIDE
     LDS_DO_TILE = BLOCK_M * DO_STRIDE
@@ -2276,9 +2400,18 @@ def build_flex_flash_bwd_dkdv_module(
         # ---- Store dk and dv ----
         # Accumulators are dkᵀ/dvᵀ[d, n]: j = n = lane % 32, 16 slots walking d as
         # `(lane//32)*4 + (s//4)*8 + s%4`, so each group of 4 slots is 4 contiguous d and
-        # goes out as one dwordx2. Rows past seq_len_q drop on the num_records bound.
+        # goes out as one dwordx2 -- or one fused 128-bit store per lane pair where
+        # `permlane_o_store` exists. Rows past seq_len_q drop on the num_records bound.
         dk_finals = [carried[i] for i in range_constexpr(D_CHUNKS)]
         dv_finals = [carried[D_CHUNKS + i] for i in range_constexpr(D_CHUNKS_V)]
+        _store_row = _make_acc_row_store(
+            dtype_str=dtype_str,
+            elem_dtype=elem_dtype,
+            d_chunk=D_CHUNK,
+            lane_div_32=lane_div_32,
+            permlane=USE_PERMLANE_STORE,
+            buffer_ops=buffer_ops,
+        )
         # dk is written at the QK extent and dv at the V extent, so each gets its own
         # chunk count and its own index function.
         for acc_list, rsrc, n_chunks, idx_fn in (
@@ -2286,17 +2419,7 @@ def build_flex_flash_bwd_dkdv_module(
             (dv_finals, dv_rsrc, D_CHUNKS_V, global_idx_v),
         ):
             for dc in range_constexpr(n_chunks):
-                for grp in range_constexpr(4):
-                    r0 = grp * 4
-                    vals = [
-                        fx.Float32(Vec(acc_list[dc])[r0 + i]).to(elem_dtype)
-                        for i in range_constexpr(4)
-                    ]
-                    pack = Vec.from_elements(vals, elem_dtype).bitcast(fx.Int32)
-                    out2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
-                    d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                    g_idx = idx_fn(kv_row, d_col)
-                    buffer_ops.buffer_store(out2, rsrc, g_idx * fx.Index(2), offset_is_bytes=True)
+                _store_row(acc_list[dc], dc, kv_row, idx_fn, rsrc)
 
     @flyc.jit
     def launch_flex_flash_bwd_dkdv(

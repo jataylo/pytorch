@@ -1050,6 +1050,45 @@ class TestFlyDSLFlexAttention(TestCase):
                 tgt_dkdv * 2, host_dkdv, f"dkdv at head_dim {head_dim}"
             )
 
+    def test_backward_fused_output_store_is_written_but_off(self):
+        """It is declined on evidence, not missing, so both states have to build.
+
+        The forward's `permlane32_swap` + `cvt_pk_bf16_f32` store applies verbatim to dq
+        and dk/dv -- same accumulator map -- and halves the store count. The ISA says it
+        also costs 4-9 VGPRs and more spilling in the kernels that already spill, trading a
+        once-per-workgroup store against scratch traffic inside the loop, so the default is
+        off. What this pins is that the switch is the only thing deciding it: off it must
+        build everywhere including gfx942, and on it must still build for a gfx950 target,
+        or the declined path would rot into an unbuildable one.
+        """
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_bwd_generic import (
+            build_flex_flash_bwd_dkdv_module,
+            build_flex_flash_bwd_dq_module,
+        )
+
+        def build(arch, **kwargs):
+            with mock.patch.dict(os.environ, {"FLYDSL_GPU_ARCH": arch}):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    return [
+                        build_flex_flash_bwd_dq_module(
+                            num_heads=H, head_dim=D, dtype_str="bf16",
+                            layout="bhsd", block_n=32, **kwargs,
+                        ),
+                        build_flex_flash_bwd_dkdv_module(
+                            num_heads=H, head_dim=D, dtype_str="bf16",
+                            layout="bhsd", block_m=32, **kwargs,
+                        ),
+                    ]
+
+        # gfx942 has no such instruction, so asking for it must not change the build --
+        # the capability gates it before the switch does.
+        off = [m.smem_bytes for m in build("gfx942")]
+        forced = [m.smem_bytes for m in build("gfx942", enable_permlane_store=True)]
+        self.assertEqual(off, forced)
+        # And on gfx950 both states lower.
+        build("gfx950", enable_permlane_store=False)
+        build("gfx950", enable_permlane_store=True)
+
     def test_gfx950_keeps_the_wider_backward_q_tile_all_the_way_up(self):
         """The saved LDS has to reach the tile filter, or it buys nothing.
 

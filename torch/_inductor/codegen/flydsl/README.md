@@ -525,7 +525,49 @@ the wrong way, 56 → 60 spilled, and its `ds_read` count rises across the board
 compiler trading LDS re-reads for scratch traffic, which is the right direction but is a
 guess about its reasoning rather than a measurement.
 
-The remaining backward gaps are `permlane_o_store` and `dma_to_lds_b128`.
+**`permlane_o_store` is written for the backward and deliberately not taken.** The forward's
+fused store applies verbatim to `dq` and `dk`/`dv`, because all three read the same
+accumulator map — `j = row = lane % 32`, 16 slots walking d as
+`(lane // 32) * 4 + (s // 4) * 8 + s % 4` — so a lane and its `lane ^ 32` partner hold two
+*adjacent* four-element groups of the same output row, and one `permlane32_swap` per dword
+gathers 16 contiguous d across the pair for a single 128-bit store each. That halves the
+store count. Against the transposing-read build on gfx950 it also costs 4–9 VGPRs and more
+spilling in the two kernels that already spill:
+
+| kernel | head_dim | VGPRs | spilled |
+| --- | --- | --- | --- |
+| `dq` | 64 | 138 → 142 | 0 → 0 |
+| `dkdv` | 64 | 240 → 244 | 0 → 0 |
+| `dq` | 128 | 223 → 232 | 0 → 0 |
+| `dkdv` | 128 | 256 → 256 | 60 → **66** |
+| `dq` | 256 | 256 → 256 | 141 → **157** |
+| `dkdv` | 256 | 256 → 256 | 394 → **436** |
+
+The fused form needs the lane's own two dwords and its partner's live at once, and these
+kernels have nothing to spare. What it trades is a store that happens once per workgroup,
+after the loop, against scratch traffic inside it — which on its face is the wrong
+direction, and the ISA is the only instrument here because nothing runs on CDNA4. So it
+sits behind `enable_permlane_store` (env `FLYDSL_FLASH_ATTN_BWD_PERMLANE_STORE`), default
+off, with both states build-tested. One measurement on a CDNA4 part settles it.
+
+**`dma_to_lds_b128` in the backward is the one gap still open**, and what blocks it has
+moved. It used to be LDS: a DMA prefetch needs a second buffer per tile, and holding four
+Q/DO orientations left `dkdv` nothing to double. The transposing read freed exactly that, so
+the footprint is no longer the obstacle. What is, is verification. In the forward the DMA is
+not an instruction swap but a pipelining rewrite across sixteen interacting sites — it
+changes the row stride and the swizzle (the DMA writes LDS contiguously from a lane's linear
+id, so the store side cannot swizzle), adds a buffer, restructures the loop and moves the
+`sched_group_barrier` placement. A misplaced barrier there is a race, and a race in these
+kernels is a wrong *gradient* — invisible to everything runnable here, since gfx942 does not
+take the path and a gfx950 target only builds. It is also an optimisation over an overlap
+that already works rather than a missing function: `_pipe_kv` stages the next tile in
+registers and wins at every head dim on gfx942, and nothing stops it on gfx950.
+
+A note on reproducibility, found while checking the store change. Gradients from these
+kernels are *not* bit-stable across recompilation: adding a bare comment to the kernel body
+moves five of 524288 elements by one bf16 ULP, because fast-math lets LLVM reassociate a
+differently scheduled accumulation. Bit-identity claims elsewhere on this branch are between
+runs of the *same* binary, which is a different and much weaker statement.
 
 And **the K swizzle was derived against 32 LDS banks**, which CDNA4 doubles to 64. It is a
 permutation either way, so answers do not change, but its conflict-freedom has not been
