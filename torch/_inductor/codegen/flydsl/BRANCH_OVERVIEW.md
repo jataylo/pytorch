@@ -510,6 +510,9 @@ aligned. Documented above, not forgotten.
 | `eb417cec30a` | Stop padding a decode shape into a 128-row Q tile |
 | `1dcfca379e8` | Copy a 0-d CPU capture instead of refusing it |
 | `b5358946953` | Give the GQA group one Q tile instead of one each |
+| `5676411895b` | Take the transposing LDS read in the backward |
+| `b83b98f211b` | Write the backward's fused output store, and decline it |
+| `60e9289831f` | Pad the K row at the taller tile, and name the deficit correctly |
 
 ## Further reading
 
