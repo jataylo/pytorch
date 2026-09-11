@@ -563,6 +563,7 @@ Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output(
 `kernel_options={"DKDV_TILE": (kv, q)}` pins the backward's dk/dv tile;
 `kernel_options={"BLOCK_M": n}` pins the forward's Q tile;
 `kernel_options={"ENABLE_KV_GPFETCH": bool}` pins the forward's K staging;
+`kernel_options={"PACK_GQA": bool}` pins whether the GQA group shares a Q tile;
 `kernel_options={"LAYOUT": "bhsd"|"bshd"}` pins which layout the kernel indexes, which is
 otherwise read off the strides of q/k/v (and `do`) so that nothing has to be copied.
 
@@ -583,6 +584,43 @@ the workgroup size had been written as "256 below 128 rows, else 512", which hap
 as the relation it always was, `BLOCK_M // 32` waves, 64 becomes expressible. 64 is the floor
 rather than 32 because a wave owns 32 rows, one per lane, and FlyDSL rejects a 64-thread
 workgroup, so a one-wave kernel is not a thing this body can be.
+
+## Packing the GQA group into the Q tile
+
+`kernel_options={"PACK_GQA": True|False}`, otherwise on whenever it is legal and `Sq <= 64`.
+
+A 64-row tile is still 63 rows of padding for a one-row Q sequence, and that bill was being
+paid once per Q *head* even though a GQA group's heads share a KV head and therefore share
+the whole KV walk. Packed, one block serves a KV head and the tile's rows are `(q_token,
+q_head_in_group)` pairs, so the same padded work happens `G` times less often and the grid
+shrinks by `G`. The row map is `row = token * G + head_in_group` rather than the other way
+round, so both halves are a shift and a mask: `G` is a compile-time constant and `Sq` is not,
+and the other layout would need a runtime divide per lane.
+
+Everything downstream follows from `q_head_idx` becoming per-lane, which the index helpers
+and the mod site already accept because they close over it as a value. Two things do not:
+
+- The **O store** had leaned on `o_rsrc`'s `num_records` to drop a partial tile's rows. A
+  packed row past `seq_len` is not past the bound any more — it is a valid address in the
+  *next* head of the group — so the store is predicated on the row instead. The LSE store
+  already was.
+- The **`num_records` bound** is a property of the buffer descriptor and so has to be
+  workgroup-uniform, while `slice_q` is per-lane once packed. It is therefore taken at the
+  *last* head of the group. An earlier head's out-of-range rows are then in bounds and read
+  the next head's data, which is harmless — every lane owns its own row, and the only
+  cross-lane reduction is the half-wave `xor` shuffle, where lanes 0–31 and 32–63 hold the
+  *same* rows.
+
+Packing is mutually exclusive with `block_mask`: a BlockMask is regridded per
+`(b, h, q_tile)` and cannot describe a tile that spans heads. It also needs `G` to divide the
+tile, so a group of 3 never packs at the 64/128/256 heights the forward offers.
+
+Because it is a pure remapping the test bar is *bit-identical* output and LSE against the
+unpacked kernel, not a tolerance, across seven shapes including partial and multiple packed
+tiles and MQA. On `(1, 8192)` D128 it measured 1.00x at grids that already fit in the 80 CUs
+and up to 4.70x where they did not, and never lost — so it is a rule rather than an autotune
+choice. It is asked only of short Q sequences because at prefill the packed and unpacked
+grids are the same size and there is nothing to win.
 
 ## Staging KV through registers
 

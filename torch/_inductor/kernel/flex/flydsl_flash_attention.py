@@ -592,12 +592,11 @@ def create_flex_flydsl_attention_kernel(
     error: NotImplementedError | None = None
     vec_sizes = _mod_vec_sizes(kernel_options, has_mod=has_score_mod or has_mask_mod)
     prefetch_depths = _qk_prefetch_depths(kernel_options)
+    # Hinted: the tile height and the packing flag are compile-time constants, so a sympy
+    # extent here would make the short-sequence tests symbolic Booleans.
+    seq_len_q_hint = V.graph.sizevars.optimization_hint(seq_len_q)
     block_ms = _forward_block_ms(
-        kernel_options,
-        num_heads=num_heads,
-        # Hinted: the tile height is a compile-time constant, so a sympy extent here would
-        # make the short-sequence test a symbolic Boolean.
-        seq_len_q=V.graph.sizevars.optimization_hint(seq_len_q),
+        kernel_options, num_heads=num_heads, seq_len_q=seq_len_q_hint
     )
     kv_gpfetches = _forward_kv_gpfetch(kernel_options)
     for mod_vec_size, qk_prefetch_depth, block_m, kv_gpfetch in itertools.product(
@@ -622,6 +621,14 @@ def create_flex_flydsl_attention_kernel(
                 QK_PREFETCH_DEPTH=qk_prefetch_depth,
                 LAYOUT=layout_str,
                 BLOCK_M=block_m,
+                PACK_GQA=_pack_gqa(
+                    kernel_options,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    block_m=block_m,
+                    seq_len_q=seq_len_q_hint,
+                    use_block_mask=use_block_mask,
+                ),
                 ENABLE_KV_GPFETCH=kv_gpfetch,
                 USE_BLOCK_MASK=use_block_mask,
                 HAS_FULL_BLOCKS=use_block_mask and has_full_blocks,
@@ -1195,6 +1202,60 @@ def _forward_block_ms(
         # Matches flex_flash_generic's own default, so an autotune-off build is unchanged.
         return [256 if num_heads >= 32 else 128]
     return [128, 256]
+
+
+def _pack_gqa(
+    kernel_options: dict[str, Any],
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    block_m: int,
+    seq_len_q: int,
+    use_block_mask: bool,
+) -> bool:
+    """Whether to give the whole GQA group one Q tile instead of one each.
+
+    A decode shape has one Q row and the shortest tile the kernel can express has 64, so
+    63 rows of MFMA are padding -- and that bill is paid once per Q head even though the
+    group's heads share a KV head and therefore share the entire KV walk. Packing spends
+    the tile on ``(token, head_in_group)`` pairs instead, so the same padded work happens
+    G times less often and the grid shrinks by G. See Note [packing the GQA group into the
+    Q tile] in ``flex_flash_generic.py`` for what that costs inside the kernel.
+
+    Measured on (1, 8192) D128 bf16, kernel-only, against the unpacked kernel at the same
+    64-row tile:
+
+        heads      grid unpacked -> packed     unpacked    packed
+        1x8/1                  8 -> 1            568 us    567 us   1.00x
+        1x32/8                32 -> 8            575 us    569 us   1.01x
+        4x32/8               128 -> 32           693 us    570 us   1.22x
+        8x32/8               256 -> 64          1374 us    572 us   2.40x
+        8x64/8               512 -> 64          2707 us    576 us   4.70x
+        16x32/8              512 -> 128         2668 us    664 us   4.02x
+
+    So it is not a trade: packing is free where it does not help and worth up to 4.7x
+    where it does. The two regimes are visible in the grid column -- below the 80 CUs
+    there is idle machine to absorb the padded MFMA and the kernel is latency-bound on the
+    KV walk, which packing does not shorten; past that the padding is real time. Since
+    there is no shape where it loses, there is nothing here to autotune.
+
+    It is still asked only of short Q sequences. For a prefill shape the packed and
+    unpacked grids are the same size -- ``B*Hkv*ceil(Sq/(BLOCK_M/G))`` against
+    ``B*Hq*ceil(Sq/BLOCK_M)`` -- so packing has nothing to win (8x32/8 at Sq 64 measures
+    1.00x, as that predicts), and the prefill path is the tuned one.
+    """
+    requested = kernel_options.get("PACK_GQA")
+    group = num_heads // num_kv_heads
+    legal = group > 1 and block_m % group == 0 and not use_block_mask
+    if requested is not None:
+        if requested and not legal:
+            raise RuntimeError(
+                f"PACK_GQA needs a GQA group dividing BLOCK_M and no block mask, got "
+                f"num_heads {num_heads}, num_kv_heads {num_kv_heads}, BLOCK_M {block_m}, "
+                f"block_mask {use_block_mask}"
+            )
+        return bool(requested)
+    return legal and seq_len_q <= 64
 
 
 def _forward_kv_gpfetch(kernel_options: dict[str, Any]) -> list[bool]:

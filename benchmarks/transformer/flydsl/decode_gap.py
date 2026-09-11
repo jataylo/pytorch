@@ -8,17 +8,23 @@ hole. The deficit is against Triton's *decode* kernel; against Triton's prefill 
 the same shape, FlyDSL is still well ahead, and quoting only the first number would be as
 misleading as quoting only the second.
 
-This script is what found the first half of the answer. The FlyDSL column used to be *flat*
-from `Sq` 1 to 8 while Triton decode rose, because the autotuner picked `BLOCK_M=128` and a
-single query row was padded into a 128-row tile; the MFMA issue count follows the tile and
-not the rows in it, so the padding was the cost. A 64-row tile is now selected for `Sq <= 64`
-and the whole column moved 1.6x.
+This script found the answer, in two halves, and both were padding rather than anything
+exotic. The FlyDSL column used to be *flat* from `Sq` 1 to 8 while Triton decode rose,
+because the autotuner picked `BLOCK_M=128` and a single query row was padded into a 128-row
+tile; the MFMA issue count follows the tile and not the rows in it, so the padding was the
+cost. Selecting a 64-row tile for `Sq <= 64` moved the column 1.6x. That left the MHA row
+at 1.20x against the GQA rows at ~3x, and since MHA is the one shape with no group to pack,
+the difference *was* the packing: a group of 4 was streaming the same KV tile from 4
+workgroups and padding 63 of 64 rows in each. Giving the whole group one tile moved the GQA
+rows another 2.4x, to 1.27x at `(1, 8192)` and *0.96x* -- ahead of Triton decode -- by
+`Sq` 8.
 
-The column that matters now is the MHA row against the GQA ones. MHA is the shape with no
-group to pack, and it is nearly level with Triton decode (1.20x); the GQA rows sit at ~3x
-because a group of 4 streams the same KV tile from 4 workgroups that could be 1. That
-difference is the remaining work: pack the GQA group into the M tile, then split the KV axis
-for parallelism.
+What is left is the remaining 1.2-1.5x, and it is the KV axis. Every row here is within
+~1.5x now, and the shape of what remains is visible in the `Skv` 4096 row being *worse*
+(1.47x) than 8192 (1.27x): the grid is `B * Hkv` workgroups regardless of how long the KV
+walk is, so at 64 workgroups on 80 CUs there is idle machine that only a KV split can use,
+and the shorter the walk the more the fixed costs show. Triton decode splits KV; this does
+not.
 
 `--check` verifies the prefill kernel against eager at these shapes with a `score_mod`
 before timing anything, since a fast wrong answer is not a baseline.
@@ -38,7 +44,8 @@ from torch.nn.attention.flex_attention import flex_attention
 
 # Long KV against a handful of query rows, which is what a generation step looks like.
 # The MHA row (Hq == Hkv) is in deliberately: it is the one shape where a GQA group cannot
-# be packed into the M tile, so it isolates how much of the deficit the packing owns.
+# be packed into the M tile, so it isolates how much of the deficit the packing owns -- and
+# it is now the slowest row, which is the packing having taken the rest.
 SHAPES = [
     # B, Hq, Hkv, Sq, Skv, D
     (8, 32, 8, 1, 4096, 128),

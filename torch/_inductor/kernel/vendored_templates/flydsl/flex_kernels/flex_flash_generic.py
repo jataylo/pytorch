@@ -151,6 +151,7 @@ def build_flex_flash_generic_module(
     num_heads,
     head_dim,
     head_dim_v=None,
+    pack_gqa=False,
     causal=True,
     dtype_str="f16",
     sm_scale=None,
@@ -382,6 +383,44 @@ def build_flex_flash_generic_module(
     # GEMM2 reduces over the KV axis, not over either head dim, so this is untouched.
     PV_K_STEP = 16 if USE_K16 else 8
     PV_K_STEPS = K_SUB_N // PV_K_STEP  # 2 steps per sub-tile (K=16) or 4 (K=8)
+
+    # Note [packing the GQA group into the Q tile]
+    #
+    # A decode shape has one Q row and the tile has BLOCK_M of them. The padding is the
+    # cost, because the MFMA issue count follows the tile rather than the rows in it, and
+    # the smallest expressible tile is 64 rows -- so 63 of 64 rows are still wasted, once
+    # per Q head. Under GQA the group's heads share a KV head and therefore share the KV
+    # walk, so they can share the tile instead of each padding their own: one block per KV
+    # head rather than per Q head, with the tile's rows being `(token, head_in_group)`
+    # pairs. That does not fill the tile either, but it does the same padded work G times
+    # less often, and the workgroup count falls by G.
+    #
+    # Everything downstream follows from `q_head_idx` becoming a per-lane value rather
+    # than a workgroup-uniform one, which the index helpers already accept because they
+    # close over it -- and so does the mod site, where `_mod_h` was always passed as a
+    # value. Two things do not follow:
+    #
+    #   - The O store had leaned on `o_rsrc`'s num_records to drop a partial tile's rows.
+    #     A packed row past seq_len is no longer past the bound, it is a valid address in
+    #     the *next* head of the group, so the store is predicated instead.
+    #   - A BlockMask is regridded per `(b, h, q_tile)` and cannot describe a tile that
+    #     spans heads, so packing and `block_mask` are mutually exclusive.
+    PACK_GQA = bool(pack_gqa)
+    _gqa_group = num_heads // num_kv_heads
+    if PACK_GQA:
+        if _gqa_group < 2:
+            raise ValueError("pack_gqa needs a GQA group to pack (num_heads > num_kv_heads)")
+        if BLOCK_M % _gqa_group != 0:
+            raise ValueError(
+                f"pack_gqa needs block_m ({BLOCK_M}) divisible by the GQA group size "
+                f"({_gqa_group})"
+            )
+        if block_mask:
+            raise ValueError("pack_gqa cannot be combined with block_mask")
+    # Tokens of one head per tile, and the head axis of the grid. Both are BLOCK_M and
+    # NUM_HEADS_Q unpacked, which is what every existing build gets.
+    Q_TOKENS_PER_TILE = BLOCK_M // _gqa_group if PACK_GQA else BLOCK_M
+    GRID_HEADS = num_kv_heads if PACK_GQA else num_heads
 
     assert BLOCK_M % NUM_WAVES == 0
     # Not a tuning choice: the mod site, the causal compare and the O/LSE stores all read
@@ -757,17 +796,34 @@ def build_flex_flash_generic_module(
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
         # ---- Decompose block_id ----
-        # Each block computes one Q head (per batch, per Q-tile).
-        q_head_idx = block_id % NUM_HEADS_Q
-        batch_q_tile_id = block_id // NUM_HEADS_Q
-        num_q_tiles = (seq_len_q_v + BLOCK_M - 1) // BLOCK_M
+        # Unpacked: each block computes one Q head (per batch, per Q-tile). Packed: each
+        # block computes one *KV* head, and the tile's rows are the whole GQA group's rows
+        # for a run of tokens. See Note [packing the GQA group into the Q tile].
+        head_of_block = block_id % GRID_HEADS
+        batch_q_tile_id = block_id // GRID_HEADS
+        num_q_tiles = (seq_len_q_v + Q_TOKENS_PER_TILE - 1) // Q_TOKENS_PER_TILE
         q_tile_idx = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
-        q_start = q_tile_idx * BLOCK_M
-        # GQA/MQA: every GQA_GROUP_SIZE consecutive Q heads share one KV head.
-        # Use Python ternary (ast.IfExp) so FlyDSL's `if`-rewriter doesn't
-        # turn this into a dynamic dispatch and lose `kv_head_idx`.
-        kv_head_idx = q_head_idx if GQA_GROUP_SIZE == 1 else q_head_idx // GQA_GROUP_SIZE
+        q_start = q_tile_idx * Q_TOKENS_PER_TILE
+        if const_expr(PACK_GQA):
+            # `row = token_in_tile * G + g` rather than `g * tokens + token`, so both
+            # halves are a shift and a mask: G is a compile-time constant here, while
+            # seq_len is not, and the other layout would need a runtime divide per lane.
+            _row_in_tile = wave_q_offset + lane_mod_32
+            kv_head_idx = head_of_block
+            q_head_idx = (
+                head_of_block * GQA_GROUP_SIZE + _row_in_tile % GQA_GROUP_SIZE
+            )
+            q_row_in_tile = _row_in_tile // GQA_GROUP_SIZE
+        else:
+            q_head_idx = head_of_block
+            q_row_in_tile = wave_q_offset + lane_mod_32
+            # GQA/MQA: every GQA_GROUP_SIZE consecutive Q heads share one KV head.
+            # Use Python ternary (ast.IfExp) so FlyDSL's `if`-rewriter doesn't
+            # turn this into a dynamic dispatch and lose `kv_head_idx`.
+            kv_head_idx = (
+                q_head_idx if GQA_GROUP_SIZE == 1 else q_head_idx // GQA_GROUP_SIZE
+            )
 
         # ---- Cooperative load decomposition ----
         # Per tensor, since the lane-to-(row, col) map is a function of the row width.
@@ -1072,8 +1128,20 @@ def build_flex_flash_generic_module(
         if const_expr(BHSD):
             _k_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_K * 2))
             _v_nrec_bytes = _raw((slice_kv + seq_len_kv_v) * fx.Index(STRIDE_TOKEN_V * 2))
-            _q_nrec_bytes = _raw((slice_q + seq_len_q_v) * fx.Index(STRIDE_TOKEN_Q * 2))
-            _o_nrec_bytes = _raw((slice_o + seq_len_q_v) * fx.Index(STRIDE_TOKEN_O * 2))
+            # A num_records bound is a property of the buffer descriptor and so has to be
+            # workgroup-uniform, but `slice_q` is per-lane once the group is packed. The
+            # bound then belongs to the *last* head of the group, which is uniform: an
+            # earlier head's rows past seq_len are in bounds and read the next head's
+            # data, which is why the O store is predicated rather than left to this.
+            if const_expr(PACK_GQA):
+                _q_plane_end = (
+                    batch_idx * fx.Index(NUM_HEADS_Q)
+                    + (kv_head_idx + fx.Index(1)) * fx.Index(GQA_GROUP_SIZE)
+                ) * seq_len_q_v
+            else:
+                _q_plane_end = slice_q + seq_len_q_v
+            _q_nrec_bytes = _raw(_q_plane_end * fx.Index(STRIDE_TOKEN_Q * 2))
+            _o_nrec_bytes = _raw(_q_plane_end * fx.Index(STRIDE_TOKEN_O * 2))
         else:
             _k_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_K * 2))
             _v_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_kv_v * fx.Index(STRIDE_TOKEN_V * 2))
@@ -1176,7 +1244,7 @@ def build_flex_flash_generic_module(
         # ---- Preload Q^T B-operand packs once (register-resident) ----
         # B operand: j = lane_mod_32, k-subblock = lane_div_32*MFMA_LANE_K. Q is
         # num_records-bounded (q_rsrc) so OOB rows read 0 -- no q_in_bounds select.
-        q_row = q_start + wave_q_offset + lane_mod_32
+        q_row = q_start + q_row_in_tile
         q_row_i32 = fx.Int32(q_row)
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
@@ -1287,7 +1355,7 @@ def build_flex_flash_generic_module(
         # diagonal. BlockMask: walk this Q block's kv_indices list instead, so blocks
         # the mask proved empty are never loaded at all. That is where the sparsity win
         # comes from -- masking alone still pays for the tile.
-        _q_end = q_start + BLOCK_M
+        _q_end = q_start + Q_TOKENS_PER_TILE
         if const_expr(CAUSAL):
             kv_upper = fx.Index(ArithValue(_q_end < seq_len_kv_v).select(_q_end, seq_len_kv_v))
         else:
@@ -2026,6 +2094,13 @@ def build_flex_flash_generic_module(
         inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
         v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(D_CHUNKS)]
 
+        # Packed rows past seq_len are a valid address in the next head of the group, so
+        # `o_rsrc`'s num_records no longer drops them. Unpacked, this is the bound doing
+        # the same job explicitly, and the branch folds away.
+        _o_row_live = (
+            ArithValue(q_row < seq_len_q_v) if const_expr(PACK_GQA) else None
+        )
+
         if const_expr(USE_PERMLANE_OSTORE):
             # gfx950: 128-bit permlane-fused store (cvt_pk_bf16_f32 + permlane32_swap).
             pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
@@ -2065,7 +2140,11 @@ def build_flex_flash_generic_module(
                     o_pack = Vec.from_elements([fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32)
                     d_col = fx.Index(dc * D_CHUNK) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
                     o_global = global_idx_o(q_row, d_col)
-                    buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                    if const_expr(PACK_GQA):
+                        if _o_row_live:
+                            buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                    else:
+                        buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
         else:
             # gfx942 fallback (no permlane32_swap / cvt_pk_bf16_f32): each lane stores
             # its 16 cols as 4 dwordx2 groups via .to(elem_dtype); col map d_col =
@@ -2078,7 +2157,11 @@ def build_flex_flash_generic_module(
                     o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
                     d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
                     o_global = global_idx_o(q_row, d_col)
-                    buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                    if const_expr(PACK_GQA):
+                        if _o_row_live:
+                            buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                    else:
+                        buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
 
     @flyc.jit
     def launch_flex_flash_generic(
@@ -2105,8 +2188,10 @@ def build_flex_flash_generic_module(
 
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len_q)
-        num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
-        grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
+        # Packed: a tile holds Q_TOKENS_PER_TILE tokens of each of the group's heads, so
+        # one block covers the whole group and the head axis of the grid is the KV heads.
+        num_q_tiles = (sl_idx + Q_TOKENS_PER_TILE - 1) // Q_TOKENS_PER_TILE
+        grid_x = bs_idx * num_q_tiles * GRID_HEADS
 
         # No `no-nans-fp-math` here; see Note [the fast-math flags stop short of nnan and
         # ninf].

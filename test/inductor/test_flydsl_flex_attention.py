@@ -1815,6 +1815,138 @@ class TestFlyDSLFlexAttention(TestCase):
         rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
         self.assertLess(rel, 2e-2, f"BLOCK_M {block_m} disagrees with eager: {rel}")
 
+    def test_gqa_packing_is_asked_only_where_it_is_legal_and_pays(self):
+        """Packing is free where it does not help, so the rule is legality plus regime.
+
+        Legality is three conditions: there has to be a group to pack, it has to divide
+        the tile, and a BlockMask is regridded per ``(b, h, q_tile)`` and so cannot
+        describe a tile spanning heads. The regime is the short Q sequence -- at prefill
+        the packed and unpacked grids are the same size, so packing has nothing to win and
+        the prefill path is the tuned one.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import _pack_gqa
+
+        def packed(opts=None, *, num_heads=32, num_kv_heads=8, block_m=64,
+                   seq_len_q=1, use_block_mask=False):
+            return _pack_gqa(
+                opts or {},
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                block_m=block_m,
+                seq_len_q=seq_len_q,
+                use_block_mask=use_block_mask,
+            )
+
+        self.assertTrue(packed())
+        self.assertTrue(packed(block_m=128))
+        self.assertTrue(packed(num_kv_heads=1))  # MQA is a group of 32
+        self.assertTrue(packed(seq_len_q=64))
+        # Past the short-sequence floor, and where there is no group to pack.
+        self.assertFalse(packed(seq_len_q=65))
+        self.assertFalse(packed(num_kv_heads=32))
+        # A group of 3 does not divide a 64-row tile, and every tile height the forward
+        # offers is a multiple of 64, so these shapes simply do not pack.
+        self.assertFalse(packed(num_heads=12, num_kv_heads=4))
+        self.assertFalse(packed(use_block_mask=True))
+        # Overridable, but not into an illegal build: the kernel would raise anyway, and
+        # a refusal naming the reason beats a template failure.
+        self.assertTrue(packed({"PACK_GQA": True}, seq_len_q=4096))
+        self.assertFalse(packed({"PACK_GQA": False}))
+        for illegal in (
+            {"num_kv_heads": 32},
+            {"num_heads": 12, "num_kv_heads": 4},
+            {"use_block_mask": True},
+        ):
+            with self.assertRaises(RuntimeError):
+                packed({"PACK_GQA": True}, **illegal)
+
+    @parametrize(
+        "num_heads,num_kv_heads,seq_len_q,block_m",
+        [
+            (8, 2, 1, 64),     # decode, group 4
+            (8, 2, 3, 64),     # a partial packed tile
+            (8, 2, 17, 64),    # rows spilling past one tile
+            (8, 1, 5, 64),     # MQA, group 8
+            (8, 2, 129, 64),   # many packed tiles
+            (8, 2, 200, 128),  # taller tile
+            (12, 6, 7, 64),    # group 2 at a head count that is not a power of two
+        ],
+    )
+    def test_packed_gqa_matches_the_unpacked_kernel_bit_for_bit(
+        self, num_heads, num_kv_heads, seq_len_q, block_m
+    ):
+        """Packing reorders which rows share a tile and must change nothing else.
+
+        It is a pure remapping -- every lane still owns one Q row and the group already
+        shared the KV head -- so the bar is equality with the unpacked kernel rather than
+        a tolerance against eager. That is what catches the two things that do not follow
+        from the remapping: the O store's new row predicate, which replaces a num_records
+        bound that a packed row past seq_len no longer trips, and the num_records bound
+        itself, which has to be taken at the last head of the group to stay uniform.
+        """
+        torch.manual_seed(0)
+        head_dim = 64
+        q = torch.randn(B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+
+        results = {}
+        for pack in (False, True):
+            launcher = build_flex_flash_generic_module(
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                causal=False,
+                sm_scale=head_dim**-0.5,
+                dtype_str="bf16",
+                return_lse=True,
+                layout="bhsd",
+                block_m=block_m,
+                pack_gqa=pack,
+            )
+            out = torch.empty_like(q)
+            lse = torch.empty(
+                (B, num_heads, seq_len_q), device="cuda", dtype=torch.float32
+            )
+            run, _, _ = prepare(launcher, q, k, v, out=out, lse=lse)
+            run()
+            torch.cuda.synchronize()
+            results[pack] = (out.clone(), lse.clone())
+
+        self.assertEqual(results[True][0], results[False][0], atol=0, rtol=0)
+        self.assertEqual(results[True][1], results[False][1], atol=0, rtol=0)
+        # And the unpacked kernel is itself right, so equality is not two matching bugs.
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+        rel = (
+            (results[True][0].float() - ref.float()).norm() / ref.float().norm()
+        ).item()
+        self.assertLess(rel, 2e-2)
+
+    def test_packing_refuses_what_it_cannot_express(self):
+        """The builder's own guards, which the lowering is trusted not to reach."""
+        def build(**kwargs):
+            opts = dict(
+                num_heads=8,
+                num_kv_heads=2,
+                head_dim=64,
+                causal=False,
+                sm_scale=D**-0.5,
+                dtype_str="bf16",
+                layout="bhsd",
+                block_m=64,
+                pack_gqa=True,
+            )
+            opts.update(kwargs)
+            return build_flex_flash_generic_module(**opts)
+
+        with self.assertRaisesRegex(ValueError, "needs a GQA group"):
+            build(num_kv_heads=8)
+        with self.assertRaisesRegex(ValueError, "divisible by the GQA group"):
+            build(num_heads=12, num_kv_heads=4)
+        # A block-masked build needs a mask_mod of its own before it gets this far.
+        with self.assertRaisesRegex(ValueError, "cannot be combined with block_mask"):
+            build(block_mask=True, mask_mod=_causal, mod_key="causal")
+
     def test_both_kv_staging_strategies_are_offered(self):
         """Neither K staging strategy wins outright, so both have to reach the autotuner.
 

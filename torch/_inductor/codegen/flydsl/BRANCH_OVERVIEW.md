@@ -284,7 +284,7 @@ instruction sequence rather than reading the graph.
 
 | | theirs | ours |
 | --- | --- | --- |
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel.** Decode shapes are served correctly by the prefill kernel at 2.0–6.5x Triton decode's time (and 3.6x faster than Triton prefill) — see `UPSTREAM_PR_COMPARISON.md` |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but the prefill kernel now has the packed-GQA mapping and a short-Q tile: 1.20–1.47x Triton decode's time at `Sq` 1 and *ahead* of it by `Sq` 8 (14x faster than Triton prefill). The KV split is the remaining piece — see `UPSTREAM_PR_COMPARISON.md` |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, four shape families | **build and ISA only.** No CDNA4 silicon here; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection, `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` first-class in **both** directions | forward any admitted pair either order; **backward refuses** |
@@ -315,28 +315,38 @@ Roughly in value order. Two of these are closed rather than pending — they are
 because "we decided not to" and "we have not got to it" are different states and the
 difference is easy to lose.
 
-**1. A decode kernel** — specifically, GQA packing. The largest remaining gap, and the
-only item here that is both implementable and fully validatable on this hardware. It is
-also now half closed by accident: see [the decode section](UPSTREAM_PR_COMPARISON.md) and
-`benchmarks/transformer/flydsl/decode_gap.py`.
+**1. A decode kernel** — now down to the **KV split**. This was the largest remaining gap
+and it turned out not to need a decode kernel at all: both halves of the deficit were
+padding, and both are fixed. Decode shapes went from 2.0–6.5x Triton's dedicated decode
+kernel to **1.20–1.47x** at `Sq` 1, and are *ahead* of it by `Sq` 8. See [the decode
+section](UPSTREAM_PR_COMPARISON.md) and `benchmarks/transformer/flydsl/decode_gap.py`.
 
-Measuring it found that the deficit was mostly a *padded M tile* rather than a missing
-kernel. The autotuner picked a 128-row tile for a 1-row Q sequence, and since the MFMA
-issue count follows the tile rather than the rows in it, the padding was the cost. The
-workgroup size had been written as "256 below 128 rows, else 512", which excludes every
-height but those two; written as the relation it always was, a 64-row tile is expressible
-and the lowering now takes it whenever `Sq <= 64`. Uniform 1.6x, and MHA decode went from
-2.04x off Triton's dedicated decode kernel to **1.20x**.
+The first half was a *padded M tile*. The autotuner picked a 128-row tile for a 1-row Q
+sequence, and since the MFMA issue count follows the tile rather than the rows in it, the
+padding was the cost. The workgroup size had been written as "256 below 128 rows, else 512",
+which excludes every height but those two; written as the relation it always was, a 64-row
+tile is expressible and the lowering now takes it whenever `Sq <= 64`. Uniform 1.6x, and MHA
+decode went from 2.04x off Triton decode to 1.20x (`eb417cec30a`).
 
-What remains is the GQA half, and the MHA row is the control that isolates it: with a group
-size of 1 there is nothing to pack and we are nearly level, while the GQA rows sit at ~3x
-because the same KV tile is streamed by four workgroups that could be one. Packing the group
-into the M tile is a 4x cut in total padded work, which would put those rows under Triton
-decode. It is a new grid mapping rather than a new kernel body — rows become
-`(q_head_in_group, q_token)` pairs, so `q_head_idx` stops being workgroup-uniform, which is
-free at the mod site because `_mod_h` is already a value and `q_row` is already per-lane. The
-cost is the block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot describe
-a tile spanning heads. Then the KV split, for parallelism.
+The second half was the GQA group, and the MHA row is the control that isolated it: with a
+group size of 1 there is nothing to pack and we were already nearly level, while the GQA rows
+sat at ~3x because the same KV tile was streamed by four workgroups that could be one, each
+padding 63 of its 64 rows. Packing is a new grid mapping rather than a new kernel body — one
+block per *KV* head, with rows becoming `(q_token, q_head_in_group)` pairs — so `q_head_idx`
+stops being workgroup-uniform, which is free at the mod site because `_mod_h` is already a
+value and `q_row` is already per-lane. Two things did not follow: the O store had leaned on
+`num_records` to drop a partial tile's rows and a packed row past `seq_len` is now a valid
+address in the next head, so it is predicated; and the `num_records` bound is a descriptor
+property, so it is taken at the last head of the group to stay uniform. It also costs the
+block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot describe a tile
+spanning heads. Another 2.4x on the GQA rows, bit-identical to the unpacked kernel, and
+measured never to lose across six grid sizes — so it is a rule rather than an autotune
+choice.
+
+What is left is the KV split, which is what their `SPLIT_KV` mode is for. The residual's
+shape says so: `Skv` 4096 is *worse* (1.47x) than 8192 (1.27x), because the packed grid is
+`B * Hkv` workgroups however long the KV walk is, so at 64 workgroups on 80 CUs there is idle
+machine that only splitting KV can use.
 
 **2. ~~Asymmetric head dims in the backward.~~ Done** as of `6315ac61cfb`. Both directions
 now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients
@@ -443,6 +453,8 @@ aligned. Documented above, not forgotten.
 | `2762d65cd8d` | Rewrite "what is not done" as an ordered account of what is left |
 | `c3f9806b140` | Ground the RDNA4 assessment in the donor's actual layout |
 | `6315ac61cfb` | Serve `qk_head_dim != v_head_dim` in the backward |
+| `eb417cec30a` | Stop padding a decode shape into a 128-row Q tile |
+| `1dcfca379e8` | Copy a 0-d CPU capture instead of refusing it |
 
 ## Further reading
 
