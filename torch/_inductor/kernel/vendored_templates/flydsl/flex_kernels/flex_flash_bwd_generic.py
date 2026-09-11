@@ -486,18 +486,44 @@ def build_flex_flash_bwd_dq_module(
     KT_SWZ_MASK = BLOCK_N // 4 - 1
     KT_SWZ_DSHIFT = VEC_WIDTH.bit_length() - 1
 
+    # Note [the Kᵀ tile exists only to serve a read the hardware can do]
+    #
+    # GEMM2 (`dq = dsᵀᵀ k`) wants K with i = d and k = n, four contiguous n per lane --
+    # the transpose of how GEMM1 wants it. Without a transposing LDS read the only way to
+    # get that is to hold K twice, so `_store_k_row` writes a second [HEAD_DIM][BLOCK_N]
+    # copy element by element, and the tile costs `HEAD_DIM * BLOCK_N` extra elements.
+    #
+    # `ds_read_tr16_b64` reads the row-major copy in that layout directly. The forward
+    # already takes this for its V operand and the derivation carries over unchanged,
+    # because the operand shape is the same: the hardware transposes 4x4 within each
+    # 16-lane block, so a lane addressing `(row_base + tr_k_group, col_base +
+    # tr_col_sub * 4)` receives `A[i = col_base + lane % 32][k = row_base + e]`, which is
+    # exactly what `_kt_pack_idx` was computing out of the transposed copy.
+    #
+    # The row-major swizzle survives it. `col ^ ((row & ROWMASK) << 4)` only moves bits at
+    # or above 4, so the four contiguous columns a lane reads stay contiguous -- the same
+    # property that let GEMM1 widen to K=16. What is not re-derived is conflict-freedom
+    # against CDNA4's 64 banks, which is open for every LDS access here and not specific
+    # to this one.
+    USE_HW_TR = CAPS.lds_transpose_read
+
     LDS_K_TILE = BLOCK_N * K_STRIDE
-    LDS_KT_TILE = HEAD_DIM * KT_STRIDE
+    LDS_KT_TILE = 0 if USE_HW_TR else HEAD_DIM * KT_STRIDE
     LDS_V_TILE = BLOCK_N * V_STRIDE
     LDS_KT_BASE = LDS_K_TILE
     LDS_V_BASE = LDS_K_TILE + LDS_KT_TILE
     LDS_TOTAL = LDS_K_TILE + LDS_KT_TILE + LDS_V_TILE
     LDS_BYTES = LDS_TOTAL * 2
     if LDS_BYTES > LDS_LIMIT:
+        _tiles = (
+            "two KV tiles: K row-major, V"
+            if USE_HW_TR
+            else "three KV tiles: K row-major, Kᵀ, V"
+        )
         raise ValueError(
             f"qk head_dim {HEAD_DIM} with v head_dim {HEAD_DIM_V} at block_n {BLOCK_N} "
-            f"needs {LDS_BYTES} B of LDS against the {LDS_LIMIT} B limit (three KV tiles: "
-            "K row-major, Kᵀ, V). Halve block_n."
+            f"needs {LDS_BYTES} B of LDS against the {LDS_LIMIT} B limit ({_tiles}). "
+            "Halve block_n."
         )
 
     if waves_per_eu is None:
@@ -613,6 +639,25 @@ def build_flex_flash_bwd_dq_module(
         lane_mod_32 = lane % 32
         lane_div_32 = lane // 32
         wave_q_offset = wave_id * _ROWS_PER_WAVE
+
+        # ds_read_b64_tr_b16 lane decomposition, identical to the forward's: the hardware
+        # transposes 4x4 within each block of 16 lanes, so a lane names one row of the
+        # group (`tr_k_group`) and one four-column group of the sixteen (`tr_col_sub`,
+        # with `tr_col_half` picking which sixteen).
+        tr_k_group = (lane % 16) // 4
+        tr_col_sub = lane % 4
+        tr_col_half = (lane % 32) // 16
+
+        def ds_read_tr_v4f16(lds_elem_idx):
+            """Read v4f16 out of LDS with the hardware transpose applied.
+
+            `result[lane][e] = tile[row_base + e][col_base + (lane % 32)]` when the lane
+            addresses `(row_base + tr_k_group, col_base + tr_col_sub * 4)`, which is the
+            MFMA A-operand layout for i = column, k = row.
+            """
+            byte_offset = lds_elem_idx * 2 + lds_offset
+            ptr = buffer_ops.create_llvm_ptr(fx.Int64(byte_offset), address_space=3)
+            return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
 
         # ---- Block -> (batch, q head, q tile) ----
         q_head_idx = block_id % NUM_HEADS_Q
@@ -748,18 +793,25 @@ def build_flex_flash_bwd_dq_module(
             return vecs
 
         def _store_k_row(lds_row, k_vec):
-            """K into both orientations: row-major, and Kᵀ one element at a time.
+            """K row-major, and -- without a transposing read -- a second Kᵀ copy.
 
             Kᵀ: scalar stores, VEC_WIDTH of them, once per tile. The alternative is a
             strided scalar *read* per GEMM2 step, which happens D_CHUNKS * DS_K_STEPS
-            times as often.
+            times as often. Where the hardware can read the row-major copy transposed
+            there is no second copy at all -- see Note [the Kᵀ tile exists only to serve
+            a read the hardware can do].
             """
             swz = _k_swizzle(lds_row, load_col_base_k)
             Vec(k_vec).store(lds, [fx.Index(0) + lds_row * K_STRIDE + swz])
-            for _e in range_constexpr(VEC_WIDTH):
-                kt_d = load_col_base_k + fx.Index(_e)
-                kt_idx = fx.Index(LDS_KT_BASE) + kt_d * KT_STRIDE + _kt_swizzle(kt_d, lds_row)
-                Vec.from_elements([Vec(k_vec)[_e]], elem_dtype).store(lds, [kt_idx])
+            if const_expr(not USE_HW_TR):
+                for _e in range_constexpr(VEC_WIDTH):
+                    kt_d = load_col_base_k + fx.Index(_e)
+                    kt_idx = (
+                        fx.Index(LDS_KT_BASE)
+                        + kt_d * KT_STRIDE
+                        + _kt_swizzle(kt_d, lds_row)
+                    )
+                    Vec.from_elements([Vec(k_vec)[_e]], elem_dtype).store(lds, [kt_idx])
 
         def _store_v_row(lds_row, v_vec):
             swz = _v_swizzle(lds_row, load_col_base_v)
@@ -932,6 +984,25 @@ def build_flex_flash_bwd_dq_module(
             d_pos = fx.Index(dc * D_CHUNK) + lane_mod_32
             n_base = fx.Index(ks * DS_K_STEP + strip * K_SUB_N) + lane_div_32 * fx.Index(4)
             return fx.Index(LDS_KT_BASE) + d_pos * KT_STRIDE + _kt_swizzle(d_pos, n_base)
+
+        def _k_tr_pack_idx(dc, ks, strip):
+            """The same operand out of the row-major K tile, for the transposing read.
+
+            i = d is the column and k = n is the row, which is the transpose of how
+            GEMM1 reads this tile -- and the whole reason the Kᵀ copy existed.
+            """
+            n_row = (
+                fx.Index(ks * DS_K_STEP + strip * K_SUB_N)
+                + lane_div_32 * fx.Index(4)
+                + tr_k_group
+            )
+            d_col = fx.Index(dc * D_CHUNK) + tr_col_half * fx.Index(16) + tr_col_sub * fx.Index(4)
+            return fx.Index(0) + n_row * K_STRIDE + _k_swizzle(n_row, d_col)
+
+        def _read_k_pack(dc, ks, strip):
+            if const_expr(USE_HW_TR):
+                return ds_read_tr_v4f16(_k_tr_pack_idx(dc, ks, strip))
+            return Vec.load(v4f16_type, lds, [_kt_pack_idx(dc, ks, strip)]).ir_value()
 
         # ---- KV loop: dq accumulates over n, so the KV axis is the reduction ----
         # Dense, or this Q tile's block list. The list is already on this kernel's
@@ -1148,7 +1219,7 @@ def build_flex_flash_bwd_dq_module(
                         # v4, not mfma_pack_type: this GEMM stays at 32x32x8 even on
                         # CDNA4. See Note [the backward runs two MFMA shapes, and only
                         # GEMM1 moves].
-                        kt_pack = Vec.load(v4f16_type, lds, [_kt_pack_idx(dc, ks, strip)])
+                        kt_pack = Vec(_read_k_pack(dc, ks, strip))
                         dq_accs[dc] = mfma_acc_k8(kt_pack, ds_packs[ks], dq_accs[dc])
 
             _yield_args = list(dq_accs)
@@ -1465,10 +1536,18 @@ def build_flex_flash_bwd_dkdv_module(
     QT_SWZ_MASK = BLOCK_M // 4 - 1
     QT_SWZ_DSHIFT = VEC_WIDTH.bit_length() - 1
 
+    # Where the hardware can read a row-major tile transposed, the two transposed copies
+    # do not exist and the footprint halves -- see Note [the Kᵀ tile exists only to serve
+    # a read the hardware can do], which is the same argument with Q/DO for K. This is the
+    # kernel where it matters most: four orientations is what makes `dkdv` the LDS-bound
+    # one, and it is why `_pipe_q` is off below head_dim 160 and why head_dim 256 runs at
+    # one workgroup per CU.
+    USE_HW_TR = CAPS.lds_transpose_read
+
     LDS_Q_TILE = BLOCK_M * Q_STRIDE
     LDS_DO_TILE = BLOCK_M * DO_STRIDE
-    LDS_QT_TILE = HEAD_DIM * QT_STRIDE
-    LDS_DOT_TILE = HEAD_DIM_V * QT_STRIDE
+    LDS_QT_TILE = 0 if USE_HW_TR else HEAD_DIM * QT_STRIDE
+    LDS_DOT_TILE = 0 if USE_HW_TR else HEAD_DIM_V * QT_STRIDE
     LDS_Q_BASE = 0
     LDS_DO_BASE = LDS_Q_TILE
     LDS_QT_BASE = LDS_Q_TILE + LDS_DO_TILE
@@ -1476,10 +1555,15 @@ def build_flex_flash_bwd_dkdv_module(
     LDS_TOTAL = LDS_Q_TILE + LDS_DO_TILE + LDS_QT_TILE + LDS_DOT_TILE
     LDS_BYTES = LDS_TOTAL * 2
     if LDS_BYTES > LDS_LIMIT:
+        _tiles = (
+            "two Q/DO tiles, row-major only"
+            if USE_HW_TR
+            else "four Q/DO tiles, each orientation"
+        )
         raise ValueError(
             f"qk head_dim {HEAD_DIM} with v head_dim {HEAD_DIM_V} at block_m {BLOCK_M} "
             f"needs {LDS_BYTES} B of LDS against "
-            f"the {LDS_LIMIT} B limit (four Q/DO tiles, each orientation). Halve block_m."
+            f"the {LDS_LIMIT} B limit ({_tiles}). Halve block_m."
         )
 
     if waves_per_eu is None:
@@ -1580,6 +1664,17 @@ def build_flex_flash_bwd_dkdv_module(
         lane_mod_32 = lane % 32
         lane_div_32 = lane // 32
         wave_n_offset = wave_id * _ROWS_PER_WAVE
+
+        # ds_read_b64_tr_b16 lane decomposition; see `dq`'s copy for the derivation.
+        tr_k_group = (lane % 16) // 4
+        tr_col_sub = lane % 4
+        tr_col_half = (lane % 32) // 16
+
+        def ds_read_tr_v4f16(lds_elem_idx):
+            """Read v4f16 out of LDS with the hardware transpose applied."""
+            byte_offset = lds_elem_idx * 2 + lds_offset
+            ptr = buffer_ops.create_llvm_ptr(fx.Int64(byte_offset), address_space=3)
+            return rocdl.ds_read_tr16_b64(v4f16_type, ptr).result
 
         # ---- Block -> (batch, kv head, kv tile) ----
         kv_head_idx = block_id % NUM_HEADS_KV
@@ -1715,22 +1810,24 @@ def build_flex_flash_bwd_dkdv_module(
             """
             swz = _q_swizzle(lds_row, load_col_base_q)
             Vec(q_vec).store(lds, [fx.Index(LDS_Q_BASE) + lds_row * Q_STRIDE + swz])
-            for _e in range_constexpr(VEC_WIDTH):
-                t_d = load_col_base_q + fx.Index(_e)
-                t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
-                Vec.from_elements([Vec(q_vec)[_e]], elem_dtype).store(
-                    lds, [fx.Index(LDS_QT_BASE) + t_off]
-                )
+            if const_expr(not USE_HW_TR):
+                for _e in range_constexpr(VEC_WIDTH):
+                    t_d = load_col_base_q + fx.Index(_e)
+                    t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
+                    Vec.from_elements([Vec(q_vec)[_e]], elem_dtype).store(
+                        lds, [fx.Index(LDS_QT_BASE) + t_off]
+                    )
 
         def _store_do_row(lds_row, do_vec):
             swz = _do_swizzle(lds_row, load_col_base_do)
             Vec(do_vec).store(lds, [fx.Index(LDS_DO_BASE) + lds_row * DO_STRIDE + swz])
-            for _e in range_constexpr(VEC_WIDTH):
-                t_d = load_col_base_do + fx.Index(_e)
-                t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
-                Vec.from_elements([Vec(do_vec)[_e]], elem_dtype).store(
-                    lds, [fx.Index(LDS_DOT_BASE) + t_off]
-                )
+            if const_expr(not USE_HW_TR):
+                for _e in range_constexpr(VEC_WIDTH):
+                    t_d = load_col_base_do + fx.Index(_e)
+                    t_off = t_d * QT_STRIDE + _qt_swizzle(t_d, lds_row)
+                    Vec.from_elements([Vec(do_vec)[_e]], elem_dtype).store(
+                        lds, [fx.Index(LDS_DOT_BASE) + t_off]
+                    )
 
         def coop_store_q_do_lds(q_vecs, do_vecs):
             for batch in range_constexpr(NUM_BATCHES_Q):
@@ -1872,6 +1969,47 @@ def build_flex_flash_bwd_dkdv_module(
             d_pos = fx.Index(dc * D_CHUNK) + lane_mod_32
             m_base = fx.Index(ks * MS_K_STEP + m_sub * 32) + lane_div_32 * fx.Index(4)
             return fx.Index(region_base) + d_pos * QT_STRIDE + _qt_swizzle(d_pos, m_base)
+
+        def _tr_row_major_idx(region_base, dc, ks, m_sub, row_stride, swizzle):
+            """The same operand out of the row-major tile, for the transposing read.
+
+            i = d is the column and k = m is the row. The stride and swizzle are
+            arguments for the same reason `_row_major_idx` takes them: Q's row is
+            HEAD_DIM wide and DO's is HEAD_DIM_V.
+            """
+            m_row = (
+                fx.Index(ks * MS_K_STEP + m_sub * 32)
+                + lane_div_32 * fx.Index(4)
+                + tr_k_group
+            )
+            d_col = (
+                fx.Index(dc * D_CHUNK)
+                + tr_col_half * fx.Index(16)
+                + tr_col_sub * fx.Index(4)
+            )
+            return fx.Index(region_base) + m_row * row_stride + swizzle(m_row, d_col)
+
+        def _read_qt_pack(dc, ks, m_sub):
+            if const_expr(USE_HW_TR):
+                return ds_read_tr_v4f16(
+                    _tr_row_major_idx(
+                        LDS_Q_BASE, dc, ks, m_sub, Q_STRIDE, _q_swizzle
+                    )
+                )
+            return Vec.load(
+                v4f16_type, lds, [_transposed_idx(LDS_QT_BASE, dc, ks, m_sub)]
+            ).ir_value()
+
+        def _read_dot_pack(dc, ks, m_sub):
+            if const_expr(USE_HW_TR):
+                return ds_read_tr_v4f16(
+                    _tr_row_major_idx(
+                        LDS_DO_BASE, dc, ks, m_sub, DO_STRIDE, _do_swizzle
+                    )
+                )
+            return Vec.load(
+                v4f16_type, lds, [_transposed_idx(LDS_DOT_BASE, dc, ks, m_sub)]
+            ).ir_value()
 
         # ---- Q loop, wrapped in the GQA group ----
         # dk/dv for one KV head is the sum over every Q head sharing it, so the group is
@@ -2116,15 +2254,11 @@ def build_flex_flash_bwd_dkdv_module(
                     # GEMM1 moves].
                     for dc in range_constexpr(D_CHUNKS_V):
                         for ks in range_constexpr(MS_K_STEPS):
-                            dot_pack = Vec.load(
-                                v4f16_type, lds, [_transposed_idx(LDS_DOT_BASE, dc, ks, m_sub)]
-                            )
+                            dot_pack = Vec(_read_dot_pack(dc, ks, m_sub))
                             dv_accs[dc] = mfma_acc_k8(dot_pack, p_packs[ks], dv_accs[dc])
                     for dc in range_constexpr(D_CHUNKS):
                         for ks in range_constexpr(MS_K_STEPS):
-                            qt_pack = Vec.load(
-                                v4f16_type, lds, [_transposed_idx(LDS_QT_BASE, dc, ks, m_sub)]
-                            )
+                            qt_pack = Vec(_read_qt_pack(dc, ks, m_sub))
                             dk_accs[dc] = mfma_acc_k8(qt_pack, ds_packs[ks], dk_accs[dc])
 
                 _yielded = dk_accs + dv_accs

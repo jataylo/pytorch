@@ -465,7 +465,7 @@ builders take their instruction selection and LDS budget from the same entry.
 | Matrix core | MFMA | MFMA |
 | LDS per workgroup | 65536 B | 163840 B |
 | DMA-to-LDS | 4 B only, so unused | 16 B (`buffer_load_dwordx4_lds`) |
-| Transposing LDS read | no, Vᵀ is staged in LDS | `ds_read_tr16_b64` |
+| Transposing LDS read | no, a second transposed copy is staged in LDS | `ds_read_tr16_b64` |
 | MFMA32 K | 8 | 16 |
 | Fused O store | per-lane `dwordx2` | `permlane32_swap` + `cvt_pk_bf16_f32` |
 
@@ -498,10 +498,34 @@ to 32 (16 `v_mfma_f32_32x32x16_bf16` plus 16 `v_mfma_f32_32x32x8_bf16`), 256 VGP
 with no spill. `dkdv` at D128 keeps 256 VGPRs but drops from 76 spilled to 56. One config
 moves the wrong way — `dkdv` at D64 goes 216 to 244 VGPRs — and it still does not spill.
 
-The remaining backward gaps are `lds_transpose_read`, `permlane_o_store` and
-`dma_to_lds_b128`, all of which are LDS-layout changes rather than instruction selection:
-the transposing read would retire the Kᵀ and Qᵀ tiles outright, which is the largest single
-win left on CDNA4 and also the one that most changes the fragment maps.
+**The backward also takes `lds_transpose_read`,** which was the largest of the three
+remaining gaps and the one that changes the LDS layout most. Both kernels were holding a
+tile *twice*: `dq` keeps K row-major for GEMM1 (`sᵀ = k qᵀ`, reducing over head_dim) and a
+[HEAD_DIM][BLOCK_N] copy for GEMM2 (`dq = dsᵀᵀ k`, where d is the free axis and n the
+reduction), and `dkdv` does the same for both Q and dO. The second copy exists only because
+the two GEMMs want the same data with the index roles swapped, and it is written *element by
+element* — `VEC_WIDTH` scalar stores per row per tile.
+
+`ds_read_b64_tr_b16` reads the row-major copy in the swapped layout directly, and the
+derivation carries over from the forward's V operand unchanged, because the operand shape is
+the same: the hardware transposes 4×4 within each block of 16 lanes, so a lane addressing
+`(row_base + tr_k_group, col_base + tr_col_sub * 4)` receives
+`A[i = col_base + lane % 32][k = row_base + e]` — exactly what the transposed-copy read was
+computing. The row-major swizzle survives it for the same reason the K=16 widening did:
+`col ^ ((row & ROWMASK) << 4)` only moves bits at or above 4, so the four contiguous columns
+a lane reads stay contiguous.
+
+So the copies go, along with their stores. `dq` drops from three tiles to two and `dkdv`
+from four to two — a third and a half of the footprint, checked as an exact ratio at head
+dims 64/128/256 — and since `dkdv` is the LDS-bound kernel of the three, that is what keeps
+the wider Q tile affordable across the whole head-dim ladder rather than only to 128. The
+ISA agrees on registers: `dq` goes 146 → 138 VGPRs at D64 and 236 → 223 at D128, and spills
+fall at D256 (`dq` 163 → 141, `dkdv` 509 → 394). `dkdv` at D128 is the one config that moves
+the wrong way, 56 → 60 spilled, and its `ds_read` count rises across the board — the
+compiler trading LDS re-reads for scratch traffic, which is the right direction but is a
+guess about its reasoning rather than a measurement.
+
+The remaining backward gaps are `permlane_o_store` and `dma_to_lds_b128`.
 
 And **the K swizzle was derived against 32 LDS banks**, which CDNA4 doubles to 64. It is a
 permutation either way, so answers do not change, but its conflict-freedom has not been

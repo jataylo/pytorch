@@ -108,7 +108,7 @@ lowering; that is not in the pushed head.
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **any admitted pair, either order, in both directions** |
 | Upstreaming | in the review queue with `albanD` / `drisspg` requested | a local branch |
-| Backward CDNA4 | their backward is written for gfx950 throughout | ours takes `mfma_k16` in GEMM1 only; `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are still forward-only |
+| Backward CDNA4 | their backward is written for gfx950 throughout | ours takes `mfma_k16` in GEMM1 and `lds_transpose_read` in both kernels, which halves the `dkdv` LDS footprint; `permlane_o_store` and `dma_to_lds_b128` are still forward-only |
 
 The first two are the honest asymmetry. Decode is a whole feature we do not have and they
 have tuned, and it is the shape where their sparse numbers are strongest — a decode step is

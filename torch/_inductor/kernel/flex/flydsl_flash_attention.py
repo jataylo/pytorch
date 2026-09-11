@@ -103,6 +103,17 @@ def _lds_budget(arch: str | None) -> int:
     # Unknown archs never reach a tile choice; `_arch_supported` has already refused them.
     return caps.lds_budget_bytes if caps else arch_caps.caps_for("gfx942").lds_budget_bytes  # type: ignore[union-attr]
 
+
+def _holds_transposed_copies(arch: str | None) -> bool:
+    """Whether the backward's LDS tiles include a second, transposed copy.
+
+    They do unless the arch can read a row-major tile transposed, and the difference is
+    half the ``dkdv`` footprint -- so this has to be the same question the builders ask or
+    the lowering offers tiles they refuse (or, worse, withholds tiles they would take).
+    """
+    caps = arch_caps.caps_for(arch)
+    return not (caps.lds_transpose_read if caps else False)
+
 _SUPPORTED_DTYPES = frozenset({torch.bfloat16, torch.float16})
 
 _FLYDSL_DTYPE_STR = {
@@ -1014,7 +1025,9 @@ def _mod_vec_sizes(kernel_options: dict[str, Any], *, has_mod: bool) -> list[int
 # The two row-major tiles carry the same 8-element row padding the kernel adds wherever
 # the XOR swizzle cannot be expressed, so this has to know the same rule: undercounting
 # would offer a tile the builder then rejects.
-def _dkdv_lds_bytes(q_tile: int, qk_head_dim: int, v_head_dim: int) -> int:
+def _dkdv_lds_bytes(
+    q_tile: int, qk_head_dim: int, v_head_dim: int, *, transposed_copies: bool = True
+) -> int:
     def _padded(width: int) -> int:
         granules = width // 16
         return width + (0 if granules & (granules - 1) == 0 else 8)
@@ -1022,7 +1035,9 @@ def _dkdv_lds_bytes(q_tile: int, qk_head_dim: int, v_head_dim: int) -> int:
     # Q and DO are sized independently: Q's rows are the QK extent and DO's the V extent,
     # in both orientations. Equal dims give the same total as the symmetric form did.
     row_major = q_tile * (_padded(qk_head_dim) + _padded(v_head_dim))
-    transposed = q_tile * (qk_head_dim + v_head_dim)
+    # Where the hardware reads a row-major tile transposed there is no second copy, which
+    # halves this -- so the arch decides which tiles exist, not just which fit.
+    transposed = q_tile * (qk_head_dim + v_head_dim) if transposed_copies else 0
     return 2 * (row_major + transposed)
 
 
@@ -1051,12 +1066,23 @@ def _backward_tiles(
     tiles = [(128, 32)]
     if torch._inductor.config.flydsl.autotune_backward_tile:
         tiles += [(256, 32), (128, 64)]
-    # A q tile of 64 does not fit past head_dim 128, so past there the sweep is over the
-    # kv tile alone. The default (128, 32) fits the whole ladder: at head_dim 256 it lands
-    # on exactly the 65536 B both current arches budget. An asymmetric pair is filtered on
-    # the sum of the two extents, which is what the kernel actually spends.
-    budget = _lds_budget(_current_arch())
-    return [t for t in tiles if _dkdv_lds_bytes(t[1], qk_head_dim, v_head_dim) <= budget]
+    # A q tile of 64 does not fit past head_dim 128 on gfx942, so past there the sweep is
+    # over the kv tile alone. The default (128, 32) fits the whole ladder: at head_dim 256
+    # it lands on exactly the 65536 B gfx942 budgets. An asymmetric pair is filtered on
+    # the sum of the two extents, which is what the kernel actually spends. On an arch with
+    # a transposing LDS read the footprint halves, so the wider q tile stays available all
+    # the way up -- which is the point of the saving rather than a side effect of it.
+    arch = _current_arch()
+    budget = _lds_budget(arch)
+    transposed_copies = _holds_transposed_copies(arch)
+    return [
+        t
+        for t in tiles
+        if _dkdv_lds_bytes(
+            t[1], qk_head_dim, v_head_dim, transposed_copies=transposed_copies
+        )
+        <= budget
+    ]
 
 
 # Workgroups per compute unit below which backward block skipping stops paying, and can

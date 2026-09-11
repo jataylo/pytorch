@@ -358,15 +358,23 @@ all 49 admitted pairs fit gfx942 at `block_n=32`. What did bite was the autotune
 LDS filter, which computed its footprint from one head dim and so offered a `block_m` the
 builder then rejected. See the README's asymmetric section.
 
-**3. The three remaining CDNA4 capabilities in the backward.** `mfma_k16` is taken in GEMM1
-as of `158ac9c0685`. `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are
-still forward-only, and all three are LDS-layout changes rather than instruction selection.
-The transposing read is the big one: it would retire the Kᵀ and Qᵀ tiles outright, which is
-both the largest win left on CDNA4 and the change that most disturbs the fragment maps. Two
-narrower pieces sit here too — widening the `ds`/`p` GEMMs to K=16 needs `_kt_swizzle`
-re-derived for eight contiguous elements, and the K swizzle's conflict-freedom has never
-been re-derived for CDNA4's 64 LDS banks (it stays a permutation, so answers do not change).
-Build- and ISA-validatable only.
+**3. The remaining CDNA4 capabilities in the backward.** `mfma_k16` is taken in GEMM1 as of
+`158ac9c0685`, and `lds_transpose_read` — the big one — is now taken in both kernels. It
+retires the Kᵀ and Qᵀ/dOᵀ tiles outright: each existed only because two GEMMs wanted the
+same data with the index roles swapped, which `ds_read_b64_tr_b16` does in the read. `dq`
+drops from three LDS tiles to two and `dkdv` from four to two, so the wider backward Q tile
+stays affordable across the whole head-dim ladder instead of stopping at head_dim 128, and
+the ISA shows fewer VGPRs in `dq` and fewer spills at head_dim 256. The derivation came
+over from the forward's V operand unchanged, which is what made it tractable.
+
+`permlane_o_store` and `dma_to_lds_b128` are still forward-only. The store is the same
+derivation again — a lane and `lane ^ 32` hold adjacent four-element groups of the same
+output row in both directions — while the DMA is not: it is a loop restructuring with a
+second LDS buffer and its own barriers, where a race shows up as a wrong gradient on
+hardware we cannot run. Two narrower pieces sit here too: widening the `ds`/`p` GEMMs to
+K=16 needs `_kt_swizzle` re-derived for eight contiguous elements, and the K swizzle's
+conflict-freedom has never been re-derived for CDNA4's 64 LDS banks (it stays a permutation,
+so answers do not change). Build- and ISA-validatable only.
 
 **4. RDNA4 (gfx1201).** Refused by capability, and what is missing is a kernel body rather
 than a gate: `require_caps` demands MFMA, and the lowering declines WMMA before a build is

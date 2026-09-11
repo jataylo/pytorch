@@ -1009,6 +1009,82 @@ class TestFlyDSLFlexAttention(TestCase):
             "gfx950 built the same LDS footprint as gfx942; FLYDSL_GPU_ARCH did not apply",
         )
 
+    def test_gfx950_backward_stops_holding_transposed_copies(self):
+        """The transposing LDS read retires the Kᵀ and Qᵀ/DOᵀ tiles, which is the point.
+
+        Both backward kernels held a second copy of a tile purely so GEMM2 could read it
+        with the index roles swapped. `ds_read_b64_tr_b16` reads the row-major copy in
+        that layout, so the copies go and the footprint falls by a third in `dq` (three
+        tiles to two) and a half in `dkdv` (four to two). That is the measurable claim
+        here; the register numbers are in `isa_stats.py --backward --arch gfx950`.
+
+        Checked through `smem_bytes` rather than by inspecting ISA because the footprint
+        is what the tile filter spends and therefore what a wrong answer here would cost.
+        """
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_bwd_generic import (
+            build_flex_flash_bwd_dkdv_module,
+            build_flex_flash_bwd_dq_module,
+        )
+
+        def footprints(head_dim):
+            with contextlib.redirect_stdout(io.StringIO()):
+                dq = build_flex_flash_bwd_dq_module(
+                    num_heads=H, head_dim=head_dim, dtype_str="bf16",
+                    layout="bhsd", block_n=32,
+                )
+                dkdv = build_flex_flash_bwd_dkdv_module(
+                    num_heads=H, head_dim=head_dim, dtype_str="bf16",
+                    layout="bhsd", block_m=32,
+                )
+            return dq.smem_bytes, dkdv.smem_bytes
+
+        for head_dim in (64, 128, 256):
+            host_dq, host_dkdv = footprints(head_dim)
+            with mock.patch.dict(os.environ, {"FLYDSL_GPU_ARCH": "gfx950"}):
+                tgt_dq, tgt_dkdv = footprints(head_dim)
+            # dq drops one of three equally sized tiles, dkdv two of four.
+            self.assertEqual(
+                tgt_dq * 3, host_dq * 2, f"dq at head_dim {head_dim}"
+            )
+            self.assertEqual(
+                tgt_dkdv * 2, host_dkdv, f"dkdv at head_dim {head_dim}"
+            )
+
+    def test_gfx950_keeps_the_wider_backward_q_tile_all_the_way_up(self):
+        """The saved LDS has to reach the tile filter, or it buys nothing.
+
+        A q tile of 64 costs more than gfx942's 65536 B past head_dim 128, so the sweep
+        there narrows to the kv tile alone. Halving the footprint keeps it affordable
+        across the whole ladder -- and the filter has to know that, because a footprint
+        computed for the wrong arch either withholds a tile the builder would take or
+        offers one it refuses.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _backward_tiles,
+            _dkdv_lds_bytes,
+        )
+
+        with config.patch({"flydsl.autotune_backward_tile": True}):
+            with mock.patch(
+                "torch._inductor.kernel.flex.flydsl_flash_attention._current_arch",
+                return_value="gfx942",
+            ):
+                self.assertEqual(_backward_tiles({}, 256, 256), [(128, 32), (256, 32)])
+            with mock.patch(
+                "torch._inductor.kernel.flex.flydsl_flash_attention._current_arch",
+                return_value="gfx950",
+            ):
+                self.assertEqual(
+                    _backward_tiles({}, 256, 256), [(128, 32), (256, 32), (128, 64)]
+                )
+        # And the footprint itself, which is what the filter spends: the transposed copies
+        # are exactly the row-major ones again at a power-of-two head dim.
+        with_copies = _dkdv_lds_bytes(32, 128, 128, transposed_copies=True)
+        without = _dkdv_lds_bytes(32, 128, 128, transposed_copies=False)
+        self.assertEqual(with_copies, 2 * without)
+        # Default is the conservative one, so a caller that forgets cannot overcommit.
+        self.assertEqual(_dkdv_lds_bytes(32, 128, 128), with_copies)
+
     def test_head_dim_256_rescales_every_o_chunk(self):
         """head_dim 256 has 8 O accumulator chunks but only 4 PV k-steps.
 
