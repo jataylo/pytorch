@@ -311,9 +311,9 @@ code, or it will be unfair on points already conceded.
 
 ## What is left
 
-Roughly in value order. Two of these are closed rather than pending — they are kept here
-because "we decided not to" and "we have not got to it" are different states and the
-difference is easy to lose.
+Roughly in value order. Several of these are closed rather than pending — they are kept
+here because "we decided not to", "we measured it and it is not what we thought" and "we
+have not got to it" are three different states and the difference is easy to lose.
 
 **1. A decode kernel** — now down to the **KV split**. This was the largest remaining gap
 and it turned out not to need a decode kernel at all: both halves of the deficit were
@@ -431,10 +431,42 @@ the new part and the part a build cannot test.
 (gfx942). Everything claimed for CDNA4 is build- and ISA-level, which is strictly weaker
 than the reference PRs' MI355X numbers. Nothing else unblocks this.
 
-**6. The dense head_dim 64/128 deficit.** `noop` at 0.90x and 0.88x, still unexplained. The
-XCD workgroup swizzle was implemented both ways and measures 1.00–1.01x on dense while
-moving causal 0.90–0.97x, so whatever the cause is, it is not L2 locality. Investigation,
-not implementation.
+**6. ~~The dense head_dim 64/128 deficit.~~ Half fixed, half explained, and misnamed
+throughout.** `noop` at 0.90x and 0.88x was never a 64/128 effect. Triton's lowering
+rounds head_dim to the next power of two
+(`QK_HEAD_DIM_ROUNDED = next_power_of_two(...)` in `flex/common.py`, used for both the
+block shape and the accumulator), and its measured wall clock per unit of *padded*
+head_dim confirms it: flat within each tier and stepping between them, 47.4 µs at D96
+against 47.9 at D128, and 62.2/62.6/62.8/62.5 across D160/192/224/256. So 64, 128 and 256
+are simply the three head_dims where Triton pads nothing and the dense comparison is
+honest. The four we win at are the four it pads, by 1.14x to 1.6x.
+
+Our own dense cost was a straight line in the real head_dim — `t = 61.7·D − 413` µs, every
+point from 96 to 256 within 5% — which is flat efficiency at 65–77 TFLOP/s against the
+part's 116.3 TF peak. There was no dip at 64 or 128 to explain. The real statement was a
+ceiling: Triton reached 89.7 TF at a 128-wide tile and aten 102.2 TF, against our best of
+77.2 at any head_dim, and that gap was just as present at 96 as at 128.
+
+Asking why nothing of ours reached 90 TF, rather than what was wrong at 128, is what found
+the fix. **The kernel now pads the LDS K row at a 256-row tile even where the granule count
+would let it swizzle**, which is 1024 B and no occupancy — a 256-row workgroup is eight
+waves where a 128-row one is four, so its one workgroup per CU is exactly the short tile's
+two. The swizzle holds at four waves and stops holding at eight, and padding a
+power-of-two head_dim measures 0.83–1.04x at the 128-row tile against **16 of 16 wins,
+10.8–19.8%,** at the 256-row one. What that recovers is the taller tile itself, which had
+been losing at six of seven head_dims. Head_dim 128 gains **1.12x geomean over all 12
+ladder cells**, the 2x32x4096 dense cell goes 0.86x → **1.02x** and causal 1.04x →
+**1.22x**, head_dim 128 now runs at 89.8 TF, and no other head_dim moves more than 1%.
+`_forward_block_ms` sweeps the tile height at head_dim 128 at any head count as a result.
+
+Head_dim 64 keeps its 0.81x. It is padded at the taller tile too and gains nothing there —
+the 128-row tile still wins every cell below 32 heads — so it does not pay for the second
+build. Two candidate explanations for the remainder are dead. The XCD workgroup swizzle,
+implemented both ways, measures 1.00–1.01x on dense while moving causal 0.90–0.97x, so it
+is not L2 locality. And the fixed per-score-element softmax no longer hiding behind the
+MFMAs is real but not ours: it puts D64 19% above the line, the `score_mod` VALU tax tracks
+it exactly (1.26x at D64 falling to 1.04x at D224), and Triton's tax is the same curve, so
+it is the machine's transcendental rate rather than either kernel.
 
 **7. ~~CPU 0-d tensor captures.~~ Done.** Symbolic captures work as of `9ce495f6605`, by
 specializing on the value; device 0-d tensors always worked. CPU 0-d tensors were declined on

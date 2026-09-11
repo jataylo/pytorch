@@ -1124,6 +1124,43 @@ class TestFlyDSLFlexAttention(TestCase):
         # Default is the conservative one, so a caller that forgets cannot overcommit.
         self.assertEqual(_dkdv_lds_bytes(32, 128, 128), with_copies)
 
+    def test_taller_forward_tile_pads_the_k_row_where_it_could_swizzle(self):
+        """The swizzle holds at four waves and stops holding at eight.
+
+        Padding a head_dim whose granule count is a power of two used to be pointless --
+        the swizzle was free and did the same job. At a 256-row tile it is not: twice the
+        waves are reading LDS at once and the measurement flips to the padding by
+        10.8-19.8% across every shape and mask tried. So the choice is the tile height's
+        as well as the granule count's, and the footprint is where that is visible.
+
+        head_dim 256 is the exception and has to stay one: unpadded it sits at exactly the
+        gfx942 budget, so the pad is dropped rather than allowed to fail the build.
+        """
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (  # noqa: B950
+            build_flex_flash_generic_module,
+        )
+
+        def lds(head_dim, block_m):
+            return build_flex_flash_generic_module(
+                num_heads=8,
+                head_dim=head_dim,
+                causal=False,
+                sm_scale=head_dim**-0.5,
+                dtype_str="bf16",
+                layout="bhsd",
+                block_m=block_m,
+            ).smem_bytes
+
+        # A padded K row is 8 elements wider, which is `block_n` * 8 * 2 B = 1024 B.
+        for head_dim in (64, 128):
+            self.assertEqual(lds(head_dim, 256) - lds(head_dim, 128), 1024)
+        # Already padded at every tile height, because they cannot swizzle at all.
+        for head_dim in (96, 160, 192, 224):
+            self.assertEqual(lds(head_dim, 256), lds(head_dim, 128))
+        # And the one that must decline it.
+        self.assertEqual(lds(256, 256), lds(256, 128))
+        self.assertEqual(lds(256, 256), 65536)
+
     def test_head_dim_256_rescales_every_o_chunk(self):
         """head_dim 256 has 8 O accumulator chunks but only 4 PV k-steps.
 
@@ -1854,22 +1891,34 @@ class TestFlyDSLFlexAttention(TestCase):
     def test_forward_q_tile_is_measured_where_the_default_reaches_for_256(self):
         """The 32-head default was a guess, and at head_dim 224/256 it cost 1.7-2.5x.
 
-        The taller tile is only ever chosen at 32 heads or more, so that is the only place
-        the two candidates differ and the only place worth paying a second build for. Below
-        that the list must stay a single point: doubling the builds of the common 8-head
-        case to re-answer a question every measurement agrees on is not free.
+        The taller tile used to be worth a second build only at 32 heads or more, and
+        below that the list stayed a single point: doubling the builds of the common
+        8-head case to re-answer a settled question is not free. The row padding at a
+        256-row tile unsettled that at head_dim 128, which now sweeps at any head count.
+        Padding alone is not the condition -- head_dim 64 is padded at the taller tile
+        too, and the 128-row tile still wins every cell there below 32 heads.
         """
         from torch._inductor.kernel.flex.flydsl_flash_attention import _forward_block_ms
 
-        def tiles(opts=None, *, num_heads=32, seq_len_q=S):
+        def tiles(opts=None, *, num_heads=32, seq_len_q=S, head_dim=192):
             return _forward_block_ms(
-                opts or {}, num_heads=num_heads, seq_len_q=seq_len_q
+                opts or {},
+                num_heads=num_heads,
+                seq_len_q=seq_len_q,
+                head_dim=head_dim,
             )
 
         with config.patch({"flydsl.autotune_forward_block_m": True}):
             self.assertEqual(tiles(num_heads=32), [128, 256])
             self.assertEqual(tiles(num_heads=64), [128, 256])
             self.assertEqual(tiles(num_heads=8), [128])
+            # head_dim 128 sweeps even at 8 heads, because that is where the padding
+            # changed which tile wins. 64 is padded too and did not change, so it keeps
+            # the shortcut rather than paying for a build that loses every cell.
+            self.assertEqual(tiles(num_heads=8, head_dim=128), [128, 256])
+            for head_dim in (64, 96, 160, 192, 224, 256):
+                self.assertEqual(tiles(num_heads=8, head_dim=head_dim), [128])
+                self.assertEqual(tiles(num_heads=32, head_dim=head_dim), [128, 256])
         # Off, both sides must reproduce the kernel's own default exactly, or an
         # autotune-off build silently changes tile.
         with config.patch({"flydsl.autotune_forward_block_m": False}):
@@ -2149,29 +2198,43 @@ class TestFlyDSLFlexAttention(TestCase):
         with self.assertRaisesRegex(ValueError, f"{zeroed} must be >= 1"):
             launcher(*args)
 
-    def test_v_swizzle_keeps_two_workgroups_per_cu(self):
-        """The head_dim 128 tile must stay within half of a 64 KB CU.
+    def test_v_swizzle_keeps_eight_waves_per_cu_at_head_dim_128(self):
+        """The head_dim 128 tile must keep eight waves resident on a 64 KB CU.
 
         Occupancy here is decided by LDS, not registers: at 33280 B only one workgroup
         fits a CU, and the 512 B that made the difference was V's transpose padding.
         Swizzling V removed it, and the failure mode if someone reintroduces padding --
         or grows the tile -- is a quiet halving of occupancy that shows up only as a
         benchmark regression, so pin the number.
+
+        Pinned in *waves* rather than workgroups because the K row padding at a 256-row
+        tile spends 1024 B and does drop that tile to one workgroup per CU. It costs no
+        occupancy doing it: a 256-row workgroup is eight waves where a 128-row one is
+        four, so one of the former is exactly two of the latter, and both land on eight.
+        The byte count is the thing that must not creep; the workgroup count was only ever
+        a proxy for it.
         """
-        launcher = build_flex_flash_generic_module(
-            num_heads=32,
-            head_dim=128,
-            causal=False,
-            dtype_str="bf16",
-            return_lse=True,
-            layout="bhsd",
-        )
-        smem = launcher.smem_bytes
-        self.assertLessEqual(
-            smem,
-            32768,
-            f"LDS is {smem} B; over 32768 only one workgroup fits a 64 KB CU",
-        )
+
+        def waves_per_cu(block_m):
+            launcher = build_flex_flash_generic_module(
+                num_heads=32,
+                head_dim=128,
+                causal=False,
+                dtype_str="bf16",
+                return_lse=True,
+                layout="bhsd",
+                block_m=block_m,
+            )
+            smem = launcher.smem_bytes
+            self.assertLessEqual(
+                smem,
+                65536 // 2 + (1024 if block_m == 256 else 0),
+                f"LDS is {smem} B at block_m {block_m}, which is over budget",
+            )
+            return (block_m // 32) * (65536 // smem)
+
+        for block_m in (128, 256):
+            self.assertEqual(waves_per_cu(block_m), 8)
 
     def test_kernels_do_not_import_buffer_ops_from_the_library(self):
         """`flydsl.expr.buffer_ops` exists in FlyDSL 0.2.4 and is gone in 0.3.1.

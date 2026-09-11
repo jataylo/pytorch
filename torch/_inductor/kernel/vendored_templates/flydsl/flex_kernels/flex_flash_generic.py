@@ -570,8 +570,6 @@ def build_flex_flash_generic_module(
     # DMA is the one path this cannot serve: it writes LDS contiguously from a lane's
     # linear id and so fixes the row stride at HEAD_DIM. It is gfx950+ only (gfx94x has
     # no 16-byte buffer_load_lds), and there the swizzle question is open again.
-    K_PAD = 8 if not K_SWZ_POW2 and not ENABLE_DMA else 0
-    K_STRIDE = HEAD_DIM + K_PAD
     if USE_HW_TR:
         V_STRIDE = HEAD_DIM_V if ENABLE_DMA else HEAD_DIM_V + 4
     else:
@@ -584,6 +582,57 @@ def build_flex_flash_generic_module(
         # conflict-freedom for nothing, the way K already does it.
         VT_STRIDE = BLOCK_N
         V_STRIDE = VT_STRIDE
+
+    # Note [the swizzle and the padding are alternatives, and the tile height picks]
+    #
+    # Which of the two is *expressible* depends on the granule count, and for a long time
+    # that decided it: swizzle where the count is a power of two, pad where it is not. But
+    # expressible and faster are different questions, and at the taller tile the answer
+    # differs. Padding a head_dim that could swizzle measures, forward-only over four
+    # shapes and both masks:
+    #
+    #     head_dim   at BLOCK_M 128        at BLOCK_M 256
+    #     64         0.93-1.04x            1.108-1.157x
+    #     128        0.83-0.98x            1.186-1.198x
+    #
+    # 16 of 16 cases win at 256 rows and none of them wins by less than 10.8%, while at
+    # 128 rows it is a wash trending negative. The tile height is what changed, and with
+    # it the wave count: a 256-row tile is eight waves reading LDS against four, so twice
+    # as many rows are in flight at once and the swizzle's permutation within a group of
+    # `K_GRANULES` rows stops being enough to keep them off each other's banks. The
+    # padding does not have that ceiling, because it separates *every* consecutive pair of
+    # rows by the four banks one lane reads rather than permuting within a fixed group.
+    #
+    # What this recovers is mostly the taller tile itself. `_forward_block_ms` in the
+    # lowering found 256 rows losing at six of seven head_dims and offers it as an
+    # autotune choice for that reason; padded, it becomes the better choice at head_dim
+    # 128. On 2x32x4096 the autotuner's best goes 6791 -> 5675 us there on dense and
+    # 3561 -> 3318 on causal, 1.12x geomean over all twelve forward ladder cells, which is
+    # the largest forward win left on gfx942 -- and it lands on one of the two head_dims
+    # where Triton was genuinely ahead rather than merely padding its own head_dim up.
+    #
+    # head_dim 64 takes the padding at the taller tile too and gains almost nothing from
+    # it, because the 128-row tile still wins there on all but the widest shape. It is
+    # padded anyway rather than special-cased: the condition that matters is the wave
+    # count, and carving out one head_dim to leave it on a layout that measures no better
+    # would be fitting the rule to the noise.
+    #
+    # The bank derivation above is a mechanism, not a proof -- it was not re-derived from
+    # CDNA3's bank geometry at eight waves, and the honest basis for this is 32 measured
+    # points that are consistent to within 1% inside each tile height.
+    _PAD_HELPS = NUM_WAVES >= 8
+    K_PAD = 0 if ENABLE_DMA else (8 if (not K_SWZ_POW2 or _PAD_HELPS) else 0)
+    if K_PAD and K_SWZ_POW2:
+        # Discretionary here rather than the only option, so it yields to the budget: at
+        # head_dim 256 the unpadded pair already sits at exactly the gfx942 limit, and a
+        # taller tile is not worth failing to build for.
+        _v_tile = BLOCK_N * V_STRIDE if USE_HW_TR else HEAD_DIM_V * VT_STRIDE
+        _padded = 2 * (
+            NUM_PREFETCH_K * BLOCK_N * (HEAD_DIM + K_PAD) + NUM_PREFETCH_V * _v_tile
+        )
+        if _padded > CAPS.lds_budget_bytes:
+            K_PAD = 0
+    K_STRIDE = HEAD_DIM + K_PAD
 
     # Vectorized cooperative load constants.
     # How many K packs are read out of LDS before the MFMA chain starts. Deeper hides

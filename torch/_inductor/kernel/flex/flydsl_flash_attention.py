@@ -607,7 +607,10 @@ def create_flex_flydsl_attention_kernel(
     # extent here would make the short-sequence tests symbolic Booleans.
     seq_len_q_hint = V.graph.sizevars.optimization_hint(seq_len_q)
     block_ms = _forward_block_ms(
-        kernel_options, num_heads=num_heads, seq_len_q=seq_len_q_hint
+        kernel_options,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q_hint,
+        head_dim=int(V.graph.sizevars.optimization_hint(qk_head_dim)),
     )
     kv_gpfetches = _forward_kv_gpfetch(kernel_options)
     for mod_vec_size, qk_prefetch_depth, block_m, kv_gpfetch in itertools.product(
@@ -1189,7 +1192,7 @@ def _qk_prefetch_depths(kernel_options: dict[str, Any]) -> list[int]:
 
 
 def _forward_block_ms(
-    kernel_options: dict[str, Any], *, num_heads: int, seq_len_q: int
+    kernel_options: dict[str, Any], *, num_heads: int, seq_len_q: int, head_dim: int
 ) -> list[int]:
     """Q tile heights to offer the forward as autotune choices.
 
@@ -1201,9 +1204,15 @@ def _forward_block_ms(
     against 66.3. So the height is measured on the shapes where the default reaches for
     256, which is the only place the two differ.
 
-    Below 32 heads there is nothing to sweep: both the default and every measurement agree
-    on 128, and offering a second point there would double the builds of the common case to
-    re-answer a settled question.
+    Below 32 heads that used to be settled at 128, and the row padding unsettled it at one
+    head_dim. The kernel now pads the LDS K row at a 256-row tile even where the granule
+    count would let it swizzle -- see Note [the swizzle and the padding are alternatives,
+    and the tile height picks] -- and at head_dim 128 that moves the taller tile from
+    losing to winning: 2x8x4096 with eight heads, dense, goes 1947 us at 128 rows to 1749
+    at 256. So head_dim 128 sweeps at any head count. Everywhere else keeps the single
+    point, including head_dim 64, which is padded too but where the 128-row tile still
+    takes every cell below 32 heads -- the shortcut's reasoning survives wherever the
+    padding did not actually change the answer, and a build is not free.
 
     A short Q sequence inverts the reasoning. There is no KV walk to amortise over rows
     that do not exist: a decode shape has one Q row and the tile pads the other 127, and
@@ -1224,9 +1233,14 @@ def _forward_block_ms(
         return [int(requested)]
     if seq_len_q <= 64:
         return [64]
-    if num_heads < 32 or not torch._inductor.config.flydsl.autotune_forward_block_m:
+    if not torch._inductor.config.flydsl.autotune_forward_block_m:
         # Matches flex_flash_generic's own default, so an autotune-off build is unchanged.
         return [256 if num_heads >= 32 else 128]
+    # 64 and 128 are both padded at the taller tile, but only at 128 does that change
+    # which tile wins below 32 heads -- at 64 the 128-row tile still takes every cell
+    # there, so a second build would buy nothing.
+    if num_heads < 32 and head_dim != 128:
+        return [128]
     return [128, 256]
 
 

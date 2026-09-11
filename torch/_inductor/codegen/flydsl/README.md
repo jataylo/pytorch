@@ -409,12 +409,40 @@ The rule that falls out is clean and cuts by head_dim rather than by shape or by
 128 lose every dense and every score_mod cell** and only reach parity on causal. 256 is a
 wash outside causal.
 
-That split is not arbitrary, and it is the same one the deficit analysis below arrives at
-from the other direction: 64 and 128 are exactly the head_dims whose granule count is a
-power of two, so they already had a working XOR swizzle and gained nothing from the row
-padding that lifted 96/160/192/224 — and they are the sizes Triton itself is most heavily
-tuned for. So if `AUTO` is ever unblocked, `head_dim in {96, 160, 192, 224}` is the
-condition to select on, and it needs no shape or variant term.
+**The forward-only gain at head_dim 128 described below does not show up in this table,
+and that is the right outcome rather than a stale number.** The backward is five of the
+seven GEMMs, so a 1.12x forward is about 1.03x of a forward+backward total, and a
+forward+backward timing on this part does not resolve 3%: re-measuring the head_dim 128
+cells with the change forced off and on gives 0.73x against 0.69x on one shape and 0.86x
+against 0.88x on the other, i.e. noise in both directions. Head_dim 256, which the change
+cannot touch, moves just as much between runs. So the verdicts here stand, and the place
+to read the forward change is the forward-only numbers.
+
+That split is not arbitrary, but it is not ours: **it is Triton's head_dim padding, and
+the four head_dims we win at are the four it pads.** `common.py` sets
+`QK_HEAD_DIM_ROUNDED = next_power_of_two(qk_head_dim)` and the Triton template shapes both
+its block and its accumulator on the rounded value, so a head_dim of 96 is computed as 128
+and 160, 192 and 224 are all computed as 256. The timings say the same thing independently.
+Triton's wall clock on 2x32x4096 dense, per unit of *padded* head_dim, is flat inside each
+tier and steps between them — 47.4 µs at D96 against 47.9 at D128, and 62.2 / 62.6 / 62.8 /
+62.5 across D160 / 192 / 224 / 256 — which is a cost that depends on the padded extent and
+not at all on the real one. Ours is proportional to the real head_dim instead: a straight
+line fitted over D ≥ 96 is `t = 61.7·D − 413` µs and every point from 96 to 256 sits within
+5% of it.
+
+So the ratio column is measuring two different things in two different places. At 64, 128
+and 256 Triton pads nothing and the comparison is like for like; at 96, 160, 192 and 224 it
+is doing between 1.14x and 1.6x the arithmetic we are, and the win is that waste rather
+than our speed. Read only the unpadded dims and the picture is flat and unflattering: 0.84x
+at 64, 0.86x at 128, 1.05x at 256 on the largest shape.
+
+The practical rule is unchanged, because a user cares which backend is faster and not why.
+But it is worth knowing it rests on someone else's padding: if Triton ever grows a
+non-power-of-two path, `head_dim in {96, 160, 192, 224}` stops being the right condition
+and there is nothing on our side that would have moved. So if `AUTO` is ever unblocked,
+that is the condition to select on, it needs no shape or variant term, and it needs
+re-measuring against any Triton version bump rather than being treated as a property of
+this backend.
 
 Until then the practical advice is the same rule stated the other way: ask for
 `BACKEND="FLYDSL"` by name at those four head_dims, and do not bother at 64 or 128.
@@ -895,11 +923,73 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   head_dim 64 and 128) the forward is **1.00x** geomean and the backward **1.17x**, winning
   8 of 18 and 15 of 18. Mods carrying a mask win — `causal` 1.36x/1.14x (D64/D128),
   `prefix_lm` 1.29x/1.10x, `sliding_window` 1.10x/0.91x — and the losses are the *dense*
-  ones, `noop` 0.90x/0.88x, `rel` 0.90x/0.85x, `head_bias` 0.97x/0.87x, which is the known
-  dense head_dim 64/128 deficit and still unexplained. `document_mask` is the odd one out at
-  0.91x/0.77x forward against 1.54x/1.28x backward.
+  ones, `noop` 0.90x/0.88x, `rel` 0.90x/0.85x, `head_bias` 0.97x/0.87x, which is the dense
+  head_dim 64/128 deficit. `document_mask` is the odd one out at 0.91x/0.77x forward
+  against 1.54x/1.28x backward.
 
-  One candidate for that deficit is now closed. Upstream's XCD workgroup swizzle
+  **That deficit is not a head_dim 64/128 phenomenon, and the name was the thing making it
+  look unexplained.** 64 and 128 are two of the three head_dims where Triton does no
+  padding — see the `next_power_of_two` finding above — so they are where the dense
+  comparison is honest, not where we are uniquely bad. Our own dense cost was a straight
+  line in head_dim (`t = 61.7·D − 413` µs, every point 96–256 within 5%), which is flat
+  efficiency at 65–77 TFLOP/s, or 56–66% of the part's 116.3 TF bf16 peak. There was no
+  dip at 64 or 128 to explain. What there was, was a ceiling: Triton reached 89.7 TF with
+  a 128-wide tile and aten 102.2 TF, against our best of 77.2 at any head_dim. That gap
+  existed at 96 exactly as much as at 128 — we simply win at 96 because a third of
+  Triton's work there is padding.
+
+  Reframing it that way is what found the fix, because it said to stop looking for
+  something wrong at 128 and start asking why no configuration of ours reached 90 TF.
+  One now does: head_dim 128 runs at **89.8 TF**, which is the 1024 B of K row padding at
+  the 256-row tile described next. The line is no longer straight, and it is the point
+  above it that matters.
+
+  **Most of head_dim 128 turned out to be recoverable, and the padding is what recovered
+  it.** 64 and 128 are the head_dims whose granule count is a power of two, so they take
+  the XOR swizzle while 96/160/192/224 take the row padding, and it is tempting to read
+  the win/loss split as that choice. At the 128-row tile that reading is simply wrong —
+  forcing the padded layout there measures 0.83–1.04x, a wash trending negative. At the
+  **256-row tile** it is right, and emphatically: padding wins 16 of 16 cases over four
+  shapes and both masks, by 10.8% to 19.8%, never less.
+
+  The tile height is what changed, and with it the wave count — eight waves reading LDS
+  against four, so twice as many rows in flight and the swizzle's permutation within a
+  group of `K_GRANULES` rows stops keeping them off each other's banks. What that recovers
+  is mostly *the taller tile itself*, which `_forward_block_ms` had found losing at six of
+  seven head_dims. Padded, it becomes the right choice at 128, and the autotuner picks it.
+  End to end over all 12 cells at head_dim 128 the forward gains **1.12x geomean**, up to
+  1.21x, while every other head_dim moves less than 1%:
+
+  | 2x32x4096, D128 | before | after |
+  |---|---|---|
+  | dense | 0.86x | **1.02x** |
+  | score_mod | 0.84x | 0.92x |
+  | causal | 1.04x | **1.22x** |
+
+  Averaged over its four shapes and three variants head_dim 128 goes 0.82x → 0.91x, and
+  the dense cell it was losing worst is now ahead. It costs 1024 B of LDS and no occupancy
+  at all: a 256-row workgroup is eight waves where a 128-row one is four, so the padded
+  tall tile's one workgroup per CU is exactly the short tile's two, and both sit at eight
+  waves. head_dim 256 is the one that must decline the pad, because unpadded it already
+  sits at exactly the gfx942 budget.
+
+  head_dim 64 is padded at the taller tile as well and gains nothing from it — the 128-row
+  tile still wins every cell below 32 heads — so it keeps the single tile height and the
+  0.81x stands. Closing *that* means matching the most heavily hand-tuned configuration in
+  every flash-attention implementation on the part, which is a different project from this
+  branch and not a bug in it.
+
+  The one genuine small-head_dim effect is real but modest and not ours either. The
+  softmax is a fixed cost per (row, column) score and does not scale with head_dim, while
+  the MFMAs do, so at small D the VALU work stops hiding behind the matrix work. D64 sits
+  19% above our own linear fit, and the `score_mod` tax — which is pure added VALU per
+  score element — falls monotonically as the MFMA:VALU ratio rises: **1.26x at D64, 1.10x
+  and 1.14x at 96 and 128, 1.04–1.05x at 160–224**. Triton's tax on the same cells is
+  1.26x / 1.13x / 1.11x / 1.03x, i.e. the same curve. Both backends are VALU-bound at D64
+  to the same degree, so this is a property of the machine's transcendental rate rather
+  than of either kernel.
+
+  One candidate for the gap was closed earlier. Upstream's XCD workgroup swizzle
   (`cf1db2f`) keeps a head's Q blocks on a single XCD so its K/V stays in that XCD's 4 MB
   of L2, and it was the last unported forward commit. Implemented both ways — Q tile on the
   fast axis, and the full remap that gives each XCD a contiguous run of heads — it measures
@@ -979,6 +1069,18 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   put every row in one bank. It is gated on `not ENABLE_DMA`, so gfx950 will need the
   rotation-based swizzle instead; both backward kernels have no DMA path at all and take the
   padding unconditionally.
+
+  **"Exactly those head_dims" held for two years and does not any more.** The granule count
+  decides which mechanism is *expressible*, not which is faster, and at a 256-row tile the
+  padding beats a swizzle that is perfectly available: 16 of 16 cases over four shapes and
+  both masks, 10.8–19.8%, where at a 128-row tile the same substitution is a wash. Eight
+  waves are reading LDS rather than four, and the swizzle permutes within a group of
+  `K_GRANULES` rows while the padding separates every consecutive pair — so the swizzle
+  runs out of group and the padding does not. `K_PAD` is therefore a function of the tile
+  height as well, it declines itself at head_dim 256 where the unpadded pair already sits
+  at exactly the gfx942 budget, and it is worth 1.12x geomean at head_dim 128. See the
+  deficit analysis above for what that recovered and why it was looked for in the wrong
+  place for so long.
 
   256 works as of the deferred-rescale fix — it had been excluded for wanting 66560 B of
   LDS, the V swizzle removed exactly the 1024 B it overshot by, and that exposed an
