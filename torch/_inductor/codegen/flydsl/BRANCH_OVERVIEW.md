@@ -326,7 +326,7 @@ parallelism. The MHA row prices the first half on its own: it is the one shape w
 group cannot be packed, and it is also where the deficit is smallest. This is a new kernel
 body, not plumbing, and it is fully validatable here.
 
-**2. ~~Asymmetric head dims in the backward.~~ Done** as of `1e8ce52f31e`. Both directions
+**2. ~~Asymmetric head dims in the backward.~~ Done** as of `6315ac61cfb`. Both directions
 now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients
 across six pairs plus one under GQA with a `score_mod`. The backward turned out to need more
 than the forward had: there the two extents were never loop bounds, while here they are four
@@ -424,7 +424,7 @@ aligned. Documented above, not forgotten.
 | `2338af8cfa6` | Price the decode gap instead of calling it nothing |
 | `2762d65cd8d` | Rewrite "what is not done" as an ordered account of what is left |
 | `c3f9806b140` | Ground the RDNA4 assessment in the donor's actual layout |
-| `1e8ce52f31e` | Serve `qk_head_dim != v_head_dim` in the backward |
+| `6315ac61cfb` | Serve `qk_head_dim != v_head_dim` in the backward |
 
 ## Further reading
 
