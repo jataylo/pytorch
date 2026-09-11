@@ -39,6 +39,7 @@ from .common import (
     is_tensor_ir_node,
     load_flex_template,
     maybe_realize,
+    promote_cpu_scalar_captures,
     realize_captures_for_cutedsl,
     set_head_dim_values,
     SubgraphResults,
@@ -237,12 +238,23 @@ def flex_attention(
     kernel_options, backend = _sanitize_kernel_options_for_triton(kernel_options)
 
     # Early check: reject scalar captures that cannot be represented by flash-attn
-    # aux_scalars before building subgraph buffers. FLYDSL has no scalar-capture path at
-    # all, and passing a host pointer to its kernel faults the GPU rather than raising.
-    if backend in ("FLASH", "FLYDSL"):
+    # aux_scalars before building subgraph buffers.
+    if backend == "FLASH":
         _check_flash_supported_scalar_captures(
             score_mod_other_buffers, mask_mod_other_buffers, backend=backend
         )
+    if backend in ("FLASH", "FLYDSL"):
+        if backend == "FLYDSL":
+            # FLYDSL has no scalar-capture path either, and a host pointer faults its
+            # kernel rather than raising -- but for rank 0 the fix is the same copy the
+            # error used to tell the caller to write by hand.
+            device = query.get_device()
+            score_mod_other_buffers = promote_cpu_scalar_captures(
+                score_mod_other_buffers, device
+            )
+            mask_mod_other_buffers = promote_cpu_scalar_captures(
+                mask_mod_other_buffers, device
+            )
         # Both read captures as whole tensors at per-axis coordinates rather than through
         # Inductor's flattened indexing, so the captures have to be real buffers.
         score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
@@ -857,15 +869,23 @@ def flex_attention_backward(*args, **kwargs):
 
     kernel_options, backend = _sanitize_kernel_options_for_triton(kernel_options)
     # Both branches for the same reasons as the forward, which is where the comment is.
-    # The forward rejects first in every path we know of, so this is a guard rather than a
+    # The forward decides first in every path we know of, so this is a guard rather than a
     # live check -- but the failure it guards against is a GPU fault, not an exception.
-    if backend in ("FLASH", "FLYDSL"):
+    if backend == "FLASH":
         _check_flash_supported_scalar_captures(
             score_mod_other_buffers,
             mask_mod_other_buffers,
             backward=True,
             backend=backend,
         )
+    if backend in ("FLASH", "FLYDSL"):
+        if backend == "FLYDSL":
+            score_mod_other_buffers = promote_cpu_scalar_captures(
+                score_mod_other_buffers, device
+            )
+            mask_mod_other_buffers = promote_cpu_scalar_captures(
+                mask_mod_other_buffers, device
+            )
         score_mod_other_buffers = realize_captures_for_cutedsl(score_mod_other_buffers)
         mask_mod_other_buffers = realize_captures_for_cutedsl(mask_mod_other_buffers)
 

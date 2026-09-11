@@ -404,10 +404,16 @@ XCD workgroup swizzle was implemented both ways and measures 1.00–1.01x on den
 moving causal 0.90–0.97x, so whatever the cause is, it is not L2 locality. Investigation,
 not implementation.
 
-**7. CPU 0-d tensor captures.** Symbolic captures work as of `9ce495f6605`, by specializing
-on the value. Device 0-d tensors work. CPU 0-d tensors are declined — Triton crashes on that
-shape, so declining is not obviously the worse behaviour, and closing it properly means the
-`aux_scalars` threading that `9ce495f6605` deliberately did not build.
+**7. ~~CPU 0-d tensor captures.~~ Done.** Symbolic captures work as of `9ce495f6605`, by
+specializing on the value; device 0-d tensors always worked. CPU 0-d tensors were declined on
+the grounds that closing them meant the `aux_scalars` threading `9ce495f6605` deliberately did
+not build — but that was the wrong reading of the requirement. The old error told the caller
+to "pass the value as a tensor on device instead", which describes a four-byte copy the
+lowering can insert itself, so it now does. `torch.tensor(2.0)` with no `device=` is the
+natural way to write a scalar, and a mod that worked under `BACKEND='TRITON'` failing here
+read as a broken backend rather than as a deliberate limit. Rank 0 is the only case that
+arises: a shaped capture is read at `(b, h, q_idx, kv_idx)`, and indexing a CPU tensor with
+device indices fails in eager before any of this.
 
 **8. `AUTO` selection — closed by decision, not pending.** A natural-log-LSE backend is
 structurally ineligible: `stats_are_log2` is decided in the eager wrapper from the literal

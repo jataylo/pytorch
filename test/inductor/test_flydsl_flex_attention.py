@@ -527,11 +527,15 @@ class TestFlyDSLFlexAttention(TestCase):
         actual, expected = self._run(q, k, v, score_mod=score_mod)
         self._assert_close(actual, expected)
 
-    def test_rejects_cpu_scalar_capture(self):
-        """A 0-d CPU capture reaches the kernel as a host pointer and faults the GPU.
+    def test_cpu_scalar_capture_is_copied_rather_than_refused(self):
+        """A 0-d CPU capture would reach the kernel as a host pointer, so it is copied.
 
-        Rejected before the captures are realized, since afterwards they no longer look
-        like scalars.
+        This used to raise and tell the caller to "pass the value as a tensor on device
+        instead" -- a workaround describing a four-byte copy the lowering can insert
+        itself, which is what it now does. Closing it properly mattered because
+        `torch.tensor(2.0)` with no `device=` is the natural way to write a scalar, and a
+        mod that works under `BACKEND='TRITON'` failing here reads as a broken backend
+        rather than as a deliberate limit.
         """
         q, k, v = self._tensors()
         cpu_scalar = torch.tensor(2.0)
@@ -539,8 +543,9 @@ class TestFlyDSLFlexAttention(TestCase):
         def score_mod(score, b, h, q_idx, kv_idx):
             return score * cpu_scalar
 
-        with self.assertRaisesRegex(Exception, "0-dim CPU tensor scalar"):
-            self._run(q, k, v, score_mod=score_mod)
+        actual, expected = self._run(q, k, v, score_mod=score_mod)
+        self._assert_close(actual, expected)
+
 
     @parametrize("name", sorted(TRANSCENDENTAL_MODS))
     def test_transcendental_mod_ops(self, name):

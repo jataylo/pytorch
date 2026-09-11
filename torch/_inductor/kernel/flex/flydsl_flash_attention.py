@@ -1282,8 +1282,9 @@ def _reject_unsupported_captures(
 ) -> None:
     """Reject captures the kernel cannot address, before anything is rendered.
 
-    CPU 0-d captures are rejected earlier, in ``flex_attention()``, because by this point
-    they have been realized and no longer look like scalars.
+    0-d CPU captures do not reach here as CPU buffers: ``flex_attention()`` copies them to
+    the device first, since for rank 0 that is four bytes and exactly the workaround the
+    old refusal told the caller to write by hand.
     """
     captures = list(score_mod_other_buffers) + list(mask_mod_other_buffers)
 

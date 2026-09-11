@@ -215,7 +215,7 @@ be believed rather than assumed, since a log2 `lse` would need the cotangent res
 | Architecture | gfx942 and gfx950, neither behind a flag. Declared as capabilities rather than names, so anything else is refused by naming what it is missing — see [GPU architectures](#gpu-architectures) |
 | dtype | bf16, f16 (all of q/k/v the same) |
 | head_dim | Multiples of 32 from 64 to 256, and `qk_head_dim != v_head_dim` in either order in both directions — see [Asymmetric head dims](#asymmetric-head-dims) |
-| Captures | At most 4 across both mods, rank ≤ 4, on device. A mod may *read* one; a gradient with respect to one is refused |
+| Captures | At most 4 across both mods, rank ≤ 4. Shaped captures must be on device; a 0-d CPU one is copied there for you. A mod may *read* one; a gradient with respect to one is refused |
 | seq_len | Any, ragged tails included, and Q may differ from KV (cross attention). K and V must match each other |
 | GQA | Yes |
 | Batch | `Bq == Bkv`. A broadcast `Bkv=1` key/value is refused in both directions: the forward addresses k and v at the Q batch index, so it would read off the end of the allocation, and `dk`/`dv` would need summing back down to `Bkv` |

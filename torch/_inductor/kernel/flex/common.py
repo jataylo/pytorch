@@ -250,6 +250,31 @@ def maybe_realize(args: list[IRNode | None]):
     )
 
 
+def promote_cpu_scalar_captures(buffers, device):
+    """Move 0-d CPU tensor captures onto ``device``.
+
+    A mod closing over ``torch.tensor(2.0)`` reaches a lowering as a 0-d CPU buffer. The
+    kernels that read captures as real tensors would be handed a host pointer for it,
+    which is why this used to be refused with "pass the value as a tensor on device
+    instead" -- a workaround that describes a copy the lowering can just as well insert.
+
+    Only rank 0 is promoted, and rank 0 is the only case that arises: a capture with a
+    shape is read at ``(b, h, q_idx, kv_idx)``, and indexing a CPU tensor with device
+    indices fails in eager before any of this, so such a mod cannot be written.
+    """
+    from ...ir import DeviceCopy
+
+    def _promote(buf):
+        if not isinstance(buf, TensorBox) or isinstance(buf, sympy.Expr):
+            return buf
+        buf_device = buf.get_device()
+        if buf_device is None or buf_device.type != "cpu" or buf.get_size():
+            return buf
+        return DeviceCopy.create(buf, device, False)
+
+    return [_promote(buf) for buf in buffers]
+
+
 def realize_captures_for_cutedsl(buffers):
     """Realize captured buffers for CuteDSL, preserving views and plain inputs.
 
