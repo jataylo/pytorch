@@ -284,11 +284,11 @@ instruction sequence rather than reading the graph.
 
 | | theirs | ours |
 | --- | --- | --- |
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **nothing**: `flex_decoding` is deferred and reaches no architecture |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel.** Decode shapes are served correctly by the prefill kernel at 2.0–6.5x Triton decode's time (and 3.6x faster than Triton prefill) — see `UPSTREAM_PR_COMPARISON.md` |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, four shape families | **build and ISA only.** No CDNA4 silicon here; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection, `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` first-class in **both** directions | forward any admitted pair either order; **backward refuses** |
-| Backward on CDNA4 | written for gfx950 throughout | reads **none** of the four CDNA4 capabilities, and the ISA confirms it |
+| Backward on CDNA4 | written for gfx950 throughout | takes `mfma_k16` in GEMM1; the three LDS-layout capabilities are still forward-only |
 | Upstreaming | in the review queue, `albanD` / `drisspg` requested | a local branch |
 
 The first two are the honest asymmetry. Decode is a whole feature we do not have and they have

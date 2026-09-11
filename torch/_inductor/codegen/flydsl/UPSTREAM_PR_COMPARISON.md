@@ -103,18 +103,50 @@ lowering; that is not in the pushed head.
 
 | | theirs | ours |
 |---|---|---|
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **nothing**: `flex_decoding` is deferred and reaches no architecture |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but decode shapes are served correctly by the prefill kernel — 2.0–6.5x slower than Triton decode, and 3.6x *faster* than Triton prefill. See below |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **forward: any admitted pair, either order**; backward refuses |
 | Upstreaming | in the review queue with `albanD` / `drisspg` requested | a local branch |
-| Backward CDNA4 | their backward is written for gfx950 throughout | ours reads **none** of the four CDNA4 capabilities; ISA confirms it (`dkdv` D128: 256 VGPR / 78 spilled on gfx942, 256 / 76 on gfx950) |
+| Backward CDNA4 | their backward is written for gfx950 throughout | ours takes `mfma_k16` in GEMM1 only; `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are still forward-only |
 
 The first two are the honest asymmetry. Decode is a whole feature we do not have and they
 have tuned, and it is the shape where their sparse numbers are strongest — a decode step is
 where a sparse mask has the most to give, because the dense work per token is tiny. And no
 amount of ISA inspection substitutes for running the kernel: our gfx950 claim is *"every
 admitted head dim lowers and the CDNA4 paths engage"*, which is strictly weaker than theirs.
+
+### What "no decode kernel" actually costs
+
+Worth stating precisely, because "deferred" reads as "broken" and it is not. `use_decode` is
+reachable only from `BACKEND='TRITON_DECODE'` or from `AUTO`, so `BACKEND='FLYDSL'` never
+routes to `flex_decoding` at all — a decode shape is served by the ordinary prefill kernel,
+mods and all, and it is correct there (checked against eager at `Sq ∈ {1, 4}` with a
+`score_mod`, GQA and MHA, rel err ≤ 8e-3).
+
+bf16, D128, gfx942, microseconds per call:
+
+| B, Hq, Hkv, Sq, Skv | Triton | Triton decode | FlyDSL | FlyDSL / decode |
+|---|---|---|---|---|
+| 8, 32, 8, 1, 4096 | 4059 | 228 | 1130 | 4.96x |
+| 8, 32, 8, 1, 8192 | 8093 | 439 | 2227 | 5.08x |
+| 8, 32, 32, 1, 8192 (MHA) | 8178 | 1101 | 2249 | 2.04x |
+| 8, 32, 8, 4, 8192 | 8094 | 447 | 2227 | 4.98x |
+| 8, 32, 8, 8, 8192 | 8091 | 596 | 2228 | 3.74x |
+| 32, 32, 8, 1, 8192 | 26378 | 1106 | 7150 | 6.46x |
+
+Two things fall out of that table. The FlyDSL column is *flat* at 2227 for `Sq` of 1, 4 and 8
+while Triton decode rises from 439 to 596, and the autotuner's own log says why: it picks
+`BLOCK_M=128`, so a single query row is padded into a 128-row tile and `Sq ≤ 128` all costs
+the same. And FlyDSL is still 3.6x faster than Triton's *prefill* kernel on the same shape,
+which is the part "reaches no architecture" obscured — the deficit is against a specialized
+decode kernel, not against the general path.
+
+So the missing work is a decode kernel, not decode plumbing: pack the GQA group into the M
+tile so the row is not wasted, and split the KV axis for parallelism, which is what their
+`SPLIT_KV` mode is for. The MHA row is the tell that the GQA packing is the larger half —
+it is the one shape where the group cannot be packed, and it is also the one where our
+deficit is smallest (2.04x rather than ~5x).
 
 ---
 

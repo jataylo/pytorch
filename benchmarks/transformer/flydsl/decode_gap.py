@@ -1,0 +1,125 @@
+"""What a decode shape costs without a decode kernel.
+
+`use_decode` in `flex_attention.py` is reachable only from `BACKEND='TRITON_DECODE'` or
+from `AUTO`, so `BACKEND='FLYDSL'` never routes to `flex_decoding`: a decode shape is
+served by the ordinary prefill kernel. That is correct -- mods and all -- and the point of
+this script is to price it rather than to leave "no decode support" as an unquantified
+hole. The deficit is against Triton's *decode* kernel; against Triton's prefill kernel, on
+the same shape, FlyDSL is still well ahead, and quoting only the first number would be as
+misleading as quoting only the second.
+
+The column that matters is FlyDSL against `Sq`. It is flat from 1 to 8 while Triton decode
+rises, because the autotuner picks `BLOCK_M=128` and a single query row is padded into a
+128-row tile. That is the shape of the missing work: pack the GQA group into the M tile,
+and split the KV axis for parallelism.
+
+`--check` verifies the prefill kernel against eager at these shapes with a `score_mod`
+before timing anything, since a fast wrong answer is not a baseline.
+
+    python benchmarks/transformer/flydsl/decode_gap.py
+    python benchmarks/transformer/flydsl/decode_gap.py --check
+"""
+
+import argparse
+
+import torch
+
+from _common import backend_options, best_us
+
+from torch.nn.attention.flex_attention import flex_attention
+
+
+# Long KV against a handful of query rows, which is what a generation step looks like.
+# The MHA row (Hq == Hkv) is in deliberately: it is the one shape where a GQA group cannot
+# be packed into the M tile, so it isolates how much of the deficit the packing owns.
+SHAPES = [
+    # B, Hq, Hkv, Sq, Skv, D
+    (8, 32, 8, 1, 4096, 128),
+    (8, 32, 8, 1, 8192, 128),
+    (8, 32, 32, 1, 8192, 128),
+    (8, 32, 8, 4, 8192, 128),
+    (8, 32, 8, 8, 8192, 128),
+    (32, 32, 8, 1, 8192, 128),
+]
+
+# `TRITON` is named rather than left to default, because the default is `AUTO` and `AUTO`
+# routes a decode shape straight to `flex_decoding` -- an unnamed column would silently be
+# a second copy of the decode one, which is how this was first written.
+BACKENDS = ("TRITON", "TRITON_DECODE", "FLYDSL")
+
+
+def _inputs(b, hq, hkv, sq, skv, d):
+    return (
+        torch.randn(b, hq, sq, d, device="cuda", dtype=torch.bfloat16),
+        torch.randn(b, hkv, skv, d, device="cuda", dtype=torch.bfloat16),
+        torch.randn(b, hkv, skv, d, device="cuda", dtype=torch.bfloat16),
+    )
+
+
+def _compiled(backend, gqa, score_mod=None):
+    options = backend_options("flydsl") if backend == "FLYDSL" else {"BACKEND": backend}
+
+    def call(q, k, v):
+        return flex_attention(
+            q, k, v, score_mod=score_mod, enable_gqa=gqa, kernel_options=options
+        )
+
+    # A reset per backend: the shapes here blow through the recompile limit otherwise, and
+    # a fallback to eager reads as "every backend is identical" rather than as a failure.
+    torch._dynamo.reset()
+    return torch.compile(call, dynamic=False)
+
+
+def check():
+    """The prefill kernel against eager at decode shapes, with a mod in the graph."""
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score * 0.5
+
+    for b, hq, hkv, sq, skv, d in SHAPES[:3]:
+        q, k, v = _inputs(min(b, 2), hq, hkv, sq, skv, d)
+        gqa = hq != hkv
+        with torch.no_grad():
+            got = _compiled("FLYDSL", gqa, score_mod)(q, k, v)
+            want = flex_attention(q, k, v, score_mod=score_mod, enable_gqa=gqa)
+        rel = (got.float() - want.float()).abs().max() / want.float().abs().max()
+        status = "ok" if rel < 2e-2 else "MISMATCH"
+        print(f"  B{min(b, 2)} Hq{hq} Hkv{hkv} Sq{sq} Skv{skv} D{d}: rel {rel:.3g} {status}")
+        if rel >= 2e-2:
+            raise SystemExit("decode-shape correctness check failed")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="verify against eager first")
+    args = parser.parse_args()
+
+    if args.check:
+        print("correctness at decode shapes:")
+        check()
+        print()
+
+    print(f"{'B, Hq, Hkv, Sq, Skv, D':<26}{'triton':>10}{'t_decode':>10}{'flydsl':>10}{'fly/dec':>9}")
+    for shape in SHAPES:
+        b, hq, hkv, sq, skv, d = shape
+        q, k, v = _inputs(*shape)
+        gqa = hq != hkv
+
+        times = {}
+        for backend in BACKENDS:
+            fn = _compiled(backend, gqa)
+            with torch.no_grad():
+                fn(q, k, v)
+                torch.cuda.synchronize()
+                times[backend] = best_us(fn, q, k, v)
+
+        label = f"{b}, {hq}, {hkv}, {sq}, {skv}, {d}"
+        ratio = times["FLYDSL"] / times["TRITON_DECODE"]
+        print(
+            f"{label:<26}{times['TRITON']:10.0f}{times['TRITON_DECODE']:10.0f}"
+            f"{times['FLYDSL']:10.0f}{ratio:8.2f}x"
+        )
+
+
+if __name__ == "__main__":
+    main()
