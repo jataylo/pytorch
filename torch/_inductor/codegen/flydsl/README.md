@@ -865,9 +865,10 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   (`decompose_causal_regions`). That works because those are build flags of known shape
   there; a `mask_mod` is not, which is the same reason its backward skipping does not port.
 - **No fusion**, matching CuteDSL: no epilogue or prologue support.
-- **gfx950 is unexecuted, and its backward is unspecialized.** It is served without a flag
-  on codegen evidence — see [GPU architectures](#gpu-architectures) — but no number here
-  has come off CDNA4 silicon, and the backward reads none of the four CDNA4 capabilities.
+- **gfx950 is unexecuted, and its backward is only half specialized.** It is served without
+  a flag on codegen evidence — see [GPU architectures](#gpu-architectures) — but no number
+  here has come off CDNA4 silicon, and the backward takes only `mfma_k16`, in GEMM1; the
+  three LDS-layout capabilities remain forward-only.
   Whether to carry *more* unexecuted code than this is the plan's open decision D3, and it
   is a real one: its phases 3–5 would add roughly 10k lines that cannot be run here.
 - **gfx1201 is refused, and not for want of a gate.** The flex bodies emit MFMA; RDNA4 has

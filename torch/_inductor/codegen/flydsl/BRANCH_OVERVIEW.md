@@ -309,20 +309,76 @@ used when `block_mask is None`). #194309's head is from 2026-08-30 and contains 
 Anything compared here should be read against the described-but-unpushed design as well as the
 code, or it will be unfair on points already conceded.
 
-## What is not done
+## What is left
 
-- **Decode.** `flex_decoding` is deferred and reaches no architecture. This is the largest
-  single gap against the reference PRs.
-- **gfx950 on silicon.** Everything there is build- and ISA-level.
-- **The backward on CDNA4.** It reads none of the four capabilities the forward selects on.
-- **RDNA4 (gfx1201).** Refused by capability; needs a second WMMA kernel body.
-- **Asymmetric head dims in the backward.** Refused loudly.
-- **Scalar captures.** Device 0-d tensors work; CPU ones are rejected. No `AUX_SCALAR_SYMBOLS`
-  machinery.
-- **`AUTO` selection.** Structurally ineligible for a natural-log backend; see above.
-- **The dense head_dim 64/128 deficit** (`noop` 0.90x/0.88x) is still unexplained. The XCD
-  workgroup swizzle was implemented both ways and measures 1.00–1.01x on dense, so whatever the
-  cause is, it is not L2 locality.
+Roughly in value order. Two of these are closed rather than pending — they are kept here
+because "we decided not to" and "we have not got to it" are different states and the
+difference is easy to lose.
+
+**1. A decode kernel.** The largest remaining gap, and now a measured one rather than an
+asserted one: see [the decode section](UPSTREAM_PR_COMPARISON.md) and
+`benchmarks/transformer/flydsl/decode_gap.py`. Decode shapes are served correctly today by
+the prefill kernel, at 2.0–6.5x Triton decode's time and 3.6x faster than Triton prefill.
+The work is GQA packing into the M tile first — FlyDSL's time is flat across `Sq` 1, 4 and
+8 because a single query row is padded into a `BLOCK_M=128` tile — then a KV split for
+parallelism. The MHA row prices the first half on its own: it is the one shape where the
+group cannot be packed, and it is also where the deficit is smallest. This is a new kernel
+body, not plumbing, and it is fully validatable here.
+
+**2. Asymmetric head dims in the backward.** The forward serves any admitted
+`qk_head_dim != v_head_dim` pair in either order; the backward refuses. Scoped and
+de-risked but not written. The concrete work is splitting the V side away from the QK side:
+`STRIDE_TOKEN_KV`, the V padding and stride, the load geometry, and the index functions
+across `k`/`v`/`do`/`dq`/`dk`/`dv`. The forward already has the shape of the answer in its
+`_load_geometry` closure, which is applied twice to yield the `_K` and `_V` constants.
+
+LDS was the thing that could have made this need new machinery, and it does not. Across all
+49 admitted pairs the `dq` footprint (K row-major, plus Kᵀ, plus V) fits gfx942 at
+`block_n=32` in 49 cases out of 49, and at `block_n=64` in 27; gfx950 fits all 49 at 64.
+Symmetric pairs that fit at 64 today are only 64/96/128/160, so wide pairs would land on
+`block_n=32` exactly the way symmetric 192+ already does, through the existing per-arch tile
+filter. Fully validatable here.
+
+**3. The three remaining CDNA4 capabilities in the backward.** `mfma_k16` is taken in GEMM1
+as of `158ac9c0685`. `lds_transpose_read`, `permlane_o_store` and `dma_to_lds_b128` are
+still forward-only, and all three are LDS-layout changes rather than instruction selection.
+The transposing read is the big one: it would retire the Kᵀ and Qᵀ tiles outright, which is
+both the largest win left on CDNA4 and the change that most disturbs the fragment maps. Two
+narrower pieces sit here too — widening the `ds`/`p` GEMMs to K=16 needs `_kt_swizzle`
+re-derived for eight contiguous elements, and the K swizzle's conflict-freedom has never
+been re-derived for CDNA4's 64 LDS banks (it stays a permutation, so answers do not change).
+Build- and ISA-validatable only.
+
+**4. RDNA4 (gfx1201).** Refused by capability, and what is missing is a kernel body rather
+than a gate. RDNA4's WMMA is 16×16×16 on wave32 against CDNA's 32×32×16 on wave64, so a lane
+holds 8 accumulator elements instead of 16 columns of one row, and every score-site index —
+the softmax column mapping, causal and window bounds, bias and dropout offsets — derives
+from that layout. The donor tree has a substantial dense gfx1201 implementation to borrow
+fragment and index derivations from, but it has no `score_mod`/`mask_mod` anywhere, so the
+mod-callback layer is new work against an unfamiliar layout rather than a port. Nothing here
+can run it, and unlike gfx950 — which runs the same validated MFMA bodies with different
+instructions selected — a successful RDNA4 build would check almost nothing, because the
+index derivation is the part that is new and the part a build cannot test.
+
+**5. gfx950 on silicon.** Hardware-blocked: every GPU in this environment is MI308X
+(gfx942). Everything claimed for CDNA4 is build- and ISA-level, which is strictly weaker
+than the reference PRs' MI355X numbers. Nothing else unblocks this.
+
+**6. The dense head_dim 64/128 deficit.** `noop` at 0.90x and 0.88x, still unexplained. The
+XCD workgroup swizzle was implemented both ways and measures 1.00–1.01x on dense while
+moving causal 0.90–0.97x, so whatever the cause is, it is not L2 locality. Investigation,
+not implementation.
+
+**7. CPU 0-d tensor captures.** Symbolic captures work as of `9ce495f6605`, by specializing
+on the value. Device 0-d tensors work. CPU 0-d tensors are declined — Triton crashes on that
+shape, so declining is not obviously the worse behaviour, and closing it properly means the
+`aux_scalars` threading that `9ce495f6605` deliberately did not build.
+
+**8. `AUTO` selection — closed by decision, not pending.** A natural-log-LSE backend is
+structurally ineligible: `stats_are_log2` is decided in the eager wrapper from the literal
+`BACKEND` string at Dynamo trace time, before Inductor picks anything. Parity gates `FLASH`
+the same way and never lets `AUTO` select it, so leaving `FLYDSL` refused keeps the two
+aligned. Documented above, not forgotten.
 
 ## Commits
 
@@ -339,6 +395,10 @@ code, or it will be unfair on points already conceded.
 | `366c3334185` | Close three gaps found reviewing the previous three commits |
 | `55a4d36dc6d` | Converge shared codegen with the parity branch |
 | `91765762509` | Validate the flex kernels on FlyDSL 0.3.2 |
+| `7f688105e51` | Add this branch overview |
+| `9ce495f6605` | Serve symbolic scalar captures, and stop refusing unproven kv pairs |
+| `158ac9c0685` | Take MFMA K=16 in the backward on CDNA4 |
+| `2338af8cfa6` | Price the decode gap instead of calling it nothing |
 
 ## Further reading
 
