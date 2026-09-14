@@ -147,6 +147,29 @@ MAX_AUX_TENSORS = 4
 _AUX_SLOT_NAMES = tuple(f"AUX{i}" for i in range(MAX_AUX_TENSORS))
 
 
+def split_kv_workspace_row_elems(head_dim_v: int) -> int:
+    """f32 elements per `(split, b, h, q_row)` row of the split-KV workspace.
+
+    A row is the unnormalised O accumulator over `[0, head_dim_v)` and then the max and
+    the sum it is relative to. Four rather than two so the row stride stays 16-byte
+    aligned -- every admitted `head_dim_v` is a multiple of 32, so `(head_dim_v + 4) * 4`
+    bytes is a multiple of 16 and the 128-bit O stores need no per-row alignment case.
+    """
+    return head_dim_v + 4
+
+
+def split_kv_workspace_elems(
+    batch_size: int, num_heads: int, seq_len_q: int, num_kv_splits: int, head_dim_v: int
+) -> int:
+    """Total f32 elements a split-KV launch needs for its workspace.
+
+    Callers allocate this; the kernel only ever indexes it, and deliberately cannot
+    compute the size itself because it is never passed the batch size.
+    """
+    rows = batch_size * num_kv_splits * num_heads * seq_len_q
+    return rows * split_kv_workspace_row_elems(head_dim_v)
+
+
 def build_flex_flash_generic_module(
     num_heads,
     head_dim,
@@ -176,6 +199,7 @@ def build_flex_flash_generic_module(
     layout="bshd",
     qk_prefetch_depth=2,
     enable_kv_gpfetch=None,
+    num_kv_splits=1,
 ):
     """Build the FlexAttention-capable flash-attention forward launcher.
 
@@ -283,10 +307,10 @@ def build_flex_flash_generic_module(
     # share this one's mod call sites).
 
     # Positional index of the two extents in the launcher signature, which is
-    # (Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, AUX0..AUXn, batch_size, seq_len_q,
-    # seq_len_kv): seven tensors, then the aux slots, then batch_size, so seq_len_q sits
-    # at 8 + n and the KV extent follows it.
-    _SEQ_LEN_Q_ARG = 8 + MAX_AUX_TENSORS
+    # (Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, AUX0..AUXn, WS, batch_size,
+    # seq_len_q, seq_len_kv): seven tensors, then the aux slots, then the split-KV
+    # workspace, then batch_size, so seq_len_q sits at 9 + n and the KV extent follows.
+    _SEQ_LEN_Q_ARG = 9 + MAX_AUX_TENSORS
     _SEQ_LEN_KV_ARG = _SEQ_LEN_Q_ARG + 1
 
     def _extract_seq_len(args, kwargs, position, name):
@@ -421,6 +445,39 @@ def build_flex_flash_generic_module(
     # NUM_HEADS_Q unpacked, which is what every existing build gets.
     Q_TOKENS_PER_TILE = BLOCK_M // _gqa_group if PACK_GQA else BLOCK_M
     GRID_HEADS = num_kv_heads if PACK_GQA else num_heads
+
+    # Note [splitting the KV walk across workgroups]
+    #
+    # Packing the GQA group fixed the grid at `B * Hkv * ceil(Sq / tokens_per_tile)`
+    # workgroups, and at decode that is all the parallelism there is: one Q tile, so
+    # `B * Hkv`. At 8x8 that is 64 workgroups on 80 CUs, and no amount of tile tuning
+    # fills the other 16 -- the work simply is not divided finely enough. The KV axis is
+    # the one left, and it is long: splitting a 8192-row walk four ways gives four
+    # workgroups where there was one, each doing a quarter of the sequence.
+    #
+    # A split cannot be a plain reduction, because each piece runs its own online softmax
+    # and so normalises against its own running max. What each piece can write is the
+    # state *before* normalisation -- the unnormalised accumulator `o = Σ 2^((s-m)σL) v`
+    # with the max `m` and the sum `l` it is relative to -- and a second pass can then
+    # rebase all the pieces onto a common max and finish the divide. That is the whole
+    # design: the main kernel's epilogue either normalises and stores O (unsplit) or
+    # stores `(o, m, l)` to a workspace (split), and `flex_flash_combine_kernel` reduces.
+    #
+    # Storing the *unnormalised* accumulator is what keeps the combine simple. Each piece
+    # contributes `2^((m_s - m_max)σL) · o_s` to the numerator and `2^((m_s - m_max)σL) ·
+    # l_s` to the denominator, so an empty piece -- a split past the end of a causal walk,
+    # or past the end of the sequence -- needs no special case at all: its loop body never
+    # runs, so it stores exactly the initial state, `o = 0` and `l = 0`, and contributes
+    # nothing to either sum. The alternative, normalising per piece and reweighting by
+    # `w·l`, needs the `l == 0` rows skipped explicitly and loses a rounding to the
+    # division it does not need to do.
+    NUM_KV_SPLITS = int(num_kv_splits)
+    if NUM_KV_SPLITS < 1:
+        raise ValueError(f"num_kv_splits must be >= 1, got {num_kv_splits!r}")
+    SPLIT_KV = NUM_KV_SPLITS > 1
+    # `head_dim_v` is normalized a little further down, but the workspace row needs it
+    # here and the normalization is just the `None` default.
+    WS_ROW_ELEMS = split_kv_workspace_row_elems(head_dim_v or head_dim)
 
     assert BLOCK_M % NUM_WAVES == 0
     # Not a tuning choice: the mod site, the causal compare and the O/LSE stores all read
@@ -752,6 +809,7 @@ def build_flex_flash_generic_module(
         AUX1: fx.Tensor,
         AUX2: fx.Tensor,
         AUX3: fx.Tensor,
+        WS: fx.Tensor,
         seq_len_q: fx.Int32,
         seq_len_kv: fx.Int32,
     ):
@@ -848,8 +906,18 @@ def build_flex_flash_generic_module(
         # Unpacked: each block computes one Q head (per batch, per Q-tile). Packed: each
         # block computes one *KV* head, and the tile's rows are the whole GQA group's rows
         # for a run of tokens. See Note [packing the GQA group into the Q tile].
-        head_of_block = block_id % GRID_HEADS
-        batch_q_tile_id = block_id // GRID_HEADS
+        # The KV split rides on the fastest axis, because NUM_KV_SPLITS is a
+        # compile-time constant and the grid extents above it are not -- peeling it off
+        # the bottom is a constant divide, peeling it off the top would be a runtime one.
+        # See Note [splitting the KV walk across workgroups].
+        if const_expr(SPLIT_KV):
+            split_idx = block_id % NUM_KV_SPLITS
+            block_of_split = block_id // NUM_KV_SPLITS
+        else:
+            split_idx = fx.Index(0)
+            block_of_split = block_id
+        head_of_block = block_of_split % GRID_HEADS
+        batch_q_tile_id = block_of_split // GRID_HEADS
         num_q_tiles = (seq_len_q_v + Q_TOKENS_PER_TILE - 1) // Q_TOKENS_PER_TILE
         q_tile_idx = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
@@ -1426,6 +1494,41 @@ def build_flex_flash_generic_module(
             _kv_lo, _kv_hi, _kv_step = fx.Index(0), _n_visit, 1
         else:
             _kv_lo, _kv_hi, _kv_step = 0, kv_upper, BLOCK_N_OUT
+
+        # Narrow the walk to this workgroup's share of it. Cut in whole loop steps rather
+        # than rows so a split boundary never lands inside a tile, which keeps every
+        # in-tile index expression -- and the causal and sequence-padding masks -- exactly
+        # as they are in the unsplit kernel. The last split takes the remainder, and a
+        # split with nothing left to do gets `hi <= lo` and runs zero iterations, which is
+        # the empty-piece case the combine needs no code for. This works the same for the
+        # block-mask walk, where the unit is a visited block rather than a row.
+        if const_expr(SPLIT_KV):
+            _steps_total = (
+                fx.Index(_kv_hi) - fx.Index(_kv_lo) + fx.Index(_kv_step - 1)
+            ) // fx.Index(_kv_step)
+            _steps_per_split = (
+                _steps_total + fx.Index(NUM_KV_SPLITS - 1)
+            ) // fx.Index(NUM_KV_SPLITS)
+            _s_first = split_idx * _steps_per_split
+            _s_last = _s_first + _steps_per_split
+            _s_last = fx.Index(
+                ArithValue(_s_last < _steps_total).select(_s_last, _steps_total)
+            )
+            # `_s_first` can run past the total when the steps do not divide evenly; the
+            # clamp above would then put `_s_last` below it, which is exactly the empty
+            # range wanted, but `range` wants hi >= lo so pin it rather than rely on that.
+            _s_last = fx.Index(
+                ArithValue(_s_first < _s_last).select(_s_last, _s_first)
+            )
+            _kv_lo = fx.Index(_kv_lo) + _s_first * fx.Index(_kv_step)
+            _kv_hi = _kv_lo + (_s_last - _s_first) * fx.Index(_kv_step)
+            if const_expr(not USE_BLOCK_MASK):
+                # The K prefetch peeks one tile past the current one and guards on the
+                # walk's end, so that has to be the *split's* end now, or the last tile
+                # of every split pulls in a tile it will not use.
+                kv_upper = fx.Index(
+                    ArithValue(_kv_hi < kv_upper).select(_kv_hi, kv_upper)
+                )
 
         # Loop-carried: [m_old, l_old, o_acc_chunks..., (buf_id if DMA dbuf),
         #                (next tile's K vecs if _pipe_k)]
@@ -2120,97 +2223,312 @@ def build_flex_flash_generic_module(
         # where σ folds into c_lse_m_scale (1.0 if score_mod already pre-scaled the
         # scores) and ln(l) = log2(l) * ln2. A fully-masked row leaves m = -inf, l = 0
         # and yields -inf, which is what flex_attention returns.
-        if const_expr(RETURN_LSE):
-            m_final = loop_results[0]
-            lse_val = _fadd(
-                _fmul(m_final, c_lse_m_scale),
-                _fmul(fx.Float32(fmath.log2(l_final, fastmath=fm_fast)), c_ln2),
-            )
-            lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
-            # Layout [B, H_q, S]. Lanes 0-31 and 32-63 hold the same 32 rows (the row
-            # reduction is a half-wave xor shuffle), so only the low half stores.
-            lse_idx = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * seq_len_q_v + q_row
-            if ArithValue(lane_div_32 == fx.Index(0)):
-                if ArithValue(q_row < seq_len_q_v):
-                    buffer_ops.buffer_store(_raw(fx.Float32(lse_val)), lse_rsrc, _raw(fx.Int32(lse_idx)))
-
-        inv_l = rocdl.rcp(T.f32, l_final)
-        if const_expr(HAS_ANY_MOD):
-            # A row left entirely masked -- by a mask_mod, or by a score_mod that
-            # returns -inf -- has l = 0, and o * rcp(0) = 0 * inf = NaN.
-            # flex_attention returns 0 for such a row.
-            inv_l = ArithValue(l_final == c_zero_f).select(c_zero_f, fx.Float32(inv_l))
-        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
-        v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(D_CHUNKS)]
-
-        # Packed rows past seq_len are a valid address in the next head of the group, so
-        # `o_rsrc`'s num_records no longer drops them. Unpacked, this is the bound doing
-        # the same job explicitly, and the branch folds away.
-        _o_row_live = (
-            ArithValue(q_row < seq_len_q_v) if const_expr(PACK_GQA) else None
-        )
-
-        if const_expr(USE_PERMLANE_OSTORE):
-            # gfx950: 128-bit permlane-fused store (cvt_pk_bf16_f32 + permlane32_swap).
-            pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-            is_hi_half = ArithValue(lane_div_32 != fx.Index(0))
-
-            def _o_pack_2dw(dc, store_group):
-                # 4 f32 outputs -> 2 packed-16bit dwords (lo = cols 0,1; hi = cols 2,3).
-                r_base = store_group * 4
-                if const_expr(dtype_str == "bf16"):
-                    lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
-                    hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
-                    return lo, hi
-                o_f16 = [fx.Float32(Vec(v_o[dc])[r_base + i]).to(elem_dtype) for i in range_constexpr(4)]
-                pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
-                return _raw(pack[0]), _raw(pack[1])
-
-            def _swap_halves(dw):
-                # permlane32_swap(a,b) -> (a.lo|b.lo, a.hi|b.hi); with a=b=dw the
-                # partner dword dw[lane^32] is result[1] on low lanes, [0] on high.
-                swapped = rocdl.permlane32_swap(pair_i32_ty, _raw(dw), _raw(dw), False, False)
-                lo_res = llvm.extractvalue(T.i32, swapped, [0])
-                hi_res = llvm.extractvalue(T.i32, swapped, [1])
-                return is_hi_half.select(lo_res, hi_res)
-
-            for dc in range_constexpr(D_CHUNKS):
-                for g in range_constexpr(2):
-                    d0_a, d1_a = _o_pack_2dw(dc, 2 * g)
-                    d0_b, d1_b = _o_pack_2dw(dc, 2 * g + 1)
-                    # low lanes: own group-2g cols 0-3 ++ partner's cols 4-7;
-                    # high lanes: partner's group-(2g+1) cols 0-3 ++ own cols 4-7.
-                    y0_a, y1_a = _swap_halves(d0_a), _swap_halves(d1_a)
-                    y0_b, y1_b = _swap_halves(d0_b), _swap_halves(d1_b)
-                    w0 = is_hi_half.select(y0_b, _raw(d0_a))
-                    w1 = is_hi_half.select(y1_b, _raw(d1_a))
-                    w2 = is_hi_half.select(_raw(d0_b), y0_a)
-                    w3 = is_hi_half.select(_raw(d1_b), y1_a)
-                    o_pack = Vec.from_elements([fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32)
-                    d_col = fx.Index(dc * D_CHUNK) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
-                    o_global = global_idx_o(q_row, d_col)
-                    if const_expr(PACK_GQA):
-                        if _o_row_live:
-                            buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
-                    else:
-                        buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
-        else:
-            # gfx942 fallback (no permlane32_swap / cvt_pk_bf16_f32): each lane stores
-            # its 16 cols as 4 dwordx2 groups via .to(elem_dtype); col map d_col =
-            # dc*D_CHUNK + lane_div_32*4 + 8*grp + r. num_records bound drops OOB rows.
+        if const_expr(SPLIT_KV):
+            # This workgroup walked a slice of the KV range, so what it holds is not an
+            # answer yet: `o_finals` is unnormalised and relative to this slice's own `m`.
+            # Store the triple and stop -- `flex_flash_combine_kernel` rebases the slices
+            # onto a common max, sums, divides, and writes O and LSE. See Note [splitting
+            # the KV walk across workgroups].
+            #
+            # One flat f32 workspace of `[splits][B][Hq][Sq]` rows of WS_ROW_ELEMS, with
+            # the row holding o in `[0, Dv)` and m and l just past it. Keeping the three
+            # in one row rather than in three planes is what lets the kernel address the
+            # workspace without knowing the batch size, which it is never passed -- a
+            # plane base would need it -- and it puts a row's m, l and o on the same cache
+            # line for the combine. The four-element stride rather than two is alignment:
+            # every admitted Dv is a multiple of 32, so `(Dv + 4) * 4` bytes is a multiple
+            # of 16 and the o stores stay 128-bit aligned on every row.
+            _ws_rsrc = buffer_ops.create_buffer_resource(WS, max_size=True)
+            _ws_row = (
+                (
+                    (batch_idx * fx.Index(NUM_KV_SPLITS) + split_idx)
+                    * fx.Index(NUM_HEADS_Q)
+                    + q_head_idx
+                )
+                * seq_len_q_v
+                + q_row
+            ) * fx.Index(WS_ROW_ELEMS)
+            _ws_live = ArithValue(q_row < seq_len_q_v)
+            # f32 rather than the output dtype: these are summed, so a rounding here is a
+            # rounding *inside* the reduction rather than at the end of it, and at the
+            # shapes a split is chosen for the workspace is a few MB either way.
             for dc in range_constexpr(D_CHUNKS):
                 for grp in range_constexpr(4):
                     r0 = grp * 4
-                    o_f16 = [fx.Float32(Vec(v_o[dc])[r0 + i]).to(elem_dtype) for i in range_constexpr(4)]
+                    o4 = Vec.from_elements(
+                        [Vec(o_finals[dc])[r0 + i] for i in range_constexpr(4)],
+                        fx.Float32,
+                    ).bitcast(fx.Int32)
+                    d_col = (
+                        fx.Index(dc * D_CHUNK)
+                        + lane_div_32 * fx.Index(4)
+                        + fx.Index(grp * 8)
+                    )
+                    if _ws_live:
+                        buffer_ops.buffer_store(
+                            o4, _ws_rsrc, _raw(fx.Int32(_ws_row + d_col))
+                        )
+            # Lanes 0-31 and 32-63 hold the same rows -- the row reduction is a half-wave
+            # xor shuffle -- so only the low half writes m and l.
+            if ArithValue(lane_div_32 == fx.Index(0)):
+                if _ws_live:
+                    _ml = Vec.from_elements(
+                        [fx.Float32(loop_results[0]), fx.Float32(l_final)], fx.Float32
+                    ).bitcast(fx.Int32)
+                    buffer_ops.buffer_store(
+                        _ml,
+                        _ws_rsrc,
+                        _raw(fx.Int32(_ws_row + fx.Index(HEAD_DIM_V))),
+                    )
+        else:
+            if const_expr(RETURN_LSE):
+                m_final = loop_results[0]
+                lse_val = _fadd(
+                    _fmul(m_final, c_lse_m_scale),
+                    _fmul(fx.Float32(fmath.log2(l_final, fastmath=fm_fast)), c_ln2),
+                )
+                lse_rsrc = buffer_ops.create_buffer_resource(LSE, max_size=True)
+                # Layout [B, H_q, S]. Lanes 0-31 and 32-63 hold the same 32 rows (the row
+                # reduction is a half-wave xor shuffle), so only the low half stores.
+                lse_idx = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * seq_len_q_v + q_row
+                if ArithValue(lane_div_32 == fx.Index(0)):
+                    if ArithValue(q_row < seq_len_q_v):
+                        buffer_ops.buffer_store(_raw(fx.Float32(lse_val)), lse_rsrc, _raw(fx.Int32(lse_idx)))
+
+            inv_l = rocdl.rcp(T.f32, l_final)
+            if const_expr(HAS_ANY_MOD):
+                # A row left entirely masked -- by a mask_mod, or by a score_mod that
+                # returns -inf -- has l = 0, and o * rcp(0) = 0 * inf = NaN.
+                # flex_attention returns 0 for such a row.
+                inv_l = ArithValue(l_final == c_zero_f).select(c_zero_f, fx.Float32(inv_l))
+            inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
+            v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(D_CHUNKS)]
+
+            # Packed rows past seq_len are a valid address in the next head of the group, so
+            # `o_rsrc`'s num_records no longer drops them. Unpacked, this is the bound doing
+            # the same job explicitly, and the branch folds away.
+            _o_row_live = (
+                ArithValue(q_row < seq_len_q_v) if const_expr(PACK_GQA) else None
+            )
+
+            if const_expr(USE_PERMLANE_OSTORE):
+                # gfx950: 128-bit permlane-fused store (cvt_pk_bf16_f32 + permlane32_swap).
+                pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+                is_hi_half = ArithValue(lane_div_32 != fx.Index(0))
+
+                def _o_pack_2dw(dc, store_group):
+                    # 4 f32 outputs -> 2 packed-16bit dwords (lo = cols 0,1; hi = cols 2,3).
+                    r_base = store_group * 4
+                    if const_expr(dtype_str == "bf16"):
+                        lo = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base], Vec(v_o[dc])[r_base + 1])
+                        hi = rocdl.cvt_pk_bf16_f32(Vec(v_o[dc])[r_base + 2], Vec(v_o[dc])[r_base + 3])
+                        return lo, hi
+                    o_f16 = [fx.Float32(Vec(v_o[dc])[r_base + i]).to(elem_dtype) for i in range_constexpr(4)]
                     pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
-                    o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
-                    d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                    o_global = global_idx_o(q_row, d_col)
-                    if const_expr(PACK_GQA):
-                        if _o_row_live:
+                    return _raw(pack[0]), _raw(pack[1])
+
+                def _swap_halves(dw):
+                    # permlane32_swap(a,b) -> (a.lo|b.lo, a.hi|b.hi); with a=b=dw the
+                    # partner dword dw[lane^32] is result[1] on low lanes, [0] on high.
+                    swapped = rocdl.permlane32_swap(pair_i32_ty, _raw(dw), _raw(dw), False, False)
+                    lo_res = llvm.extractvalue(T.i32, swapped, [0])
+                    hi_res = llvm.extractvalue(T.i32, swapped, [1])
+                    return is_hi_half.select(lo_res, hi_res)
+
+                for dc in range_constexpr(D_CHUNKS):
+                    for g in range_constexpr(2):
+                        d0_a, d1_a = _o_pack_2dw(dc, 2 * g)
+                        d0_b, d1_b = _o_pack_2dw(dc, 2 * g + 1)
+                        # low lanes: own group-2g cols 0-3 ++ partner's cols 4-7;
+                        # high lanes: partner's group-(2g+1) cols 0-3 ++ own cols 4-7.
+                        y0_a, y1_a = _swap_halves(d0_a), _swap_halves(d1_a)
+                        y0_b, y1_b = _swap_halves(d0_b), _swap_halves(d1_b)
+                        w0 = is_hi_half.select(y0_b, _raw(d0_a))
+                        w1 = is_hi_half.select(y1_b, _raw(d1_a))
+                        w2 = is_hi_half.select(_raw(d0_b), y0_a)
+                        w3 = is_hi_half.select(_raw(d1_b), y1_a)
+                        o_pack = Vec.from_elements([fx.Int32(w0), fx.Int32(w1), fx.Int32(w2), fx.Int32(w3)], fx.Int32)
+                        d_col = fx.Index(dc * D_CHUNK) + (fx.Index(2 * g) + lane_div_32) * fx.Index(8)
+                        o_global = global_idx_o(q_row, d_col)
+                        if const_expr(PACK_GQA):
+                            if _o_row_live:
+                                buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                        else:
+                            buffer_ops.buffer_store(o_pack, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+            else:
+                # gfx942 fallback (no permlane32_swap / cvt_pk_bf16_f32): each lane stores
+                # its 16 cols as 4 dwordx2 groups via .to(elem_dtype); col map d_col =
+                # dc*D_CHUNK + lane_div_32*4 + 8*grp + r. num_records bound drops OOB rows.
+                for dc in range_constexpr(D_CHUNKS):
+                    for grp in range_constexpr(4):
+                        r0 = grp * 4
+                        o_f16 = [fx.Float32(Vec(v_o[dc])[r0 + i]).to(elem_dtype) for i in range_constexpr(4)]
+                        pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
+                        o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
+                        d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
+                        o_global = global_idx_o(q_row, d_col)
+                        if const_expr(PACK_GQA):
+                            if _o_row_live:
+                                buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+                        else:
                             buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
-                    else:
-                        buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
+
+
+    # ---- Split-KV combine ----
+    # One lane owns four output columns, so a `(b, h, q_row)` row needs HEAD_DIM_V // 4
+    # lanes and a 256-thread block covers several rows at once. The row count is
+    # `B * Hq * Sq` and nothing makes it divide the rows per block, so the grid rounds up
+    # and the tail block predicates -- the 950 kernel's floor divide quietly drops rows
+    # for e.g. six heads at Sq 1.
+    COMBINE_BLOCK = 256
+    COMBINE_LANES_PER_ROW = HEAD_DIM_V // 4
+    COMBINE_ROWS_PER_BLOCK = max(1, COMBINE_BLOCK // COMBINE_LANES_PER_ROW)
+
+    @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
+    def flex_flash_combine_kernel(
+        O: fx.Tensor,
+        LSE: fx.Tensor,
+        WS: fx.Tensor,
+        batch_size: fx.Int32,
+        seq_len_q: fx.Int32,
+    ):
+        # See Note [the fast-math flags stop short of nnan and ninf].
+        fm_fast = FASTMATH
+        elem_dtype = dtype_to_elem_type(dtype_str)
+        # The same three constants the main kernel builds, and they have to agree with it:
+        # `m` was stored raw, so rebasing it onto the common max applies the scale here
+        # exactly where the main kernel's own rescale applied it.
+        c_softmax_log2e = fx.Float32(
+            _LOG2E if HAS_SCORE_MOD else sm_scale * _LOG2E
+        )
+        c_lse_m_scale = fx.Float32(1.0 if HAS_SCORE_MOD else sm_scale)
+        c_ln2 = fx.Float32(1.0 / _LOG2E)
+
+        def _fadd(a, b):
+            return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fmul(a, b):
+            return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fsub(a, b):
+            return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fmax(a, b):
+            return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        seq_v = fx.Index(seq_len_q)
+        tid = fx.Index(gpu.thread_idx.x)
+        row = (
+            fx.Index(gpu.block_idx.x) * fx.Index(COMBINE_ROWS_PER_BLOCK)
+            + tid // fx.Index(COMBINE_LANES_PER_ROW)
+        )
+        col = (tid % fx.Index(COMBINE_LANES_PER_ROW)) * fx.Index(4)
+
+        _rows_total = fx.Index(batch_size) * fx.Index(NUM_HEADS_Q) * seq_v
+        if ArithValue(row < _rows_total):
+            # `row` counts (b, h, s) in the *unsplit* order, which is how O and LSE are
+            # laid out; the workspace inserts the split axis between b and h, so a split's
+            # row is `row` shifted by whole `(h, s)` planes plus the batch's own stride.
+            _b = row // (fx.Index(NUM_HEADS_Q) * seq_v)
+            _hs = row % (fx.Index(NUM_HEADS_Q) * seq_v)
+            _plane = fx.Index(NUM_HEADS_Q) * seq_v
+            _ws_row0 = (
+                _b * fx.Index(NUM_KV_SPLITS) * _plane + _hs
+            ) * fx.Index(WS_ROW_ELEMS)
+            _ws_stride = _plane * fx.Index(WS_ROW_ELEMS)
+
+            ws_rsrc = buffer_ops.create_buffer_resource(WS, max_size=True)
+
+            def _ml(i):
+                """This split's (m, l), which sit just past its O row."""
+                pair = buffer_ops.buffer_load(
+                    ws_rsrc,
+                    _raw(
+                        fx.Int32(
+                            _ws_row0
+                            + fx.Index(i) * _ws_stride
+                            + fx.Index(HEAD_DIM_V)
+                        )
+                    ),
+                    vec_width=2,
+                )
+                v = Vec(pair, (2,), fx.Float32)
+                return v[0], v[1]
+
+            m_s = []
+            l_s = []
+            for i in range_constexpr(NUM_KV_SPLITS):
+                _m, _l = _ml(i)
+                m_s.append(_m)
+                l_s.append(_l)
+
+            m_max = m_s[0]
+            for i in range_constexpr(NUM_KV_SPLITS - 1):
+                m_max = _fmax(m_max, m_s[i + 1])
+
+            # Rebase each slice onto the common max and add. An empty slice stored
+            # `l = 0` and a zero accumulator, so it contributes nothing and needs no
+            # test; that is the whole reason the main kernel stores O unnormalised.
+            # `m_max` is finite whenever any slice saw a score, and when none did every
+            # `l` is 0, `den` is 0 and the guarded reciprocal below returns zero --
+            # which is what flex_attention gives for a fully masked row.
+            den = _raw(fx.Float32(0.0))
+            acc = _raw(Vec.filled(4, 0.0, fx.Float32))
+            for i in range_constexpr(NUM_KV_SPLITS):
+                w = ArithValue(
+                    _fmul(_fsub(m_s[i], m_max), c_softmax_log2e)
+                ).exp2(fastmath=fm_fast)
+                den = _fadd(den, _fmul(w, l_s[i]))
+                o4 = buffer_ops.buffer_load(
+                    ws_rsrc,
+                    _raw(fx.Int32(_ws_row0 + fx.Index(i) * _ws_stride + col)),
+                    vec_width=4,
+                )
+                w4 = Vec.from_elements([fx.Float32(w)], fx.Float32).broadcast_to(4)
+                acc = _fadd(acc, _fmul(w4, Vec(o4, (4,), fx.Float32)))
+
+            inv = ArithValue(fx.Float32(den) > fx.Float32(0.0)).select(
+                fx.Float32(rocdl.rcp(T.f32, den)), fx.Float32(0.0)
+            )
+            inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
+            out4 = Vec(_fmul(acc, inv4), (4,), fx.Float32)
+            # The portable conversion rather than `cvt_pk_bf16_f32`, which is CDNA4-only
+            # -- the main kernel reaches for it just inside `USE_PERMLANE_OSTORE`. This
+            # kernel touches `B * Hq * Sq * Dv` elements once, so there is nothing here
+            # worth an arch split for.
+            o_pack = (
+                Vec.from_elements(
+                    [fx.Float32(out4[i]).to(elem_dtype) for i in range_constexpr(4)],
+                    elem_dtype,
+                )
+                .bitcast(fx.Int32)
+            )
+            # O is contiguous in the launcher's layout, so `row` already names the token
+            # plane and only the column offset is left. BSHD reaches here having been
+            # transposed by the interface, same as the unsplit path.
+            o_rsrc_c = buffer_ops.create_buffer_resource(O, max_size=True)
+            buffer_ops.buffer_store(
+                o_pack,
+                o_rsrc_c,
+                _raw(fx.Int32((row * fx.Index(HEAD_DIM_V) + col) * fx.Index(2))),
+                offset_is_bytes=True,
+            )
+
+            if const_expr(RETURN_LSE):
+                # Same quantity and the same derivation as the unsplit epilogue, with the
+                # rebased sum standing in for `l`: ln Σ e^(s σ) = m σ + ln(Σ w l).
+                if ArithValue(col == fx.Index(0)):
+                    lse_val = _fadd(
+                        _fmul(m_max, c_lse_m_scale),
+                        _fmul(
+                            fx.Float32(fmath.log2(den, fastmath=fm_fast)),
+                            c_ln2,
+                        ),
+                    )
+                    lse_rsrc_c = buffer_ops.create_buffer_resource(LSE, max_size=True)
+                    buffer_ops.buffer_store(
+                        _raw(fx.Float32(lse_val)), lse_rsrc_c, _raw(fx.Int32(row))
+                    )
 
     @flyc.jit
     def launch_flex_flash_generic(
@@ -2225,6 +2543,7 @@ def build_flex_flash_generic_module(
         AUX1: fx.Tensor,
         AUX2: fx.Tensor,
         AUX3: fx.Tensor,
+        WS: fx.Tensor,
         batch_size: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -2240,7 +2559,10 @@ def build_flex_flash_generic_module(
         # Packed: a tile holds Q_TOKENS_PER_TILE tokens of each of the group's heads, so
         # one block covers the whole group and the head axis of the grid is the KV heads.
         num_q_tiles = (sl_idx + Q_TOKENS_PER_TILE - 1) // Q_TOKENS_PER_TILE
-        grid_x = bs_idx * num_q_tiles * GRID_HEADS
+        # Splitting the KV walk multiplies the grid by exactly that, which is the point:
+        # it is the axis left once packing has fixed the others. See Note [splitting the
+        # KV walk across workgroups].
+        grid_x = bs_idx * num_q_tiles * GRID_HEADS * NUM_KV_SPLITS
 
         # No `no-nans-fp-math` here; see Note [the fast-math flags stop short of nnan and
         # ninf].
@@ -2264,6 +2586,7 @@ def build_flex_flash_generic_module(
             AUX1,
             AUX2,
             AUX3,
+            WS,
             seq_len_q,
             seq_len_kv,
             value_attrs={
@@ -2280,6 +2603,27 @@ def build_flex_flash_generic_module(
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
+        if const_expr(SPLIT_KV):
+            # Second pass over `B * Hq * Sq` output rows. Rounded up, with the tail block
+            # predicated, because nothing makes the row count divide the rows per block.
+            _combine_rows = bs_idx * fx.Index(NUM_HEADS_Q) * sl_idx
+            flex_flash_combine_kernel(
+                O,
+                LSE,
+                WS,
+                batch_size,
+                seq_len_q,
+                value_attrs={"passthrough": passthrough_entries},
+            ).launch(
+                grid=(
+                    (_combine_rows + fx.Index(COMBINE_ROWS_PER_BLOCK - 1))
+                    // fx.Index(COMBINE_ROWS_PER_BLOCK),
+                    1,
+                    1,
+                ),
+                block=(COMBINE_BLOCK, 1, 1),
+                stream=stream,
+            )
 
     # Best MI355X FMHA numbers so far were measured with ROCm/llvm-project
     # `felix/tune_fmha` at c8cf6da4367c010c7cbbb7789a9c4349e7407619.
@@ -2321,7 +2665,7 @@ def build_flex_flash_generic_module(
             return launch_flex_flash_generic(*args, **kwargs)
 
     def _compile(  # noqa: E741
-        Q, K, V, O, LSE, KVNB, KVI, AUX0, AUX1, AUX2, AUX3, batch_size, seq_len_q, seq_len_kv, stream=None
+        Q, K, V, O, LSE, KVNB, KVI, AUX0, AUX1, AUX2, AUX3, WS, batch_size, seq_len_q, seq_len_kv, stream=None
     ):
         with CompilationContext.compile_hints(_fmha_compile_hints):
             return flyc.compile(
@@ -2337,6 +2681,7 @@ def build_flex_flash_generic_module(
                 AUX1,
                 AUX2,
                 AUX3,
+                WS,
                 batch_size,
                 seq_len_q,
                 seq_len_kv,
@@ -2354,6 +2699,11 @@ def build_flex_flash_generic_module(
     # Published because "is the swizzle on" is not visible in the numbers: a bad mask
     # gives a wrong answer, and a disabled one gives a slow right answer.
     _guarded.k_swizzle_rowmask = K_SWZ_ROWMASK
+    # The host has to size the split-KV workspace, and it is the only party that can: the
+    # size needs the batch, which the kernel is never passed. Zero splits' worth of row
+    # elements is the unsplit build's way of saying "no workspace".
+    _guarded.num_kv_splits = NUM_KV_SPLITS
+    _guarded.ws_row_elems = WS_ROW_ELEMS if SPLIT_KV else 0
     _guarded.num_aux_tensors = NUM_AUX
     # Published so the host pads the argument list to the signature's width without
     # importing this module, and so the two cannot drift apart.

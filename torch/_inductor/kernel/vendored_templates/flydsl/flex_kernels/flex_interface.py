@@ -334,6 +334,20 @@ def prepare(launcher, q, k, v, kv_num_blocks=None, kv_indices=None, aux=None, ou
     max_aux = getattr(launcher, "max_aux_tensors", 2)
     aux_args = [t.reshape(-1) for t in aux] + [_dummy(device)] * (max_aux - len(aux))
 
+    # Split-KV scratch. The kernel cannot size this -- it is never passed the batch -- so
+    # the launcher publishes the row width and the host multiplies out. Uninitialised is
+    # correct: every row a split is responsible for is written before the combine reads
+    # it, and a split with no work still writes its zero accumulator and zero sum.
+    ws_row_elems = getattr(launcher, "ws_row_elems", 0)
+    if ws_row_elems:
+        ws = torch.empty(
+            B * getattr(launcher, "num_kv_splits", 1) * H * S * ws_row_elems,
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        ws = _dummy(device)
+
     args = (
         q.contiguous().reshape(-1),
         k.contiguous().reshape(-1),
@@ -343,6 +357,7 @@ def prepare(launcher, q, k, v, kv_num_blocks=None, kv_indices=None, aux=None, ou
         nb,
         kvi,
         *aux_args,
+        ws,
         B,
         S,
         S_KV,
