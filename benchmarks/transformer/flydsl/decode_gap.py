@@ -8,8 +8,8 @@ hole. The deficit is against Triton's *decode* kernel; against Triton's prefill 
 the same shape, FlyDSL is still well ahead, and quoting only the first number would be as
 misleading as quoting only the second.
 
-This script found the answer, in two halves, and both were padding rather than anything
-exotic. The FlyDSL column used to be *flat* from `Sq` 1 to 8 while Triton decode rose,
+This script found the answer, in three parts, and none of them was a decode kernel. Two were
+padding. The FlyDSL column used to be *flat* from `Sq` 1 to 8 while Triton decode rose,
 because the autotuner picked `BLOCK_M=128` and a single query row was padded into a 128-row
 tile; the MFMA issue count follows the tile and not the rows in it, so the padding was the
 cost. Selecting a 64-row tile for `Sq <= 64` moved the column 1.6x. That left the MHA row
@@ -19,12 +19,16 @@ workgroups and padding 63 of 64 rows in each. Giving the whole group one tile mo
 rows another 2.4x, to 1.27x at `(1, 8192)` and *0.96x* -- ahead of Triton decode -- by
 `Sq` 8.
 
-What is left is the remaining 1.2-1.5x, and it is the KV axis. Every row here is within
-~1.5x now, and the shape of what remains is visible in the `Skv` 4096 row being *worse*
-(1.47x) than 8192 (1.27x): the grid is `B * Hkv` workgroups regardless of how long the KV
-walk is, so at 64 workgroups on 80 CUs there is idle machine that only a KV split can use,
-and the shorter the walk the more the fixed costs show. Triton decode splits KV; this does
-not.
+The third was parallelism, which is what Triton decode's own `SPLIT_KV` is for, and the
+residual's shape said so: `Skv` 4096 measured *worse* (1.47x) than 8192 (1.27x), because the
+packed grid is `B * Hkv` workgroups regardless of how long the KV walk is, so at 64
+workgroups on 80 CUs there was idle machine and the shorter the walk the more the fixed costs
+showed. Splitting the walk across workgroups gives it something to do, and it is the largest
+of the three on the shapes where the grid was smallest. Every row here is now at or ahead of
+Triton's dedicated decode kernel.
+
+What this does not cover is *sparse* decode, where their strongest numbers are: a block-mask
+walk is left unsplit, because its length is the mask's data rather than the shape's.
 
 `--check` verifies the prefill kernel against eager at these shapes with a `score_mod`
 before timing anything, since a fast wrong answer is not a baseline.

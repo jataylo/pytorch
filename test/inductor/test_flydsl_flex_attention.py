@@ -2086,6 +2086,269 @@ class TestFlyDSLFlexAttention(TestCase):
         ).item()
         self.assertLess(rel, 2e-2)
 
+    def test_kv_split_count_follows_the_slice_and_the_grid(self):
+        """Two terms: a slice wants 1024 KV rows, and the grid wants 32 WGs per CU.
+
+        The sweep those came from is in ``_forward_kv_splits``. What is pinned here is that
+        each term binds where it should -- the same base grid takes four times the splits
+        on a walk four times as long, and the same walk takes fewer splits as the base grid
+        grows -- plus the two gates, since the prefill one is what keeps the tuned path
+        untouched and a block-mask walk has no length to size a split against.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _forward_kv_splits,
+        )
+
+        cus = torch.cuda.get_device_properties(
+            torch.device("cuda")
+        ).multi_processor_count
+
+        def splits(opts=None, *, batch_size=8, num_heads=32, num_kv_heads=8,
+                   seq_len_q=1, seq_len_kv=8192, v_head_dim=128, block_m=64,
+                   pack_gqa=True, use_block_mask=False):
+            return _forward_kv_splits(
+                opts or {},
+                batch_size=batch_size,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                seq_len_q=seq_len_q,
+                seq_len_kv=seq_len_kv,
+                v_head_dim=v_head_dim,
+                block_m=block_m,
+                pack_gqa=pack_gqa,
+                use_block_mask=use_block_mask,
+                device=torch.device("cuda"),
+            )
+
+        # The walk term. 8192 rows is eight slices of 1024 and the base grid here (64) is
+        # far under the target, so the slice length is what decides.
+        self.assertEqual(splits(), 8)
+        self.assertEqual(splits(seq_len_kv=16384), 16)
+        self.assertEqual(splits(seq_len_kv=4096), 4)
+        self.assertEqual(splits(seq_len_kv=2048), 2)
+        # Shorter than one slice: there is nothing to cut.
+        self.assertEqual(splits(seq_len_kv=1023), 1)
+
+        # The grid term, on a walk long enough that only the grid can bind. Base grid is
+        # batch * kv_heads at one Q token, so the batch is the knob.
+        self.assertEqual(splits(batch_size=1), 8)
+        self.assertEqual(
+            splits(batch_size=64, seq_len_kv=1 << 20),
+            32 * cus // (64 * 8),
+        )
+        # Enough workgroups already that the target is met unsplit.
+        self.assertEqual(splits(batch_size=32 * cus, seq_len_kv=1 << 20), 1)
+
+        # Unpacked (MHA) counts Q heads in the grid, not KV heads.
+        self.assertEqual(splits(num_kv_heads=32, pack_gqa=False), 8)
+
+        # The two gates. Prefill keeps the tuned path; a block-mask walk's length is the
+        # mask's data rather than the shape's.
+        self.assertEqual(splits(seq_len_q=65), 1)
+        self.assertEqual(splits(seq_len_q=4096, block_m=128, pack_gqa=False), 1)
+        self.assertEqual(splits(use_block_mask=True, pack_gqa=False), 1)
+
+        # Overridable, and the override is validated rather than trusted.
+        self.assertEqual(splits({"NUM_KV_SPLITS": 3}), 3)
+        self.assertEqual(splits({"NUM_KV_SPLITS": 1}, seq_len_kv=1 << 20), 1)
+        self.assertEqual(splits({"NUM_KV_SPLITS": 4}, seq_len_q=4096), 4)
+        for bad in (0, -1, 2.5, "4"):
+            with self.assertRaises(RuntimeError):
+                splits({"NUM_KV_SPLITS": bad})
+
+    def test_kv_split_workspace_budget_caps_the_count(self):
+        """The workspace is 2*splits times the output, which only bites at long Sq.
+
+        At one query token it is a few MB and never binds; the cap exists for the top of
+        the decode range, where the same rule would otherwise ask for hundreds of MB of
+        scratch to accelerate a small kernel.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _SPLIT_WORKSPACE_BUDGET_BYTES,
+            _forward_kv_splits,
+        )
+
+        def splits(**kw):
+            opts = dict(
+                batch_size=8,
+                num_heads=32,
+                num_kv_heads=8,
+                seq_len_q=1,
+                seq_len_kv=1 << 20,
+                v_head_dim=128,
+                block_m=64,
+                pack_gqa=True,
+                use_block_mask=False,
+                device=torch.device("cuda"),
+            )
+            opts.update(kw)
+            return _forward_kv_splits({}, **opts)
+
+        def workspace_bytes(n, *, batch_size, num_heads, seq_len_q, v_head_dim):
+            return batch_size * n * num_heads * seq_len_q * (v_head_dim + 4) * 4
+
+        # Sq 1: the grid term binds, and the workspace it asks for is nowhere near.
+        shape = dict(batch_size=8, num_heads=32, seq_len_q=1, v_head_dim=128)
+        self.assertLess(
+            workspace_bytes(splits(**shape), **shape),
+            _SPLIT_WORKSPACE_BUDGET_BYTES // 8,
+        )
+
+        # A shape where it binds: 64 query tokens over 64 heads at head_dim 256, where one
+        # split alone is ~34 MB.
+        big = dict(batch_size=8, num_heads=64, seq_len_q=64, v_head_dim=256)
+        n = splits(**big, num_kv_heads=8, block_m=64)
+        self.assertLessEqual(
+            workspace_bytes(n, **big), _SPLIT_WORKSPACE_BUDGET_BYTES
+        )
+        # And the cap is what chose it, not the other two terms.
+        self.assertGreater(
+            workspace_bytes(n + 1, **big), _SPLIT_WORKSPACE_BUDGET_BYTES
+        )
+
+    @parametrize("num_kv_splits", [2, 3, 5, 8])
+    @parametrize("seq_len_q", [1, 8, 64])
+    def test_split_kv_agrees_with_the_unsplit_kernel(self, num_kv_splits, seq_len_q):
+        """A split changes how the walk is divided, not what it computes.
+
+        Not bit-exact, and it cannot be: the unsplit kernel adds the sequence in one
+        running sum while a split adds per-slice sums rebased onto a common max, so the
+        additions happen in a different order. The output is bf16, whose spacing is about
+        1/256, so two roundings of nearby f32 values sit that far apart and there is no
+        room to be tighter than eager on O.
+
+        LSE is where the bar can be sharp. It is f32, it is the same sum both kernels are
+        forming, and the combine computes it from the rebased denominator -- so the two
+        have to agree to a few f32 roundings, which is 1e-5 rather than the 1e-2 eager
+        needs. A combine that dropped or double-counted a slice fails that by orders of
+        magnitude while still looking plausible on O.
+        """
+        torch.manual_seed(0)
+        B, num_heads, num_kv_heads, S, head_dim = 2, 8, 2, 4096, 128
+        q = torch.randn(
+            B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+
+        results = {}
+        for n in (1, num_kv_splits):
+            launcher = build_flex_flash_generic_module(
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                causal=False,
+                sm_scale=head_dim**-0.5,
+                dtype_str="bf16",
+                return_lse=True,
+                layout="bhsd",
+                block_m=64,
+                pack_gqa=True,
+                num_kv_splits=n,
+            )
+            run, out, lse = prepare(launcher, q, k, v)
+            run()
+            torch.cuda.synchronize()
+            results[n] = (out.clone(), lse.clone())
+
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, enable_gqa=True
+        )
+        ref_lse = torch.logsumexp(
+            (q.float() @ k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+             .float().transpose(-1, -2)) * head_dim**-0.5,
+            dim=-1,
+        )
+        for n, (out_n, lse_n) in results.items():
+            rel = ((out_n.float() - ref.float()).norm() / ref.float().norm()).item()
+            self.assertLess(rel, 2e-2, f"{n} splits disagrees with eager: {rel}")
+            self.assertLess((lse_n - ref_lse).abs().max().item(), 1e-2)
+        self.assertLess(
+            (results[num_kv_splits][1] - results[1][1]).abs().max().item(),
+            1e-5,
+            "the combine's LSE must match the unsplit kernel's to f32 rounding",
+        )
+        # And O agrees to bf16 spacing, which is all the dtype allows.
+        self.assertLess(
+            (
+                (results[num_kv_splits][0].float() - results[1][0].float()).norm()
+                / results[1][0].float().norm()
+            ).item(),
+            2**-7,
+        )
+
+    def test_split_kv_handles_the_slices_with_no_work(self):
+        """An empty slice is the case the unnormalised partial exists to make free.
+
+        A causal walk gets shorter the earlier the Q tile, so most slices of an early tile
+        have nothing in them; so does any slice past a short sequence. Such a slice never
+        enters its loop, so it stores the state it started with -- a zero accumulator and a
+        zero sum -- and drops out of the combine's sums on its own. With more splits than
+        the walk has tiles, *every* slice but the first is empty, which is the degenerate
+        end of the same path.
+        """
+        torch.manual_seed(0)
+        B, num_heads, head_dim = 2, 8, 64
+        for seq_len, causal, n in (
+            (512, True, 8),
+            (64, False, 8),
+            (64, False, 32),  # more splits than the walk has tiles
+            (1024, True, 16),
+        ):
+            q = torch.randn(
+                B, num_heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16
+            )
+            k = torch.randn_like(q)
+            v = torch.randn_like(q)
+            launcher = build_flex_flash_generic_module(
+                num_heads=num_heads,
+                num_kv_heads=num_heads,
+                head_dim=head_dim,
+                causal=causal,
+                sm_scale=head_dim**-0.5,
+                dtype_str="bf16",
+                return_lse=True,
+                layout="bhsd",
+                block_m=128,
+                num_kv_splits=n,
+            )
+            run, out, lse = prepare(launcher, q, k, v)
+            run()
+            torch.cuda.synchronize()
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=causal
+            )
+            rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+            self.assertLess(
+                rel, 2e-2, f"S={seq_len} causal={causal} splits={n}: {rel}"
+            )
+            self.assertTrue(torch.isfinite(lse).all())
+
+    def test_split_kv_workspace_row_stays_aligned(self):
+        """The row carries the accumulator, the max and the sum, 16-byte aligned.
+
+        The accumulator is stored 128 bits at a time, so the row stride has to keep every
+        row's base aligned -- which is why the tail is four elements and not the two the
+        max and the sum need. Every admitted head_dim_v is a multiple of 32, so this holds
+        for all of them, and the assertion is the derivation rather than a spot check.
+        """
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
+            split_kv_workspace_elems,
+            split_kv_workspace_row_elems,
+        )
+
+        for head_dim_v in (64, 96, 128, 160, 192, 224, 256):
+            row = split_kv_workspace_row_elems(head_dim_v)
+            self.assertEqual(row, head_dim_v + 4)
+            self.assertGreaterEqual(row - head_dim_v, 2)  # room for m and l
+            self.assertEqual((row * 4) % 16, 0)
+        self.assertEqual(
+            split_kv_workspace_elems(
+                batch_size=8, num_heads=32, seq_len_q=1, num_kv_splits=4, head_dim_v=128
+            ),
+            8 * 4 * 32 * 1 * 132,
+        )
+
     def test_packing_refuses_what_it_cannot_express(self):
         """The builder's own guards, which the lowering is trusted not to reach."""
         def build(**kwargs):

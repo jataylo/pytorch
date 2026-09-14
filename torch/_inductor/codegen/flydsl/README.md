@@ -658,6 +658,8 @@ Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output(
 `kernel_options={"BLOCK_M": n}` pins the forward's Q tile;
 `kernel_options={"ENABLE_KV_GPFETCH": bool}` pins the forward's K staging;
 `kernel_options={"PACK_GQA": bool}` pins whether the GQA group shares a Q tile;
+`kernel_options={"NUM_KV_SPLITS": n}` pins how many workgroups share one Q tile's KV walk,
+and 1 disables the split and the combine kernel with it;
 `kernel_options={"LAYOUT": "bhsd"|"bshd"}` pins which layout the kernel indexes, which is
 otherwise read off the strides of q/k/v (and `do`) so that nothing has to be copied.
 
@@ -715,6 +717,84 @@ tiles and MQA. On `(1, 8192)` D128 it measured 1.00x at grids that already fit i
 and up to 4.70x where they did not, and never lost — so it is a rule rather than an autotune
 choice. It is asked only of short Q sequences because at prefill the packed and unpacked
 grids are the same size and there is nothing to win.
+
+## Splitting the KV walk across workgroups
+
+Packing fixed the grid at `B * Hkv * ceil(Sq / tokens_per_tile)`, and at one query token
+that is just `B * Hkv` — 64 workgroups on 80 CUs at 8x8. Nothing about the Q tile divides it
+further. The KV axis does, and it is long: `num_kv_splits` hands each of N workgroups a slice
+of the sequence, and `flex_flash_combine_kernel` merges them.
+
+**A slice stores its state before normalisation.** It has to: each slice runs its own online
+softmax and so normalises against its own running max, and those maxima do not agree. So a
+slice writes the unnormalised accumulator `o = Σ 2^((s-m)σL) v` together with the max `m` and
+the sum `l` it is relative to, and the combine rebases every slice onto a common
+`m_max = max_s m_s`:
+
+```
+w_s   = 2^((m_s - m_max)·σ·L)
+out   = Σ_s w_s · o_s  /  Σ_s w_s · l_s
+lse   = m_max·σ + ln(Σ_s w_s · l_s)
+```
+
+Unnormalised rather than per-slice-normalised is the choice worth stating, because it is what
+makes an **empty slice free**. A slice past a causal diagonal, or past the end of the
+sequence, never enters its loop — so it stores exactly the initial state, `o = 0` and
+`l = 0`, and contributes nothing to either sum with no test anywhere. `flex_flash_950.py`
+takes the other option, normalising per slice and reweighting by `w·l`, and consequently has
+to skip `l == 0` rows explicitly and eats a rounding to a division it did not need to do.
+
+The split cuts in whole **loop steps** rather than rows, so a boundary never lands inside a
+tile. That is what keeps every in-tile index expression, the causal mask and the
+sequence-padding mask identical to the unsplit kernel's, and it is also why the same code
+covers the block-mask walk, where the unit is a visited block rather than a row.
+
+The workspace is one flat f32 buffer of `[splits][B][Hq][Sq]` rows, each carrying the
+accumulator over `[0, Dv)` and then `m` and `l` just past it. One row rather than three
+planes because the kernel is never passed the batch size and a plane base would need it; four
+elements of tail rather than the two `m` and `l` need so the row stride stays 16-byte aligned
+and the 128-bit accumulator stores need no per-row alignment case. f32 rather than the output
+dtype because these values are summed, so a rounding here lands *inside* the reduction.
+
+**One NaN had to be fixed for this.** `kv_upper` stops at the diagonal of the *tile*, not of
+the row, so a slice can begin past a given row's diagonal and have every element masked —
+rows 0–63 of a tile whose second slice starts at column 64. The running max then stays
+`-inf`, and the rescale computes `exp2(-inf - -inf)`, which is NaN, and it poisons `l` and `o`
+for the rest of the loop. This is the same hazard the block-skip path has, and the same fix:
+seed the running max at the finite `-1.0e30` sentinel, which is an invariant from then on
+because `max(finite, -inf)` is still finite. Unsplit, the dense causal path never reaches it,
+because a tile's *first* sub-tile always holds a visible column.
+
+Unlike packing this is not free everywhere, so the count is a rule with two terms, swept over
+base grids from 8 to 512 workgroups (bf16 D128, `Sq` 1, kernel-only µs):
+
+| base | s=1 | s=2 | s=4 | s=8 | s=16 | s=32 | rule | got / best |
+|---|---|---|---|---|---|---|---|---|
+| 8 | 573 | 291 | 258 | **227** | 247 | 229 | 8 | 2.52x / 2.53x |
+| 32 | 574 | 293 | 247 | **225** | 234 | 248 | 8 | 2.55x / 2.55x |
+| 64 | 576 | 353 | 358 | 355 | **325** | 327 | 8 | 1.62x / 1.77x |
+| 256 | 1354 | 1322 | 1177 | **1140** | 1161 | 1231 | 8 | 1.19x / 1.19x |
+| 512 | 2651 | 2311 | **2215** | 2243 | 2293 | 2427 | 5 | 1.20x / 1.20x |
+| 64, `Skv` 2048 | **221** | 224 | 229 | 226 | 227 | 222 | 2 | 0.99x / 1.00x |
+| 64, `Skv` 16384 | 1139 | 667 | 680 | 679 | 610 | **603** | 16 | 1.87x / 1.89x |
+
+A slice wants at least **1024 KV rows** — the `Skv` 2048 row is the control where the walk is
+too short to cut and the kernel is already on its fixed costs, and `Skv` 16384 is the same
+base grid wanting four times the splits for a walk four times as long — and the product
+`base * splits` wants about **32 workgroups per CU**, which is what separates the 512 row
+(wanting 5) from the 32 row (wanting 8, and which would take 80). The rule lands on the
+measured best in eight of eleven rows and within 3% in two more, a smaller spread than the
+tile height's, so it is a rule rather than an autotune axis. Override with
+`NUM_KV_SPLITS` in `kernel_options`.
+
+Only short Q sequences are offered it. The workspace scales with `Sq` while the win does not:
+at `Sq` 512, base 256, the best split is 4 for 1.11x while the rule's 8 would be *worse* than
+not splitting at all. Prefill keeps the tuned path untouched. A third term caps the workspace
+at 128 MiB, which only binds at the top of the decode range.
+
+End to end this closed the decode gap: against Triton's dedicated decode kernel the six
+shapes in `decode_gap.py` went from 1.20–1.47x behind to **0.58–1.02x** — ahead of it on four
+of them. What is *not* covered is sparse decode; see item 9 in `BRANCH_OVERVIEW.md`.
 
 ## Staging KV through registers
 

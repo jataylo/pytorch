@@ -613,9 +613,19 @@ def create_flex_flydsl_attention_kernel(
         head_dim=int(V.graph.sizevars.optimization_hint(qk_head_dim)),
     )
     kv_gpfetches = _forward_kv_gpfetch(kernel_options)
+    seq_len_kv_hint = int(V.graph.sizevars.optimization_hint(key.get_size()[2]))
+    batch_hint = int(V.graph.sizevars.optimization_hint(batch_size))
     for mod_vec_size, qk_prefetch_depth, block_m, kv_gpfetch in itertools.product(
         vec_sizes, prefetch_depths, block_ms, kv_gpfetches
     ):
+        pack_gqa = _pack_gqa(
+            kernel_options,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            block_m=block_m,
+            seq_len_q=seq_len_q_hint,
+            use_block_mask=use_block_mask,
+        )
         with patch_fixed_layout_indexer_for_cutedsl():
             error = _flydsl_flash_attention_template().maybe_append_choice(
                 choices,
@@ -635,13 +645,19 @@ def create_flex_flydsl_attention_kernel(
                 QK_PREFETCH_DEPTH=qk_prefetch_depth,
                 LAYOUT=layout_str,
                 BLOCK_M=block_m,
-                PACK_GQA=_pack_gqa(
+                PACK_GQA=pack_gqa,
+                NUM_KV_SPLITS=_forward_kv_splits(
                     kernel_options,
+                    batch_size=batch_hint,
                     num_heads=num_heads,
                     num_kv_heads=num_kv_heads,
-                    block_m=block_m,
                     seq_len_q=seq_len_q_hint,
+                    seq_len_kv=seq_len_kv_hint,
+                    v_head_dim=int(V.graph.sizevars.optimization_hint(v_head_dim)),
+                    block_m=block_m,
+                    pack_gqa=pack_gqa,
                     use_block_mask=use_block_mask,
+                    device=device,
                 ),
                 ENABLE_KV_GPFETCH=kv_gpfetch,
                 USE_BLOCK_MASK=use_block_mask,
@@ -1296,6 +1312,111 @@ def _pack_gqa(
             )
         return bool(requested)
     return legal and seq_len_q <= 64
+
+
+# A split shorter than this many KV rows stops paying for itself: the slice no longer
+# amortises the prologue, the partial write and the combine's read of it. 1024 is where the
+# measurement below flattens, and it is the same number at every grid size, which is what
+# makes it a property of the slice rather than of the shape.
+_SPLIT_MIN_KV_ROWS = 1024
+# Workgroups per CU to aim the split at. Past this the grid is fine enough that the tail
+# round's idle CUs are a small fraction of the whole, and cutting further only adds slices.
+_SPLIT_TARGET_WGS_PER_CU = 32
+# The workspace is `2 * splits` times the size of the output, which is nothing at `Sq` 1
+# and not nothing at the top of the decode range. This only binds there.
+_SPLIT_WORKSPACE_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+def _forward_kv_splits(
+    kernel_options: dict[str, Any],
+    *,
+    batch_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    v_head_dim: int,
+    block_m: int,
+    pack_gqa: bool,
+    use_block_mask: bool,
+    device: Any,
+) -> int:
+    """How many workgroups should share one query tile's KV walk.
+
+    Packing the GQA group was the second of two fixes that took decode from 2.0-6.5x off
+    Triton's dedicated decode kernel to 1.20-1.47x, and it left the grid at
+    ``B * Hkv * ceil(Sq / tokens_per_tile)`` -- which at one query token is just ``B * Hkv``,
+    64 workgroups on 80 CUs at 8x8. Nothing about the Q tile can divide that further. The
+    KV axis can, and it is long. See Note [splitting the KV walk across workgroups] in
+    ``flex_flash_generic.py`` for how a slice stores its unnormalised state and what
+    reduces them.
+
+    Swept against the unsplit kernel over base grids from 8 to 512 workgroups, bf16 D128
+    ``Sq`` 1 unless noted, kernel-only microseconds:
+
+        base   s=1   s=2   s=4   s=8  s=16  s=32     rule   picked / best
+           8   573   291   258   227   247   229      s=8   2.52x / 2.53x
+          16   574   291   246   243   240   244      s=8   2.39x / 2.39x
+          32   574   293   247   225   234   248      s=8   2.55x / 2.55x
+          64   576   353   358   355   325   327      s=8   1.62x / 1.77x
+         128   673   679   673   614   597   630      s=8   1.10x / 1.13x
+         256  1354  1322  1177  1140  1161  1231      s=8   1.19x / 1.19x
+         512  2651  2311  2215  2243  2293  2427      s=5   1.20x / 1.20x
+         256  1335  1335  1185  1138  1167  1219      s=8   1.17x / 1.17x   MHA, unpacked
+          64   221   224   229   226   227   222      s=2   0.99x / 1.00x   Skv 2048
+          64  1139   667   680   679   610   603     s=16   1.87x / 1.89x   Skv 16384
+         256  1382  1351  1217  1189  1282  1538      s=8   1.16x / 1.16x   Sq 64
+
+    Two terms explain all of it. A slice wants at least ``_SPLIT_MIN_KV_ROWS`` rows -- the
+    ``Skv`` 2048 row is the control, where the walk is too short to cut at all and the
+    kernel is already on its fixed costs, and the ``Skv`` 16384 row is the same base grid
+    wanting four times the splits because the walk is four times longer. And the product
+    ``base * splits`` wants to reach roughly 32 workgroups per CU, which is what separates
+    the 512 row (which only wants 5) from the 32 row (which wants 8 and would take 80).
+
+    The rule lands on the measured best in eight of eleven rows and within 3% in two more;
+    the exception is base 64, 9% behind the 16 splits it would rather have. That is a
+    smaller spread than the tile height's, so this is a rule rather than an autotune axis,
+    for the same reason ``_pack_gqa`` is.
+
+    Only short query sequences are offered it. A prefill shape has a large grid already, so
+    the split has little to win, and the workspace scales with ``Sq`` while the win does
+    not: at ``Sq`` 512, base 256, the best split is 4 for 1.11x while the rule's 8 would be
+    *worse* than not splitting (2556 us against 2286). The decode gate keeps the tuned
+    prefill path exactly as it was.
+    """
+    requested = kernel_options.get("NUM_KV_SPLITS")
+    if requested is not None:
+        if not (isinstance(requested, int) and requested >= 1):
+            raise RuntimeError(
+                f"NUM_KV_SPLITS must be a positive integer, got {requested!r}"
+            )
+        return int(requested)
+    # The block-mask walk splits the same way -- the loop bounds are the same expression in
+    # visited blocks rather than rows -- but its length is the mask's data, not the shape's,
+    # so there is nothing here to size a split against. Left unsplit rather than guessed at.
+    if use_block_mask or seq_len_q > 64:
+        return 1
+
+    group = num_heads // num_kv_heads
+    tokens_per_tile = block_m // group if pack_gqa else block_m
+    grid_heads = num_kv_heads if pack_gqa else num_heads
+    base = batch_size * grid_heads * -(-seq_len_q // tokens_per_tile)
+    if base < 1:
+        return 1
+
+    num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+    splits = min(
+        seq_len_kv // _SPLIT_MIN_KV_ROWS,
+        _SPLIT_TARGET_WGS_PER_CU * num_cus // base,
+    )
+    # See split_kv_workspace_row_elems: the row carries Dv accumulator plus the max, the
+    # sum and two elements of alignment tail.
+    row_bytes = (v_head_dim + 4) * 4
+    per_split_bytes = batch_size * num_heads * seq_len_q * row_bytes
+    if per_split_bytes:
+        splits = min(splits, _SPLIT_WORKSPACE_BUDGET_BYTES // per_split_bytes)
+    return max(1, splits)
 
 
 def _forward_kv_gpfetch(kernel_options: dict[str, Any]) -> list[bool]:

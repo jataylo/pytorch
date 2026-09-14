@@ -315,11 +315,11 @@ Roughly in value order. Several of these are closed rather than pending — they
 here because "we decided not to", "we measured it and it is not what we thought" and "we
 have not got to it" are three different states and the difference is easy to lose.
 
-**1. A decode kernel** — now down to the **KV split**. This was the largest remaining gap
-and it turned out not to need a decode kernel at all: both halves of the deficit were
-padding, and both are fixed. Decode shapes went from 2.0–6.5x Triton's dedicated decode
-kernel to **1.20–1.47x** at `Sq` 1, and are *ahead* of it by `Sq` 8. See [the decode
-section](UPSTREAM_PR_COMPARISON.md) and `benchmarks/transformer/flydsl/decode_gap.py`.
+**1. ~~A decode kernel.~~ Closed on dense shapes**, and it never needed a decode kernel:
+the whole deficit was padding and parallelism. Decode went from 2.0–6.5x Triton's dedicated
+decode kernel to **0.58–1.02x** — *faster* than it on four of six shapes and level on the
+other two. What is left is **sparse** decode, which is narrower and is item 9. See [the
+decode section](UPSTREAM_PR_COMPARISON.md) and `benchmarks/transformer/flydsl/decode_gap.py`.
 
 The first half was a *padded M tile*. The autotuner picked a 128-row tile for a 1-row Q
 sequence, and since the MFMA issue count follows the tile rather than the rows in it, the
@@ -343,10 +343,22 @@ spanning heads. Another 2.4x on the GQA rows, bit-identical to the unpacked kern
 measured never to lose across six grid sizes — so it is a rule rather than an autotune
 choice (`b5358946953`).
 
-What is left is the KV split, which is what their `SPLIT_KV` mode is for. The residual's
-shape says so: `Skv` 4096 is *worse* (1.47x) than 8192 (1.27x), because the packed grid is
-`B * Hkv` workgroups however long the KV walk is, so at 64 workgroups on 80 CUs there is idle
-machine that only splitting KV can use.
+The third was the KV walk, their `SPLIT_KV` mode, and the residual's shape said so: `Skv`
+4096 was *worse* (1.47x) than 8192 (1.27x), because the packed grid is `B * Hkv` workgroups
+however long the walk is, so at 64 workgroups on 80 CUs there was idle machine that only
+splitting KV could use. Each workgroup now walks a slice and a combine kernel merges them,
+and a slice stores its state *unnormalised* — accumulator, max, sum — rather than
+normalised, which is what makes an empty slice free: it never enters its loop, so it stores
+the zero accumulator and zero sum it started with and drops out of both of the combine's
+sums with no test. One hazard came with it. `kv_upper` stops at the diagonal of the tile
+rather than of the row, so a slice can start past a row's diagonal with every element
+masked, leaving the running max at `-inf` and the rescale computing `exp2(-inf - -inf)`;
+the finite seed the mod-carrying builds already used against the same NaN in the block-skip
+path is the fix. How many slices is a rule on a sweep of base grids from 8 to 512
+workgroups — 1024 KV rows per slice, 32 workgroups per CU — which lands on the measured
+best in eight of eleven rows. Worth 1.16–2.55x, largest exactly where the grid was
+smallest, and offered only to short Q sequences because the workspace scales with `Sq`
+while the win does not (`60c6a1f07a1`).
 
 **2. ~~Asymmetric head dims in the backward.~~ Done** as of `6315ac61cfb`. Both directions
 now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients
@@ -484,6 +496,18 @@ structurally ineligible: `stats_are_log2` is decided in the eager wrapper from t
 `BACKEND` string at Dynamo trace time, before Inductor picks anything. Parity gates `FLASH`
 the same way and never lets `AUTO` select it, so leaving `FLYDSL` refused keeps the two
 aligned. Documented above, not forgotten.
+
+**9. Sparse decode — what is left of item 1.** Their strongest reported numbers (3.6–7.0x)
+are on a top-k-16 mask at decode, which is where a sparse mask has the most to give because
+the dense work per token is so small. Neither of the two things that closed the dense gap
+reaches that shape. Packing the GQA group is mutually exclusive with a BlockMask, because
+the mask is regridded per `(b, h, q_tile)` and cannot describe a tile spanning heads. And
+the KV split is offered only to the dense walk: the block-mask walk splits by the very same
+arithmetic — the loop bounds are already expressed in visited blocks rather than rows, so
+the kernel needs no change at all — but its *length* is the mask's data rather than the
+shape's, so there is nothing at lowering time to size a split against. Something
+runtime-derived would be needed, which is a different mechanism from anything here now, and
+it is unpriced: we have never measured a sparse decode shape.
 
 ## Commits
 

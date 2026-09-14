@@ -1557,7 +1557,18 @@ def build_flex_flash_generic_module(
         # p = exp2(-inf + BIG*scale) = 0, and once a real score appears
         # m_new >= row_max so the exponent stays <= 0. Costs nothing in the loop,
         # and the mod-free build keeps the upstream -inf seed exactly.
-        init_args = [c_neg_floor if HAS_ANY_MOD else c_neg_inf, c_zero_f]
+        #
+        # Splitting the KV walk brings the same hazard to the dense causal path, which is
+        # why it needs the seed too. `kv_upper` stops at the diagonal of the tile, not of
+        # the row, so a slice can begin past a given row's diagonal and have *every*
+        # element masked -- rows 0-63 of a tile whose second slice starts at column 64.
+        # Unsplit that never happens on the first sub-tile, so the running max is already
+        # finite by the time a fully-masked one arrives; split, the slice has nothing
+        # before it.
+        init_args = [
+            c_neg_floor if (HAS_ANY_MOD or SPLIT_KV) else c_neg_inf,
+            c_zero_f,
+        ]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(c_zero_v16f32)
         def _kv_tile_start(iv):

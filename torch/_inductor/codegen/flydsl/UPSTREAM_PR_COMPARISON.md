@@ -103,39 +103,50 @@ lowering; that is not in the pushed head.
 
 | | theirs | ours |
 |---|---|---|
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but decode shapes are served correctly by the prefill kernel, with GQA packing and a short-Q tile — 1.20–1.47x off Triton decode at `Sq` 1, *ahead* of it by `Sq` 8, and 14x faster than Triton prefill. What remains is the KV split. See below |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel, and no longer a deficit**: the prefill kernel serves decode shapes with GQA packing, a short-Q tile and a KV split, and now measures **0.58–1.02x** of Triton's dedicated decode kernel — ahead of it on four of six shapes, level on the other two. Sparse decode is the part we do not have: a block-mask walk is left unsplit. See below |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **any admitted pair, either order, in both directions** |
 | Upstreaming | in the review queue with `albanD` / `drisspg` requested | a local branch |
 | Backward CDNA4 | their backward is written for gfx950 throughout | ours takes `mfma_k16` in GEMM1 and `lds_transpose_read` in both kernels, which halves the `dkdv` LDS footprint; `permlane_o_store` is written but declined on register pressure; `dma_to_lds_b128` is the one gap left |
 
-The first two are the honest asymmetry. Decode is a whole feature we do not have and they
-have tuned, and it is the shape where their sparse numbers are strongest — a decode step is
-where a sparse mask has the most to give, because the dense work per token is tiny. And no
-amount of ISA inspection substitutes for running the kernel: our gfx950 claim is *"every
+Real gfx950 validation is the honest asymmetry, and it is the one nothing here can fix: no
+amount of ISA inspection substitutes for running the kernel, so our gfx950 claim is *"every
 admitted head dim lowers and the CDNA4 paths engage"*, which is strictly weaker than theirs.
+
+Decode used to head this list and no longer does. What is left of it is narrower and worth
+stating precisely: **sparse** decode. Their 3.6–7.0x is measured on a top-k-16 mask, and a
+decode step is exactly where a sparse mask has the most to give, because the dense work per
+token is tiny. Two things of ours stop short there. The KV split is offered only to the
+dense walk — a block-mask walk splits by the same arithmetic, in visited blocks rather than
+rows, but its length is the mask's data rather than the shape's, so there is nothing at
+lowering time to size a split against. And packing the GQA group is mutually exclusive with
+a BlockMask to begin with, since the mask is regridded per `(b, h, q_tile)` and cannot
+describe a tile spanning heads. So a sparse decode shape gets neither of the two fixes that
+closed the dense gap, and we have not priced it.
 
 ### What "no decode kernel" actually costs
 
-Worth stating precisely, because "deferred" reads as "broken" and it is not. `use_decode` is
+Nothing, on a dense shape, which took three fixes to be able to say. `use_decode` is
 reachable only from `BACKEND='TRITON_DECODE'` or from `AUTO`, so `BACKEND='FLYDSL'` never
 routes to `flex_decoding` at all — a decode shape is served by the ordinary prefill kernel,
 mods and all, and it is correct there (checked against eager at `Sq ∈ {1, 4}` with a
 `score_mod`, GQA and MHA, rel err ≤ 8e-3).
 
-bf16, D128, gfx942, microseconds per call. The FlyDSL column is *after* both fixes below;
-the two "was" columns are what a `BLOCK_M=128` tile cost and what the 64-row tile cost before
-the GQA group was packed into it:
+bf16, D128, gfx942, microseconds per call. The FlyDSL column is *after* all three fixes
+below; the three "was" columns are what a `BLOCK_M=128` tile cost, what the 64-row tile cost
+before the GQA group was packed into it, and what the packed tile cost before the KV walk was
+split. Four of the six rows are now faster than Triton's dedicated decode kernel and the
+other two are level, so the row that used to read 1.47x reads 0.80x:
 
-| B, Hq, Hkv, Sq, Skv | Triton | Triton decode | FlyDSL | was (128-row) | was (unpacked) | FlyDSL / decode |
-|---|---|---|---|---|---|---|
-| 8, 32, 8, 1, 4096 | 4053 | 225 | 331 | 1130 | 689 | 1.47x |
-| 8, 32, 8, 1, 8192 | 8084 | 450 | 571 | 2227 | 1364 | 1.27x |
-| 8, 32, 32, 1, 8192 (MHA) | 8169 | 1102 | 1320 | 2249 | 1319 | 1.20x |
-| 8, 32, 8, 4, 8192 | 8085 | 459 | 572 | 2227 | 1363 | 1.25x |
-| 8, 32, 8, 8, 8192 | 8088 | 598 | 572 | 2228 | 1365 | **0.96x** |
-| 32, 32, 8, 1, 8192 | 26313 | 1103 | 1343 | 7150 | 4637 | 1.22x |
+| B, Hq, Hkv, Sq, Skv | Triton | Triton decode | FlyDSL | was (128-row) | was (unpacked) | was (unsplit) | FlyDSL / decode |
+|---|---|---|---|---|---|---|---|
+| 8, 32, 8, 1, 4096 | 4056 | 228 | 183 | 1130 | 689 | 331 | **0.80x** |
+| 8, 32, 8, 1, 8192 | 8087 | 460 | 346 | 2227 | 1364 | 571 | **0.75x** |
+| 8, 32, 32, 1, 8192 (MHA) | 8171 | 1103 | 1119 | 2249 | 1319 | 1320 | 1.02x |
+| 8, 32, 8, 4, 8192 | 8093 | 463 | 341 | 2227 | 1363 | 572 | **0.74x** |
+| 8, 32, 8, 8, 8192 | 8106 | 597 | 344 | 2228 | 1365 | 572 | **0.58x** |
+| 32, 32, 8, 1, 8192 | 49614 | 1104 | 1123 | 7150 | 4637 | 1343 | 1.02x |
 
 The first version of this table had a flat FlyDSL column — 2227 µs for `Sq` of 1, 4 *and* 8,
 while Triton decode rose from 439 to 596 — and the autotuner's own log said why: it picked
@@ -150,9 +161,9 @@ whenever `Sq <= 64`. That is 1.6x, uniformly, for a constant.
 64 is the floor rather than 32 because a wave owns 32 rows, one per lane, and FlyDSL rejects
 a 64-thread workgroup, so a one-wave kernel is not a thing this body can be.
 
-FlyDSL is also 14x faster than Triton's *prefill* kernel on the same shape, which is the
-part "reaches no architecture" obscured — the remaining deficit is against a specialized
-decode kernel, not against the general path.
+FlyDSL is also 14-44x faster than Triton's *prefill* kernel on the same shape, which is the
+part "reaches no architecture" obscured — the deficit was against a specialized decode
+kernel throughout, never against the general path, and it is now a surplus on four rows.
 
 The second fix is the gap between the MHA row and the GQA ones. MHA is the shape where the
 group is a single head and so there is nothing to pack, and after the tile fix it sat at
@@ -176,12 +187,37 @@ enabled whenever it is legal and `Sq <= 64`; it was measured across six grid siz
 loses — 1.00x where the unpacked grid already fits in the 80 CUs, up to 4.70x where it does
 not — so there is nothing here to autotune.
 
-What is left is the KV axis, which is their `SPLIT_KV` mode. Every row is now within 1.5x,
-and the residual's shape is visible in `Skv` 4096 being *worse* (1.47x) than 8192 (1.27x):
-the packed grid is `B * Hkv` workgroups no matter how long the KV walk is, so at 64
-workgroups on 80 CUs there is idle machine that only a KV split can use, and the shorter the
-walk the more the fixed costs show. By `Sq` 8 there are enough real rows in the tile that
-FlyDSL is already *ahead* of Triton's dedicated decode kernel.
+The third fix was the KV axis, their `SPLIT_KV` mode, and the residual's shape is what said
+so: `Skv` 4096 used to be *worse* (1.47x) than 8192 (1.27x), because the packed grid is
+`B * Hkv` workgroups no matter how long the KV walk is, so at 64 workgroups on 80 CUs there
+was idle machine and the shorter the walk the more the fixed costs showed. Splitting gives
+that machine something to do: each workgroup walks a slice of the sequence and a second
+kernel combines the slices.
+
+The combine is where the design choice is. A slice cannot simply be summed, because each
+runs its own online softmax and normalises against its own running max, so what a slice
+stores is the state *before* normalisation — the unnormalised accumulator, the max, and the
+sum it is relative to — and the combine rebases all the slices onto a common max before
+dividing. Storing it unnormalised rather than per-slice-normalised is what makes an empty
+slice free: a slice past a causal diagonal or past the end of the sequence never enters its
+loop, so it stores exactly the initial state, a zero accumulator and a zero sum, and drops
+out of both sums with no test. The 950 kernel's variant normalises per slice, reweights by
+`w·l`, and consequently needs the `l == 0` rows skipped explicitly.
+
+One hazard did not survive the split and had to be fixed: `kv_upper` stops at the diagonal
+of the *tile*, not of the row, so a slice can begin past a given row's diagonal and have
+every element masked — rows 0-63 of a tile whose second slice starts at column 64. That
+leaves the running max at `-inf`, and the rescale then computes `exp2(-inf - -inf)`, which
+is NaN. The finite `-1.0e30` seed that the mod-carrying builds already used for the same
+reason in the block-skip path is the fix; unsplit, the dense causal path never reaches it,
+because the first sub-tile always holds a visible column.
+
+How many slices is a rule rather than an autotune axis, on a sweep over base grids from 8 to
+512 workgroups: a slice wants at least 1024 KV rows and the product `base * splits` wants
+about 32 workgroups per CU, which between them land on the measured best in eight of eleven
+rows. Only short query sequences are offered it — at `Sq` 512 the workspace scales with `Sq`
+while the win does not, and the rule's choice would be worse than not splitting. See
+`_forward_kv_splits`.
 
 ---
 
