@@ -2450,9 +2450,12 @@ class TestFlyDSLFlexAttention(TestCase):
         )
         filler = torch.full((1,), 5, device="cuda", dtype=torch.float32)
         lens = {"seq_len_q": 4, "seq_len_kv": 4} | {zeroed: 0}
-        # Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, the aux slots, batch, then the two.
+        # Q, K, V, O, LSE, KV_NUM_BLOCKS, KV_INDICES, the aux slots, the split-KV
+        # workspace, batch, then the two extents. The count is derived rather than
+        # written out so that adding a tensor slot fails the build here instead of
+        # silently reading a neighbour.
         args = (
-            [filler] * (7 + launcher.max_aux_tensors)
+            [filler] * (8 + launcher.max_aux_tensors)
             + [2]
             + [lens["seq_len_q"], lens["seq_len_kv"]]
         )

@@ -284,7 +284,7 @@ instruction sequence rather than reading the graph.
 
 | | theirs | ours |
 | --- | --- | --- |
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel**, but the prefill kernel now has the packed-GQA mapping and a short-Q tile: 1.20–1.47x Triton decode's time at `Sq` 1 and *ahead* of it by `Sq` 8 (14x faster than Triton prefill). The KV split is the remaining piece — see `UPSTREAM_PR_COMPARISON.md` |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel, and no deficit either**: the prefill kernel carries the packed-GQA mapping, a short-Q tile and a KV split, and measures **0.58–1.02x** of Triton decode's time — faster on four of six shapes, level on two (14–44x faster than Triton prefill). **Sparse** decode is what is left, and is item 9 |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, four shape families | **build and ISA only.** No CDNA4 silicon here; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection, `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` first-class in **both** directions | forward any admitted pair either order; **backward refuses** |
@@ -358,7 +358,7 @@ path is the fix. How many slices is a rule on a sweep of base grids from 8 to 51
 workgroups — 1024 KV rows per slice, 32 workgroups per CU — which lands on the measured
 best in eight of eleven rows. Worth 1.16–2.55x, largest exactly where the grid was
 smallest, and offered only to short Q sequences because the workspace scales with `Sq`
-while the win does not (`60c6a1f07a1`).
+while the win does not (`7ecd62a1b7d`, `4b8cc3e65d7`).
 
 **2. ~~Asymmetric head dims in the backward.~~ Done** as of `6315ac61cfb`. Both directions
 now serve any admitted `qk_head_dim != v_head_dim` pair in either order, checked on gradients
@@ -537,6 +537,9 @@ it is unpriced: we have never measured a sparse decode shape.
 | `5676411895b` | Take the transposing LDS read in the backward |
 | `b83b98f211b` | Write the backward's fused output store, and decline it |
 | `60e9289831f` | Pad the K row at the taller tile, and name the deficit correctly |
+| `b4c9c98b0d8` | Record the last three commits in the overview table |
+| `7ecd62a1b7d` | Split the KV walk across workgroups in the flex forward |
+| `4b8cc3e65d7` | Route decode through the KV split, and close the decode gap |
 
 ## Further reading
 
