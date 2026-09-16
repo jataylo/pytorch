@@ -185,7 +185,7 @@ ptrtoint`; there is no `to_llvm_ptr`. **This cannot be shimmed in Python.**
 Fix: build FlyDSL from this branch. That means building LLVM/MLIR at pinned
 commit `e2a39f504fee836e4def9581bed817ecc327b9dc`
 (`scripts/build_llvm.sh`, then `scripts/build.sh`). Submodules under
-`thirdparty/` are not checked out (cloned `--single-branch`).
+its vendored-dependency directory are not checked out (cloned `--single-branch`).
 
 Machine is well suited: 224 cores, 1007 GB RAM, 450 GB free on `/dockerx`,
 cmake 3.31.6, ninja present. Estimate 20–40 min at `-j64`.
@@ -519,7 +519,7 @@ were overhead on every variant, where block-skipping only ever helped the masked
 Causal at 2x32x4096 now **beats autotuned Triton, 1.02x** (59.7 vs 58.4 TF), and against
 the original Phase 1 baseline causal is up 20.7 → 29.7 TF (+43%) at 1x8x4096 and
 50.6 → 59.7 TF (+18%) at 2x32x4096. All 47 tests pass, `test_layouts_agree` pins the two
-addressings together, and BHSD matches eager to the same 0.0045 l2_rel as BSHD.
+addressing modes together, and BHSD matches eager to the same 0.0045 l2_rel as BSHD.
 
 #### Phase 1d — R1 closed, occupancy diagnosed, two items measured and declined
 
@@ -691,7 +691,7 @@ end to end against the same script that produces the Triton comparison:
 | 4x8x4096 | 128 | causal | 2374 | 2329 | 1.9% |
 | 4x8x4096 | 128 | score_mod | 4741 | 4710 | 0.7% |
 
-`score_mod` gains most, which fits: a mod puts VALU work between the MFMAs, leaving more
+`score_mod` gains most, which fits: a mod puts vector-ALU work between the MFMAs, leaving more
 room for the grouped `ds_read`s to hide behind. head_dim 64 is flat.
 
 It is still **off by default** — 2–5% does not pay for four times the builds when the

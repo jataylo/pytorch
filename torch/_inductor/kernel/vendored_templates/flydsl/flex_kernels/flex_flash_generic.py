@@ -1834,7 +1834,7 @@ def build_flex_flash_generic_module(
                 #
                 # Note [mask_mod runs on every visited block, including the full ones]
                 #
-                # Deliberate, not deferred. The mod site is VALU and the loop is
+                # Deliberate, not deferred. The mod site is vector-ALU and the loop is
                 # MFMA-bound, so on an all-true mask over a dense walk -- where the mask is
                 # pure overhead by construction -- lowering it lands within 2% of a build
                 # with no mask, sign varying between runs.
@@ -2039,7 +2039,7 @@ def build_flex_flash_generic_module(
                     #
                     # Skipped entirely under KV_TILES_EXACT: if seq_len_kv divides the
                     # tile then no visited column can reach it, and this is 32 v_cmp plus
-                    # 32 v_cndmask per block per wave (~15% of the loop's VALU) selecting
+                    # 32 v_cndmask per block per wave (~15% of the loop's vector-ALU) selecting
                     # the value it already had. Worth 1.08x dense at D128.
                     #
                     # The KV load's row clamp stays either way -- it is per loaded row
@@ -2734,7 +2734,7 @@ def build_flex_flash_generic_module(
         "llvm_options": {
             # Note [post-RA scheduling cannot spill, so it is a default]
             #
-            # The KV loop issues ~13 VALU per MFMA and the two paths do not overlap.
+            # The KV loop issues ~13 vector-ALU per MFMA and the two paths do not overlap.
             # Pre-RA the scheduler will not interleave them hard, because that lengthens
             # live ranges; running it again after allocation has no such constraint.
             # Measured at both settings, all 20 builds across both directions report

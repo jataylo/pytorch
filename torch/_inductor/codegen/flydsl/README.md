@@ -718,9 +718,14 @@ and the mod site already accept because they close over it as a value. Two thing
   cross-lane reduction is the half-wave `xor` shuffle, where lanes 0–31 and 32–63 hold the
   *same* rows.
 
-Packing is mutually exclusive with `block_mask`: a BlockMask is regridded per
-`(b, h, q_tile)` and cannot describe a tile that spans heads. It also needs `G` to divide the
-tile, so a group of 3 never packs at the 64/128/256 heights the forward offers.
+A `block_mask` no longer refuses packing, though it did for a long time. A BlockMask is
+regridded per `(b, h, q_tile)` and cannot describe a tile that spans heads, so the host hands
+over the group's *union* instead and the walk is indexed by the grid's KV head, which stays
+workgroup-uniform. The union is exact for any mask that does not read `h` — causal, sliding
+window, document, so in practice all of them — and conservative otherwise, and `mask_mod`
+still runs per element against each lane's own head, so what is approximated is which blocks
+get visited and never an answer. Packing does still need `G` to divide the tile, so a group
+of 3 never packs at the 64/128/256 heights the forward offers.
 
 Because it is a pure remapping the test bar is *bit-identical* output and LSE against the
 unpacked kernel, not a tolerance, across seven shapes including partial and multiple packed
@@ -805,7 +810,10 @@ at 128 MiB, which only binds at the top of the decode range.
 
 End to end this closed the decode gap: against Triton's dedicated decode kernel the six
 shapes in `decode_gap.py` went from 1.20–1.47x behind to **0.58–1.02x** — ahead of it on four
-of them. What is *not* covered is sparse decode; see item 9 in `BRANCH_OVERVIEW.md`.
+of them. Sparse decode is covered too, as of the union above and the split taking the same
+rule on a masked walk that it takes on a dense one: 2.5–8.4x, in `sparse_gaps.py`. The
+over-split that rule accepts on a sparse mask is priced there and in Note [sizing a split
+against a mask you cannot see] — 4% on the one shape where it is the only variable.
 
 ## Staging KV through registers
 
@@ -853,7 +861,7 @@ Numerics are bit-identical wherever any of this is enabled, so it only ever trad
 
 ## The softmax exponential, and what the denormal fixup is for
 
-The KV loop issues roughly 13 VALU instructions per MFMA, and the largest single
+The KV loop issues roughly 13 vector-ALU instructions per MFMA, and the largest single
 contributor is the exponential: `llvm.exp2.f32` lowers to four instructions, not one.
 `v_exp_f32` is the arithmetic; `v_ldexp_f32`, `v_cmp_gt_f32` and `v_cndmask_b32` rescale
 the input when the result would be denormal, so that a general exp2 does not return zero
@@ -872,10 +880,10 @@ spellings are offered at 128 and up and the timing decides; at 64 nothing spills
 and bare wins outright. This is the only axis whose settings are not bit-identical, in the
 last bits of weights that round to zero, so tests that compare two lowerings pin it.
 
-Two more instructions came out of the same VALU budget:
+Two more instructions came out of the same vector-ALU budget:
 
 - **The KV padding mask.** A non-causal build bounds-checks every score element against
-  `seq_len_kv` — 32 `v_cmp` plus 32 `v_cndmask` per KV block, about 15% of the loop's VALU
+  `seq_len_kv` — 32 `v_cmp` plus 32 `v_cndmask` per KV block, about 15% of the loop's vector-ALU
   — to guard a tail that exists only in the last tile. When the host can prove the KV
   extent divides the widest tile the kernel walks, the check folds away at trace time
   (`KV_TILES_EXACT`): 1.08x dense at head_dim 128, 1.09x with a head bias. A dynamic
@@ -1043,7 +1051,7 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   the MFMA chain. With it the pathology is gone and depth becomes an ordinary tradeoff:
   0.6–2.1% kernel-only, and 2–5% end to end at the larger head_dim 128 shapes once the
   autotuner picks per shape. `score_mod` gains most (5.4% at 2x32x4096), which fits — a mod
-  puts VALU work between the MFMAs for the grouped reads to hide behind. Still opt-in via
+  puts vector-ALU work between the MFMAs for the grouped reads to hide behind. Still opt-in via
   `TORCHINDUCTOR_FLYDSL_AUTOTUNE_QK_PREFETCH_DEPTH=1`, since four times the builds is a
   poor trade at 2–5% for a kernel compiled per shape, but worth setting for an expensive
   mod on a large shape.
@@ -1110,11 +1118,11 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
 
   The one genuine small-head_dim effect is real but modest and not ours either. The
   softmax is a fixed cost per (row, column) score and does not scale with head_dim, while
-  the MFMAs do, so at small D the VALU work stops hiding behind the matrix work. D64 sits
-  19% above our own linear fit, and the `score_mod` tax — which is pure added VALU per
-  score element — falls monotonically as the MFMA:VALU ratio rises: **1.26x at D64, 1.10x
+  the MFMAs do, so at small D the vector-ALU work stops hiding behind the matrix work. D64 sits
+  19% above our own linear fit, and the `score_mod` tax — which is pure added vector-ALU per
+  score element — falls monotonically as the MFMA:vector-ALU ratio rises: **1.26x at D64, 1.10x
   and 1.14x at 96 and 128, 1.04–1.05x at 160–224**. Triton's tax on the same cells is
-  1.26x / 1.13x / 1.11x / 1.03x, i.e. the same curve. Both backends are VALU-bound at D64
+  1.26x / 1.13x / 1.11x / 1.03x, i.e. the same curve. Both backends are vector-ALU-bound at D64
   to the same degree, so this is a property of the machine's transcendental rate rather
   than of either kernel.
 
@@ -1280,8 +1288,8 @@ backward. [`UPSTREAM_PR_COMPARISON.md`](UPSTREAM_PR_COMPARISON.md) is the compar
 each side is better at, and the four things in them worth taking. The short version is that
 they accept only an identity `score_mod`, so they are a fast dense FlashAttention reached
 through the FlexAttention API rather than a competing backend — and that what is left of
-their decode advantage is the **sparse** case, dense decode now measuring at or ahead of
-Triton's own decode kernel.
+their decode advantage is the tuning rather than any shape, both dense and sparse decode now
+measuring at or ahead of Triton's own decode kernel without a decode kernel of our own.
 
 Its §8 has since answered the question it opens with, and the answer for gfx942 is **no**.
 Every lead that moved the number turned out to be ours to take — the 512 B LDS overage, the

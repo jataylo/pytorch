@@ -1228,7 +1228,7 @@ class TestFlyDSLFlexAttention(TestCase):
         head_dim 256 is the exception and has to stay one: unpadded it sits at exactly the
         gfx942 budget, so the pad is dropped rather than allowed to fail the build.
         """
-        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (  # noqa: B950
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
             build_flex_flash_generic_module,
         )
 
@@ -2341,7 +2341,7 @@ class TestFlyDSLFlexAttention(TestCase):
         head's list would pass every other test here. This one uses a mask that genuinely
         differs per head, where a walk covering only one of them drops the others' blocks.
         """
-        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (  # noqa: B950
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (
             regrid_block_mask,
         )
 

@@ -21,6 +21,7 @@ from typing import Any, TYPE_CHECKING
 import sympy
 
 import torch
+from torch.utils._ordered_set import OrderedSet
 
 from ...ir import ComputedBuffer, InputBuffer
 from ...virtualized import V
@@ -213,7 +214,7 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             strides[i] = strides[i + 1] * sizes[i + 1]
 
         spec = [0, 0, 0, 0]
-        claimed: set[int] = set()
+        claimed: OrderedSet[int] = OrderedSet()
         computed: list[tuple[int, sympy.Expr]] = []
         for axis_index, index_expr in enumerate(dim_indices):
             expr = self.rename_indexing(index_expr)
@@ -456,7 +457,7 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
             # dynamic sharing on that axis; the alternative is threading a scalars tuple
             # through the mod ABI in all three vendored kernels, the way flash's
             # `aux_scalars` does.
-            sizevars_before = set(self.args.sizevars)
+            sizevars_before = OrderedSet(self.args.sizevars)
             with V.set_kernel_handler(self), V.set_ops_handler(handler):
                 if isinstance(subgraph, list):
                     raise NotImplementedError(

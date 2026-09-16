@@ -142,7 +142,7 @@ def build_flex_flash_950_module(
         `m_tile_max - m_row <= 8` for every lane in the wave. A score_mod changes the
         score dynamic range and therefore how often that fires. Build with
         `dualwave_swp_debug_lazy_counts=True` to count it.
-      - The score-domain round trip below costs 2 VALU per element (see MOD_* constants).
+      - The score-domain round trip below costs 2 vector-ALU per element (see MOD_* constants).
 
     ``varlen`` builds the QKV variable-length (packed) variant: Q/O are
     ``[total_q, H, D]``, K/V are ``[total_kv, H_kv, D]``, and per-batch token
@@ -600,7 +600,7 @@ def build_flex_flash_950_module(
             return fly.mma_atom_call_ssa([v16f32_type], _mma_atom, a, b, c)
 
         def _sched_barrier_pairs(pairs, valu_cnt, group):
-            """Emit `pairs` × {1 MFMA + valu_cnt VALU} sched_group_barrier groups."""
+            """Emit `pairs` × {1 MFMA + valu_cnt vector-ALU} sched_group_barrier groups."""
             for _ in range_constexpr(pairs):
                 rocdl.sched_group_barrier(_MFMA_MASK, 1, group)
                 rocdl.sched_group_barrier(_VALU_MASK, valu_cnt, group)
@@ -1012,7 +1012,7 @@ def build_flex_flash_950_module(
                         if const_expr(HAS_SCORE_MOD):
                             # Q is pre-scaled by sm_scale*log2(e) here, so registers hold
                             # the exp2-domain score, not the FlexAttention one. Convert
-                            # in, run the mod, convert back: 2 VALU per element.
+                            # in, run the mod, convert back: 2 vector-ALU per element.
                             #
                             # The zero-cost alternative is to scale Q by sm_scale only and
                             # fold log2(e) into the softmax by turning `_attn_sub_row`'s

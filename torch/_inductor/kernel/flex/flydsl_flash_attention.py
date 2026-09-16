@@ -83,7 +83,7 @@ if TYPE_CHECKING:
 # k-step, capping it at 4 rescales, so chunks 5-7 were never scaled and everything from
 # d160 up was wrong by ~42%. It now fits at exactly 65536 B and matches head_dim 128's
 # error to four digits.
-_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 160, 192, 224, 256})
+_SUPPORTED_HEAD_DIMS = frozenset([64, 96, 128, 160, 192, 224, 256])
 
 # The backward reaches the same head_dims, but it gets there differently and that is worth
 # knowing before someone changes its tile. Its dq kernel needs K in both orientations --
@@ -115,7 +115,7 @@ def _holds_transposed_copies(arch: str | None) -> bool:
     return not (caps.lds_transpose_read if caps else False)
 
 
-_SUPPORTED_DTYPES = frozenset({torch.bfloat16, torch.float16})
+_SUPPORTED_DTYPES = frozenset([torch.bfloat16, torch.float16])
 
 _FLYDSL_DTYPE_STR = {
     torch.bfloat16: "bf16",

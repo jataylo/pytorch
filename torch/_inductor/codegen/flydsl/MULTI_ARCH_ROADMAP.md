@@ -783,7 +783,7 @@ rather than luck — worth writing down so nobody re-derives them:
   precondition is largely absent. We are also on ROCm 7.2.2 / clang 22 rather than their
   24.0.0git. Their `tooling/llvm-lostcopy/mircfg.py` is the detector if this ever needs
   revisiting.
-- **VALU→MFMA and `exp2` wait states** needing hand-written tied-operand `s_nop`s, because
+- **vector-ALU→MFMA and `exp2` wait states** needing hand-written tied-operand `s_nop`s, because
   `GCNHazardRecognizer` does not model the gfx950 timings. It models ours:
   `checkMAIHazards` routes gfx942 through `checkMAIHazards90A`, and the extra latency is
   gated on the new part — `return NumPasses + 1 + IsGFX950`. CDNA4 needs one wait state
@@ -905,7 +905,7 @@ registers is the same overlap within what the part can actually do.
 **The MFMA operand wait state does not apply, and this was checked rather than argued.**
 Upstream emits `s_nop 1` between a bf16 pack and the MFMA reading it, for documented
 non-deterministic wrong answers. Its own docstring is explicit that the scope is not
-established and that the general "VALU write then MFMA read" rule is wrong (~7500 such
+established and that the general "vector-ALU write then MFMA read" rule is wrong (~7500 such
 sites across 426 mostly-passing kernels). The hazard is named on a `v_cvt_pk_*_f32` write
 reaching an MFMA SrcA/SrcB; we pack bf16 *bitwise*, as `(hi & 0xFFFF0000) | (lo >> 16)`.
 Dumping our backward ISA (`FLYDSL_DUMP_IR=1 FLYDSL_DEBUG_DUMP_ASM=1`) and scanning for the

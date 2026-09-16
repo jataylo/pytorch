@@ -103,7 +103,7 @@ lowering; that is not in the pushed head.
 
 | | theirs | ours |
 |---|---|---|
-| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel, and no longer a deficit**: the prefill kernel serves decode shapes with GQA packing, a short-Q tile and a KV split, and now measures **0.58–1.02x** of Triton's dedicated decode kernel — ahead of it on four of six shapes, level on the other two. Sparse decode is the part we do not have: a block-mask walk is left unsplit. See below |
+| **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, ≤256 packed query rows per KV head, pipelined KV double-buffering, and a `SPLIT_KV` mode splitting KV blocks across two worker waves for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel, and no longer a deficit**: the prefill kernel serves decode shapes with GQA packing, a short-Q tile and a KV split, and now measures **0.58–1.02x** of Triton's dedicated decode kernel — ahead of it on four of six shapes, level on the other two. Sparse decode is served too, at **2.5–8.4x**, once packing took the GQA group's union of block lists and the split stopped refusing a masked walk. See below |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, FlyDSL 0.3.1, four shape families | **build and ISA only.** We have no gfx950 silicon; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection (1/2/4/8), a `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
 | Asymmetric head dims | `(192, 128)` — `qk_head_dim != v_head_dim` is first-class, both directions | **any admitted pair, either order, in both directions** |
@@ -114,16 +114,23 @@ Real gfx950 validation is the honest asymmetry, and it is the one nothing here c
 amount of ISA inspection substitutes for running the kernel, so our gfx950 claim is *"every
 admitted head dim lowers and the CDNA4 paths engage"*, which is strictly weaker than theirs.
 
-Decode used to head this list and no longer does. What is left of it is narrower and worth
-stating precisely: **sparse** decode. Their 3.6–7.0x is measured on a top-k-16 mask, and a
-decode step is exactly where a sparse mask has the most to give, because the dense work per
-token is tiny. Two things of ours stop short there. The KV split is offered only to the
-dense walk — a block-mask walk splits by the same arithmetic, in visited blocks rather than
-rows, but its length is the mask's data rather than the shape's, so there is nothing at
-lowering time to size a split against. And packing the GQA group is mutually exclusive with
-a BlockMask to begin with, since the mask is regridded per `(b, h, q_tile)` and cannot
-describe a tile spanning heads. So a sparse decode shape gets neither of the two fixes that
-closed the dense gap, and we have not priced it.
+Decode used to head this list and no longer does, on dense shapes or sparse ones. Their
+3.6–7.0x is measured on a top-k-16 mask, and a decode step is exactly where a sparse mask has
+the most to give, because the dense work per token is tiny — so it is worth saying what ours
+now does there. Both fixes that closed the dense gap had been switched off whenever a block
+mask was present: packing because a packed Q tile spans the GQA group while the mask is
+regridded per `(b, h, q_tile)`, the KV split because a masked walk's length is the mask's data
+rather than the shape's. The first is fixed by handing the kernel the group's *union* of block
+lists, exact for any mask not reading `h`; the second by taking the dense rule anyway and
+accepting an over-split, since a surplus slice at decode runs zero iterations concurrently
+with the ones that have work.
+
+That is **2.5–8.4x** across the ten GQA rows (`sparse_gaps.py`), and 0.86–1.48x of Triton's decode
+kernel against 3–8x behind it before. The one row that does not move is MHA, which has no
+group to pack: it costs 4% on a 12.5%-dense window, the over-split's whole price. And most of
+the per-head table has no Triton baseline at all, because its decode kernel serves a KV head's
+whole group in one block and so refuses a block mask with a real head axis under `enable_gqa`
+— the case the union was written for. This kernel serves both layouts at the same speed.
 
 ### What "no decode kernel" actually costs
 
@@ -178,8 +185,10 @@ been leaning on `o_rsrc`'s `num_records` to drop a partial tile's rows, and a pa
 `seq_len` is no longer out of bounds — it is a valid address in the *next* head of the group
 — so the store is predicated instead; and the `num_records` bound itself is a property of the
 buffer descriptor, so it has to be taken at the last head of the group to stay uniform. It
-also costs the block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot
-describe a tile spanning heads, so packing and `block_mask` are mutually exclusive.
+also cost the block-mask path, whose regrid is indexed per `(b, h, q_tile)` and cannot
+describe a tile spanning heads, so packing and `block_mask` were mutually exclusive until the
+host started handing over the group's *union* of block lists — see the sparse decode row
+above, which is what that unblocked.
 
 That is another 2.4x on the GQA rows, and it is measured as *bit-identical* to the unpacked
 kernel rather than to a tolerance, which is the right bar for a pure remapping. Packing is
