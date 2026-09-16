@@ -135,13 +135,22 @@ class TestFlyDSLFlexAttention(TestCase):
         torch._dynamo.reset()
 
     def _tensors(
-        self, dtype=torch.bfloat16, num_kv_heads=H, seq_len=S, head_dim=D, seq_len_kv=None
+        self,
+        dtype=torch.bfloat16,
+        num_kv_heads=H,
+        seq_len=S,
+        head_dim=D,
+        seq_len_kv=None,
     ):
         seq_len_kv = seq_len if seq_len_kv is None else seq_len_kv
         torch.manual_seed(0)
         q = torch.randn(B, H, seq_len, head_dim, device="cuda", dtype=dtype)
-        k = torch.randn(B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=dtype)
-        v = torch.randn(B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=dtype)
+        k = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=dtype
+        )
         return q, k, v
 
     def _run(self, q, k, v, *, kernel_options=None, **kwargs):
@@ -457,6 +466,27 @@ class TestFlyDSLFlexAttention(TestCase):
         with self.assertRaisesRegex(Exception, "captured tensors"):
             self._run(q, k, v, score_mod=score_mod)
 
+    def test_rejects_more_aux_slots_than_the_signature_holds(self):
+        """A slot is a (tensor, index pattern) pair, so three captures can need six.
+
+        The capture-count check above cannot see this: it counts *tensors* and three is
+        under the limit of four. Only the slot allocator knows that reading one table by
+        query row and again by key column takes two slots, because a reader carries one
+        stride per coordinate. Without the cap there the template goes on to name an
+        `AUX4` the kernel signature does not have, and the failure arrives from inside the
+        builder with nothing in it about captures.
+        """
+        q, k, v = self._tensors()
+        tables = [torch.rand(S, device="cuda", dtype=torch.float32) for _ in range(3)]
+
+        def score_mod(score, b, h, q_idx, kv_idx):
+            for t in tables:
+                score = score + t[q_idx] * 0.1 + t[kv_idx] * 0.1
+            return score
+
+        with self.assertRaisesRegex(Exception, "aux slots"):
+            self._run(q, k, v, score_mod=score_mod)
+
     def test_aux_slot_limit_matches_the_kernel_signature(self):
         """Lowering's copy of the slot count must match the kernel's own.
 
@@ -464,14 +494,64 @@ class TestFlyDSLFlexAttention(TestCase):
         installed -- so the limit is duplicated, and a mismatch would either reject
         captures the kernel could hold or pass more arguments than the signature takes.
         """
-        from torch._inductor.kernel.flex.flydsl_flash_attention import (
-            _MAX_AUX_TENSORS,
-        )
+        from torch._inductor.kernel.flex.flydsl_flash_attention import _MAX_AUX_TENSORS
         from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_flash_generic import (
             MAX_AUX_TENSORS,
         )
 
         self.assertEqual(_MAX_AUX_TENSORS, MAX_AUX_TENSORS)
+
+        # And codegen's copy, which is the one that actually bounds the signature.
+        from torch._inductor.codegen.flydsl.flydsl_flex_kernel import (
+            MAX_AUX_TENSORS as CODEGEN_MAX_AUX_TENSORS,
+        )
+
+        self.assertEqual(CODEGEN_MAX_AUX_TENSORS, MAX_AUX_TENSORS)
+
+    def test_empty_extents_are_refused_by_the_gate(self):
+        """A zero-length Q or KV axis is legal FlexAttention and a degenerate kernel.
+
+        At ``Skv`` 0 the KV row clamp is ``seq_len_kv - 1``, which is -1, so the first
+        load addresses off the front of K -- a fault whose reachability depends on what
+        the allocator left there. The builder guards this too, but only once the extent
+        reaches it as a concrete int, which under dynamic shapes it does not, so the gate
+        has to see it while the extent is still symbolic.
+
+        The gate is asked directly because an empty extent does not survive the trip to
+        it: ``flex_attention`` itself indexes the Q axis while building the default block
+        mask and raises first.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _can_use_flydsl_shapes_and_arch,
+        )
+        from torch._inductor.sizevars import SizeVarAllocator
+        from torch._inductor.virtualized import V
+
+        class _Extents:
+            """Just enough IR node for the shape half of the gate."""
+
+            def __init__(self, seq_len):
+                self._size = [B, H, seq_len, D]
+
+            def get_size(self):
+                return self._size
+
+            def get_dtype(self):
+                return torch.bfloat16
+
+        class _Graph:
+            sizevars = SizeVarAllocator()
+
+        def gate(seq_len_q, seq_len_kv):
+            kv = _Extents(seq_len_kv)
+            with V.set_graph_handler(_Graph()):  # type: ignore[arg-type]
+                return _can_use_flydsl_shapes_and_arch(_Extents(seq_len_q), kv, kv)
+
+        self.assertTrue(gate(S, S)[0], "a non-empty pair must still pass")
+        for seq_len_q, seq_len_kv, named in ((0, S, "seq_len_q"), (S, 0, "seq_len_kv")):
+            ok, reason = gate(seq_len_q, seq_len_kv)
+            self.assertFalse(ok, f"{named} 0 was admitted")
+            self.assertIn(f"{named} is 0", reason)
 
     def test_captured_view_built_inside_the_graph(self):
         """A capture that is a view produced by the traced graph, not a leaf tensor.
@@ -545,7 +625,6 @@ class TestFlyDSLFlexAttention(TestCase):
 
         actual, expected = self._run(q, k, v, score_mod=score_mod)
         self._assert_close(actual, expected)
-
 
     @parametrize("name", sorted(TRANSCENDENTAL_MODS))
     def test_transcendental_mod_ops(self, name):
@@ -907,6 +986,7 @@ class TestFlyDSLFlexAttention(TestCase):
         again. A tolerance check on a whole tensor would not catch either, since a NaN in
         one row is not a large relative error, which is why the assertions here are exact.
         """
+
         # Row 0 attends to nothing; every other row attends to column 0 only. Keeping the
         # rest of the tile alive matters -- a kernel that got this right only by way of an
         # entirely empty walk would still be wrong for the mixed case, which is the one a
@@ -931,7 +1011,9 @@ class TestFlyDSLFlexAttention(TestCase):
         self.assertFalse(torch.isnan(lse.float()).any(), "NaN anywhere in the LSE")
         # The masked row: exactly zero, and -inf rather than a large finite number.
         self.assertEqual(
-            out[:, :, 0].float().abs().max().item(), 0.0, "masked row is not exactly zero"
+            out[:, :, 0].float().abs().max().item(),
+            0.0,
+            "masked row is not exactly zero",
         )
         self.assertTrue(
             torch.isneginf(lse[:, :, 0]).all(), f"masked row LSE is {lse[:, :, 0]}"
@@ -1029,12 +1111,18 @@ class TestFlyDSLFlexAttention(TestCase):
         def footprints(head_dim):
             with contextlib.redirect_stdout(io.StringIO()):
                 dq = build_flex_flash_bwd_dq_module(
-                    num_heads=H, head_dim=head_dim, dtype_str="bf16",
-                    layout="bhsd", block_n=32,
+                    num_heads=H,
+                    head_dim=head_dim,
+                    dtype_str="bf16",
+                    layout="bhsd",
+                    block_n=32,
                 )
                 dkdv = build_flex_flash_bwd_dkdv_module(
-                    num_heads=H, head_dim=head_dim, dtype_str="bf16",
-                    layout="bhsd", block_m=32,
+                    num_heads=H,
+                    head_dim=head_dim,
+                    dtype_str="bf16",
+                    layout="bhsd",
+                    block_m=32,
                 )
             return dq.smem_bytes, dkdv.smem_bytes
 
@@ -1043,12 +1131,8 @@ class TestFlyDSLFlexAttention(TestCase):
             with mock.patch.dict(os.environ, {"FLYDSL_GPU_ARCH": "gfx950"}):
                 tgt_dq, tgt_dkdv = footprints(head_dim)
             # dq drops one of three equally sized tiles, dkdv two of four.
-            self.assertEqual(
-                tgt_dq * 3, host_dq * 2, f"dq at head_dim {head_dim}"
-            )
-            self.assertEqual(
-                tgt_dkdv * 2, host_dkdv, f"dkdv at head_dim {head_dim}"
-            )
+            self.assertEqual(tgt_dq * 3, host_dq * 2, f"dq at head_dim {head_dim}")
+            self.assertEqual(tgt_dkdv * 2, host_dkdv, f"dkdv at head_dim {head_dim}")
 
     def test_backward_fused_output_store_is_written_but_off(self):
         """It is declined on evidence, not missing, so both states have to build.
@@ -1071,12 +1155,20 @@ class TestFlyDSLFlexAttention(TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     return [
                         build_flex_flash_bwd_dq_module(
-                            num_heads=H, head_dim=D, dtype_str="bf16",
-                            layout="bhsd", block_n=32, **kwargs,
+                            num_heads=H,
+                            head_dim=D,
+                            dtype_str="bf16",
+                            layout="bhsd",
+                            block_n=32,
+                            **kwargs,
                         ),
                         build_flex_flash_bwd_dkdv_module(
-                            num_heads=H, head_dim=D, dtype_str="bf16",
-                            layout="bhsd", block_m=32, **kwargs,
+                            num_heads=H,
+                            head_dim=D,
+                            dtype_str="bf16",
+                            layout="bhsd",
+                            block_m=32,
+                            **kwargs,
                         ),
                     ]
 
@@ -1268,8 +1360,9 @@ class TestFlyDSLFlexAttention(TestCase):
         torch.manual_seed(0)
         q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
         k, v = (
-            torch.randn(B, S, num_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-            .transpose(1, 2)
+            torch.randn(
+                B, S, num_kv_heads, D, device="cuda", dtype=torch.bfloat16
+            ).transpose(1, 2)
             for _ in range(2)
         )
         with torch.no_grad():
@@ -1419,9 +1512,7 @@ class TestFlyDSLFlexAttention(TestCase):
         kwargs = {
             "score_mod": score_mod,
             "block_mask": (
-                create_block_mask(
-                    mask_mod, None, None, seq_len, seq_len, device="cuda"
-                )
+                create_block_mask(mask_mod, None, None, seq_len, seq_len, device="cuda")
                 if mask_mod is not None
                 else None
             ),
@@ -1547,9 +1638,7 @@ class TestFlyDSLFlexAttention(TestCase):
         torch._dynamo.reset()
         compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
         actual = torch.autograd.grad(
-            compiled(
-                q, k, v, score_mod=_alibi, kernel_options={"BACKEND": "FLYDSL"}
-            ),
+            compiled(q, k, v, score_mod=_alibi, kernel_options={"BACKEND": "FLYDSL"}),
             (q, k, v),
             grad_out,
         )
@@ -1849,7 +1938,8 @@ class TestFlyDSLFlexAttention(TestCase):
         torch.manual_seed(0)
         b, h, s, d = 2, 4, 512, 128
         q, k, v = (
-            torch.randn(b, h, s, d, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+            torch.randn(b, h, s, d, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
         )
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
@@ -1876,7 +1966,9 @@ class TestFlyDSLFlexAttention(TestCase):
 
     def test_qk_prefetch_depth_is_off_by_default(self):
         """The depth knob must not quietly multiply everyone's build count by four."""
-        from torch._inductor.kernel.flex.flydsl_flash_attention import _qk_prefetch_depths
+        from torch._inductor.kernel.flex.flydsl_flash_attention import (
+            _qk_prefetch_depths,
+        )
 
         with config.patch({"flydsl.autotune_qk_prefetch_depth": False}):
             self.assertEqual(_qk_prefetch_depths({}), [2])
@@ -1982,23 +2074,25 @@ class TestFlyDSLFlexAttention(TestCase):
     def test_gqa_packing_is_asked_only_where_it_is_legal_and_pays(self):
         """Packing is free where it does not help, so the rule is legality plus regime.
 
-        Legality is three conditions: there has to be a group to pack, it has to divide
-        the tile, and a BlockMask is regridded per ``(b, h, q_tile)`` and so cannot
-        describe a tile spanning heads. The regime is the short Q sequence -- at prefill
-        the packed and unpacked grids are the same size, so packing has nothing to win and
-        the prefill path is the tuned one.
+        Legality is two conditions: there has to be a group to pack, and it has to divide
+        the tile. The regime is the short Q sequence -- at prefill the packed and unpacked
+        grids are the same size, so packing has nothing to win and the prefill path is the
+        tuned one.
+
+        A block mask used to be a third condition, because a BlockMask is indexed per
+        ``(b, h, q_tile)`` and a packed tile spans the group's heads. The host now unions
+        the group's lists, so it is legal -- which is why the mask is not a parameter here
+        at all; ``test_packed_gqa_under_a_block_mask_*`` covers that it is also correct.
         """
         from torch._inductor.kernel.flex.flydsl_flash_attention import _pack_gqa
 
-        def packed(opts=None, *, num_heads=32, num_kv_heads=8, block_m=64,
-                   seq_len_q=1, use_block_mask=False):
+        def packed(opts=None, *, num_heads=32, num_kv_heads=8, block_m=64, seq_len_q=1):
             return _pack_gqa(
                 opts or {},
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
                 block_m=block_m,
                 seq_len_q=seq_len_q,
-                use_block_mask=use_block_mask,
             )
 
         self.assertTrue(packed())
@@ -2011,7 +2105,6 @@ class TestFlyDSLFlexAttention(TestCase):
         # A group of 3 does not divide a 64-row tile, and every tile height the forward
         # offers is a multiple of 64, so these shapes simply do not pack.
         self.assertFalse(packed(num_heads=12, num_kv_heads=4))
-        self.assertFalse(packed(use_block_mask=True))
         # Overridable, but not into an illegal build: the kernel would raise anyway, and
         # a refusal naming the reason beats a template failure.
         self.assertTrue(packed({"PACK_GQA": True}, seq_len_q=4096))
@@ -2019,7 +2112,6 @@ class TestFlyDSLFlexAttention(TestCase):
         for illegal in (
             {"num_kv_heads": 32},
             {"num_heads": 12, "num_kv_heads": 4},
-            {"use_block_mask": True},
         ):
             with self.assertRaises(RuntimeError):
                 packed({"PACK_GQA": True}, **illegal)
@@ -2027,13 +2119,13 @@ class TestFlyDSLFlexAttention(TestCase):
     @parametrize(
         "num_heads,num_kv_heads,seq_len_q,block_m",
         [
-            (8, 2, 1, 64),     # decode, group 4
-            (8, 2, 3, 64),     # a partial packed tile
-            (8, 2, 17, 64),    # rows spilling past one tile
-            (8, 1, 5, 64),     # MQA, group 8
-            (8, 2, 129, 64),   # many packed tiles
+            (8, 2, 1, 64),  # decode, group 4
+            (8, 2, 3, 64),  # a partial packed tile
+            (8, 2, 17, 64),  # rows spilling past one tile
+            (8, 1, 5, 64),  # MQA, group 8
+            (8, 2, 129, 64),  # many packed tiles
             (8, 2, 200, 128),  # taller tile
-            (12, 6, 7, 64),    # group 2 at a head count that is not a power of two
+            (12, 6, 7, 64),  # group 2 at a head count that is not a power of two
         ],
     )
     def test_packed_gqa_matches_the_unpacked_kernel_bit_for_bit(
@@ -2050,9 +2142,15 @@ class TestFlyDSLFlexAttention(TestCase):
         """
         torch.manual_seed(0)
         head_dim = 64
-        q = torch.randn(B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+        q = torch.randn(
+            B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16
+        )
 
         results = {}
         for pack in (False, True):
@@ -2092,8 +2190,7 @@ class TestFlyDSLFlexAttention(TestCase):
         The sweep those came from is in ``_forward_kv_splits``. What is pinned here is that
         each term binds where it should -- the same base grid takes four times the splits
         on a walk four times as long, and the same walk takes fewer splits as the base grid
-        grows -- plus the two gates, since the prefill one is what keeps the tuned path
-        untouched and a block-mask walk has no length to size a split against.
+        grows -- plus the prefill gate, which is what keeps the tuned path untouched.
         """
         from torch._inductor.kernel.flex.flydsl_flash_attention import (
             _forward_kv_splits,
@@ -2103,9 +2200,18 @@ class TestFlyDSLFlexAttention(TestCase):
             torch.device("cuda")
         ).multi_processor_count
 
-        def splits(opts=None, *, batch_size=8, num_heads=32, num_kv_heads=8,
-                   seq_len_q=1, seq_len_kv=8192, v_head_dim=128, block_m=64,
-                   pack_gqa=True, use_block_mask=False):
+        def splits(
+            opts=None,
+            *,
+            batch_size=8,
+            num_heads=32,
+            num_kv_heads=8,
+            seq_len_q=1,
+            seq_len_kv=8192,
+            v_head_dim=128,
+            block_m=64,
+            pack_gqa=True,
+        ):
             return _forward_kv_splits(
                 opts or {},
                 batch_size=batch_size,
@@ -2116,7 +2222,6 @@ class TestFlyDSLFlexAttention(TestCase):
                 v_head_dim=v_head_dim,
                 block_m=block_m,
                 pack_gqa=pack_gqa,
-                use_block_mask=use_block_mask,
                 device=torch.device("cuda"),
             )
 
@@ -2142,11 +2247,15 @@ class TestFlyDSLFlexAttention(TestCase):
         # Unpacked (MHA) counts Q heads in the grid, not KV heads.
         self.assertEqual(splits(num_kv_heads=32, pack_gqa=False), 8)
 
-        # The two gates. Prefill keeps the tuned path; a block-mask walk's length is the
-        # mask's data rather than the shape's.
+        # The gate. Prefill keeps the tuned path.
         self.assertEqual(splits(seq_len_q=65), 1)
         self.assertEqual(splits(seq_len_q=4096, block_m=128, pack_gqa=False), 1)
-        self.assertEqual(splits(use_block_mask=True, pack_gqa=False), 1)
+
+        # A block-mask walk takes the same rule -- which is why the mask is not a parameter
+        # here. Its length is the mask's data rather than the shape's, so `seq_len_kv` is
+        # an upper bound on it and a sparse mask is over-split; see Note [sizing a split
+        # against a mask you cannot see] for why that is cheaper than refusing, and
+        # `test_split_kv_under_a_block_mask_*` for that the surplus slices are harmless.
 
         # Overridable, and the override is validated rather than trusted.
         self.assertEqual(splits({"NUM_KV_SPLITS": 3}), 3)
@@ -2156,6 +2265,187 @@ class TestFlyDSLFlexAttention(TestCase):
             with self.assertRaises(RuntimeError):
                 splits({"NUM_KV_SPLITS": bad})
 
+    @parametrize("num_kv_heads", [4, 1])
+    @parametrize("seq_len_q", [1, 16, 64])
+    def test_packed_gqa_under_a_block_mask_matches_the_unpacked_walk(
+        self, num_kv_heads, seq_len_q
+    ):
+        """Packing and a block mask together, which used to be mutually exclusive.
+
+        A packed Q tile holds the whole GQA group, so there is no single head whose block
+        list it can walk; the host hands over the group's union instead. The bar is
+        equality with the *unpacked* kernel on the same mask, because the union is exact
+        here -- these masks do not read ``h``, so every head in the group has the same
+        list and the union is that list. A union taken over the wrong axis, or a walk
+        indexing the lists by a per-lane ``q_head_idx`` instead of the workgroup's KV
+        head, both show up as heads reading each other's walks.
+
+        Everything else the two builds could differ in is pinned below, so the bar is the
+        walk rather than the code generator.
+        """
+        torch.manual_seed(0)
+        num_heads, seq_len_kv, head_dim = 8, 2048, 128
+        q = torch.randn(
+            B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        # Anchored at the end of the cache, so the walk is most of it rather than the one
+        # block `q_idx >= kv_idx` admits at seq_len_q 1.
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx >= seq_len_kv - 1024
+
+        block_mask = create_block_mask(
+            mask_mod, B, num_heads, seq_len_q, seq_len_kv, device="cuda"
+        )
+
+        results = {}
+        for pack in (False, True):
+            torch._dynamo.reset()
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            results[pack] = compiled(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                enable_gqa=num_kv_heads != num_heads,
+                kernel_options={
+                    "BACKEND": "FLYDSL",
+                    "PACK_GQA": pack,
+                    "BLOCK_M": 64,
+                    "NUM_KV_SPLITS": 1,
+                    # An autotune axis at head_dim 128, and the only one whose
+                    # settings are not bit-identical: left free, the two calls can be
+                    # built with different exponentials and disagree in the last bits for
+                    # a reason that is not the walk.
+                    "RAW_EXP2": True,
+                },
+            )
+        self.assertEqual(results[True], results[False], atol=0, rtol=0)
+
+        # And the unpacked walk is itself right, so equality is not two matching bugs.
+        expected = flex_attention(
+            q, k, v, block_mask=block_mask, enable_gqa=num_kv_heads != num_heads
+        )
+        self._assert_close(results[True], expected, "for the packed sparse walk")
+
+    def test_packed_gqa_visits_every_block_a_head_in_the_group_needs(self):
+        """The union is over the group, and it is a union rather than a sample.
+
+        Every mask anyone writes is head-invariant, so a bug that took (say) the first
+        head's list would pass every other test here. This one uses a mask that genuinely
+        differs per head, where a walk covering only one of them drops the others' blocks.
+        """
+        from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels.flex_interface import (  # noqa: B950
+            regrid_block_mask,
+        )
+
+        num_heads, group, seq_len, block = 8, 4, 1024, 128
+        n_tiles = seq_len // block
+
+        # Head h admits exactly the one KV block h % n_tiles, so the group's union is
+        # four distinct blocks and any single head's list is one.
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (kv_idx // block) == (h % n_tiles)
+
+        block_mask = create_block_mask(
+            mask_mod,
+            1,
+            num_heads,
+            seq_len,
+            seq_len,
+            device="cuda",
+            BLOCK_SIZE=(block, block),
+        )
+        counts, indices = regrid_block_mask(
+            block_mask.kv_num_blocks,
+            block_mask.kv_indices,
+            block_mask.full_kv_num_blocks,
+            block_mask.full_kv_indices,
+            batch=1,
+            num_heads=num_heads,
+            sparse_q_block_size=block,
+            sparse_kv_block_size=block,
+            q_block_size=block,
+            kv_block_size=block,
+            num_q_tiles=n_tiles,
+            num_kv_tiles=n_tiles,
+            head_group=group,
+        )
+        self.assertEqual(counts.shape, (1, num_heads // group, n_tiles))
+        for kv_head in range(num_heads // group):
+            wanted = {
+                h % n_tiles for h in range(kv_head * group, (kv_head + 1) * group)
+            }
+            for q_tile in range(n_tiles):
+                n = int(counts[0, kv_head, q_tile])
+                got = set(indices[0, kv_head, q_tile, :n].tolist())
+                self.assertEqual(
+                    got, wanted, f"kv_head {kv_head} q_tile {q_tile} walks {got}"
+                )
+
+    @parametrize("num_kv_splits", [2, 4, 8])
+    def test_split_kv_under_a_block_mask_agrees_with_the_unsplit_walk(
+        self, num_kv_splits
+    ):
+        """Splitting a *masked* walk divides the block list, not the KV rows.
+
+        The loop bounds are the same expression either way -- the unit is a visited block
+        rather than a row -- so this covers that the split arithmetic survives the swap,
+        including the slices that land past the end of a short list and run zero
+        iterations. LSE is the sharp bar for the same reason as in the dense split test:
+        it is f32 and it is the same sum both walks form.
+        """
+        torch.manual_seed(0)
+        num_heads, num_kv_heads, seq_len_kv, head_dim = 8, 2, 4096, 128
+        q = torch.randn(B, num_heads, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            B, num_kv_heads, seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+
+        # 1024 of 4096, so the walk is a quarter of the tiles and eight splits genuinely
+        # leave some of them with nothing to do.
+        def mask_mod(b, h, q_idx, kv_idx):
+            return kv_idx >= seq_len_kv - 1024
+
+        block_mask = create_block_mask(
+            mask_mod, B, num_heads, 1, seq_len_kv, device="cuda"
+        )
+
+        results = {}
+        for n in (1, num_kv_splits):
+            torch._dynamo.reset()
+            compiled = torch.compile(flex_attention, fullgraph=True, dynamic=False)
+            results[n] = compiled(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                enable_gqa=True,
+                return_lse=True,
+                kernel_options={"BACKEND": "FLYDSL", "NUM_KV_SPLITS": n},
+            )
+
+        expected = flex_attention(
+            q, k, v, block_mask=block_mask, enable_gqa=True, return_lse=True
+        )
+        for n, (out_n, lse_n) in results.items():
+            self._assert_close(out_n, expected[0], f"for {n} splits on a masked walk")
+            self.assertLess((lse_n - expected[1]).abs().max().item(), 1e-2)
+        self.assertLess(
+            (results[num_kv_splits][1] - results[1][1]).abs().max().item(),
+            1e-4,
+            "the combine's LSE must match the unsplit masked walk to f32 rounding",
+        )
+
     def test_kv_split_workspace_budget_caps_the_count(self):
         """The workspace is 2*splits times the output, which only bites at long Sq.
 
@@ -2164,8 +2454,8 @@ class TestFlyDSLFlexAttention(TestCase):
         scratch to accelerate a small kernel.
         """
         from torch._inductor.kernel.flex.flydsl_flash_attention import (
-            _SPLIT_WORKSPACE_BUDGET_BYTES,
             _forward_kv_splits,
+            _SPLIT_WORKSPACE_BUDGET_BYTES,
         )
 
         def splits(**kw):
@@ -2178,7 +2468,6 @@ class TestFlyDSLFlexAttention(TestCase):
                 v_head_dim=128,
                 block_m=64,
                 pack_gqa=True,
-                use_block_mask=False,
                 device=torch.device("cuda"),
             )
             opts.update(kw)
@@ -2198,13 +2487,9 @@ class TestFlyDSLFlexAttention(TestCase):
         # split alone is ~34 MB.
         big = dict(batch_size=8, num_heads=64, seq_len_q=64, v_head_dim=256)
         n = splits(**big, num_kv_heads=8, block_m=64)
-        self.assertLessEqual(
-            workspace_bytes(n, **big), _SPLIT_WORKSPACE_BUDGET_BYTES
-        )
+        self.assertLessEqual(workspace_bytes(n, **big), _SPLIT_WORKSPACE_BUDGET_BYTES)
         # And the cap is what chose it, not the other two terms.
-        self.assertGreater(
-            workspace_bytes(n + 1, **big), _SPLIT_WORKSPACE_BUDGET_BYTES
-        )
+        self.assertGreater(workspace_bytes(n + 1, **big), _SPLIT_WORKSPACE_BUDGET_BYTES)
 
     @parametrize("num_kv_splits", [2, 3, 5, 8])
     @parametrize("seq_len_q", [1, 8, 64])
@@ -2228,8 +2513,12 @@ class TestFlyDSLFlexAttention(TestCase):
         q = torch.randn(
             B, num_heads, seq_len_q, head_dim, device="cuda", dtype=torch.bfloat16
         )
-        k = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
+            B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn(
+            B, num_kv_heads, S, head_dim, device="cuda", dtype=torch.bfloat16
+        )
 
         results = {}
         for n in (1, num_kv_splits):
@@ -2251,12 +2540,15 @@ class TestFlyDSLFlexAttention(TestCase):
             torch.cuda.synchronize()
             results[n] = (out.clone(), lse.clone())
 
-        ref = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, enable_gqa=True
-        )
+        ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, enable_gqa=True)
         ref_lse = torch.logsumexp(
-            (q.float() @ k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-             .float().transpose(-1, -2)) * head_dim**-0.5,
+            (
+                q.float()
+                @ k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+                .float()
+                .transpose(-1, -2)
+            )
+            * head_dim**-0.5,
             dim=-1,
         )
         for n, (out_n, lse_n) in results.items():
@@ -2319,9 +2611,7 @@ class TestFlyDSLFlexAttention(TestCase):
                 q, k, v, is_causal=causal
             )
             rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
-            self.assertLess(
-                rel, 2e-2, f"S={seq_len} causal={causal} splits={n}: {rel}"
-            )
+            self.assertLess(rel, 2e-2, f"S={seq_len} causal={causal} splits={n}: {rel}")
             self.assertTrue(torch.isfinite(lse).all())
 
     def test_split_kv_workspace_row_stays_aligned(self):
@@ -2351,6 +2641,7 @@ class TestFlyDSLFlexAttention(TestCase):
 
     def test_packing_refuses_what_it_cannot_express(self):
         """The builder's own guards, which the lowering is trusted not to reach."""
+
         def build(**kwargs):
             opts = dict(
                 num_heads=8,
@@ -2370,9 +2661,46 @@ class TestFlyDSLFlexAttention(TestCase):
             build(num_kv_heads=8)
         with self.assertRaisesRegex(ValueError, "divisible by the GQA group"):
             build(num_heads=12, num_kv_heads=4)
-        # A block-masked build needs a mask_mod of its own before it gets this far.
-        with self.assertRaisesRegex(ValueError, "cannot be combined with block_mask"):
-            build(block_mask=True, mask_mod=_causal, mod_key="causal")
+
+        # A block mask is *not* one of them any more: the packed tile walks the group's
+        # union, which the host builds. Covered end to end by
+        # `test_packed_gqa_under_a_block_mask_matches_the_unpacked_walk`.
+        build(block_mask=True, mask_mod=_causal, mod_key="causal")
+
+    def test_both_exponentials_are_offered_where_they_disagree(self):
+        """The softmax exponential is swept at head_dim 128, and only there.
+
+        Which spelling is faster is a property of the build rather than of the shape (see
+        ``_raw_exp2s``), so both have to reach the autotuner where the trade is live --
+        and head_dim 64, which spills either way, must not pay for a second build.
+        """
+        from torch._inductor.kernel.flex.flydsl_flash_attention import _raw_exp2s
+
+        self.assertEqual(_raw_exp2s({}, head_dim=64), [True])
+        for head_dim in (128, 192, 256):
+            self.assertEqual(_raw_exp2s({}, head_dim=head_dim), [True, False])
+        # Pinnable either way, so a shape that measures badly can be held to one spelling
+        # without also pinning the tile or the staging.
+        for head_dim in (64, 128):
+            self.assertEqual(_raw_exp2s({"RAW_EXP2": True}, head_dim=head_dim), [True])
+            self.assertEqual(
+                _raw_exp2s({"RAW_EXP2": False}, head_dim=head_dim), [False]
+            )
+
+    @parametrize("raw_exp2", [True, False])
+    def test_either_exponential_agrees_with_eager(self, raw_exp2):
+        """Both spellings must be usable, not just whichever one is faster here.
+
+        The autotuner picks on time, so the slower spelling would otherwise go untested at
+        head_dim 128 while staying reachable on another machine. What is being checked is
+        the claim in Note [the exponential is four instructions, three of them for
+        denormals]: the fixup the bare instruction drops cannot change a softmax weight.
+        """
+        self._assert_grads_match_eager(
+            f"with raw_exp2={raw_exp2}",
+            head_dim=128,
+            kernel_options={"RAW_EXP2": raw_exp2},
+        )
 
     def test_both_kv_staging_strategies_are_offered(self):
         """Neither K staging strategy wins outright, so both have to reach the autotuner.
@@ -2394,12 +2722,18 @@ class TestFlyDSLFlexAttention(TestCase):
         # An explicit request pins it either way, sweep on or off.
         for sweep in (True, False):
             with config.patch({"flydsl.autotune_kv_gpfetch": sweep}):
-                self.assertEqual(_forward_kv_gpfetch({"ENABLE_KV_GPFETCH": False}), [False])
-                self.assertEqual(_forward_kv_gpfetch({"ENABLE_KV_GPFETCH": True}), [True])
+                self.assertEqual(
+                    _forward_kv_gpfetch({"ENABLE_KV_GPFETCH": False}), [False]
+                )
+                self.assertEqual(
+                    _forward_kv_gpfetch({"ENABLE_KV_GPFETCH": True}), [True]
+                )
 
     @parametrize("gpfetch", [False, True])
     @parametrize("seq_len_kv", [S, S // 2 + 1])
-    def test_forward_agrees_with_eager_under_either_kv_staging(self, seq_len_kv, gpfetch):
+    def test_forward_agrees_with_eager_under_either_kv_staging(
+        self, seq_len_kv, gpfetch
+    ):
         """Staging K through registers must not change the answer, only the timing.
 
         The register path rewrites how a KV tile reaches LDS: the global read becomes
@@ -2536,7 +2870,7 @@ class TestFlyDSLFlexAttention(TestCase):
         )
 
     def test_layouts_agree(self):
-        """The two global layouts must be two addressings of the same kernel.
+        """The two global layouts must be two ways of addressing the same kernel.
 
         The flex path builds `layout="bhsd"` to index what FlexAttention hands it, while
         standalone callers still use `bshd`. Only the affine coefficients of the global
@@ -2545,7 +2879,8 @@ class TestFlyDSLFlexAttention(TestCase):
         torch.manual_seed(0)
         b, h, s, d = 2, 4, 256, 64
         bhsd = [
-            torch.randn(b, h, s, d, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+            torch.randn(b, h, s, d, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
         ]
         results = {}
         for layout in ("bshd", "bhsd"):
@@ -2624,7 +2959,9 @@ class TestFlyDSLFlexAttention(TestCase):
         i32 = {"dtype": torch.int32, "device": "cuda"}
         # A lower-triangular 4x4 mask: Q tile i visits KV tiles 0..i.
         num = torch.tensor([[[1, 2, 3, 4]]], **i32)
-        idx = torch.tensor([[[[0, 0, 0, 0], [0, 1, 0, 0], [0, 1, 2, 0], [0, 1, 2, 3]]]], **i32)
+        idx = torch.tensor(
+            [[[[0, 0, 0, 0], [0, 1, 0, 0], [0, 1, 2, 0], [0, 1, 2, 3]]]], **i32
+        )
         grid = {
             "batch": 1,
             "num_heads": 1,
@@ -2636,7 +2973,9 @@ class TestFlyDSLFlexAttention(TestCase):
             "num_kv_tiles": 4,
         }
 
-        kv_counts, kv_indices = regrid_block_mask(num, idx, None, None, walk="kv", **grid)
+        kv_counts, kv_indices = regrid_block_mask(
+            num, idx, None, None, walk="kv", **grid
+        )
         q_counts, q_indices = regrid_block_mask(num, idx, None, None, walk="q", **grid)
 
         # Transposed, the triangle inverts: KV tile j is visited by Q tiles j..3.
@@ -2753,7 +3092,9 @@ class TestFlyDSLFlexAttention(TestCase):
         first_coarse = regrid_block_mask(num, idx, None, None, **coarse)
         first_fine = regrid_block_mask(num, idx, None, None, **fine)
         # Asking for one must not have dropped the other.
-        self.assertIs(regrid_block_mask(num, idx, None, None, **coarse)[0], first_coarse[0])
+        self.assertIs(
+            regrid_block_mask(num, idx, None, None, **coarse)[0], first_coarse[0]
+        )
         self.assertIs(regrid_block_mask(num, idx, None, None, **fine)[0], first_fine[0])
         # And they are genuinely different lists, so this is not one entry serving both.
         self.assertEqual(int(first_coarse[0][0, 0, 0]), 2)

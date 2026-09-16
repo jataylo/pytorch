@@ -31,11 +31,11 @@ def block_mask_tensors(mask_fn, batch, num_heads, seq_len, q_block, kv_block, de
     """Build the (kv_num_blocks, kv_indices) pair the kernel's block-skip loop reads.
 
     Uses `create_block_mask` and then takes the **union** of the partial and
-    fully-unmasked block lists, because this kernel visits both with `mask_mod` applied
-    (it does not yet emit a separate body for full blocks). Returns i32 tensors shaped
-    `[B, H, n_q_blocks]` and `[B, H, n_q_blocks, n_kv_blocks]`, expanded over heads: a
-    head-broadcast BlockMask (H=1) is materialised here rather than adding a second
-    stride set to the kernel.
+    fully-unmasked block lists, because the kernel walks one list and applies `mask_mod`
+    to everything on it -- see Note [mask_mod runs on every visited block, including the
+    full ones]. Returns i32 tensors shaped `[B, H, n_q_blocks]` and
+    `[B, H, n_q_blocks, n_kv_blocks]`, expanded over heads: a head-broadcast BlockMask
+    (H=1) is materialised here rather than adding a second stride set to the kernel.
     """
     from torch.nn.attention.flex_attention import create_block_mask
 
@@ -125,6 +125,7 @@ def _regrid_uncached(
     num_q_tiles,
     num_kv_tiles,
     walk="kv",
+    head_group=1,
 ):
     """Re-express a FlexAttention BlockMask on this kernel's own tile grid.
 
@@ -143,15 +144,18 @@ def _regrid_uncached(
     FlexAttention supplies two disjoint block lists -- partial blocks, which still need
     `mask_mod` per element, and fully-unmasked ones -- on its own
     `(sparse_q_block_size, sparse_kv_block_size)` grid. This kernel walks a *single*
-    list and applies `mask_mod` to every block it visits, on its own
-    `(BLOCK_M, BLOCK_N_OUT)` grid. So the two lists are unioned and the grid converted:
-    a split along KV, where the kernel's 64-wide tile is finer than FlexAttention's
-    128 default, and usually a merge along Q, where `BLOCK_M` is 256 for the
-    `num_heads >= 32` builds.
+    list, on its own `(q_block_size, kv_block_size)` grid. So the two lists are unioned
+    and the grid converted: a split along KV, where the kernel's 64-wide tile is finer
+    than FlexAttention's 128 default, and usually a merge along Q, where `BLOCK_M` is
+    256 for the `num_heads >= 32` builds.
 
-    Visiting the union rather than the partial list alone is what keeps this correct:
-    the kernel has no separate body for fully-unmasked blocks, so a full block that
-    went unvisited would simply be dropped from the softmax.
+    Visiting the union rather than the partial list alone is what keeps this correct: one
+    walk means a full block that went unvisited would simply be dropped from the softmax.
+    Losing the distinction costs nothing measurable -- see Note [mask_mod runs on every
+    visited block, including the full ones] in `flex_flash_generic.py`.
+
+    ``head_group`` collapses that many consecutive Q heads into one list, for the packed
+    GQA build whose Q tile spans the group, leaving one list per KV head.
 
     Every op here is small, so the whole conversion is launch-bound at a roughly fixed
     cost per call regardless of sequence length; `regrid_block_mask` memoises it.
@@ -192,6 +196,17 @@ def _regrid_uncached(
 
     occ = _rescale_blocks(occ, 3, sparse_kv_block_size, kv_block_size, num_kv_tiles)
     occ = _rescale_blocks(occ, 2, sparse_q_block_size, q_block_size, num_q_tiles)
+
+    if head_group > 1:
+        # One list per KV head, for a build packing the GQA group into one Q tile: the
+        # tile's rows span the group, so the walk has to cover every head in it. See Note
+        # [packing the GQA group into the Q tile] for why unioning is exact here.
+        if num_heads % head_group:
+            raise ValueError(
+                f"head_group ({head_group}) must divide num_heads ({num_heads})"
+            )
+        occ = occ.unflatten(1, (-1, head_group)).any(2)
+
     if walk == "q":
         occ = occ.transpose(-1, -2)
     elif walk != "kv":

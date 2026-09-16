@@ -200,6 +200,8 @@ def build_flex_flash_generic_module(
     qk_prefetch_depth=2,
     enable_kv_gpfetch=None,
     num_kv_splits=1,
+    kv_tiles_exact=False,
+    raw_exp2=True,
 ):
     """Build the FlexAttention-capable flash-attention forward launcher.
 
@@ -362,6 +364,11 @@ def build_flex_flash_generic_module(
         PATH_TAG = "N32"
     BLOCK_N_OUT = 128 if PATH_TAG == "N128" else BLOCK_N
     N_SUBTILES = BLOCK_N_OUT // BLOCK_N
+    # Whether seq_len_kv divides the KV tile, which only the caller can know and only for
+    # a static extent. False keeps the padding mask, so a build told nothing stays correct.
+    KV_TILES_EXACT = bool(kv_tiles_exact)
+    # See Note [the exponential is four instructions, three of them for denormals].
+    USE_RAW_EXP2 = bool(raw_exp2)
     ENABLE_PREFETCH_3BUF = os.getenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_PREFETCH3", "0") == "1"
     # buffer_load_dwordx4_lds (16B DMA-to-LDS) requires gfx950+; gfx94x only has dword (4B).
     # Declared per arch rather than tested here: this used to read `not
@@ -427,8 +434,13 @@ def build_flex_flash_generic_module(
     #   - The O store had leaned on `o_rsrc`'s num_records to drop a partial tile's rows.
     #     A packed row past seq_len is no longer past the bound, it is a valid address in
     #     the *next* head of the group, so the store is predicated instead.
-    #   - A BlockMask is regridded per `(b, h, q_tile)` and cannot describe a tile that
-    #     spans heads, so packing and `block_mask` are mutually exclusive.
+    #   - A BlockMask is indexed per `(b, h, q_tile)` and a packed tile spans G heads, so
+    #     there is no single list to walk. The host passes the union over the group
+    #     (`head_group` on `regrid_block_mask`), one list per `(b, kv_head, q_tile)`.
+    #     Conservative rather than approximate: `mask_mod` still runs per element against
+    #     this lane's `q_head_idx`, so a block visited only for a sibling head has the
+    #     other heads' rows masked off. Free for causal, sliding-window and document
+    #     masks, which do not read `h` and so give the whole group the same list.
     PACK_GQA = bool(pack_gqa)
     _gqa_group = num_heads // num_kv_heads
     if PACK_GQA:
@@ -439,8 +451,6 @@ def build_flex_flash_generic_module(
                 f"pack_gqa needs block_m ({BLOCK_M}) divisible by the GQA group size "
                 f"({_gqa_group})"
             )
-        if block_mask:
-            raise ValueError("pack_gqa cannot be combined with block_mask")
     # Tokens of one head per tile, and the head axis of the grid. Both are BLOCK_M and
     # NUM_HEADS_Q unpacked, which is what every existing build gets.
     Q_TOKENS_PER_TILE = BLOCK_M // _gqa_group if PACK_GQA else BLOCK_M
@@ -479,7 +489,10 @@ def build_flex_flash_generic_module(
     # here and the normalization is just the `None` default.
     WS_ROW_ELEMS = split_kv_workspace_row_elems(head_dim_v or head_dim)
 
-    assert BLOCK_M % NUM_WAVES == 0
+    # Each wave owns a contiguous band of Q rows.
+    assert BLOCK_M % NUM_WAVES == 0, (
+        f"block_m ({BLOCK_M}) must divide among the waves ({NUM_WAVES})"
+    )
     # Not a tuning choice: the mod site, the causal compare and the O/LSE stores all read
     # the Q row as `wave_id * ROWS_PER_WAVE + lane % 32`, one row per lane.
     assert ROWS_PER_WAVE == 32, (
@@ -496,8 +509,13 @@ def build_flex_flash_generic_module(
         512,
     ), f"flat_work_group_size must be 128, 256, or 512, got {flat_work_group_size}"
     assert dtype_str in ("f16", "bf16"), "flex_flash_generic only supports f16 and bf16"
-    assert BLOCK_N % 32 == 0
-    assert BLOCK_N_OUT % BLOCK_N == 0
+    assert BLOCK_N % 32 == 0, (
+        f"BLOCK_N ({BLOCK_N}) must be a multiple of the 32-wide MFMA sub-tile"
+    )
+    # BLOCK_N_OUT is the loop's KV step, BLOCK_N the sub-tile it walks in.
+    assert BLOCK_N_OUT % BLOCK_N == 0, (
+        f"BLOCK_N_OUT ({BLOCK_N_OUT}) must be a whole number of BLOCK_N ({BLOCK_N})"
+    )
 
     if sm_scale is None:
         sm_scale = 1.0 / host_math.sqrt(head_dim)
@@ -701,8 +719,11 @@ def build_flex_flash_generic_module(
         raise ValueError(f"qk_prefetch_depth must be >= 1, got {qk_prefetch_depth}")
 
     VEC_WIDTH = 16 if ENABLE_LDS_VEC16 else 8
-    assert HEAD_DIM % VEC_WIDTH == 0
-    assert HEAD_DIM_V % VEC_WIDTH == 0
+    # The cooperative load geometry divides a row into whole vectors.
+    for _name, _dim in (("head_dim", HEAD_DIM), ("head_dim_v", HEAD_DIM_V)):
+        assert _dim % VEC_WIDTH == 0, (
+            f"{_name} ({_dim}) must be divisible by the LDS vector width ({VEC_WIDTH})"
+        )
 
     if not USE_HW_TR:
         # Granule is the 4 elements a v4f16 read wants contiguous, so the XOR moves
@@ -840,6 +861,28 @@ def build_flex_flash_generic_module(
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
+
+        def _exp2(a):
+            # Note [the exponential is four instructions, three of them for denormals]
+            #
+            # With f32 denormals enabled, which FlyDSL pins, `llvm.exp2.f32` guards
+            # `v_exp_f32` against arguments whose result would be denormal: it biases the
+            # input and undoes that with `v_ldexp_f32` under a compare and a select. The
+            # D64 loop shows 33 of each per KV block.
+            #
+            # A max-subtracted softmax does not need the guard. Arguments are `s - max <=
+            # 0` and the row contains the max, so a denormal result is a term below 2^-126
+            # in a sum containing 1.0, far beneath the bf16 it is stored in. `exp2(-inf)`
+            # is 0 in hardware either way, which is what the masked rows and the LSE guard
+            # rely on.
+            #
+            # Kernel-only this is worth 1.10x at D64 causal, 1.18x at D128 and 1.72x for
+            # backward `dq` at D128, where the fixup's temporaries were half the spilling
+            # at the 256-VGPR ceiling (56 slots to 13). It loses on some D128 builds for
+            # the same register reasons, so the spelling is a choice -- see `_raw_exp2s`.
+            if const_expr(USE_RAW_EXP2):
+                return rocdl.exp2(fx.Float32.ir_type, _raw(a))
+            return ArithValue(_raw(a)).exp2(fastmath=fm_fast)
 
         def mfma_acc(a, b, c):
             if const_expr(dtype_str == "bf16"):
@@ -1479,14 +1522,20 @@ def build_flex_flash_generic_module(
             kv_upper = seq_len_kv_v
 
         if const_expr(USE_BLOCK_MASK):
-            # kv_num_blocks [B, H_q, num_q_blocks] i32
-            # kv_indices    [B, H_q, num_q_blocks, num_kv_blocks] i32
+            # kv_num_blocks [B, GRID_HEADS, num_q_tiles] i32
+            # kv_indices    [B, GRID_HEADS, num_q_tiles, num_kv_tiles] i32
             # A BlockMask built with H=1 must be expanded by the host; broadcasting it
             # here would need a second stride set for no real gain.
+            #
+            # Indexed by the grid's head -- `q_head_idx` unpacked, `kv_head_idx` packed --
+            # and not by `q_head_idx` directly, which packing makes per-lane: a walk length
+            # has to be workgroup-uniform or the lanes disagree on the iteration count. The
+            # host unions the group's lists to match; see Note [packing the GQA group into
+            # the Q tile].
             _nb_rsrc = buffer_ops.create_buffer_resource(KV_NUM_BLOCKS, max_size=True)
             _kvi_rsrc = buffer_ops.create_buffer_resource(KV_INDICES, max_size=True)
             _kv_blocks_total = (seq_len_kv_v + fx.Index(BLOCK_N_OUT - 1)) // fx.Index(BLOCK_N_OUT)
-            _qblk_lin = (batch_idx * fx.Index(NUM_HEADS_Q) + q_head_idx) * num_q_tiles + q_tile_idx
+            _qblk_lin = (batch_idx * fx.Index(GRID_HEADS) + head_of_block) * num_q_tiles + q_tile_idx
             _n_visit = fx.Index(
                 fx.Int32(buffer_ops.buffer_load(_nb_rsrc, _raw(fx.Int32(_qblk_lin)), vec_width=1, dtype=T.i32))
             )
@@ -1783,13 +1832,21 @@ def build_flex_flash_generic_module(
                 # gives offset 8g + j, so each group of 4 consecutive r is contiguous in
                 # kv_idx and groups are 8 apart -- which is why MOD_VEC caps at 4.
                 #
-                # mask_mod is applied on every visited block, including ones the
-                # BlockMask marks fully-unmasked. Skipping it there needs the full and
-                # partial block lists walked by *separate* loops with separately
-                # emitted bodies (as FlexAttention does), because the predicate is
-                # runtime data and FlyDSL's dynamic `if` propagates rebound locals, not
-                # writes into these score lists. Deferred: the block-skip below is the
-                # larger win, and this only costs instructions on blocks we visit.
+                # Note [mask_mod runs on every visited block, including the full ones]
+                #
+                # Deliberate, not deferred. The mod site is VALU and the loop is
+                # MFMA-bound, so on an all-true mask over a dense walk -- where the mask is
+                # pure overhead by construction -- lowering it lands within 2% of a build
+                # with no mask, sign varying between runs.
+                #
+                # Skipping it measured worse. Which blocks are full is runtime data, so the
+                # skip is a dynamic branch, and FlyDSL's `if` yields the locals its body
+                # rebinds: all 32 scores cross the merge point, costing register copies and
+                # the scheduler's interleaving. That read 0.84-0.89x on the all-true mask
+                # and 0.77-0.80x on real causal, window and document masks. Avoiding the
+                # branch needs FlexAttention's structure -- full and partial lists in
+                # separate loops with separate bodies -- for a 1% ceiling at double the
+                # loop body and compile time. See benchmarks/transformer/flydsl/sparse_gaps.py.
                 if const_expr(HAS_ANY_MOD):
                     _mod_b = fx.Int32(batch_idx)
                     _mod_h = fx.Int32(q_head_idx)
@@ -1974,11 +2031,20 @@ def build_flex_flash_generic_module(
                         s_raw_hi_14,
                         s_raw_hi_15,
                     ]
-                else:
+                elif const_expr(not KV_TILES_EXACT):
                     # Non-causal KV padding mask: keys with absolute column >= seq_len_kv
                     # -> -inf, so OOB KV (0 or duplicated row) doesn't leak into softmax.
                     # Col layout (mirrors causal): lo = kv_start + lane_div_32*4 +
                     # ((r//4)*8 + r%4); hi = +K_SUB_N.
+                    #
+                    # Skipped entirely under KV_TILES_EXACT: if seq_len_kv divides the
+                    # tile then no visited column can reach it, and this is 32 v_cmp plus
+                    # 32 v_cndmask per block per wave (~15% of the loop's VALU) selecting
+                    # the value it already had. Worth 1.08x dense at D128.
+                    #
+                    # The KV load's row clamp stays either way -- it is per loaded row
+                    # rather than per score element, and it is what makes the duplicated
+                    # OOB row safe on the builds that still need this mask.
                     kv_start_i32 = fx.Int32(kv_start)
                     lane_off_i32 = fx.Int32(lane_div_32) * fx.Int32(4)
                     seq_len_i32 = fx.Int32(seq_len_kv_v)
@@ -2003,7 +2069,7 @@ def build_flex_flash_generic_module(
 
                 diff_m_raw = _fsub(m_running, m_new_raw)
                 diff_m_scaled = _fmul(diff_m_raw, c_softmax_log2e)
-                corr = ArithValue(diff_m_scaled).exp2(fastmath=fm_fast)
+                corr = _exp2(diff_m_scaled)
 
                 scaled_max = _fmul(c_softmax_log2e, m_new_raw)
                 neg_scaled_max = _fsub(c_zero_f, scaled_max)
@@ -2013,12 +2079,12 @@ def build_flex_flash_generic_module(
                 local_sum = c_zero_f
                 for r in range_constexpr(16):
                     diff_lo = fmath.fma(s_raw_lo[r], c_softmax_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_lo = ArithValue(diff_lo).exp2(fastmath=fm_fast)
+                    p_lo = _exp2(diff_lo)
                     p_vals_lo.append(p_lo)
                     local_sum = _fadd(local_sum, p_lo)
                 for r in range_constexpr(16):
                     diff_hi = fmath.fma(s_raw_hi[r], c_softmax_log2e, neg_scaled_max, fastmath=fm_fast)
-                    p_hi = ArithValue(diff_hi).exp2(fastmath=fm_fast)
+                    p_hi = _exp2(diff_hi)
                     p_vals_hi.append(p_hi)
                     local_sum = _fadd(local_sum, p_hi)
 
@@ -2666,7 +2732,22 @@ def build_flex_flash_generic_module(
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {
-            "enable-post-misched": False,
+            # Note [post-RA scheduling cannot spill, so it is a default]
+            #
+            # The KV loop issues ~13 VALU per MFMA and the two paths do not overlap.
+            # Pre-RA the scheduler will not interleave them hard, because that lengthens
+            # live ranges; running it again after allocation has no such constraint.
+            # Measured at both settings, all 20 builds across both directions report
+            # identical VGPR, AGPR and spill counts, so this only reorders: 1.03-1.14x on
+            # the forward, 1.06-1.11x on the backward, against about 2% on D128 causal
+            # and backward dq. The 2% is repeatable, and the first place to look if a D128
+            # causal shape reads slow.
+            #
+            # `rocdl.iglp_opt`, which asks AMDGPUIGroupLP for this interleaving directly,
+            # was tried first and emitted ISA byte-identical to no intrinsic at any
+            # strategy -- the mutation declines silently when the loop is not shaped like
+            # the one it expects.
+            "enable-post-misched": True,
             "lsr-drop-solution": True,
         },
     }
@@ -2705,7 +2786,12 @@ def build_flex_flash_generic_module(
     # and to build a BlockMask whose block size matches the kernel's KV tile.
     _guarded = _guard_seqlen(_launch)
     _guarded.kv_block_size = BLOCK_N_OUT
-    _guarded.q_block_size = BLOCK_M
+    # Tokens per tile, not BLOCK_M: packed, a tile's BLOCK_M rows are G heads' worth of
+    # tokens, and the host regrids the mask against the token count. BLOCK_M here would
+    # give the mask G times too few Q tiles.
+    _guarded.q_block_size = Q_TOKENS_PER_TILE
+    # Consecutive Q heads sharing one block list: 1 unpacked, the GQA group packed.
+    _guarded.mask_head_group = GQA_GROUP_SIZE if PACK_GQA else 1
     _guarded.returns_lse = RETURN_LSE
     # Published because "is the swizzle on" is not visible in the numbers: a bad mask
     # gives a wrong answer, and a disabled one gives a slow right answer.

@@ -9,6 +9,7 @@ import os
 import sys
 
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 
 # score_mod.py, one directory up, is where the mods and the shapes come from: measuring
@@ -44,6 +45,37 @@ def best_us(fn, *args, repeats=3, **kwargs):
     return min(
         score_mod.benchmark_torch_function_in_microseconds(fn, *args, **kwargs)
         for _ in range(repeats)
+    )
+
+
+def device_us(fn, *args, calls=20):
+    """Summed GPU time of every kernel one call launches, or None if the backend refuses.
+
+    Wall clock cannot see a decode kernel. A compiled `flex_attention` call spends ~350 us
+    on the host -- guards, the regrid memo lookup, argument marshalling -- against a kernel
+    that runs for tens of microseconds, so `best_us` of a decode shape measures Inductor's
+    Python and comes out flat in `Skv`. The sum is over every kernel a call launches, which
+    is more than one when the KV walk is split: the partial pass and the combine.
+
+    Prefill shapes should use `best_us`, which is what the published tables used.
+    """
+    try:
+        with torch.no_grad():
+            fn(*args)
+            torch.cuda.synchronize()
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                for _ in range(calls):
+                    fn(*args)
+                torch.cuda.synchronize()
+    except Exception:
+        return None
+    return (
+        sum(
+            e.self_device_time_total
+            for e in prof.key_averages()
+            if e.self_device_time_total > 0
+        )
+        / calls
     )
 
 

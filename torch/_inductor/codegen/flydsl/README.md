@@ -197,8 +197,12 @@ module global, a generated constexpr — is invisible to it, and two mods differ
 such a constant would silently share the first one's binary. `mod_key()` hashes the rendered
 bodies to break that.
 
-**The autotune space is one tunable, not a config sweep.** Only `mod_vec_size` (1, 2 or 4)
-is exposed. All three must produce identical results; the autotuner is free to pick any.
+**The autotune space is a handful of tunables, not a config sweep.** CuteDSL exposes
+`mod_vec_size` (1, 2 or 4) and nothing else; this backend has six axes, each of which had to
+earn its builds by measurement (see [Config flags](#config-flags)). Every one of them but
+the softmax exponential produces bit-identical results, so the autotuner is free to pick any
+on time alone; that one differs in the last bits of weights that round to zero, and is
+pinned wherever a test compares two lowerings for exact equality.
 
 **LSE is natural log and a mutated input.** The kernel writes `ln(sum exp)` in place, so
 `FLYDSL` is listed in `_NATURAL_LOG_LSE_BACKENDS` in
@@ -661,7 +665,14 @@ Beyond the generic `{{def_kernel(...)}}`, `{{gen_defines()}}` and `{{get_output(
 `kernel_options={"NUM_KV_SPLITS": n}` pins how many workgroups share one Q tile's KV walk,
 and 1 disables the split and the combine kernel with it;
 `kernel_options={"LAYOUT": "bhsd"|"bshd"}` pins which layout the kernel indexes, which is
-otherwise read off the strides of q/k/v (and `do`) so that nothing has to be copied.
+otherwise read off the strides of q/k/v (and `do`) so that nothing has to be copied;
+`kernel_options={"RAW_EXP2": bool}` pins how the softmax exponential is spelled, in both
+directions at once.
+
+That last one has no flag of its own because the head_dim already restricts it: it is swept
+at 128 and up, where the register file makes the two spellings disagree, and pinned to the
+bare instruction at 64, where they do not. See
+[the softmax exponential](#the-softmax-exponential-and-what-the-denormal-fixup-is-for).
 
 The forward's Q tile is swept only at 32 heads and up, which is where the old
 `BLOCK_M = 256 if num_heads >= 32` heuristic engaged and the only place the two candidates
@@ -840,6 +851,40 @@ The two kernels landed differently, which is why one is a sweep and the other a 
 
 Numerics are bit-identical wherever any of this is enabled, so it only ever trades speed.
 
+## The softmax exponential, and what the denormal fixup is for
+
+The KV loop issues roughly 13 VALU instructions per MFMA, and the largest single
+contributor is the exponential: `llvm.exp2.f32` lowers to four instructions, not one.
+`v_exp_f32` is the arithmetic; `v_ldexp_f32`, `v_cmp_gt_f32` and `v_cndmask_b32` rescale
+the input when the result would be denormal, so that a general exp2 does not return zero
+where a subnormal answer exists.
+
+A max-subtracted softmax does not need that. Every input is `score - max`, so the result
+is in `(0, 1]`, and reaching the denormal window means a weight 2^-126 smaller than the
+row's largest — nothing, in a sum containing a 1.0 term, and below the bf16 the answer is
+stored in. `rocdl.exp2` is the bare `v_exp_f32` and computes the same softmax.
+
+It is an axis rather than a change because fewer instructions is not always better code:
+three fewer per element gives the scheduler more to interleave, the live ranges it builds
+are longer, and a build already on the 256-VGPR ceiling at head_dim 128 can spill where it
+did not before. Nothing the host can read predicts which way a build lands, so both
+spellings are offered at 128 and up and the timing decides; at 64 nothing spills either way
+and bare wins outright. This is the only axis whose settings are not bit-identical, in the
+last bits of weights that round to zero, so tests that compare two lowerings pin it.
+
+Two more instructions came out of the same VALU budget:
+
+- **The KV padding mask.** A non-causal build bounds-checks every score element against
+  `seq_len_kv` — 32 `v_cmp` plus 32 `v_cndmask` per KV block, about 15% of the loop's VALU
+  — to guard a tail that exists only in the last tile. When the host can prove the KV
+  extent divides the widest tile the kernel walks, the check folds away at trace time
+  (`KV_TILES_EXACT`): 1.08x dense at head_dim 128, 1.09x with a head bias. A dynamic
+  extent keeps it, and causal builds were already gated separately.
+- **Post-RA scheduling**, now on. Worth 3–14% across both directions and unable to spill,
+  since it reorders after allocation. See Note [post-RA scheduling cannot spill, so it is a
+  default] in `flex_flash_generic.py`, which also records the `iglp_opt` intrinsic that
+  asks LLVM for this interleaving directly and emitted identical ISA at every strategy.
+
 ## What autotuning costs, and why the sweeps are kept narrow
 
 Over 84 cold cells against autotuned Triton:
@@ -890,6 +935,10 @@ closed: an axis earns a sweep only if measurement says neither setting can be pi
 forward's staging axis clears that bar (pinning it on costs 1.121x geomean on the 20 of 84
 blocks where off won, worst 1.35x; pinning it off costs 1.098x on the other 64), and `dq`'s
 and `dkdv`'s do not, which is why both are defaults instead.
+
+The sixth axis, the softmax exponential above, clears it in both directions: at head_dim
+128 pinning the bare instruction costs 1.13x on a document-mask forward and 1.14x on its
+backward, and pinning it off costs 1.13x and 1.45x on the dense pair.
 
 Use `TORCH_LOGS="output_code"` to see the generated module.
 

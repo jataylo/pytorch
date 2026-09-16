@@ -115,6 +115,10 @@ def _launcher():
             # More than one and the launcher runs a second, combining kernel and wants a
             # workspace, which `prepare` sizes off the row width it publishes.
             num_kv_splits=NUM_KV_SPLITS,
+            # Whether the KV extent divides the walk, so the kernel can drop the per-element
+            # padding mask. Only the host can answer it, and only when the extent is static.
+            kv_tiles_exact={{ "True" if KV_TILES_EXACT else "False" }},
+            raw_exp2={{ "True" if RAW_EXP2 else "False" }},
         )
     return _LAUNCHER
 
@@ -170,6 +174,9 @@ def _launcher():
         kv_block_size=_launch.kv_block_size,
         num_q_tiles=-(-_sq // _launch.q_block_size),
         num_kv_tiles=-(-_skv // _launch.kv_block_size),
+        # Read off the build, not decided here: the packed build wants the GQA group's
+        # heads unioned into one list, and only it knows whether it packs.
+        head_group=_launch.mask_head_group,
     )
     {% else %}
     _launch = _launcher()

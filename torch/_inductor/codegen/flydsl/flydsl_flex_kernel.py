@@ -35,6 +35,12 @@ from .flydsl_op_overrides import (
 from .flydsl_template import FlyDSLTemplate
 
 
+# Mirrors `flex_flash_generic.MAX_AUX_TENSORS`, which is the definition. Copied rather
+# than imported for the same reason `_MAX_AUX_TENSORS` in the lowering is: this module is
+# reachable wherever Inductor is, and the kernel module it comes from imports flydsl.
+MAX_AUX_TENSORS = 4
+
+
 if TYPE_CHECKING:
     from ...ir import Buffer
 
@@ -157,6 +163,18 @@ class FlyDSLFlexTemplateKernel(FlyDSLTemplateKernel):
         slot = self._aux_slots.get(key)
         if slot is None:
             slot = len(self._aux_arg_names)
+            # Checked here as well as on the lowering's capture count, because the two
+            # counts differ: document masking reads one table two ways and so takes two
+            # slots, clearing a four-tensor check while needing a fifth slot. Without
+            # this the template names an `AUX4` the signature lacks, and it surfaces as a
+            # missing-argument error inside the builder.
+            if slot >= MAX_AUX_TENSORS:
+                raise NotImplementedError(
+                    f"the FlyDSL flex kernels carry {MAX_AUX_TENSORS} aux slots and this "
+                    f"lowering needs {slot + 1}: a slot is a (captured tensor, index "
+                    f"pattern) pair, so a capture read with two index patterns takes two. "
+                    f"Slots so far: {list(self._aux_slots)}; adding {(name, tuple(spec))}"
+                )
             self._aux_slots[key] = slot
             self._aux_arg_names.append(arg_name)
             self._aux_specs.append(list(spec))

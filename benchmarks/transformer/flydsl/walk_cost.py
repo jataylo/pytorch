@@ -8,7 +8,12 @@ of KV actually costs.
 This is the measurement that found the layout copies: the intercept came out at 1075 us
 against Triton's 41 us while the slope was 1.6x *better*, which is not a shape a kernel
 problem takes. See `profile_call.py` for what the intercept turned out to be. It reads
-around 350 us now, so an intercept back up in the thousands means the copies are back.
+around 560 us now -- ~350 us when the copies were removed, drifting up with the tile
+heights the autotuner picks -- so an intercept back in the thousands means they are back.
+
+The slope is the better half: 1.6x cheaper per block than Triton, which is why `speedup`
+climbs from 0.71x at one block per tile to 1.42x at sixteen. Short walks are where the
+intercept dominates and where this backend loses.
 
     python benchmarks/transformer/flydsl/walk_cost.py --d 128
 """

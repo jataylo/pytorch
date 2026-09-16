@@ -24,11 +24,15 @@ Not handled here, by construction:
   the aux-slot path, shared with the forward -- but a capture that itself requires grad
   needs the joint graph's ``zeros_and_scatter`` outputs accumulated with atomics. The gate
   in ``flydsl_flash_attention.py`` refuses those.
-- ``block_mask``: both walks are dense. ``mask_mod`` is evaluated on every tile rather
-  than whole tiles being skipped, so a causal backward does the work of a full one. That
-  is a performance gap, not a correctness one, and it is the largest one left here.
 - ``causal`` as a build flag: the caller expresses causality as a ``mask_mod``, which is
   the supported path.
+
+``block_mask`` *is* supported here, on both walks: each kernel can walk a block list
+instead of its axis densely, on opposite axes (``dq`` tiles Q and walks KV, ``dkdv`` tiles
+KV and walks Q; see ``regrid_block_mask``'s ``walk``). The list is the union of the partial
+and fully-unmasked lists and ``mask_mod`` runs on every block in it, which the forward
+measured as free -- see Note [mask_mod runs on every visited block, including the full
+ones] in ``flex_flash_generic.py``.
 
 Note [Backward GEMMs are the forward's two GEMMs]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -344,6 +348,7 @@ def build_flex_flash_bwd_dq_module(
     has_dlse=False,
     enable_kv_gpfetch=None,
     enable_permlane_store=None,
+    raw_exp2=True,
 ):
     """Build the ``dq`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DQ, AUX0..3, KVNB, KVI, B, S)``.
 
@@ -707,6 +712,7 @@ def build_flex_flash_bwd_dq_module(
 
         # See Note [the fast-math flags stop short of nnan and ninf].
         fm_fast = FASTMATH
+        USE_RAW_EXP2 = bool(raw_exp2)
         v4f16_type = Vec.make_type(4, elem_dtype)
         v8f16_type = Vec.make_type(8, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
@@ -720,6 +726,13 @@ def build_flex_flash_bwd_dq_module(
 
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _exp2(a):
+            # See Note [the exponential is four instructions, three of them for
+            # denormals] in flex_flash_generic.
+            if const_expr(USE_RAW_EXP2):
+                return rocdl.exp2(fx.Float32.ir_type, _raw(a))
+            return ArithValue(_raw(a)).exp2(fastmath=fm_fast)
 
         def mfma_acc_k8(a, b, c):
             """32x32x8, for operands packed four at a time."""
@@ -1290,7 +1303,7 @@ def build_flex_flash_bwd_dq_module(
                     exponent = fmath.fma(
                         fx.Float32(s_masked), c_softmax_log2e, neg_lse_log2e, fastmath=fm_fast
                     )
-                    p = ArithValue(exponent).exp2(fastmath=fm_fast)
+                    p = _exp2(exponent)
                     # Gradient with respect to the *post*-mod score.
                     dp_minus_delta = _fsub(Vec(dp_acc)[r], delta_val)
                     ds_vals.append(_fmul(fx.Float32(p), fx.Float32(dp_minus_delta)))
@@ -1435,7 +1448,9 @@ def build_flex_flash_bwd_dq_module(
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {
-            "enable-post-misched": False,
+            # See Note [post-RA scheduling cannot spill, so it is a default] in
+            # flex_flash_generic. Worth 6-11% to both kernels here.
+            "enable-post-misched": True,
             "lsr-drop-solution": True,
         },
     }
@@ -1482,6 +1497,7 @@ def build_flex_flash_bwd_dkdv_module(
     has_dlse=False,
     enable_q_gpfetch=None,
     enable_permlane_store=None,
+    raw_exp2=True,
 ):
     """Build the ``dk``/``dv`` launcher: ``(Q, K, V, DO, LSE, DELTA, DLSE, DK, DV, AUX0..3, QNB, QI, B, S)``.
 
@@ -1749,6 +1765,7 @@ def build_flex_flash_bwd_dkdv_module(
 
         # See Note [the fast-math flags stop short of nnan and ninf].
         fm_fast = FASTMATH
+        USE_RAW_EXP2 = bool(raw_exp2)
         v4f16_type = Vec.make_type(4, elem_dtype)
         v8f16_type = Vec.make_type(8, elem_dtype)
         v16f32_type = Vec.make_type(16, fx.Float32)
@@ -1759,6 +1776,13 @@ def build_flex_flash_bwd_dkdv_module(
 
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _exp2(a):
+            # See Note [the exponential is four instructions, three of them for
+            # denormals] in flex_flash_generic.
+            if const_expr(USE_RAW_EXP2):
+                return rocdl.exp2(fx.Float32.ir_type, _raw(a))
+            return ArithValue(_raw(a)).exp2(fastmath=fm_fast)
 
         def mfma_acc_k8(a, b, c):
             """32x32x8, for operands packed four at a time."""
@@ -2337,7 +2361,7 @@ def build_flex_flash_bwd_dkdv_module(
                             fx.Float32(_fmul(lse_r, c_neg_log2e)),
                             fastmath=fm_fast,
                         )
-                        p = fx.Float32(ArithValue(exponent).exp2(fastmath=fm_fast))
+                        p = fx.Float32(_exp2(exponent))
                         # m is the reduction axis here, so a row past seq_len_q would be
                         # *summed into* dk/dv rather than dropped at the store the way an
                         # out-of-range row is in the dq kernel. Select p rather than
@@ -2498,7 +2522,9 @@ def build_flex_flash_bwd_dkdv_module(
         "fast_fp_math": fast_fp_math,
         "unsafe_fp_math": unsafe_fp_math,
         "llvm_options": {
-            "enable-post-misched": False,
+            # See Note [post-RA scheduling cannot spill, so it is a default] in
+            # flex_flash_generic. Worth 6-11% to both kernels here.
+            "enable-post-misched": True,
             "lsr-drop-solution": True,
         },
     }

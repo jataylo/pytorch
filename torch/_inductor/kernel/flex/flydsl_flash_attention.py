@@ -99,9 +99,9 @@ def _lds_budget(arch: str | None) -> int:
     Declared per arch in ``arch_caps``, which is also where the builders read it, because
     a lowering that disagreed would offer a tile the builder then refuses.
     """
-    caps = arch_caps.caps_for(arch)
     # Unknown archs never reach a tile choice; `_arch_supported` has already refused them.
-    return caps.lds_budget_bytes if caps else arch_caps.caps_for("gfx942").lds_budget_bytes  # type: ignore[union-attr]
+    caps = arch_caps.caps_for(arch) or arch_caps.caps_for("gfx942")
+    return caps.lds_budget_bytes  # type: ignore[union-attr]
 
 
 def _holds_transposed_copies(arch: str | None) -> bool:
@@ -113,6 +113,7 @@ def _holds_transposed_copies(arch: str | None) -> bool:
     """
     caps = arch_caps.caps_for(arch)
     return not (caps.lds_transpose_read if caps else False)
+
 
 _SUPPORTED_DTYPES = frozenset({torch.bfloat16, torch.float16})
 
@@ -318,6 +319,25 @@ def _can_use_flydsl_shapes_and_arch(query, key, value) -> tuple[bool, str]:
     if not seq_ok:
         return False, seq_reason
 
+    # An empty extent is a legal FlexAttention call and a degenerate kernel. At Skv=0
+    # `_kv_row_clamp` clamps to `seq_len_kv - 1`, which is -1, so the first KV load
+    # addresses off the front of the tensor -- a fault whose reachability depends on what
+    # sits before the allocation. At Sq=0 the grid is empty and the launch is a no-op, but
+    # only by accident of the arithmetic. The builder guards this too, and much later: its
+    # check only fires once the extent reaches it as a concrete int, which under dynamic
+    # shapes it does not. Refuse here, where a symbolic extent proven zero is still
+    # visible. Shared rather than per-direction because the backward reads the same
+    # extents -- see Note [FlyDSL forward and backward must be chosen together].
+    for name, extent in (
+        ("seq_len_q", query.get_size()[-2]),
+        ("seq_len_kv", key.get_size()[-2]),
+    ):
+        if V.graph.sizevars.statically_known_leq(extent, 0):
+            return (
+                False,
+                f"{name} is {extent}; the FlyDSL flex kernels need a non-empty extent",
+            )
+
     # FlexAttention broadcasts a `Bkv=1` key/value across the Q batch, and neither
     # direction is built for it: the forward addresses k and v at the *Q* batch index and
     # so reads off the end of the allocation, which faults the GPU rather than returning
@@ -332,9 +352,7 @@ def _can_use_flydsl_shapes_and_arch(query, key, value) -> tuple[bool, str]:
             f"a broadcast KV batch is not supported (Bq={batch_q}, Bkv={batch_kv})",
         )
 
-    return _head_dim_supported(
-        query, value
-    )
+    return _head_dim_supported(query, value)
 
 
 def _can_use_flydsl_flash_attention(
@@ -351,9 +369,7 @@ def _can_use_flydsl_flash_attention(
     """
     from .flex_flash_attention import input_buffers_require_grads
 
-    shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(
-        query, key, value
-    )
+    shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(query, key, value)
     if not shared_ok:
         return False, shared_reason
 
@@ -443,9 +459,7 @@ def _can_use_flydsl_flash_attention_backward(
     the template renders, exactly as it does on the forward path, and duplicating that
     knowledge in the gate is how the two drift apart.
     """
-    shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(
-        query, key, value
-    )
+    shared_ok, shared_reason = _can_use_flydsl_shapes_and_arch(query, key, value)
     if not shared_ok:
         return False, shared_reason
 
@@ -606,6 +620,13 @@ def create_flex_flydsl_attention_kernel(
     # Hinted: the tile height and the packing flag are compile-time constants, so a sympy
     # extent here would make the short-sequence tests symbolic Booleans.
     seq_len_q_hint = V.graph.sizevars.optimization_hint(seq_len_q)
+    # Proved, not hinted: this one licenses the kernel to drop a bounds check, so a wrong
+    # answer is a wrong result rather than a slow one. 128 is the widest KV tile any build
+    # walks, and a multiple of it is a multiple of the narrower ones, so one question
+    # covers every path. A dynamic extent cannot be proved and keeps the check.
+    kv_tiles_exact = V.graph.sizevars.statically_known_multiple_of(
+        key.get_size()[2], 128
+    )
     block_ms = _forward_block_ms(
         kernel_options,
         num_heads=num_heads,
@@ -613,10 +634,19 @@ def create_flex_flydsl_attention_kernel(
         head_dim=int(V.graph.sizevars.optimization_hint(qk_head_dim)),
     )
     kv_gpfetches = _forward_kv_gpfetch(kernel_options)
+    raw_exp2s = _raw_exp2s(
+        kernel_options, head_dim=int(V.graph.sizevars.optimization_hint(qk_head_dim))
+    )
     seq_len_kv_hint = int(V.graph.sizevars.optimization_hint(key.get_size()[2]))
     batch_hint = int(V.graph.sizevars.optimization_hint(batch_size))
-    for mod_vec_size, qk_prefetch_depth, block_m, kv_gpfetch in itertools.product(
-        vec_sizes, prefetch_depths, block_ms, kv_gpfetches
+    for (
+        mod_vec_size,
+        qk_prefetch_depth,
+        block_m,
+        kv_gpfetch,
+        raw_exp2,
+    ) in itertools.product(
+        vec_sizes, prefetch_depths, block_ms, kv_gpfetches, raw_exp2s
     ):
         pack_gqa = _pack_gqa(
             kernel_options,
@@ -624,7 +654,6 @@ def create_flex_flydsl_attention_kernel(
             num_kv_heads=num_kv_heads,
             block_m=block_m,
             seq_len_q=seq_len_q_hint,
-            use_block_mask=use_block_mask,
         )
         with patch_fixed_layout_indexer_for_cutedsl():
             error = _flydsl_flash_attention_template().maybe_append_choice(
@@ -656,7 +685,6 @@ def create_flex_flydsl_attention_kernel(
                     v_head_dim=int(V.graph.sizevars.optimization_hint(v_head_dim)),
                     block_m=block_m,
                     pack_gqa=pack_gqa,
-                    use_block_mask=use_block_mask,
                     device=device,
                 ),
                 ENABLE_KV_GPFETCH=kv_gpfetch,
@@ -672,12 +700,19 @@ def create_flex_flydsl_attention_kernel(
                     if use_block_mask
                     else 0
                 ),
+                KV_TILES_EXACT=kv_tiles_exact,
+                RAW_EXP2=raw_exp2,
             )
         # With alternatives left to try, a failed build is one choice fewer rather than a
         # failed lowering; `if not choices` below catches the case where all of them fail.
         if (
             error is not None
-            and len(vec_sizes) * len(prefetch_depths) * len(block_ms) * len(kv_gpfetches) == 1
+            and len(vec_sizes)
+            * len(prefetch_depths)
+            * len(block_ms)
+            * len(kv_gpfetches)
+            * len(raw_exp2s)
+            == 1
         ):
             raise RuntimeError(f"FlyDSL template failed: {error}")
 
@@ -741,6 +776,8 @@ def create_flydsl_flash_attention_backward_kernel(
     mask_graph_buffer,
     has_score_mod,
     has_mask_mod,
+    score_mod_other_buffers=(),
+    mask_mod_other_buffers=(),
     kv_num_blocks=None,
     kv_indices=None,
     full_kv_num_blocks=None,
@@ -775,6 +812,8 @@ def create_flydsl_flash_attention_backward_kernel(
     unavailable = flydsl_unavailable_reason()
     if unavailable is not None:
         raise RuntimeError(f"FlyDSL flex kernels are unavailable: {unavailable}")
+
+    _reject_unsupported_captures(score_mod_other_buffers, mask_mod_other_buffers)
 
     # Imported here, not at module scope: this module is loaded on every ROCm Inductor run
     # whether or not FLYDSL was asked for, and the kernel module pulls in flydsl itself.
@@ -866,6 +905,10 @@ def create_flydsl_flash_attention_backward_kernel(
         V.graph.sizevars.optimization_hint(v_head_dim),
     )
     mod_vec_size = _backward_mod_vec_size(kernel_options)
+    raw_exp2s = _raw_exp2s(
+        kernel_options,
+        head_dim=int(V.graph.sizevars.optimization_hint(qk_head_dim)),
+    )
 
     # Block skipping is a policy decision rather than an autotune knob, because enabling
     # it changes the kernel's *inputs* (the two list tensors), and choices in one autotune
@@ -905,7 +948,7 @@ def create_flydsl_flash_attention_backward_kernel(
         if has_full_blocks:
             input_nodes.extend([full_kv_num_blocks, full_kv_indices])
 
-    for dkdv_kv_tile, dkdv_q_tile in tiles:
+    for (dkdv_kv_tile, dkdv_q_tile), raw_exp2 in itertools.product(tiles, raw_exp2s):
         with patch_fixed_layout_indexer_for_cutedsl():
             error = _flydsl_flash_attention_backward_template().maybe_append_choice(
                 choices,
@@ -935,10 +978,11 @@ def create_flydsl_flash_attention_backward_kernel(
                 HAS_FULL_BLOCKS=has_full_blocks,
                 SPARSE_Q_BLOCK_SIZE=sparse_q_block_size or 0,
                 SPARSE_KV_BLOCK_SIZE=sparse_kv_block_size or 0,
+                RAW_EXP2=raw_exp2,
             )
         # A tile can be refused for its LDS footprint at large head_dim, which is fine as
         # long as one survives; a lone requested tile failing is not.
-        if error is not None and len(tiles) == 1:
+        if error is not None and len(tiles) * len(raw_exp2s) == 1:
             raise RuntimeError(f"FlyDSL backward template failed: {error}")
     if not choices:
         raise RuntimeError(f"FlyDSL backward template failed: {error}")
@@ -1200,7 +1244,9 @@ def _qk_prefetch_depths(kernel_options: dict[str, Any]) -> list[int]:
     requested = kernel_options.get("QK_PREFETCH_DEPTH")
     if requested is not None:
         if not (isinstance(requested, int) and requested >= 1):
-            raise RuntimeError(f"QK_PREFETCH_DEPTH must be a positive int, got {requested}")
+            raise RuntimeError(
+                f"QK_PREFETCH_DEPTH must be a positive int, got {requested}"
+            )
         return [int(requested)]
     if not torch._inductor.config.flydsl.autotune_qk_prefetch_depth:
         return [2]
@@ -1239,6 +1285,20 @@ def _forward_block_ms(
     8x32x(1, 8192) D128 GQA, kernel-only: 2196 us at 128 rows against 1376 us at 64, with
     identical results. That is the padding, not a tuning artefact, and the rest of the
     decode deficit is the workgroup count -- see the decode entry in BRANCH_OVERVIEW.md.
+
+    A block mask does not change the offer, though it does change what the taller tile
+    costs. The kernel walks one list per Q tile, so a 256-row tile walks the union of what
+    its 256 rows need, and a narrow band pays for the part of that union it does not fill:
+    2.0x the mask's own walk at a one-block band, decaying to 1.06x by sixteen blocks. The
+    autotuner cannot see that, because the mask it benchmarks is flex's shared
+    ``create_num_blocks_fake_generator``, which is fully occupied -- tile heights are always
+    ranked on a dense walk. Ranking them on the real mask does not change the answer,
+    because the union only costs what the band fails to fill. Measured at head_dim 128, the
+    256-row tile is 14-18% ahead on causal, document and prefix_lm masks and level with the
+    128-row tile on a 512-token sliding window, which is about where the crossover is; only
+    below that does the shorter tile win, by up to 22% at a one-block band. So a mask whose
+    band is narrower than one tile's worth of rows wants ``BLOCK_M=128`` and has to ask. See
+    ``benchmarks/transformer/flydsl/tile_vs_band.py``.
     """
     requested = kernel_options.get("BLOCK_M")
     if requested is not None:
@@ -1260,6 +1320,35 @@ def _forward_block_ms(
     return [128, 256]
 
 
+def _raw_exp2s(kernel_options: dict[str, Any], *, head_dim: int) -> list[bool]:
+    """Whether to spell the softmax exponential as the bare instruction, as choices.
+
+    One rule for both directions, which measured the same way. The bare instruction is the
+    better arithmetic everywhere -- see Note [the exponential is four instructions, three
+    of them for denormals] in ``flex_flash_generic.py`` -- but not always the better code:
+    three fewer instructions per element gives the scheduler more to interleave, the live
+    ranges it builds are longer, and a build already on the 256-VGPR ceiling can spill
+    where it did not before.
+
+    At head_dim 128 both directions of that trade are live. Forward, the dense walk gains
+    1.13x bare while a document mask over ragged inputs loses 1.13x; backward, the same
+    pair reads 1.45x and 1.14x. Nothing here predicts which side a build lands on -- not
+    the captures, not the tile height, and not the spill count, which for the backward
+    favours bare in every mod-free build the ISA can show. So both are offered and the
+    timing decides.
+
+    head_dim 64 does not ask: nothing spills either way and bare wins outright (forward
+    1.10-1.21x, backward 1.11x for dq and 1.21x for dkdv), so a second build could only
+    cost a compile.
+    """
+    requested = kernel_options.get("RAW_EXP2")
+    if requested is not None:
+        return [bool(requested)]
+    if head_dim <= 64:
+        return [True]
+    return [True, False]
+
+
 def _pack_gqa(
     kernel_options: dict[str, Any],
     *,
@@ -1267,7 +1356,6 @@ def _pack_gqa(
     num_kv_heads: int,
     block_m: int,
     seq_len_q: int,
-    use_block_mask: bool,
 ) -> bool:
     """Whether to give the whole GQA group one Q tile instead of one each.
 
@@ -1299,16 +1387,24 @@ def _pack_gqa(
     unpacked grids are the same size -- ``B*Hkv*ceil(Sq/(BLOCK_M/G))`` against
     ``B*Hq*ceil(Sq/BLOCK_M)`` -- so packing has nothing to win (8x32/8 at Sq 64 measures
     1.00x, as that predicts), and the prefill path is the tuned one.
+
+    A block mask no longer refuses it. A packed tile spans the GQA group, so there is no
+    one head whose block list it walks; the host resolves that by handing over the group's
+    *union*, which is exact for any mask that does not read ``h`` (causal, sliding window,
+    document -- so, in practice, all of them) and conservative otherwise. See Note
+    [packing the GQA group into the Q tile] in ``flex_flash_generic.py``. That is most of
+    a 2.5-8.4x on sparse decode, measured in
+    ``benchmarks/transformer/flydsl/sparse_gaps.py``; the rows that do not move are the
+    MHA ones, which have no group to pack.
     """
     requested = kernel_options.get("PACK_GQA")
     group = num_heads // num_kv_heads
-    legal = group > 1 and block_m % group == 0 and not use_block_mask
+    legal = group > 1 and block_m % group == 0
     if requested is not None:
         if requested and not legal:
             raise RuntimeError(
-                f"PACK_GQA needs a GQA group dividing BLOCK_M and no block mask, got "
-                f"num_heads {num_heads}, num_kv_heads {num_kv_heads}, BLOCK_M {block_m}, "
-                f"block_mask {use_block_mask}"
+                f"PACK_GQA needs a GQA group dividing BLOCK_M, got num_heads "
+                f"{num_heads}, num_kv_heads {num_kv_heads}, BLOCK_M {block_m}"
             )
         return bool(requested)
     return legal and seq_len_q <= 64
@@ -1338,7 +1434,6 @@ def _forward_kv_splits(
     v_head_dim: int,
     block_m: int,
     pack_gqa: bool,
-    use_block_mask: bool,
     device: Any,
 ) -> int:
     """How many workgroups should share one query tile's KV walk.
@@ -1384,6 +1479,32 @@ def _forward_kv_splits(
     not: at ``Sq`` 512, base 256, the best split is 4 for 1.11x while the rule's 8 would be
     *worse* than not splitting (2556 us against 2286). The decode gate keeps the tuned
     prefill path exactly as it was.
+
+    Note [sizing a split against a mask you cannot see]
+    A block-mask walk splits the same way -- the loop bounds are the same expression, in
+    visited blocks rather than rows -- but its *length* is the mask's data and not the
+    shape's, so ``seq_len_kv`` here is an upper bound on it rather than the thing being
+    divided. A sparse mask therefore gets more splits than its walk can fill, and the
+    surplus slices run zero iterations.
+
+    That is deliberate rather than tolerated, because at decode an empty slice is very
+    nearly free and the alternative is worse. A slice that runs no iterations still pays
+    its prologue and its partial store, but those run *concurrently* with the slices that
+    do have work, so they cost wall clock only if they crowd the machine -- and the second
+    term already holds the whole grid to 32 workgroups per CU. What they add to the combine
+    is a read of ``(Dv + 4)`` zeroed floats per surplus slice, which at the top of the
+    decode range is single-digit megabytes. Refusing to split instead gives up the 2.5x
+    the dense rows above measure, on the grounds that the mask *might* be sparse enough to
+    make a few microseconds of idle prologue matter.
+
+    Measured, in ``benchmarks/transformer/flydsl/sparse_gaps.py``, it holds. A 1024-wide
+    sliding window over an 8192 cache is 12.5% dense, so the rule cuts a 16-block walk
+    eight ways and over-splits by any reckoning; on the one shape where that is all it
+    does -- MHA, which has no GQA group to pack, so the split is the only variable -- it
+    costs 4% (202us against 210us). Everywhere the packing also applies, the pair is
+    2.5-8.4x. Four percent on one shape is the whole price of not knowing the mask.
+
+    A caller who does know can still say so: ``NUM_KV_SPLITS`` is honoured above.
     """
     requested = kernel_options.get("NUM_KV_SPLITS")
     if requested is not None:
@@ -1392,10 +1513,7 @@ def _forward_kv_splits(
                 f"NUM_KV_SPLITS must be a positive integer, got {requested!r}"
             )
         return int(requested)
-    # The block-mask walk splits the same way -- the loop bounds are the same expression in
-    # visited blocks rather than rows -- but its length is the mask's data, not the shape's,
-    # so there is nothing here to size a split against. Left unsplit rather than guessed at.
-    if use_block_mask or seq_len_q > 64:
+    if seq_len_q > 64:
         return 1
 
     group = num_heads // num_kv_heads

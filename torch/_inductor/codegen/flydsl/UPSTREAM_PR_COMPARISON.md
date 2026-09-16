@@ -76,7 +76,7 @@ requires pattern-matching an instruction sequence rather than reading the graph.
 | Sequence lengths | ragged, and cross attention (`Sq != Sk`) in all three kernels | `Sk % 128 == 0`; prefill `Sq % 128 == 0`. #193854 is MHA-only with `Sq == Sk` |
 | GQA | MHA/GQA/MQA both directions, no post-pass and no atomics (the group is the outer loop) | forward yes; **backward rejects GQA** |
 | Captured buffers | 4 slots, f32, with the descriptor given the tensor's real size | 4 slots, **int32 only** |
-| Autotuning | 5 swept axes, each earning its sweep by measurement; `mod_vec_size`, forward `BLOCK_M`, `dkdv` tile, KV staging on by default | one choice appended, then `configs = []` and `append_flex_attention_choices` skipped entirely |
+| Autotuning | 6 swept axes, each earning its sweep by measurement; `mod_vec_size`, forward `BLOCK_M`, `dkdv` tile, KV staging, softmax exponential on by default | one choice appended, then `configs = []` and `append_flex_attention_choices` skipped entirely |
 | Eager frontend | `_Backend` and the natural-log LSE set only | adds `_create_dense_block_mask` and swaps it in when `BACKEND == "FLYDSL"`, because the kernels cannot consume the O(1) empty-mask sentinel |
 | Measured against Triton | forward 1.09x geomean over 84 cells, forward+backward 1.28x, on hardware | forward 0.94–1.49x prefill on gfx950; backward unmeasured against Triton |
 

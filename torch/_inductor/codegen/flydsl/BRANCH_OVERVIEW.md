@@ -276,7 +276,7 @@ instruction sequence rather than reading the graph.
 | seq_len | ragged, and cross attention in all three kernels | `Sk % 128 == 0`; #193854 is MHA-only with `Sq == Sk` |
 | GQA | both directions, no atomics | forward yes; **backward rejects GQA** |
 | Captures | 4 slots, f32 | 4 slots, **int32 only** |
-| Autotuning | 5 swept axes, each earning its sweep by measurement | one choice appended, then `configs = []` and the choice hook skipped entirely |
+| Autotuning | 6 swept axes, each earning its sweep by measurement | one choice appended, then `configs = []` and the choice hook skipped entirely |
 | Measured vs Triton | forward 1.09x geomean over 84 cells, forward+backward 1.28x, on hardware | forward 0.94–1.49x prefill on gfx950; backward unmeasured against Triton |
 | CI | 168 tests on gfx942 | none: workflows awaiting approval |
 

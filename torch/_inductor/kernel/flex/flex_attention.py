@@ -989,6 +989,11 @@ def flex_attention_backward(*args, **kwargs):
             mask_graph_buffer=mask_graph_buffer,
             has_score_mod=not is_trivial_score_graph(fw_graph.graph_module),
             has_mask_mod=not is_trivial_mask_graph(mask_graph.graph_module),
+            # For the same capture pre-check the forward does. Usually the forward has
+            # already rejected an over-capture, but a recompile can rebuild the backward
+            # alone, and the two do not have to agree on slot counts.
+            score_mod_other_buffers=score_mod_other_buffers,
+            mask_mod_other_buffers=mask_mod_other_buffers,
             # Both backward kernels can walk a block list instead of their axis densely,
             # on opposite axes. The full lists are included because these kernels have one
             # body per visited block and no fast path for unmasked ones, so the list they
