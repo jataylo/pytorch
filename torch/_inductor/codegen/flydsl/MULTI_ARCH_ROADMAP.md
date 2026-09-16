@@ -686,12 +686,18 @@ instruction selection with *"Do not know how to expand this operator's operand"*
 
 ### P4 — gfx950 backward specialization (not validatable)
 
-The backward builds for gfx950 today and takes none of its instructions: `mfma_k16`,
-`lds_transpose_read` and `permlane_o_store` are forward-only, and the ISA confirms it —
-`dkdv` at D128 lands on 256 VGPRs with 78 spilled on gfx942 and 256 with 76 on gfx950.
-Teaching it the CDNA4 paths is the largest single gfx950 gap, and the 2.5x LDS is the other
-half of it: the budget is already declared per arch, so the tile filter admits the wider Q
-tile at head_dim 256 (131072 B) there and nowhere else.
+Mostly done since this was written, and what is left is narrower than the heading. The
+backward takes `mfma_k16` in GEMM1 (`158ac9c0685`) and `lds_transpose_read` in both kernels,
+the latter retiring the Kᵀ and Qᵀ/dOᵀ tiles outright — `dq` drops from three LDS tiles to
+two and `dkdv` from four to two. `permlane_o_store` is written and declined on evidence: it
+halves the store count but costs 4–9 VGPRs and more spilling, `dkdv` at head_dim 256 going
+394 → 436 spilled, so it sits behind `enable_permlane_store` until a CDNA4 part settles it.
+`dma_to_lds_b128` is the one capability neither kernel has, and its blocker is now
+verification rather than LDS.
+
+The 2.5x LDS is the other half of the original item and still stands: the budget is already
+declared per arch, so the tile filter admits the wider Q tile at head_dim 256 (131072 B)
+there and nowhere else.
 
 Reuses P2's plumbing. ~3.4k code lines plus per-body flex hooks. Same gate as P3.
 

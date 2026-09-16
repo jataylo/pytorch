@@ -287,8 +287,7 @@ instruction sequence rather than reading the graph.
 | **Decode** | packed-GQA decode, `Sq ∈ {1,4,8}`, pipelined KV double-buffering, a `SPLIT_KV` mode for low-parallelism MHA decode. Reports **3.6–7.0x** on top-k-16 sparse decode | **no decode kernel, and no deficit either**: the prefill kernel carries the packed-GQA mapping, a short-Q tile and a KV split, and measures **0.58–1.02x** of Triton decode's time — faster on four of six shapes, level on two (14–44x faster than Triton prefill). Sparse decode closed too, at 2.5–8.4x, once packing and the split stopped refusing a block mask (item 9) |
 | **Real gfx950 validation** | benchmarked on MI355X, ROCm 7.2.53211, four shape families | **build and ISA only.** No CDNA4 silicon here; correctness there is unproven |
 | gfx950 schedule | hand-written: owner-wave selection, `waves_per_eu` occupancy hint, dual-wave staging | the generic builder's output, with CDNA4 instructions selected off capabilities |
-| Asymmetric head dims | `(192, 128)` first-class in **both** directions | forward any admitted pair either order; **backward refuses** |
-| Backward on CDNA4 | written for gfx950 throughout | takes `mfma_k16` in GEMM1; the three LDS-layout capabilities are still forward-only |
+| Backward on CDNA4 | written for gfx950 throughout | takes `mfma_k16` in GEMM1 and `lds_transpose_read` in both kernels; `permlane_o_store` is written but declined on register pressure, and `dma_to_lds_b128` is the one capability left |
 | Upstreaming | in the review queue, `albanD` / `drisspg` requested | a local branch |
 
 Real gfx950 validation is the honest asymmetry, and no amount of ISA inspection substitutes
@@ -296,6 +295,9 @@ for running the kernel. Decode used to head this list on the strength of being a
 feature we do not have; it is left here because the comparison is still worth stating, but
 both the dense and the sparse shape now measure at or ahead of Triton's decode kernel without
 one.
+
+Asymmetric head dims used to be a row here and are not one any more: both directions serve
+any admitted pair in either order as of `6315ac61cfb`, which is item 2.
 
 Two of their bugs are **not** ours, and why is instructive: their `_run_compiled` duplicates a
 shared helper and drops `os.getpid()` from the cache key, so a fork after a warm launch reuses a

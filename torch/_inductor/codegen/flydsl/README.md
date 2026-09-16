@@ -451,6 +451,18 @@ this backend.
 Until then the practical advice is the same rule stated the other way: ask for
 `BACKEND="FLYDSL"` by name at those four head_dims, and do not bother at 64 or 128.
 
+**One caveat on the two head_dims that lose, and it is about the measurement's age rather
+than its method.** The table above was taken before the softmax's instruction count came
+down, and that change is the first one to move the *backward* at 64 and 128 — the bare
+exponential is worth 1.45x on the dense backward and post-RA scheduling another 1.06–1.11x,
+where the earlier head_dim 128 work was forward-only and so was diluted to about 3% of a
+forward+backward total. The backward-only mod matrix now reads 1.19x at D64 and 1.21x at
+D128 on `noop`, against a table that says both lose combined. Those are not comparable
+numbers — different shapes, wall clock against TFLOP/s, one direction against both — so the
+verdicts stand as the last thing actually measured. But "do not bother at 64 or 128" is the
+sentence to re-derive from a fresh `shape_ladder.py --backward` before leaning on it, and it
+is the only advice here whose evidence predates the current kernel.
+
 ## Fast-math, and the two flags these kernels cannot assert
 
 All three kernels run their fp arithmetic under a fast-math flag set, but **not** the full
@@ -1055,16 +1067,23 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   `TORCHINDUCTOR_FLYDSL_AUTOTUNE_QK_PREFETCH_DEPTH=1`, since four times the builds is a
   poor trade at 2–5% for a kernel compiled per shape, but worth setting for an expensive
   mod on a large shape.
-- **What is left in the forward is dense, not sparse.** Against autotuned Triton on the
+- ~~What is left in the forward is dense, not sparse~~ **The forward's dense losses are
+  gone; what is left sits in the backward.** Against autotuned Triton on the
   `benchmarks/transformer/score_mod.py` matrix (B=4, H=16, S=4096, bf16, 18 cells over
-  head_dim 64 and 128) the forward is **1.00x** geomean and the backward **1.17x**, winning
-  8 of 18 and 15 of 18. Mods carrying a mask win — `causal` 1.36x/1.14x (D64/D128),
-  `prefix_lm` 1.29x/1.10x, `sliding_window` 1.10x/0.91x — and the losses are the *dense*
-  ones, `noop` 0.90x/0.88x, `rel` 0.90x/0.85x, `head_bias` 0.97x/0.87x, which is the dense
-  head_dim 64/128 deficit. `document_mask` is the odd one out at 0.91x/0.77x forward
-  against 1.54x/1.28x backward.
+  head_dim 64 and 128) the forward is **1.35x** geomean with **no losing cell**, and the
+  backward **1.20x** winning 14 of 18. The four backward losses are `rel` 0.83x,
+  `sliding_window` 0.92x, `alibi` 0.98x and `head_bias` 0.99x, and none of them is new:
+  `rel` and `sliding_window` measure the same with the softmax and padding-mask changes
+  reverted, and the other two measure the same under either exponential, so the autotuner
+  is not mis-picking there.
 
-  **That deficit is not a head_dim 64/128 phenomenon, and the name was the thing making it
+  It read as a dense deficit for a long time, and the cells that carried it — `noop` at
+  0.90x/0.88x, `rel` at 0.90x/0.85x, `head_bias` at 0.97x/0.87x on the forward — are the
+  ones the K row padding and then the softmax's instruction count went on to recover. The
+  analysis below is kept because it is why those fixes were found, not because the numbers
+  it opens with still stand.
+
+  **That deficit was not a head_dim 64/128 phenomenon, and the name was the thing making it
   look unexplained.** 64 and 128 are two of the three head_dims where Triton does no
   padding — see the `next_power_of_two` finding above — so they are where the dense
   comparison is honest, not where we are uniquely bad. Our own dense cost was a straight
@@ -1269,10 +1288,11 @@ Use `TORCH_LOGS="output_code"` to see the generated module.
   (`decompose_causal_regions`). That works because those are build flags of known shape
   there; a `mask_mod` is not, which is the same reason its backward skipping does not port.
 - **No fusion**, matching CuteDSL: no epilogue or prologue support.
-- **gfx950 is unexecuted, and its backward is only half specialized.** It is served without
-  a flag on codegen evidence — see [GPU architectures](#gpu-architectures) — but no number
-  here has come off CDNA4 silicon, and the backward takes only `mfma_k16`, in GEMM1; the
-  three LDS-layout capabilities remain forward-only.
+- **gfx950 is unexecuted, and one backward capability is still missing.** It is served
+  without a flag on codegen evidence — see [GPU architectures](#gpu-architectures) — but no
+  number here has come off CDNA4 silicon. The backward now takes `mfma_k16` in GEMM1 and
+  `lds_transpose_read` in both kernels; `permlane_o_store` is written but declined on
+  register pressure, and `dma_to_lds_b128` is the one capability neither kernel has.
   Whether to carry *more* unexecuted code than this is the plan's open decision D3, and it
   is a real one: its phases 3–5 would add roughly 10k lines that cannot be run here.
 - **gfx1201 is refused, and not for want of a gate.** The flex bodies emit MFMA; RDNA4 has
