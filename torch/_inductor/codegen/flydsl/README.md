@@ -113,9 +113,12 @@ Both skip unless FlyDSL is installed on a supported architecture.
 ### Benchmarks
 
 [`benchmarks/transformer/flydsl/`](../../../../benchmarks/transformer/flydsl/) reproduces
-every number quoted below: `mod_matrix.py` for the geomean against Triton, and five
-narrower scripts for the questions that came up while chasing it — where a call's fixed
-cost goes, which layout to index, what the kernel does per head_dim, and where it spills.
+every number quoted below. `mod_matrix.py` and `mod_matrix.py --bwd` are the geomeans
+against Triton, `shape_ladder.py --backward` is the per-head_dim table, and nine narrower
+scripts answer the questions that came up while chasing them — where a call's fixed cost
+goes, what a decode or a sparse mask costs, which layout to index, what the kernel does per
+head_dim, and where it spills. Its README has the commands, what each script answers, and a
+claim-to-command table for the numbers quoted here.
 
 ## How a score_mod becomes a kernel
 

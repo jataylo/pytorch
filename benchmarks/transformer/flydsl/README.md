@@ -8,8 +8,9 @@ comparable to a cell there.
 Run them from anywhere; they find `score_mod.py` themselves.
 
 ```bash
-python benchmarks/transformer/flydsl/mod_matrix.py
-bash benchmarks/transformer/flydsl/run_all.sh out.log   # every table, ~1 h
+python benchmarks/transformer/flydsl/mod_matrix.py          # the headline forward table
+python benchmarks/transformer/flydsl/mod_matrix.py --bwd    # and the backward one
+bash benchmarks/transformer/flydsl/run_all.sh out.log       # every table, ~1 h
 ```
 
 `run_all.sh` runs them one at a time on purpose: they all measure the same GPU, so two at
@@ -18,6 +19,58 @@ once measure each other.
 Every script takes `--help`. They all need a ROCm GPU and the `flydsl` package;
 `kernel_only.py` and `isa_stats.py` additionally bypass Inductor and build launchers
 directly, so they will not run against a build where the vendored kernels are absent.
+
+The flag for the backward is `--bwd` on `mod_matrix.py` and `layout_ab.py` but `--backward`
+on `shape_ladder.py` and `isa_stats.py`. That is historical rather than meaningful, and
+`--help` is authoritative per script.
+
+## Running one question
+
+```bash
+# The mod matrix: 9 mods x head_dim {64, 128} at B=4, H=16, S=4096, bf16 -- 18 cells.
+python mod_matrix.py --mods causal,document_mask --head-dims 128
+python mod_matrix.py --bwd --flydsl-options RAW_EXP2=False   # pin a knob on our side only
+
+# Shapes and head_dims against Triton and aten. `--backward` times forward + backward,
+# which is the table the head_dim recommendation rests on.
+python shape_ladder.py --backward
+
+# Decode. `--check` verifies against eager first, `--mods` puts a mod in the graph, and
+# `--wall` times end to end so you can see the ~350 us of host it normally excludes.
+python decode_gap.py --check --mods alibi
+
+# The two sparse questions, which are separate tables.
+python sparse_gaps.py --decode
+python sparse_gaps.py --mask-cost
+
+# Where a call's time goes: fixed per Q tile against per KV block, then by kernel name.
+python walk_cost.py --d 128
+python profile_call.py --shapes
+
+# Register pressure and spills. `--arch` cross-compiles, one subprocess per build, which
+# is the only CDNA4 evidence a gfx942 host can produce.
+python isa_stats.py --backward
+python isa_stats.py --arch gfx950
+```
+
+**Expect the first run to be compile-bound rather than measurement-bound.** A single cold
+kernel costs ~1.54s and an 84-cell ladder is about 800s of compile in the forward and 1240s
+in the backward, against 461s and 1377s for autotuned Triton on the same cells — see "What
+autotuning costs" in [the backend README](../../../torch/_inductor/codegen/flydsl/README.md).
+Inductor's cache makes a second run of the same cells much cheaper, so a script that took
+twenty minutes cold can take two warm. Nothing here needs `max_autotune` passed in; the
+scripts set the autotune mode they want themselves.
+
+## Reproducing a number the docs quote
+
+| Claim | Where it is quoted | Command |
+| --- | --- | --- |
+| forward 1.35x, backward 1.20x geomean over 18 cells | backend README, "the forward's dense losses are gone" | `mod_matrix.py`, then `--bwd` |
+| the per-head_dim verdicts, `fly/tri` on TFLOP/s | backend README, "Why `AUTO` cannot pick this backend" | `shape_ladder.py --backward` |
+| decode at 0.58–1.02x of Triton's decode kernel | backend README, "Splitting the KV walk" | `decode_gap.py` |
+| sparse decode at 2.5–8.4x | `BRANCH_OVERVIEW.md` item 9 | `sparse_gaps.py --decode` |
+| the mod site costing nothing on full blocks | backend README, "Two more instructions" | `sparse_gaps.py --mask-cost` |
+| VGPR and spill counts, and the gfx950 claims | backend README, "GPU architectures" | `isa_stats.py`, `--backward`, `--arch gfx950` |
 
 ## What each one answers
 
