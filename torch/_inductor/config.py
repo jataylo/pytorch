@@ -1403,6 +1403,31 @@ partitioned_scatter_force: bool = (
     os.environ.get("TORCHINDUCTOR_PARTITIONED_SCATTER_FORCE", "0") == "1"
 )
 
+# Lower contended atomic-add scatters (index_put(accumulate=True), index_add,
+# scatter_add, scatter_reduce(sum), ...) to a Triton template that sorts each chunk
+# of writes by destination and sums equal destinations before issuing atomics, so
+# each destination takes at most one atomic per chunk. Takes precedence over the
+# partitioned scatter pass for the scatters it claims. Block sizes come from
+# get_scatter_preagg_configs in heuristics/template/triton.py; max_autotune
+# benchmarks a wider set.
+scatter_preagg_enabled: bool = (
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG", "0") == "1"
+)
+
+# Skip scatters writing fewer elements than this.
+scatter_preagg_min_index_size: int = 4096
+
+# Skip scatters with fewer writes per destination than this (tokens / destinations,
+# assuming uniformly spread indices). Below it the per-chunk sort costs more than
+# the contention it removes. Skewed indices raise real contention above this
+# estimate, so the threshold is deliberately low.
+scatter_preagg_min_contention_ratio: float = 16.0
+
+# Bypass the size and contention gates. Enable via TORCHINDUCTOR_SCATTER_PREAGG_FORCE=1
+scatter_preagg_force: bool = (
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_FORCE", "0") == "1"
+)
+
 
 class _collective:
     auto_select: bool = False

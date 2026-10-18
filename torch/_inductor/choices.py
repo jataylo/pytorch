@@ -186,6 +186,16 @@ class InductorChoices:
         flex_heuristics = self.get_config_heuristics(device_type)
         return flex_heuristics.get_flex_decode_configs(head_dim, dtype)
 
+    def get_scatter_preagg_configs(
+        self,
+        num_tokens: int,
+        num_inner: int,
+        dtype: torch.dtype,
+        device_type: str | None = "cuda",
+    ) -> list[Any]:
+        heuristics = self.get_config_heuristics(device_type)
+        return heuristics.get_scatter_preagg_configs(num_tokens, num_inner, dtype)
+
     def append_flex_attention_choices(
         self,
         choices: list[Any],

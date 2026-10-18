@@ -397,6 +397,21 @@ class ROCmFlexDecodeConfig(FlexDecodeConfig):
     kpack: int = 1
 
 
+@dataclasses.dataclass(frozen=True)
+class ScatterPreaggConfig:
+    """
+    Config for the scatter pre-aggregation template (kernel/scatter_preagg.py).
+    Each program sorts and pre-sums block_t tokens, then loops over d_iters
+    slices of block_d along the inner (row) dim, reusing the sort.
+    """
+
+    block_t: int
+    block_d: int
+    d_iters: int
+    num_stages: int
+    num_warps: int
+
+
 class BaseHeuristicSingleton(type):
     """
     Thread-safe implementation of singleton to be used in the config heuristic subclasses
@@ -1372,6 +1387,68 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             flex_decode_configs.append(default_config)
 
         return flex_decode_configs
+
+    # Scatter pre-aggregation helpers
+    def _scatter_preagg_config(
+        self,
+        num_tokens: int,
+        num_inner: int,
+        max_block_d: int,
+        tile_elems: int,
+        num_warps: int,
+    ) -> ScatterPreaggConfig:
+        from ...runtime.runtime_utils import next_power_of_2
+        from ...utils import ceildiv
+
+        block_d = min(next_power_of_2(num_inner), max_block_d)
+        if num_inner % block_d != 0:
+            # Prefer a block that divides the inner size: ragged blocks need
+            # clamped (non-vectorizable) indexing.
+            divisor = num_inner & -num_inner
+            if divisor >= 8:
+                block_d = min(divisor, max_block_d)
+        if num_inner % block_d != 0:
+            # Ragged blocks change the layout chosen for the sort/scan and
+            # exceed the 64KB LDS of gfx9 above 4K elements.
+            tile_elems = min(tile_elems, 4096)
+        block_t = next_power_of_2(max(1, tile_elems // block_d))
+        block_t = max(32, min(1024, block_t))
+
+        # Fewest programs along the inner dim (one sort per token block) that
+        # still keeps enough programs in flight to fill the GPU.
+        num_blocks = ceildiv(num_inner, block_d)
+        token_programs = ceildiv(num_tokens, block_t)
+        d_iters = 1
+        for cand in range(min(num_blocks, 64), 0, -1):
+            if num_blocks % cand == 0 and token_programs * (num_blocks // cand) >= 1024:
+                d_iters = cand
+                break
+        return ScatterPreaggConfig(block_t, block_d, d_iters, 1, num_warps)
+
+    def get_scatter_preagg_configs(
+        self, num_tokens: int, num_inner: int, dtype: Any
+    ) -> list[ScatterPreaggConfig]:
+        configs: list[ScatterPreaggConfig] = []
+        if config.max_autotune:
+            for max_block_d, tile_elems, num_warps in itertools.product(
+                (32, 64), (4096, 8192, 16384), (4, 8)
+            ):
+                cfg = self._scatter_preagg_config(
+                    num_tokens, num_inner, max_block_d, tile_elems, num_warps
+                )
+                if cfg not in configs:
+                    configs.append(cfg)
+
+        # Narrow slices for narrow rows; a full 16K-element tile when one slice
+        # covers the row, half that when the program loops over slices.
+        max_block_d = 32 if num_inner <= 128 else 64
+        tile_elems = 16384 if num_inner <= max_block_d else 8192
+        default_config = self._scatter_preagg_config(
+            num_tokens, num_inner, max_block_d, tile_elems, 4
+        )
+        if default_config not in configs:
+            configs.append(default_config)
+        return configs
 
 
 class CPUConfigHeuristic(BaseConfigHeuristic):

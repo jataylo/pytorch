@@ -247,6 +247,9 @@ class TestPartitionedScatterOpt(TestCase):
         self._saved_enabled = config.partitioned_scatter_enabled
         self._saved_force = config.partitioned_scatter_force
         config.partitioned_scatter_enabled = True
+        preagg_patch = config.patch(scatter_preagg_enabled=False)
+        preagg_patch.__enter__()
+        self.addCleanup(preagg_patch.__exit__, None, None, None)
 
     def tearDown(self):
         config.partitioned_scatter_enabled = self._saved_enabled

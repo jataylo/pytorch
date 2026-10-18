@@ -199,6 +199,24 @@ def _evaluate_candidate(
         _record_skip(ctx, "zero_size", node_name)
         return None
 
+    if config.scatter_preagg_enabled:
+        from torch._inductor.kernel.scatter_preagg import would_claim_fx
+
+        shapes_static = not any(
+            isinstance(s, torch.SymInt)
+            for s in (*input_meta["shape"], *index_meta["shape"])
+        )
+        if would_claim_fx(
+            input_meta["device"],
+            input_meta["dtype"],
+            shapes_static,
+            index_size,
+            output_size // scatter_dim_size,
+            scatter_dim_size,
+        ):
+            _record_skip(ctx, "scatter_preagg", node_name)
+            return None
+
     min_index_size: int = config.partitioned_scatter_min_index_size
     if not force and index_size < min_index_size:
         _record_skip(
