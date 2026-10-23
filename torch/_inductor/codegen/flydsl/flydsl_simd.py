@@ -1076,8 +1076,11 @@ class FlyDSLKernel(SIMDKernel):
             # several rows instead, while the grid stays large.
             # Normalization kernels (several passes, a full-size store) measured best
             # with one row per group: 89us vs 97us at two rows on a 64-wide softmax. A
-            # bare reduction wanted two: 43us vs 49us on a 32-wide sum.
-            self.xunroll = 2 if self._pure_reduction() else 1
+            # bare reduction wants about 64 elements a thread, every row's loads issued
+            # up front (see emit_inner): 40us vs 43us at two rows on a 32-wide sum.
+            self.xunroll = (
+                max(2, min(8, 64 // (iters * self.ept))) if self._pure_reduction() else 1
+            )
             while (
                 self.xunroll > 1
                 and -(-self.xnumel // (self.rpb * self.xunroll)) < enough_blocks
@@ -1876,17 +1879,47 @@ class FlyDSLKernel(SIMDKernel):
                 code.writeline(f"_rl = _t // {self.stride}")
                 lane_x = f"_t % {self.stride}"
             code.writeline("_lane0 = _rl == 0")
+
+            def row_start() -> None:
+                code.writeline(
+                    f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
+                )
+                if self._xmask():
+                    code.writeline(f"xmask = xindex < {self.xnumel}")
+
+            if self.xunroll > 1 and self.preload_lines:
+                # Every row's preloads first, into per-row trace-time caches: a row's
+                # stores would otherwise hold back the next row's loads, which the
+                # backend cannot prove independent -- one row's loads in flight at a
+                # time where Triton issues all of its rows'.
+                code.writeline("_caches = []")
+                code.writeline(f"for _xr in range_constexpr({self.xunroll}):")
+                with code.indent():
+                    code.writeline("_vc, _sc, _lc = {}, {}, {}")
+                    row_start()
+                    pre = IndentedBuffer()
+                    pre.get_lines_ref().extend(
+                        li
+                        for li in self.body.get_lines_ref()[: self._preload_at]
+                        if isinstance(li, str)
+                    )
+                    pre.get_lines_ref().extend(self.preload_lines)
+                    code.splice(pre)
+                    code.writeline("_caches.append((_vc, _sc, _lc))")
+                self.preload_lines = []
+                code.writeline(f"for _xr in range_constexpr({self.xunroll}):")
+                with code.indent():
+                    code.writeline("_vc, _sc, _lc = _caches[_xr]")
+                    row_start()
+                    code.splice(self.body)
+                return
             code.writeline(f"for _xr in range_constexpr({self.xunroll}):")
             with code.indent():
                 # Trace-time load caches are per row.
                 code.writeline("_vc = {}")
                 code.writeline("_sc = {}")
                 code.writeline("_lc = {}")
-                code.writeline(
-                    f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
-                )
-                if self._xmask():
-                    code.writeline(f"xmask = xindex < {self.xnumel}")
+                row_start()
                 self._splice_preload()
                 code.splice(self.body)
 
