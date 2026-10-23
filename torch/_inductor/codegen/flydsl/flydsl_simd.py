@@ -83,6 +83,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 THREADS = 256
+# A transposing tile's block: 54us vs 57us at 256 threads on an NCHW -> NHWC copy.
+TILE_THREADS = 128
 WAVE = 64
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
@@ -744,6 +746,7 @@ class FlyDSLKernel(SIMDKernel):
         self.tpr = 1
         self.stride = 1
         self.threads = THREADS  # block size
+        self.in_combo = False
         self.rpb = self.threads
         self.xunroll = 1
         self.persistent = False
@@ -969,7 +972,8 @@ class FlyDSLKernel(SIMDKernel):
         ``xunroll``, persistence -- from the kernel's shape and access patterns."""
         widest_vec = max(1, min(8, 16 // min(self._buffer_itemsizes())))
         roots = [self._root_expr(i) for i in indices]
-        self.threads = _tune("threads", THREADS)
+        tiled = self.tile2d and not self.in_combo
+        self.threads = _tune("threads", TILE_THREADS if tiled else THREADS)
         self.rpb = self.threads
         if self.tile2d:
             self._finalize_tile2d(widest_vec)
@@ -2229,6 +2233,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                         self._choose_tiling(features), features=features
                     )
                     kernel.args = args
+                    kernel.in_combo = True  # one block size for the whole launch
                     self.codegen_node_schedule_with_kernel(node_schedule, kernel)
                     kernels.append(kernel)
                     schedules.append(node_schedule)
