@@ -2803,6 +2803,15 @@ class flydsl:
     natural log where Triton's backward reads log2.
     """
 
+    # Generate Inductor's pointwise and reduction kernels with FlyDSL instead of Triton
+    # (ROCm only, experimental). A kernel FlyDSL cannot express falls back to Triton, one
+    # kernel at a time; torch._dynamo.utils.counters["flydsl_simd"] counts both outcomes
+    # and the fallback reasons.
+    simd: bool = os.environ.get("TORCHINDUCTOR_FLYDSL_SIMD") == "1"
+
+    # With simd on, raise instead of falling back to Triton. For tests and coverage work.
+    simd_strict: bool = os.environ.get("TORCHINDUCTOR_FLYDSL_SIMD_STRICT") == "1"
+
     # Offer mod_vec_size 1, 2 and 4 as autotune choices instead of just 1. Each is a
     # separate kernel build, so the compile cost is three JIT compilations rather than
     # one; worth it when the mod is expensive enough for the vectorization to matter.

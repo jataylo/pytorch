@@ -5,6 +5,10 @@ Inductor codegen for it: a generic template backend (the FlyDSL analog of
 [`codegen/cutedsl/`](../cutedsl/README.md)) plus a FlexAttention path that lowers user
 `score_mod` / `mask_mod` functions into hand-tuned flash-attention kernels.
 
+A third, separate path generates Inductor's ordinary pointwise and reduction kernels in
+FlyDSL instead of Triton (`TORCHINDUCTOR_FLYDSL_SIMD=1`); it has its own design notes and
+benchmarks in [SIMD_BACKEND.md](SIMD_BACKEND.md).
+
 The FlexAttention path is **ROCm only and experimental**, and covers forward and backward.
 It is never chosen by `AUTO`; it has to be asked for by name, and when it is asked for and
 cannot be served it raises with the reason rather than silently falling back. Forward and

@@ -4,6 +4,9 @@ from __future__ import annotations
 import logging
 from typing import Any, TYPE_CHECKING
 
+import torch
+
+from .. import config
 from ..ir import MultiTemplateBuffer
 from ..scheduler import (
     BaseSchedulerNode,
@@ -29,7 +32,6 @@ if TYPE_CHECKING:
 
     from sympy import Expr
 
-    import torch
     from torch.utils._ordered_set import OrderedSet
 
     from .common import BackendFeature
@@ -50,6 +52,10 @@ class CUDACombinedScheduling(BaseScheduling):
     def __init__(self, scheduler: Scheduler | None) -> None:
         super().__init__(scheduler)
         self._triton_scheduling = TritonScheduling(scheduler)
+        if config.flydsl.simd and torch.version.hip:
+            from .flydsl.flydsl_simd import FlyDSLSIMDScheduling
+
+            self._triton_scheduling = FlyDSLSIMDScheduling(scheduler)
         self._cutlass_scheduling = CUTLASSScheduling(scheduler)
         self._rocm_cpp_scheduling = ROCmCPPScheduling(scheduler)
         self._cutedsl_scheduling = CuteDSLScheduling(scheduler)
