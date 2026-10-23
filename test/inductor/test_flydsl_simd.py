@@ -145,6 +145,47 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 1000, device="cuda")
         self.check(lambda x: x * 2 + 1, a[:, :777])
 
+    def test_transposed_tiles(self):
+        # {y, x} tiling: transposed loads staged through LDS; ragged edges masked.
+        a = torch.randn(1000, 777, device="cuda")
+        self.check(lambda x: x.t() + 1, a)
+        torch._dynamo.reset()
+        self.check(lambda x: x + x.t(), torch.randn(1000, 1000, device="cuda"))
+        torch._dynamo.reset()
+        q = torch.randn(8, 128, 12, 64, device="cuda", dtype=torch.bfloat16)
+        self.check(
+            lambda x: x.permute(0, 2, 1, 3).contiguous() * 2, q, atol=1e-2, rtol=1e-2
+        )
+        torch._dynamo.reset()
+        i = torch.randint(0, 100, (300, 500), device="cuda")
+        self.check(lambda x: x.t().contiguous() + 1, i)
+        torch._dynamo.reset()
+        c, b = torch.randn(4, 64, 30, 30, device="cuda"), torch.randn(64, device="cuda")
+        self.check(
+            lambda c, b: (c + b.view(1, -1, 1, 1)).to(
+                memory_format=torch.channels_last
+            ),
+            c,
+            b,
+        )
+
+    def test_foreach_combo(self):
+        # Foreach ops become one combo launch: sub-kernels on ranges of block ids.
+        ps = [torch.randn(s, device="cuda") for s in (1000, 4096, 777, 3)]
+        gs = [torch.randn_like(p) for p in ps]
+
+        def step(ps, gs):
+            ms = torch._foreach_mul(gs, 0.1)
+            out = torch._foreach_addcdiv(
+                ps,
+                ms,
+                torch._foreach_add(torch._foreach_sqrt(torch._foreach_abs(gs)), 1e-8),
+            )
+            return out, torch._foreach_norm(gs)
+
+        self.check(step, ps, gs)
+        self.assertGreater(counters["flydsl_simd"]["combo"], 0)
+
     def test_indirect(self):
         w = torch.randn(5000, 128, device="cuda")
         ix = torch.randint(0, 5000, (64, 33), device="cuda")
@@ -288,13 +329,6 @@ class TestFlyDSLSIMDFallback(TestCase):
             lambda x: x + torch.rand_like(x) * 0,
             torch.randn(1000, device="cuda"),
             reason="load_seed",
-        )
-
-    def test_transpose(self):
-        self._fallback(
-            lambda x: x + x.t(),
-            torch.randn(1000, 1000, device="cuda"),
-            reason="2D tile",
         )
 
     def test_bf16_atomic(self):

@@ -80,6 +80,15 @@ WAVE = 64
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
 PERSISTENT_MAX_UNROLL = 16
+# Buffers one combo (foreach) launch may take; larger groups are split.
+COMBO_MAX_ARGS = 128
+# Edge of the square tile a block covers in a {y, x} (transposing) pointwise kernel.
+TILE = 64
+# LDS words a staged tile row takes: one word of padding spreads the transposed reads
+# over the banks.
+TILE_PITCH = TILE + 1
+# LDS budget for staged tiles (of 64 KiB): three f32 tiles.
+MAX_TILE_WORDS = 3 * TILE * TILE_PITCH
 _I32_LIMIT = 2**31 - 1
 
 _STORAGE = {
@@ -623,7 +632,10 @@ class FlyDSLKernel(SIMDKernel):
     kexpr = staticmethod(_printer.doprint)  # type: ignore[assignment]
 
     def __init__(self, tiling: dict[str, sympy.Expr], **kwargs) -> None:
-        if OrderedSet(tiling) - OrderedSet(["x", "r0_"]) or "x" not in tiling:
+        keys = OrderedSet(tiling)
+        if "x" not in keys or not (
+            keys <= OrderedSet(["x", "r0_"]) or keys == OrderedSet(["x", "y"])
+        ):
             raise FlyDSLUnsupported(f"tiling {sorted(tiling)}")
         super().__init__(tiling, **kwargs)
         self.xnumel = self._static(self.numels["x"], "xnumel")
@@ -633,7 +645,12 @@ class FlyDSLKernel(SIMDKernel):
             if self.is_reduction_kernel
             else 1
         )
-        if self.xnumel * self.rnumel > _I32_LIMIT:
+        # A {y, x} pointwise kernel runs TILE x TILE tiles: see _finalize_tile2d.
+        self.tile2d = "y" in self.numels
+        self.ynumel = self._static(self.numels["y"], "ynumel") if self.tile2d else 1
+        self.fast = "x"  # the dimension a thread's vector runs follow
+        self.staged: list[dict[str, Any]] = []
+        if self.xnumel * self.rnumel * self.ynumel > _I32_LIMIT:
             raise FlyDSLUnsupported("more than 2**31 elements")
         self.outside_loop_vars: OrderedSet[Any] = OrderedSet()
         self.post_loop_combine = IndentedBuffer()
@@ -696,8 +713,11 @@ class FlyDSLKernel(SIMDKernel):
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return storage_kind(dtype)
 
+    def _tree_sym(self, prefix: str):
+        return next(t for t in self.range_trees if t.prefix == prefix).symbol()
+
     def _x_sym(self):
-        return self.range_trees[0].symbol()
+        return self._tree_sym("x")
 
     def _r_sym(self):
         return self.range_trees[-1].symbol() if self.is_reduction_kernel else None
@@ -722,6 +742,11 @@ class FlyDSLKernel(SIMDKernel):
         return sizes or [4]
 
     def _describe(self) -> str:
+        if self.tile2d:
+            return (
+                f"tiled pointwise ynumel={self.ynumel} xnumel={self.xnumel} fast={self.fast} "
+                f"ept={self.ept} staged={[(s['arg'], s['w']) for s in self.staged]}"
+            )
         if not self.is_reduction_kernel:
             return f"pointwise xnumel={self.xnumel} ept={self.ept} unroll={self.unroll}"
         mode = "column" if self.stride > 1 else "row"
@@ -730,6 +755,42 @@ class FlyDSLKernel(SIMDKernel):
             f"unroll={self.unroll} tpr={self.tpr} stride={self.stride} xunroll={self.xunroll} "
             f"persistent={self.persistent}"
         )
+
+    def _finalize_tile2d(self, widest_vec: int) -> None:
+        """Layout of a {y, x} pointwise kernel: each block covers a TILE x TILE tile.
+
+        A thread's vector runs follow the ``fast`` dimension, chosen so the stores are
+        contiguous along it. Loads contiguous along the other dimension are staged:
+        read coalesced along that dimension into an LDS tile, then read back
+        transposed (see ``load`` and ``emit_inner``).
+        """
+        stores = self._memory_roots(loads=False) or []
+        x, y = self._x_sym(), self._tree_sym("y")
+        x_st = sum(classify_access(e, x, 2) == "contig" for e in stores)
+        y_st = sum(classify_access(e, y, 2) == "contig" for e in stores)
+        self.fast = "y" if y_st > x_st else "x"
+        f = self._tree_sym(self.fast)
+        fast_roots = [
+            e
+            for e in (self._memory_roots() or [])
+            if classify_access(e, f, 2) == "contig"
+        ]
+        ept = widest_vec
+        while ept > 1 and not all(
+            classify_access(e, f, ept) == "contig" for e in fast_roots
+        ):
+            ept //= 2
+        self.ept = _tune("ept", ept)
+        # Runs of a pass: TILE // ept threads across the fast dimension, the block's
+        # remaining threads down the slow one; `unroll` passes cover the tile.
+        self.unroll = TILE * TILE // (THREADS * self.ept)
+        self.rpb = THREADS * self.ept // TILE
+
+    def _tile_counts(self) -> tuple[int, int]:
+        """Tiles along (fast, slow)."""
+        nf = self.xnumel if self.fast == "x" else self.ynumel
+        ns = self.ynumel if self.fast == "x" else self.xnumel
+        return -(-nf // TILE), -(-ns // TILE)
 
     def _pure_reduction(self) -> bool:
         """Every node is a reduction: the kernel stores only row results."""
@@ -740,21 +801,20 @@ class FlyDSLKernel(SIMDKernel):
         self.__dict__.setdefault("_node_index_vars", []).append(index_vars)
         return index_vars
 
-    def _memory_roots(self) -> list[sympy.Expr] | None:
-        """Root-symbol indices of the loads and stores alone -- ``finalize_indexing``
+    def _memory_roots(self, loads=True, stores=True) -> list[sympy.Expr] | None:
+        """Root-symbol indices of the loads and/or stores alone -- ``finalize_indexing``
         also sees index_expr values such as a split reduction's bounds check -- or None
         if the per-node ranges recorded by ``split_and_set_ranges`` do not line up."""
         from ...loop_body import MemoryUsageType
 
         nodes = list(self.features.scheduler_nodes())
-        calls, self._node_index_vars = self._node_index_vars, []
+        # The first pass over the schedule records one call per node, in order.
+        calls = self._node_index_vars
         if len(calls) < len(nodes):
             return None
-        kinds = (
-            MemoryUsageType.LOAD,
-            MemoryUsageType.STORE,
-            MemoryUsageType.STORE_REDUCTION,
-        )
+        kinds = (MemoryUsageType.LOAD,) if loads else ()
+        if stores:
+            kinds += (MemoryUsageType.STORE, MemoryUsageType.STORE_REDUCTION)
         roots = []
         for node, index_vars in zip(nodes, calls):
             body = getattr(node, "_body", None)
@@ -772,6 +832,9 @@ class FlyDSLKernel(SIMDKernel):
         ``xunroll``, persistence -- from the kernel's shape and access patterns."""
         widest_vec = max(1, min(8, 16 // min(self._buffer_itemsizes())))
         roots = [self._root_expr(i) for i in indices]
+        if self.tile2d:
+            self._finalize_tile2d(widest_vec)
+            return
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
         if not self.is_reduction_kernel:
@@ -887,10 +950,12 @@ class FlyDSLKernel(SIMDKernel):
     def _entry_is_uniform(self, entry: IterationRangesEntry) -> bool:
         if self.is_reduction_kernel and not entry.root.is_reduction:
             return True  # one row per thread: x entries are fixed across its r runs
-        var = self._r_sym() if self.is_reduction_kernel else self._x_sym()
+        var = self._r_sym() if self.is_reduction_kernel else self._tree_sym(self.fast)
         return classify_access(entry.expr, var, self.ept) == "uniform"
 
     def _xmask(self) -> str | None:
+        if self.tile2d:
+            return None if self.xnumel % TILE == 0 else "xmask"
         if self.is_reduction_kernel:
             block = self.rpb * self.xunroll
         else:
@@ -906,6 +971,8 @@ class FlyDSLKernel(SIMDKernel):
         ms = []
         if (m := self._xmask()) is not None:
             ms.append(m)
+        if self.tile2d and self.ynumel % TILE:
+            ms.append("ymask")
         if include_r and (m := self._rmask()) is not None:
             ms.append(m)
         if self._load_mask is not None:
@@ -923,7 +990,7 @@ class FlyDSLKernel(SIMDKernel):
     def _vector_var(self):
         """The root index that varies across the elements one thread owns in this region."""
         if not self.is_reduction_kernel:
-            return self._x_sym()
+            return self._tree_sym(self.fast)
         if self.inside_reduction and self.ept > 1:
             return self._r_sym()
         return None
@@ -971,6 +1038,10 @@ class FlyDSLKernel(SIMDKernel):
                 kind = "contig"
         elif hoist:
             kind = "hoisted"
+        if kind == "other" and self.tile2d and not dependent:
+            staged = self._stage(arg, index_str, root, dtype)
+            if staged is not None:
+                return self.cse.generate(self.loads, staged, dtype=dtype)
         self.load_site += 1
         key = self._site_key(arg, index_str)
         if kind == "contig":
@@ -989,6 +1060,36 @@ class FlyDSLKernel(SIMDKernel):
         if hoist or not self._in_loop_region():
             self.outside_loop_vars.add(result)
         return result
+
+    def _stage(self, arg: str, index_str: str, root, dtype) -> str | None:
+        """Route a load contiguous along the slow dimension through an LDS tile; returns
+        the expression reading this thread's element, or None if it does not qualify."""
+        slow = self._tree_sym("y" if self.fast == "x" else "x")
+        w = min(8, max(1, 16 // dtype.itemsize))
+        while w > 1 and classify_access(root, slow, w) != "contig":
+            w //= 2
+        if w == 1:
+            return None
+        ck = compute_kind(dtype)
+        words = 2 if ck in ("i64", "f64") else 1
+        for s in self.staged:
+            if (s["arg"], s["index"]) == (arg, index_str):
+                break
+        else:
+            base = sum(s["words"] * TILE * TILE_PITCH for s in self.staged)
+            if base + words * TILE * TILE_PITCH > MAX_TILE_WORDS:
+                return None
+            s = {
+                "arg": arg,
+                "index": index_str,
+                "st": storage_kind(dtype),
+                "w": w,
+                "base": base,
+                "words": words,
+            }
+            self.staged.append(s)
+        plane = TILE * TILE_PITCH
+        return f"fdp.tile_get(_smem, {s['base']}, {plane}, _fl * {TILE_PITCH} + _sl, {ck!r})"
 
     def _in_loop_region(self) -> bool:
         return self.is_reduction_kernel and self.inside_reduction
@@ -1330,133 +1431,152 @@ class FlyDSLKernel(SIMDKernel):
             extents[a] = nbytes
         return extents
 
+    @property
+    def smem_words(self) -> int:
+        if self.staged:
+            return sum(s["words"] * TILE * TILE_PITCH for s in self.staged)
+        # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
+        return THREADS * 2 * self.max_components if self.uses_smem else 0
+
+    @property
+    def num_blocks(self) -> int:
+        if self.tile2d:
+            nf, ns = self._tile_counts()
+            return nf * ns
+        if not self.is_reduction_kernel:
+            return -(-self.xnumel // (THREADS * self.ept * self.unroll))
+        return -(-self.xnumel // (self.rpb * self.xunroll))
+
+    def arg_names(self) -> list[str]:
+        arg_defs, _, _, _ = self.args.python_argdefs()
+        names = [a.full_name() for a in arg_defs]
+        if any(a in self.args.sizevars.values() for a in names):
+            raise FlyDSLUnsupported("dynamic shapes")
+        return names
+
     def codegen_kernel(self, name=None):
         """The module source: the ``@flyc.kernel``, its ``@flyc.jit`` launcher, and the
         ``_main`` / ``_precompile`` entry points the wrapper calls."""
         self.codegen_body()
-        arg_defs, _, _, _ = self.args.python_argdefs()
-        arg_names = [a.full_name() for a in arg_defs]
-        if any(a in self.args.sizevars.values() for a in arg_names):
-            raise FlyDSLUnsupported("dynamic shapes")
+        arg_names = self.arg_names()
         extents = self._arg_extents(arg_names)
-        kname = str(Placeholder.KERNEL_NAME)
-
-        code = IndentedBuffer()
-        code.splice(
-            """
-            import flydsl.compiler as flyc
-            import flydsl.expr as fx
-            from flydsl.expr import range_constexpr
-            from torch._inductor.codegen.flydsl import flydsl_simd_runtime as fdp
-            """
-        )
-        smem_words = 0
-        if self.uses_smem:
-            # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
-            smem_words = THREADS * 2 * self.max_components
-            code.splice(
-                f"""
-                @fx.struct
-                class _Smem:
-                    words: fx.Array[fx.Int32, {smem_words}, 16]
-                """
-            )
-        sig = ", ".join(f"{a}: fx.Int64" for a in arg_names)
-        code.writeline("")
-        code.writeline("@flyc.kernel")
-        code.writeline(f"def {kname}_kernel({sig}):")
+        code = _module_prologue(arg_names, extents, self.smem_words, [self._describe()])
         with code.indent():
-            # FlyDSL's binary cache keys on this function's source and on helpers in the
-            # same directory -- not on the runtime modules it calls -- so stamp them in.
-            code.writeline(f"# runtime {_runtime_fingerprint()}")
-            code.writeline(f"# {self._describe()}")
-            for a in arg_names:
-                code.writeline(f"_r_{a} = fdp.rsrc({a}, {extents[a]})")
-            if self.uses_smem:
-                code.writeline(
-                    f"_smem = fx.SharedAllocator().allocate(_Smem).peek().words.view(fx.make_layout({smem_words}, 1))"
-                )
-            code.writeline("_t = fdp.tid()")
             code.writeline("_b = fdp.bid()")
-            if not self.is_reduction_kernel:
-                code.writeline("_vc = {}")
-                code.writeline("_sc = {}")
-                ept, span = self.ept, THREADS * self.ept
-                # With several runs a thread, issue every run's loads (into the trace-time
-                # vector cache) before the first store: the backend cannot prove a store
-                # leaves a later run's input alone, so it would otherwise wait out each
-                # store before the next load -- 141us vs 95us on an in-place bias add.
-                passes = (
-                    [self.prefetch, self.body]
-                    if self.unroll > 1 and self.prefetch
-                    else [self.body]
-                )
-                for part in passes:
-                    code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
-                    with code.indent():
-                        code.writeline(
-                            f"xindex = _b * {span * self.unroll} + (_j // {ept}) * {span} + _t * {ept} + _j % {ept}"
-                        )
-                        if self._xmask():
-                            code.writeline(f"xmask = xindex < {self.xnumel}")
-                        code.splice(part)
-            else:
-                if self.stride == 1:
-                    code.writeline(f"_rl = _t % {self.tpr}")
-                    lane_x = f"_t // {self.tpr}"
-                else:
-                    code.writeline(f"_rl = _t // {self.stride}")
-                    lane_x = f"_t % {self.stride}"
-                code.writeline("_lane0 = _rl == 0")
-                code.writeline(f"for _xr in range_constexpr({self.xunroll}):")
+            self.emit_inner(code)
+        code.splice(_module_epilogue(arg_names, self.num_blocks))
+        return code.getvalue()
+
+    def emit_inner(self, code: IndentedBuffer) -> None:
+        """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
+        if self.tile2d:
+            self._emit_tile2d(code)
+        elif not self.is_reduction_kernel:
+            code.writeline("_vc = {}")
+            code.writeline("_sc = {}")
+            ept, span = self.ept, THREADS * self.ept
+            # With several runs a thread, issue every run's loads (into the trace-time
+            # vector cache) before the first store: the backend cannot prove a store
+            # leaves a later run's input alone, so it would otherwise wait out each
+            # store before the next load -- 141us vs 95us on an in-place bias add.
+            passes = (
+                [self.prefetch, self.body]
+                if self.unroll > 1 and self.prefetch
+                else [self.body]
+            )
+            for part in passes:
+                code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
                 with code.indent():
-                    # Trace-time load caches are per row.
-                    code.writeline("_vc = {}")
-                    code.writeline("_sc = {}")
-                    code.writeline("_lc = {}")
                     code.writeline(
-                        f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
+                        f"xindex = _b * {span * self.unroll} + (_j // {ept}) * {span} + _t * {ept} + _j % {ept}"
                     )
                     if self._xmask():
                         code.writeline(f"xmask = xindex < {self.xnumel}")
-                    code.splice(self.body)
+                    code.splice(part)
+        else:
+            if self.stride == 1:
+                code.writeline(f"_rl = _t % {self.tpr}")
+                lane_x = f"_t // {self.tpr}"
+            else:
+                code.writeline(f"_rl = _t // {self.stride}")
+                lane_x = f"_t % {self.stride}"
+            code.writeline("_lane0 = _rl == 0")
+            code.writeline(f"for _xr in range_constexpr({self.xunroll}):")
+            with code.indent():
+                # Trace-time load caches are per row.
+                code.writeline("_vc = {}")
+                code.writeline("_sc = {}")
+                code.writeline("_lc = {}")
+                code.writeline(
+                    f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
+                )
+                if self._xmask():
+                    code.writeline(f"xmask = xindex < {self.xnumel}")
+                code.splice(self.body)
 
-        grid = (
-            -(-self.xnumel // (THREADS * self.ept * self.unroll))
-            if not self.is_reduction_kernel
-            else -(-self.xnumel // (self.rpb * self.xunroll))
-        )
-        launch_sig = ", ".join(
-            [f"{a}: fx.Int64" for a in arg_names] + ["_grid: fx.Int32"]
-        )
-        code.splice(
-            f"""
+    def _emit_tile2d(self, code: IndentedBuffer) -> None:
+        f = self.fast
+        s = "y" if f == "x" else "x"
+        nf, _ = self._tile_counts()
+        code.writeline(f"_bf = _b % {nf}")
+        code.writeline(f"_bs = _b // {nf}")
+        masks = []
+        if self.xnumel % TILE:
+            masks.append(f"xmask = xindex < {self.xnumel}")
+        if self.ynumel % TILE:
+            masks.append(f"ymask = yindex < {self.ynumel}")
+        entries = [
+            f"{e.name} = {self.kexpr(self.rename_indexing(e.expr))}"
+            for e in self.range_tree_nodes.values()
+        ]
+        mask_arg = self._mask_arg([m.split(" ")[0] for m in masks])
 
-            @flyc.jit
-            def {kname}_launch({launch_sig}, stream: fx.Stream = fx.Stream(None)):
-                {kname}_kernel({", ".join(arg_names)}).launch(grid=(_grid, 1, 1), block=({THREADS}, 1, 1), stream=stream)
+        def coords(fl: str, sl: str) -> None:
+            code.writeline(f"_fl = {fl}")
+            code.writeline(f"_sl = {sl}")
+            code.writeline(f"{f}index = _bf * {TILE} + _fl")
+            code.writeline(f"{s}index = _bs * {TILE} + _sl")
+            for m in masks:
+                code.writeline(m)
 
+        # Staging: threads run along the slow dimension, so each staged load is a
+        # coalesced vector read; the tile keeps (fast, slow) coordinates.
+        for i, st in enumerate(self.staged):
+            w = st["w"]
+            tps = TILE // w
+            rps = THREADS // tps
+            code.writeline(f"_vs{i} = {{}}")
+            code.writeline(f"for _j in range_constexpr({w * (TILE // rps)}):")
+            with code.indent():
+                coords(
+                    f"_t // {tps} + (_j // {w}) * {rps}",
+                    f"(_t % {tps}) * {w} + _j % {w}",
+                )
+                for e in entries:
+                    code.writeline(e)
+                code.writeline(
+                    f"_v = fdp.vload(_vs{i}, 'stage', _j, {w}, _r_{st['arg']}, {st['index']}, "
+                    f"{st['st']!r}{mask_arg})"
+                )
+                code.writeline(
+                    f"fdp.tile_put(_smem, {st['base']}, {TILE * TILE_PITCH}, "
+                    f"_fl * {TILE_PITCH} + _sl, _v)"
+                )
+        if self.staged:
+            code.writeline("fdp.barrier()")
 
-            _compiled = None
-
-
-            def {kname}_main({", ".join(arg_names)}, stream=None):
-                global _compiled
-                args = ({"".join(f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
-                if _compiled is None:
-                    # flyc.compile launches once while compiling, so this call is done.
-                    _compiled = flyc.compile({kname}_launch, *args)
-                    return
-                _compiled(*args)
-
-
-            def {kname}_precompile(**_):
-                # All-zero addresses with a zero grid: compiles into FlyDSL's disk cache and
-                # launches nothing.
-                {kname}_launch({"0, " * len(arg_names)}0, 0)
-            """
-        )
-        return code.getvalue()
+        code.writeline("_vc = {}")
+        code.writeline("_sc = {}")
+        ept, tpf = self.ept, TILE // self.ept
+        passes = [self.prefetch, self.body] if self.prefetch else [self.body]
+        for part in passes:
+            code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
+            with code.indent():
+                coords(
+                    f"(_t % {tpf}) * {ept} + _j % {ept}",
+                    f"_t // {tpf} + (_j // {ept}) * {self.rpb}",
+                )
+                code.splice(part)
 
     def call_kernel(self, name: str, node=None, deallocate_ws: bool = True):
         wrapper = V.graph.wrapper_code
@@ -1467,6 +1587,116 @@ class FlyDSLKernel(SIMDKernel):
 # ---------------------------------------------------------------------------------------
 # Scheduling
 # ---------------------------------------------------------------------------------------
+
+
+def _module_prologue(
+    arg_names: list[str], extents: dict[str, int], smem_words: int, notes: list[str]
+) -> IndentedBuffer:
+    """Imports, the LDS struct, and the ``@flyc.kernel`` header up to ``_t``; the caller
+    writes the rest of the body at the returned buffer's next indent."""
+    code = IndentedBuffer()
+    code.splice(
+        """
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+        from flydsl.expr import range_constexpr
+        from torch._inductor.codegen.flydsl import flydsl_simd_runtime as fdp
+        """
+    )
+    if smem_words:
+        code.splice(
+            f"""
+            @fx.struct
+            class _Smem:
+                words: fx.Array[fx.Int32, {smem_words}, 16]
+            """
+        )
+    sig = ", ".join(f"{a}: fx.Int64" for a in arg_names)
+    code.writeline("")
+    code.writeline("@flyc.kernel")
+    code.writeline(f"def {Placeholder.KERNEL_NAME}_kernel({sig}):")
+    with code.indent():
+        # FlyDSL's binary cache keys on this function's source and on helpers in the
+        # same directory -- not on the runtime modules it calls -- so stamp them in.
+        code.writeline(f"# runtime {_runtime_fingerprint()}")
+        for note in notes:
+            code.writeline(f"# {note}")
+        for a in arg_names:
+            code.writeline(f"_r_{a} = fdp.rsrc({a}, {extents[a]})")
+        if smem_words:
+            code.writeline(
+                f"_smem = fx.SharedAllocator().allocate(_Smem).peek().words.view(fx.make_layout({smem_words}, 1))"
+            )
+        code.writeline("_t = fdp.tid()")
+    return code
+
+
+def _module_epilogue(arg_names: list[str], grid: int) -> str:
+    kname = str(Placeholder.KERNEL_NAME)
+    launch_sig = ", ".join([f"{a}: fx.Int64" for a in arg_names] + ["_grid: fx.Int32"])
+    return f"""
+
+        @flyc.jit
+        def {kname}_launch({launch_sig}, stream: fx.Stream = fx.Stream(None)):
+            {kname}_kernel({", ".join(arg_names)}).launch(grid=(_grid, 1, 1), block=({THREADS}, 1, 1), stream=stream)
+
+
+        _compiled = None
+
+
+        def {kname}_main({", ".join(arg_names)}, stream=None):
+            global _compiled
+            args = ({"".join(f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
+            if _compiled is None:
+                # flyc.compile launches once while compiling, so this call is done.
+                _compiled = flyc.compile({kname}_launch, *args)
+                return
+            _compiled(*args)
+
+
+        def {kname}_precompile(**_):
+            # All-zero addresses with a zero grid: compiles into FlyDSL's disk cache and
+            # launches nothing.
+            {kname}_launch({"0, " * len(arg_names)}0, 0)
+        """
+
+
+def _combo_source(kernels: list[FlyDSLKernel]) -> str:
+    """One launch for several kernels sharing a KernelArgs: each owns a contiguous range
+    of block ids and runs, with ``_b`` rebased, under a branch on the block id."""
+    inners = []
+    for k in kernels:
+        with V.set_kernel_handler(k):
+            k.codegen_body()
+            buf = IndentedBuffer()
+            k.emit_inner(buf)
+            # Deferred lines resolve against the current kernel's removed buffers.
+            inners.append(buf.getvalue())
+    arg_names = kernels[0].arg_names()
+    extents = kernels[0]._arg_extents(arg_names)
+    smem = max(k.smem_words for k in kernels)
+    code = _module_prologue(arg_names, extents, smem, [k._describe() for k in kernels])
+    start = 0
+    with code.indent():
+        code.writeline("_bid = fdp.bid()")
+        if len(kernels) == 1:
+            code.writeline("_b = _bid")
+            code.splice(inners[0])
+            start = kernels[0].num_blocks
+        for i, (k, inner) in enumerate(
+            zip(kernels, inners) if len(kernels) > 1 else []
+        ):
+            end = start + k.num_blocks
+            if i == len(kernels) - 1:
+                code.writeline("else:")
+            else:
+                code.writeline(f"{'if' if i == 0 else 'elif'} _bid < {end}:")
+            with code.indent():
+                code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
+                code.splice(inner)
+            start = end
+    code.splice(_module_epilogue(arg_names, start))
+    return code.getvalue()
 
 
 class _DropFallbackErrors(logging.Filter):
@@ -1517,6 +1747,108 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         log.debug("FlyDSL SIMD fallback to Triton: %s", reason)
         return super().codegen_node_schedule(kernel_features)
 
+    def codegen_combo_kernel(self, combo_kernel_node):
+        """Foreach (and horizontally fused) kernels: one FlyDSL launch per group of
+        sub-kernels, each owning a range of block ids."""
+        reason = self._precheck(None)
+        if reason is None:
+            try:
+                with _quiet_scheduler_codegen_errors():
+                    self._codegen_flydsl_combo(combo_kernel_node)
+                return
+            except FlyDSLUnsupported as e:
+                reason = str(e)
+        flydsl_simd_counters()[f"fallback: combo: {reason}"] += 1
+        flydsl_simd_counters()["triton_kernels"] += 1
+        if config.flydsl.simd_strict:
+            raise FlyDSLUnsupported(f"FlyDSL SIMD kernel refused ({reason})")
+        return super().codegen_combo_kernel(combo_kernel_node)
+
+    def _combo_groups(self, subkernel_nodes) -> list[list[Any]]:
+        """Split the sub-kernels so no launch takes more than COMBO_MAX_ARGS buffers."""
+        groups: list[list[Any]] = []
+        names: OrderedSet[str] = OrderedSet()
+        for pn in subkernel_nodes:
+            rw = pn.read_writes
+            mine = OrderedSet(d.name for d in (*rw.reads, *rw.writes))
+            if groups and len(names | mine) <= COMBO_MAX_ARGS:
+                groups[-1].append(pn)
+                names |= mine
+            else:
+                groups.append([pn])
+                names = mine
+        return groups
+
+    def _codegen_flydsl_combo(self, combo_kernel_node) -> None:
+        from ..common import KernelArgs
+        from ..simd_kernel_features import SIMDKernelFeatures
+
+        count_before = metrics.generated_kernel_count
+        built = []
+        try:
+            for group in self._combo_groups(combo_kernel_node.get_subkernel_nodes()):
+                args = KernelArgs()
+                kernels, schedules = [], []
+                for pn in group:
+                    nodes = pn.get_nodes()
+                    _, (numel, rnumel) = max(
+                        nodes, key=lambda n: int(n.is_reduction())
+                    ).group
+                    node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
+                    features = SIMDKernelFeatures(node_schedule, numel, rnumel)
+                    kernel = FlyDSLKernel(
+                        self._choose_tiling(features), features=features
+                    )
+                    kernel.args = args
+                    self.codegen_node_schedule_with_kernel(node_schedule, kernel)
+                    kernels.append(kernel)
+                    schedules.append(node_schedule)
+                built.append((kernels, schedules, _combo_source(kernels)))
+        except FlyDSLUnsupported:
+            metrics.generated_kernel_count = count_before
+            raise
+        except (NotImplementedError, TypeError, KeyError, AssertionError) as e:
+            metrics.generated_kernel_count = count_before
+            raise FlyDSLUnsupported(f"{type(e).__name__}: {e}") from e
+
+        for kernels, schedules, src_code in built:
+            node_schedule = [n for s in schedules for n in s]
+            kernel_name = self._define_flydsl_kernel(src_code, node_schedule)
+            lead = kernels[0]
+            lead.kernel_name = kernel_name
+            flydsl_simd_counters()["flydsl_kernels"] += 1
+            flydsl_simd_counters()["combo"] += 1
+            for k in kernels:
+                with V.set_kernel_handler(k):
+                    for node in k.features.scheduler_nodes():
+                        node.mark_run()
+                V.graph.removed_buffers |= k.removed_buffers
+                V.graph.inplaced_to_remove |= k.inplaced_to_remove
+            self.codegen_comment(combo_kernel_node.snodes, kernel_name)
+            lead.call_kernel(kernel_name)
+        self.free_buffers_in_scheduler()
+
+    def _choose_tiling(self, kernel_features) -> dict[str, sympy.Expr]:
+        flat = self._flat_tiling(kernel_features)
+        if _tune("force_flat"):
+            return flat
+        # Triton's tiling analysis adds a y (or z) dimension exactly when some access
+        # is transposed relative to the others. A flat kernel then coalesces the
+        # stores and strides the loads (or the reverse), which measured 8x slower on
+        # a 4096^2 transpose; a pointwise kernel takes the {y, x} tiling instead and
+        # stages the transposed loads through LDS.
+        preferred, _ = self.get_tiling_and_scores(
+            kernel_features.node_schedule,
+            kernel_features.numel,
+            kernel_features.reduction_numel,
+            kernel_features.coalesce_analysis,
+        )
+        if not OrderedSet(preferred) & OrderedSet(["y", "z"]):
+            return flat
+        if "z" in preferred or kernel_features.is_reduction():
+            raise FlyDSLUnsupported("transposed access needs a 2D tile")
+        return {"y": preferred["y"], "x": preferred["x"]}
+
     @staticmethod
     def _precheck(kernel_features) -> str | None:
         if V.graph.cpp_wrapper:
@@ -1535,20 +1867,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
 
     def _codegen_flydsl(self, kernel_features: SIMDKernelFeatures):
         node_schedule = kernel_features.node_schedule
-        if not _tune("force_flat"):
-            # Triton's tiling analysis adds a y (or z) dimension exactly when some access
-            # is transposed relative to the others. A flat kernel then coalesces the
-            # stores and strides the loads (or the reverse), which measured 8x slower on
-            # a 4096^2 transpose; doing better needs a 2D tile staged through LDS.
-            preferred, _ = self.get_tiling_and_scores(
-                node_schedule,
-                kernel_features.numel,
-                kernel_features.reduction_numel,
-                kernel_features.coalesce_analysis,
-            )
-            if OrderedSet(preferred) & OrderedSet(["y", "z"]):
-                raise FlyDSLUnsupported("transposed access needs a 2D tile")
-        tiling = self._flat_tiling(kernel_features)
+        tiling = self._choose_tiling(kernel_features)
         count_before = metrics.generated_kernel_count
         with _quiet_scheduler_codegen_errors():
             return self._codegen_flydsl_inner(

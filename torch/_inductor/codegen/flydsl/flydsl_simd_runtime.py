@@ -1016,6 +1016,25 @@ def _group_reduce(vals, comb, tpr: int, smem, threads: int, stride: int = 1):
     return acc
 
 
+def barrier():
+    gpu.barrier()
+
+
+def tile_put(smem, base: int, plane: int, off, value):
+    """Park ``value`` at word ``off`` of a staged tile starting at ``base``; a 64-bit
+    value's second word goes one ``plane`` further on."""
+    for i, word in enumerate(_to_words(_canon(value))):
+        fx.memref_store(ArithValue(word), smem, idx(off) + (base + i * plane))
+
+
+def tile_get(smem, base: int, plane: int, off, k: str):
+    words = [
+        _val(ArithValue(fx.memref_load(smem, idx(off) + (base + i * plane))))
+        for i in range(2 if k in ("i64", "f64") else 1)
+    ]
+    return _from_words(words, k)
+
+
 def smem_words(threads: int, components: int) -> int:
     """LDS words a group reduction needs: one slot per thread for each 32-bit word of
     each component (two words per component covers 64-bit kinds)."""
