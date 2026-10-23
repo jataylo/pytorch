@@ -1083,7 +1083,9 @@ class FlyDSLKernel(SIMDKernel):
             # bare reduction wants about 64 elements a thread, every row's loads issued
             # up front (see emit_inner): 40us vs 43us at two rows on a 32-wide sum.
             self.xunroll = (
-                max(2, min(8, 64 // (iters * self.ept))) if self._pure_reduction() else 1
+                max(2, min(8, 64 // (iters * self.ept)))
+                if self._pure_reduction()
+                else 1
             )
             while (
                 self.xunroll > 1
@@ -1807,6 +1809,15 @@ class FlyDSLKernel(SIMDKernel):
         return extents
 
     @property
+    def slp(self) -> bool:
+        """Whether LLVM's SLP vectorizer runs. It pairs a reduction's f32 math into
+        ``v_pk_*`` ops whose operands need a ``v_mov`` each to line up -- 44us vs 49us
+        on a 512-wide bf16 softmax backward, and 5-10% on LayerNorm backward and
+        RMSNorm -- while pointwise kernels gain from it overall (gelu: 0.79x vs 0.94x
+        of Triton)."""
+        return bool(_tune("slp", int(not self.is_reduction_kernel or self.tile2d)))
+
+    @property
     def smem_words(self) -> int:
         if self.staged:
             return sum(s["words"] * TILE * TILE_PITCH for s in self.staged)
@@ -1846,7 +1857,9 @@ class FlyDSLKernel(SIMDKernel):
         with code.indent():
             code.writeline("_b = fdp.bid()")
             self.emit_inner(code)
-        code.splice(_module_epilogue(arg_names, self.num_blocks, self.threads))
+        code.splice(
+            _module_epilogue(arg_names, self.num_blocks, self.threads, self.slp)
+        )
         return code.getvalue()
 
     def emit_inner(self, code: IndentedBuffer) -> None:
@@ -2055,16 +2068,23 @@ def _module_prologue(
     return code
 
 
-def _module_epilogue(arg_names: list[str], grid: int, threads: int) -> str:
+def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -> str:
     kname = str(Placeholder.KERNEL_NAME)
+    hints = (
+        ""
+        if slp
+        else (
+            f"\n        {kname}_launch.compile_hints = "
+            '{"llvm_options": {"vectorize-slp": False}}\n'
+        )
+    )
     launch_sig = ", ".join([f"{a}: fx.Int64" for a in arg_names] + ["_grid: fx.Int32"])
     return f"""
 
         @flyc.jit
         def {kname}_launch({launch_sig}, stream: fx.Stream = fx.Stream(None)):
             {kname}_kernel({", ".join(arg_names)}).launch(grid=(_grid, 1, 1), block=({threads}, 1, 1), stream=stream)
-
-
+{hints}
         _compiled = None
 
 
@@ -2127,7 +2147,11 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
                 code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
                 code.splice(inner)
             start = end
-    code.splice(_module_epilogue(arg_names, start, kernels[0].threads))
+    code.splice(
+        _module_epilogue(
+            arg_names, start, kernels[0].threads, all(k.slp for k in kernels)
+        )
+    )
     return code.getvalue()
 
 

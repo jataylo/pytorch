@@ -149,6 +149,23 @@ def const(v, k: str):
     return ArithValue(_arith.ConstantOp(t, ir.FloatAttr.get(t, float(v))).result)
 
 
+def _f32_to_bf16(v):
+    """Round to nearest even, NaN to the canonical NaN, as Triton converts: LLVM's
+    ``fptrunc`` keeps the NaN's payload instead, an extra ``v_or`` an element -- a tenth
+    of a bf16 softmax backward's vector-ALU work."""
+
+    def i32(c):
+        return _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), c)).result
+
+    bits = _arith.BitcastOp(T.i32(), v).result
+    lsb = _arith.AndIOp(_arith.ShRUIOp(bits, i32(16)).result, i32(1)).result
+    rounded = _arith.AddIOp(_arith.AddIOp(bits, i32(0x7FFF)).result, lsb).result
+    nan = _arith.CmpFOp(_arith.CmpFPredicate.UNO, v, v).result
+    bits = _arith.SelectOp(nan, i32(0x7FC00000), rounded).result
+    half = _arith.TruncIOp(T.i16(), _arith.ShRUIOp(bits, i32(16)).result).result
+    return _arith.BitcastOp(T.bf16(), half).result
+
+
 def _cvt(v, src: str, dst: str, unsigned: bool = False):
     """Convert a bare value between kinds (storage or compute)."""
     if src == "index":
@@ -185,6 +202,17 @@ def _cvt(v, src: str, dst: str, unsigned: bool = False):
     sw = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64}
     if sw[src] < sw[dst]:
         return _arith.ExtFOp(dst_t, v).result
+    if src == "f32" and dst == "bf16":
+        # A widened bf16 -- Inductor rounds through bf16 before a bf16 store -- comes
+        # back exactly; LLVM folds that for ``fptrunc`` but not for the bit math.
+        owner = getattr(v, "owner", None)
+        if (
+            isinstance(owner, ir.Operation | ir.OpView)
+            and owner.name == "arith.extf"
+            and owner.operands[0].type == T.bf16()
+        ):
+            return owner.operands[0]
+        return _f32_to_bf16(v)
     if sw[src] > sw[dst]:
         return _arith.TruncFOp(dst_t, v).result
     # f16 <-> bf16

@@ -150,6 +150,19 @@ class TestFlyDSLSIMD(TestCase):
             a,
         )
 
+    def test_bf16_rounding(self):
+        # Round to nearest even, ties and the overflow to inf included; NaN stays NaN.
+        x = torch.randn(1 << 16, device="cuda") * 1e3
+        edges = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 3.4e38,
+                 1.00390625, 1.01171875, -2.5, 1e-40, -1e-40, 2.0**-130]  # fmt: skip
+        x[: len(edges)] = torch.tensor(edges, device="cuda")
+        y = torch.compile(lambda a: (a * 1.0).to(torch.bfloat16))(x)
+        ref = x.to(torch.bfloat16)
+        same = (y.view(torch.int16) == ref.view(torch.int16)) | (
+            y.isnan() & ref.isnan()
+        )
+        self.assertTrue(bool(same.all()))
+
     def test_transcendentals(self):
         a = torch.randn(4097, 33, device="cuda")
         self.check(
