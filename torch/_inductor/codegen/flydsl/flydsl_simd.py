@@ -586,6 +586,29 @@ def _run_uniform(expr: sympy.Expr, var: sympy.Symbol, w: int) -> bool:
     return var not in expr.xreplace(stand_ins).free_symbols
 
 
+def _aligned_shift(arg: sympy.Expr, var: sympy.Symbol, w: int) -> bool:
+    """``arg`` is ``var`` plus terms free of it that are multiples of ``w``: over an
+    aligned run of ``var`` it then moves exactly as ``var`` does. A split reduction's
+    ``r + 87382 * x`` is one, for runs of 2."""
+    if arg == var:
+        return True
+    rest = sympy.expand(arg - var)
+    if var in rest.free_symbols:
+        return False
+    for term in sympy.Add.make_args(rest):
+        coeff, factor = term.as_coeff_Mul()
+        c = _int_or_none(coeff)
+        if c is None:
+            return False
+        if factor.is_number:
+            f = _int_or_none(factor)
+            if f is None or (c * f) % w:
+                return False
+        elif c % w:
+            return False
+    return True
+
+
 def classify_access(
     expr: sympy.Expr, var: sympy.Symbol, w: int, uniform: frozenset[str] = frozenset()
 ) -> str:
@@ -625,7 +648,9 @@ def classify_access(
         if factor == var:
             linear += c
             continue
-        if isinstance(factor, ModularIndexing) and factor.args[0] == var:
+        if isinstance(factor, ModularIndexing) and _aligned_shift(
+            factor.args[0], var, w
+        ):
             d, m = (_int_or_none(a) for a in factor.args[1:])
             if d is None or m is None:
                 return "other"
@@ -637,7 +662,7 @@ def classify_access(
                 linear += c
                 continue
             return "other"
-        if isinstance(factor, FloorDiv) and factor.args[0] == var:
+        if isinstance(factor, FloorDiv) and _aligned_shift(factor.args[0], var, w):
             d = _int_or_none(factor.args[1])
             if d is not None and d % w == 0:
                 if c % w:

@@ -80,6 +80,19 @@ class TestClassifyAccess(TestCase):
         self.assertEqual(self.classify(ModularIndexing(x, 1, 6), x, 4), "other")
         self.assertEqual(self.classify(FloorDiv(x, 3), x, 4), "other")
 
+    def test_split_reduction_shift(self):
+        # A split reduction indexes ``r + rnumel * x`` through the input's view.
+        r = self.x
+        x1 = sympy.Symbol("x1", integer=True, nonnegative=True)
+        e = 262144 * ModularIndexing(r + 87382 * x1, 4096, 64) + ModularIndexing(
+            r + 87382 * x1, 1, 4096
+        )
+        self.assertEqual(self.classify(e, r, 2), "contig")
+        self.assertEqual(self.classify(e, r, 4), "other")
+        self.assertEqual(
+            self.classify(ModularIndexing(r + 87383 * x1, 1, 4096), r, 2), "other"
+        )
+
 
 @requires_flydsl
 @instantiate_parametrized_tests

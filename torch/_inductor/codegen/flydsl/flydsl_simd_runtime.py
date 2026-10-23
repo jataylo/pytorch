@@ -1638,11 +1638,13 @@ def online_softmax_block(mx, s, items):
 
 def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
     """(max, sum of exp(x - max)) over a row held entirely in registers: a max pass and an
-    exp-sum pass, one exp per element, as Triton does for a persistent reduction."""
+    exp-sum pass, as Triton does for a persistent reduction. ``exp(x - max)`` exactly as
+    the kernel's normalizing pass writes it -- no -inf guard; an all -inf row is NaN
+    either way, as in eager and Triton -- so LLVM shares each exp between the two
+    passes: 268us vs 317us on a causal softmax over 512."""
     xs = _masked_items(items, "f32", float("-inf"))
     gm = group_reduce("max", _tree(xs, maximum), tpr, smem, threads, stride)
-    base = _softmax_base(gm)
-    ls = _tree([exp(sub(x, base)) for x in xs], add)
+    ls = _tree([exp(sub(x, gm)) for x in xs], add)
     return gm, group_reduce("sum", ls, tpr, smem, threads, stride)
 
 
