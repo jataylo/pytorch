@@ -54,7 +54,23 @@ def _ln_bwd(g, x, w):
     return dx.to(x.dtype)
 
 
-# name -> (fn, [arg factories], output bytes override or None)
+# Outputs drawn from the RNG: Inductor's Philox stream differs from eager's.
+RANDOM = {"dropout_bf16", "randn_f32_16M"}
+
+
+def _params(seed):
+    shapes = [(768, 768), (768,), (3072, 768), (768, 3072), (2304, 768), (2304,)] * 8
+    return lambda: [torch.randn(s, device="cuda") for s in shapes]
+
+
+def _adam(ps, gs, ms, vs):
+    ms = torch._foreach_add(torch._foreach_mul(ms, 0.9), torch._foreach_mul(gs, 0.1))
+    vs = torch._foreach_addcmul(torch._foreach_mul(vs, 0.999), gs, gs, value=0.001)
+    den = torch._foreach_add(torch._foreach_sqrt(vs), 1e-8)
+    return torch._foreach_addcdiv(ps, ms, den, value=-1e-3), ms, vs
+
+
+# name -> (fn, [arg factories])
 CASES = {
     # pointwise
     "add_f32_16M": (lambda a, b: a + b, [_r(1 << 24), _r(1 << 24)]),
@@ -131,6 +147,67 @@ CASES = {
         .to(bf16),
         [_r(49152, 512, dtype=bf16), _r(49152, 512, dtype=bf16)],
     ),
+    # LayerNorm weight/bias gradients at ViT-B shapes (197 tokens x 32): a split column
+    # reduction of bf16 rows
+    "ln_wgrad_vit": (
+        lambda g, x, m, r: (
+            (g.float() * ((x.float() - m) * r)).sum(0),
+            g.float().sum(0),
+        ),
+        [
+            _r(6304, 768, dtype=bf16),
+            _r(6304, 768, dtype=bf16),
+            _r(6304, 1),
+            _r(6304, 1),
+        ],
+    ),
+    # The same over (batch, tokens, dim): the split's row index wraps through a view
+    "ln_wgrad_vit3d": (
+        lambda g, x, m, r: (
+            (g.float() * ((x.float() - m) * r)).sum((0, 1)),
+            g.float().sum((0, 1)),
+        ),
+        [
+            _r(32, 197, 768, dtype=bf16),
+            _r(32, 197, 768, dtype=bf16),
+            _r(32, 197, 1),
+            _r(32, 197, 1),
+        ],
+    ),
+    # Exact (erf) GELU forward and backward at ViT-B MLP shapes
+    "gelu_erf_bf16": (lambda a: F.gelu(a), [_r(6304, 3072, dtype=bf16)]),
+    "gelu_erf_bwd_bf16": (
+        lambda g, a: torch.ops.aten.gelu_backward(g, a),
+        [_r(6304, 3072, dtype=bf16), _r(6304, 3072, dtype=bf16)],
+    ),
+    # Random numbers (Philox per element)
+    "dropout_bf16": (lambda a: F.dropout(a, 0.1, True), [_r(8192, 8192, dtype=bf16)]),
+    "randn_f32_16M": (lambda a: a + torch.randn_like(a), [_r(1 << 24)]),
+    # 2D tiles: transposed loads staged through LDS
+    "permute_heads_bf16": (
+        lambda x: x.view(32, 512, 12, 64).permute(0, 2, 1, 3).contiguous(),
+        [_r(32 * 512, 768, dtype=bf16)],
+    ),
+    "nchw_to_nhwc_f32": (
+        lambda x: x.contiguous(memory_format=torch.channels_last),
+        [_r(64, 64, 64, 64)],
+    ),
+    # Llama pieces
+    "rope_bf16": (
+        lambda x, c, s: x * c + torch.cat((-x[..., 32:], x[..., :32]), -1) * s,
+        [
+            _r(8, 16, 1024, 64, dtype=bf16),
+            _r(1024, 64, dtype=bf16),
+            _r(1024, 64, dtype=bf16),
+        ],
+    ),
+    # Scans
+    "cumsum_rows_f32": (lambda a: a.cumsum(-1), [_r(8192, 4096)]),
+    # Foreach (one combo launch over many parameters)
+    "adam_foreach_f32": (
+        lambda ps, gs, ms, vs: _adam(ps, gs, ms, vs),
+        [_params(seed) for seed in range(4)],
+    ),
 }
 
 
@@ -201,11 +278,17 @@ def run_case(name, fn, factories):
         out = cfn(*args)
         torch.cuda.synchronize()
         row[f"{backend}_compile_s"] = time.perf_counter() - t0
-        torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2)
+        if name not in RANDOM:
+            torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
         if backend == "flydsl":
             c = counters["flydsl_simd"]
             row["flydsl_kernels"] = c["flydsl_kernels"]
             row["triton_fallbacks"] = c["triton_kernels"]
+            row["fallback_reasons"] = {
+                k[len("fallback: ") :]: v
+                for k, v in c.items()
+                if k.startswith("fallback: ")
+            }
         row[f"{backend}_gpu_us"] = _graph_time_us(cfn, args)
         row[f"{backend}_call_us"] = _call_time_us(cfn, args)
     ic.flydsl.simd = False
@@ -232,7 +315,8 @@ def main():
         print(
             f"{name:20s} {r['triton_gpu_us']:9.1f} {r['flydsl_gpu_us']:9.1f} "
             f"{r['flydsl_gpu_us'] / r['triton_gpu_us']:8.2f} {gb(r['triton_gpu_us']):9.0f} {gb(r['flydsl_gpu_us']):9.0f}"
-            f" {r['triton_call_us']:9.1f} {r['flydsl_call_us']:9.1f}  fly={r['flydsl_kernels']} fallback={r['triton_fallbacks']}",
+            f" {r['triton_call_us']:9.1f} {r['flydsl_call_us']:9.1f}  fly={r['flydsl_kernels']} fallback={r['triton_fallbacks']}"
+            f" {r['fallback_reasons'] or ''}",
             flush=True,
         )
     if a.json:

@@ -454,12 +454,71 @@ def vstore(cache: dict, key, j: int, w: int, r, off, value, st: str, mask=None):
             )
 
 
+def _packed_half(o, value, st: str):
+    """(two-lane vector, byte offset of its 32-bit word) for a 16-bit atomic add at
+    element ``o``: the value in its lane and -0.0 in the neighbour's."""
+    h = _cvt(_val(to(value, "f32")), "f32", st)
+    et = _STORAGE_IR[st]()
+    negz = _arith.ConstantOp(et, ir.FloatAttr.get(et, -0.0)).result
+    odd = _val(eq(ArithValue(_arith.AndIOp(_val(o), _val(fx.Int32(1))).result), 1))
+    lo = _arith.SelectOp(odd, negz, h).result
+    hi = _arith.SelectOp(odd, h, negz).result
+    v = _vector.FromElementsOp(ir.VectorType.get([2], et), [lo, hi]).result
+    word = _arith.AndIOp(_val(o), _val(fx.Int32(-2))).result
+    return v, _val(mul(ArithValue(word), 2))
+
+
+def _when(m, emit):
+    """Run ``emit()`` under ``scf.if m`` (or unconditionally when ``m`` is None)."""
+    if m is None:
+        emit()
+        return
+    if_op = _scf.IfOp(m)
+    with ir.InsertionPoint(if_op.then_block):
+        emit()
+        _scf.YieldOp([])
+
+
+def atomic_add_global(addr, off, value, st: str, mask=None):
+    """bf16 ``*(addr + off) += value``: gfx942 has a packed bf16 atomic add only on
+    global pointers (``buffer_atomic_pk_add_bf16`` is gfx950), so this one goes through
+    an LLVM ``atomicrmw`` on the raw address instead of the buffer descriptor."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    v, byte_off = _packed_half(idx(off), value, st)
+    a = _arith.AddIOp(
+        _val(to(addr, "i64")), _arith.ExtUIOp(T.i64(), byte_off).result
+    ).result
+
+    def emit():
+        ptr = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), a).result
+        _llvm.AtomicRMWOp(
+            _llvm.AtomicBinOp.fadd,
+            ptr,
+            v,
+            _llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=4,
+        )
+
+    _when(_mask(mask), emit)
+
+
 def atomic_add(r, off, value, st: str, mask=None):
-    """``*(r + off) += value`` for f32, through the buffer atomic; a masked lane does nothing."""
-    if st != "f32":
+    """``*(r + off) += value`` through the buffer atomic; a masked lane does nothing.
+
+    f16/bf16 have only packed (two-lane) atomic adds: the element's lane gets the value
+    and its neighbour -0.0, the additive identity for every float including -0.0, so
+    the neighbour is left bit-for-bit unchanged.
+    """
+    o = idx(off)
+    if st in ("f32", "f64"):
+        v = _val(to(value, st))
+        byte_off = _val(mul(o, 4 if st == "f32" else 8))
+    elif st == "f16":
+        v, byte_off = _packed_half(o, value, st)
+    else:
         raise NotImplementedError(f"atomic_add of {st}")
-    v = _val(to(value, "f32"))
-    byte_off = _val(mul(idx(off), 4))
     m = _mask(mask)
     if m is None:
         zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
@@ -570,7 +629,12 @@ def _cmp(a, b, ipred, fpred):
 
 
 def lt(a, b):
-    return _cmp(a, b, _arith.CmpIPredicate.slt, _arith.CmpFPredicate.OLT)
+    return _cmp(
+        a,
+        b,
+        _arith.CmpIPredicate.slt,
+        _arith.CmpFPredicate.OLT,  # codespell:ignore
+    )  # codespell:ignore
 
 
 def le(a, b):
@@ -794,6 +858,88 @@ def libdevice_exp(x):
     return exp(x)
 
 
+def _rcp(x):
+    """``v_rcp_f32``: 1 ulp, against ~10 instructions for an IEEE fdiv. Only for
+    denominators kept well away from zero and denormals."""
+    return ArithValue(_rocdl.rcp(T.f32(), _val(x)))
+
+
+def _exp2_raw(x):
+    """Bare ``v_exp_f32``, without LLVM's denormal-range fix-up (~4 instructions): for
+    the callers below a denormal result and zero are interchangeable."""
+    return ArithValue(_rocdl.exp2(T.f32(), _val(x)))
+
+
+def _copysign(mag, x):
+    return ArithValue(fmath.copysign(mag, x))
+
+
+def _horner(z, coeffs):
+    """``coeffs[0] + coeffs[1] z + ...``, as fused multiply-adds."""
+    acc = fdu.const_f32(coeffs[-1])
+    for c in reversed(coeffs[:-1]):
+        acc = ArithValue(fmath.fma(acc, z, fdu.const_f32(c)))
+    return acc
+
+
+# Odd Taylor series for small arguments, where erf's and tanh's `1 - (close to 1)` forms
+# lose all relative accuracy: 2/sqrt(pi) (-1)^n / (n! (2n+1)), and tanh's from the
+# Bernoulli numbers. Truncation below 3e-8 relative on |x| < 0.25.
+# erf(x) / x on [0, 1] in powers of x^2: a relative-error fit, 5e-8 in exact arithmetic.
+_ERF_UNIT = (
+    1.1283791065216064,
+    -0.37612324953079224,
+    0.11280179768800735,
+    -0.02671131119132042,
+    0.00491755036637187,
+    -0.000563141773454845,
+)
+_TANH_SMALL = (1.0, -1.0 / 3, 2.0 / 15, -17.0 / 315, 62.0 / 2835)
+_SMALL = 0.25
+
+
+def _erf_rcp(x):
+    # Below 1, erf(x) / x as a polynomial in x^2 (relative error ~1e-7). Above, fdu.erf's
+    # A&S 7.1.26 (abs error 1.5e-7) with 1 / (1 + p|x|), which lies in (0, 1], taken by
+    # v_rcp_f32. Pointwise kernels around erf are ALU-bound on MI300 (~35 instructions
+    # an element at HBM speed), so every instruction here shows: an erf GELU went
+    # 121us -> 96us without the fdiv. The two sides are a real branch, as in OCML's
+    # erf: a wave whose lanes are all below 1 skips the exp path (126us vs 143us on
+    # the GELU of a freshly initialized ViT MLP).
+    x = _f32(x)
+    ax = ArithValue(fmath.absf(x))
+    if_op = _scf.IfOp(_val(ax < fdu.const_f32(1.0)), [T.f32()], has_else=True)
+    with ir.InsertionPoint(if_op.then_block):
+        small = ArithValue(ax * _horner(ArithValue(ax * ax), _ERF_UNIT))
+        _scf.YieldOp([_val(small)])
+    with ir.InsertionPoint(if_op.else_block):
+        t = _rcp(fmath.fma(fdu.const_f32(fdu._ERF_P), ax, fdu.const_f32(1.0)))
+        poly = ArithValue(t * _horner(t, tuple(reversed(fdu._ERF_COEFFS))))
+        e = _exp2_raw(ArithValue(ArithValue(ax * ax) * fdu.const_f32(-_LOG2E)))
+        big = ArithValue(fmath.fma(ArithValue(-poly), e, fdu.const_f32(1.0)))
+        _scf.YieldOp([_val(big)])
+    return _copysign(ArithValue(if_op.results[0]), x)
+
+
+def _tanh_rcp(x):
+    # 1 - 2 / (exp(2|x|) + 1), the denominator >= 2 (rcp(inf) = 0); the series below.
+    x = _f32(x)
+    ax = ArithValue(fmath.absf(x))
+    e = _exp2_raw(ArithValue(ax * fdu.const_f32(2.0 * _LOG2E)))
+    big = ArithValue(
+        fmath.fma(fdu.const_f32(-2.0), _rcp(e + fdu.const_f32(1.0)), fdu.const_f32(1.0))
+    )
+    small = ArithValue(ax * _horner(ArithValue(ax * ax), _TANH_SMALL))
+    r = ArithValue(ArithValue(ax < fdu.const_f32(_SMALL)).select(small, big))
+    return _copysign(r, x)
+
+
+def _sigmoid_rcp(x):
+    # 1 / (1 + exp(-x)): the denominator is >= 1, and rcp(inf) = 0 for very negative x.
+    e = _exp2_raw(ArithValue(_f32(x) * fdu.const_f32(-_LOG2E)))
+    return _rcp(e + fdu.const_f32(1.0))
+
+
 exp = _unary_f32("exp", fdu.exp)
 exp2 = _unary_f32("exp2", fdu.exp2)
 expm1 = _unary_f32("expm1", fdu.expm1)
@@ -803,8 +949,8 @@ log10 = _unary_f32("log10", fdu.log10)
 log1p = _unary_f32("log1p", fdu.log1p)
 sin = _unary_f32("sin", fdu.sin)
 cos = _unary_f32("cos", fdu.cos)
-tanh = _unary_f32("tanh", fdu.tanh)
-sigmoid = _unary_f32("sigmoid", fdu.sigmoid)
+tanh = _unary_f32("tanh", _tanh_rcp)
+sigmoid = _unary_f32("sigmoid", _sigmoid_rcp)
 sinh = _unary_f32("sinh", fdu.sinh)
 cosh = _unary_f32("cosh", fdu.cosh)
 asin = _unary_f32("asin", fdu.asin)
@@ -813,7 +959,7 @@ atan = _unary_f32("atan", fdu.atan)
 asinh = _unary_f32("asinh", fdu.asinh)
 acosh = _unary_f32("acosh", fdu.acosh)
 atanh = _unary_f32("atanh", fdu.atanh)
-erf = _unary_f32("erf", fdu.erf)
+erf = _unary_f32("erf", _erf_rcp)
 erfc = _unary_f32("erfc", fdu.erfc)
 
 
@@ -844,6 +990,112 @@ def hypot(a, b):
 
 def identity(x):
     return x
+
+
+# ---------------------------------------------------------------------------------------
+# Random numbers: Philox-4x32-10, the same stream as Triton's tl.rand/tl.randn/randint
+# ---------------------------------------------------------------------------------------
+
+_PHILOX_KEY_A, _PHILOX_KEY_B = 0x9E3779B9, 0xBB67AE85
+_PHILOX_ROUND_A, _PHILOX_ROUND_B = 0xD2511F53, 0xCD9E8D57
+
+
+def _u32c(v: int):
+    return _val(const(v - 2**32 if v >= 2**31 else v, "i32"))
+
+
+def _philox(seed, offset):
+    """Four uint32 words (held as i32) for counter (offset, 0, 0, 0) under key ``seed``."""
+    s = _val(to(seed, "i64"))
+    k0 = _arith.TruncIOp(T.i32(), s).result
+    k1 = _arith.TruncIOp(
+        T.i32(),
+        _arith.ShRUIOp(s, _val(const(32, "i64"))).result,
+    ).result
+    c0, c1, c2, c3 = _val(idx(offset)), None, None, None
+    a, b = _u32c(_PHILOX_ROUND_A), _u32c(_PHILOX_ROUND_B)
+    ka, kb = _u32c(_PHILOX_KEY_A), _u32c(_PHILOX_KEY_B)
+
+    def xor(*vs):
+        vs = [v for v in vs if v is not None]
+        out = vs[0]
+        for v in vs[1:]:
+            out = _arith.XOrIOp(out, v).result
+        return out
+
+    for _ in range(10):
+        # c1..c3 start at zero; skipping them keeps the first round short.
+        hb = _arith.MulUIExtendedOp(b, c2).results if c2 is not None else None
+        ha = _arith.MulUIExtendedOp(a, c0).results
+        n0 = xor(hb[1] if hb else None, c1, k0)
+        n2 = xor(ha[1], c3, k1)
+        c1 = hb[0] if hb else _u32c(0)
+        c3 = ha[0]
+        c0, c2 = n0, n2
+        k0 = _arith.AddIOp(k0, ka).result
+        k1 = _arith.AddIOp(k1, kb).result
+    return c0, c1, c2, c3
+
+
+def _uniform(word):
+    # Triton's uint_to_uniform_float: reinterpret as int32, fold negatives, scale 2**-31.
+    x = ArithValue(word)
+    x = ArithValue(
+        _arith.SelectOp(
+            _val(lt(x, const(0, "i32"))), _val(const(-1, "i32") - x), word
+        ).result
+    )
+    return mul(to(x, "f32"), const(4.6566127342e-10, "f32"))
+
+
+def rand(seed, offset):
+    return _uniform(_philox(seed, offset)[0])
+
+
+def randn(seed, offset):
+    w = _philox(seed, offset)
+    u1 = maximum(_uniform(w[0]), const(1.0e-7, "f32"))
+    th = mul(_uniform(w[1]), const(6.283185307179586, "f32"))
+    return mul(sqrt(mul(const(-2.0, "f32"), log(u1))), cos(th))
+
+
+def _philox_group(cache, key, j: int, seed, offset):
+    """The four Philox words of offset group ``offset // 4``, computed once per group of
+    four consecutive elements (``j`` counts a thread's elements; groups are aligned)."""
+
+    def words():
+        base = sub(idx(offset), j % 4) if j % 4 else idx(offset)
+        return _philox(seed, idiv(base, 4))
+
+    return memo(cache, (key, j // 4), words)
+
+
+def rand4(cache, key, j: int, seed, offset):
+    return _uniform(_philox_group(cache, key, j, seed, offset)[j % 4])
+
+
+def randn4(cache, key, j: int, seed, offset):
+    def normals():
+        w = _philox_group(cache, key, j, seed, offset)
+        out = []
+        for a, b in ((w[0], w[1]), (w[2], w[3])):
+            u1 = maximum(_uniform(a), const(1.0e-7, "f32"))
+            th = mul(_uniform(b), const(6.283185307179586, "f32"))
+            r = sqrt(mul(const(-2.0, "f32"), log(u1)))
+            out += [mul(r, cos(th)), mul(r, sin(th))]
+        return out
+
+    return memo(cache, (key, "n", j // 4), normals)[j % 4]
+
+
+def randint64(seed, offset, low, high):
+    w = _philox(seed, offset)
+    lo = _arith.ExtUIOp(T.i64(), w[0]).result
+    hi = _arith.ExtUIOp(T.i64(), w[1]).result
+    r = _arith.OrIOp(lo, _arith.ShLIOp(hi, _val(const(32, "i64"))).result).result
+    low, high = to(low, "i64"), to(high, "i64")
+    size = _val(sub(high, low))
+    return add(ArithValue(_arith.RemUIOp(r, size).result), low)
 
 
 # ---------------------------------------------------------------------------------------
@@ -894,39 +1146,77 @@ def combine(op: str, acc, value, mask=None):
     return ArithValue(_arith.SelectOp(m, _val(new), _val(acc)).result)
 
 
-def _shfl(x, off: int, width: int):
-    """``shuffle_xor`` for any compute kind: 64-bit values travel as two dwords."""
-    x = _canon(x)
-    k = kind(x)
-    if k in ("i32", "f32"):
-        return ArithValue(ArithValue(x).shuffle_xor(fx.Int32(off), fx.Int32(width)))
-    if k == "b1":
-        w = _cvt(_val(x), "b1", "i32")
-        s = ArithValue(ArithValue(w).shuffle_xor(fx.Int32(off), fx.Int32(width)))
-        return ArithValue(_cvt(_val(s), "i32", "b1"))
-    bits = _val(x) if k == "i64" else _arith.BitcastOp(T.i64(), _val(x)).result
-    lo = _arith.TruncIOp(T.i32(), bits).result
-    c32 = _arith.ConstantOp(T.i64(), ir.IntegerAttr.get(T.i64(), 32)).result
-    hi = _arith.TruncIOp(T.i32(), _arith.ShRUIOp(bits, c32).result).result
-    lo = _val(ArithValue(ArithValue(lo).shuffle_xor(fx.Int32(off), fx.Int32(width))))
-    hi = _val(ArithValue(ArithValue(hi).shuffle_xor(fx.Int32(off), fx.Int32(width))))
-    joined = _arith.OrIOp(
-        _arith.ExtUIOp(T.i64(), lo).result,
-        _arith.ShLIOp(_arith.ExtUIOp(T.i64(), hi).result, c32).result,
-    ).result
-    return ArithValue(
-        joined if k == "i64" else _arith.BitcastOp(T.f64(), joined).result
-    )
+def _shfl(x, off, width: int, mode: str = "xor"):
+    """``gpu.shuffle`` for any compute kind: 64-bit values travel as two dwords."""
+    from flydsl._mlir.dialects.gpu import ShuffleOp
+
+    def one(word):
+        return ShuffleOp(
+            word, _val(idx(off)), _val(fx.Int32(width)), mode=mode
+        ).shuffleResult
+
+    words = _to_words(x)
+    return _from_words([one(w) for w in words], kind(_canon(x)))
 
 
-def _lane_reduce(vals, comb, width: int):
-    """Butterfly over groups of ``width`` lanes (power of two, at most a wave)."""
-    off = width // 2
-    while off >= 1:
-        peer = tuple(_shfl(v, off, WAVE) for v in vals)
-        vals = comb(vals, peer)
-        off //= 2
-    return vals
+_DPP_ROW_SHR = 0x110  # + n: lane i reads lane i - n of its row of 16
+_DPP_ROW_BCAST15 = 0x142  # lane 15 of each row to the whole next row
+_DPP_ROW_BCAST31 = 0x143  # lane 31 to rows 2 and 3
+
+
+def _dpp(x, ctrl: int, row_mask: int = 0xF, old=None):
+    """Lane movement ``ctrl``; a lane with no source (or outside ``row_mask``) gets
+    ``old``, or its own value."""
+    olds = _to_words(old) if old is not None else None
+
+    def one(i, word):
+        o = olds[i] if olds is not None else word
+        return _rocdl.update_dpp(T.i32(), o, word, ctrl, row_mask, 0xF, False)
+
+    return _from_words([one(i, w) for i, w in enumerate(_to_words(x))], kind(_canon(x)))
+
+
+def _readlane(x, lane: int):
+    c = _val(fx.Int32(lane))
+    words = [_rocdl.readlane(T.i32(), w, c) for w in _to_words(x)]
+    return _from_words(words, kind(_canon(x)))
+
+
+def _dpp_reduce(vals, comb, tpr: int, ident=None):
+    """Reduce over groups of ``tpr`` consecutive lanes (a power of two, at most a wave)
+    with DPP, as LLVM's and Triton's wave reductions do: a scan within each row of 16
+    by row shifts, then row broadcasts across rows, which leaves the group total in its
+    last lane; that lane is then read back. Given ``comb``'s identity (one per value),
+    lanes a step has no source for read it and every lane combines, so LLVM folds each
+    move into its combine (``v_add_f32_dpp``); without one they keep their value
+    through a select. The scan order keeps ``comb(earlier, later)``. Instruction count
+    is what counts: a 768-wide LayerNorm is vector-ALU-bound, and went 141us -> 110us
+    with the identity, where DPP alone measured even with ``ds_bpermute``."""
+    lane = imod(tid(), WAVE)
+
+    def step(ctrl, row_mask, ok):
+        if ident is not None:
+            moved = tuple(_dpp(v, ctrl, row_mask, i) for v, i in zip(vals, ident))
+            return tuple(_canon(c) for c in comb(moved, vals))
+        moved = tuple(_dpp(v, ctrl, row_mask) for v in vals)
+        return tuple(_canon(where(ok, c, v)) for c, v in zip(comb(moved, vals), vals))
+
+    k = 1
+    while k < min(tpr, 16):
+        vals = step(_DPP_ROW_SHR + k, 0xF, ge(imod(lane, 16), k))
+        k *= 2
+    if tpr >= 32:
+        vals = step(_DPP_ROW_BCAST15, 0xA, eq(imod(idiv(lane, 16), 2), 1))
+    if tpr == WAVE:
+        vals = step(_DPP_ROW_BCAST31, 0xC, ge(lane, 32))
+        return tuple(_canon(_readlane(v, WAVE - 1)) for v in vals)
+    if tpr == 32:
+        hi = ge(lane, 32)
+        return tuple(
+            _canon(where(hi, _readlane(v, 63), _readlane(v, 31))) for v in vals
+        )
+    last = lane - imod(lane, tpr) + (tpr - 1)
+    return tuple(_canon(_shfl(v, last, WAVE, "idx")) for v in vals)
 
 
 def _to_words(x):
@@ -964,7 +1254,9 @@ def _from_words(words, k):
     )
 
 
-def _group_reduce(vals, comb, tpr: int, smem, threads: int, stride: int = 1):
+def _group_reduce(
+    vals, comb, tpr: int, smem, threads: int, stride: int = 1, ident=None
+):
     """Reduce a tuple of per-thread values over groups of ``tpr`` threads ``stride`` apart.
 
     A group is ``{base + k * stride : k < tpr}``: consecutive threads for a row reduction
@@ -978,11 +1270,14 @@ def _group_reduce(vals, comb, tpr: int, smem, threads: int, stride: int = 1):
     vals = tuple(_canon(v) for v in vals)
     if tpr <= 1:
         return vals
-    off = stride
-    while off < WAVE and off < stride * tpr:
-        peer = tuple(_shfl(v, off, WAVE) for v in vals)
-        vals = comb(vals, peer)
-        off *= 2
+    if stride == 1:
+        vals = _dpp_reduce(vals, comb, min(tpr, WAVE), ident)
+    else:
+        off = stride
+        while off < WAVE and off < stride * tpr:
+            peer = tuple(_shfl(v, off, WAVE) for v in vals)
+            vals = comb(vals, peer)
+            off *= 2
     if stride * tpr <= WAVE:
         return vals
     t = tid()
@@ -1016,6 +1311,108 @@ def _group_reduce(vals, comb, tpr: int, smem, threads: int, stride: int = 1):
     return acc
 
 
+def scan_first(r0_offset, j: int):
+    """Whether run ``j`` of the step at ``r0_offset`` starts the row (no carry yet)."""
+    if j:
+        return False
+    if isinstance(r0_offset, int):
+        return r0_offset == 0
+    return eq(r0_offset, 0)
+
+
+def scan_init(*kinds):
+    return tuple(const(0, k) for k in kinds)
+
+
+def group_scan(fn, values, carry, first, tpr: int, lane):
+    """Inclusive scan of one value per thread over each group of ``tpr`` consecutive
+    lanes (at most a wave), continuing from ``carry``, the previous runs' total.
+
+    ``fn(earlier, later)`` is the combine on tuples. Returns the scanned values followed
+    by the carry for the next run, as one flat tuple. ``first`` (a trace-time or device
+    bool) discards ``carry``.
+    """
+    out, nxt = _group_scan(fn, values, carry, first, tpr, lane)
+    return (*out, *nxt)
+
+
+def group_scan_runs(
+    fn,
+    values,
+    carry,
+    first,
+    tpr: int,
+    lane,
+    state: dict,
+    key,
+    j: int,
+    ept: int,
+    phase: int,
+):
+    """``group_scan`` where each thread owns runs of ``ept`` contiguous elements.
+
+    The body is traced twice per step. Phase 0 only records element ``j``'s value (its
+    results are unused, so the trace is dead code). In phase 1 the run's first element
+    scans the thread's values in registers, scans the per-thread totals across the
+    lanes, and then offsets every element by the lanes before it and the carry, so a
+    run costs one cross-lane scan rather than ``ept``.
+    """
+    run, e = j // ept, j % ept
+    if phase == 0:
+        state[(key, run, e)] = tuple(_canon(v) for v in values)
+        return (*state[(key, run, e)], *carry)
+    if e == 0:
+        pre = [state[(key, run, 0)]]
+        for k in range(1, ept):
+            pre.append(tuple(_canon(v) for v in fn(pre[-1], state[(key, run, k)])))
+        inc, nxt = _group_scan(fn, pre[-1], carry, first, tpr, lane)
+        # inc is inclusive of this lane's total; the lane before holds the exclusive.
+        ex = tuple(_shfl(v, 1, WAVE, "up") for v in inc)
+        lead = eq(lane, 0)
+        outs = []
+        for p in pre:
+            after = tuple(_canon(v) for v in fn(ex, p))
+            if first is True:
+                head = p
+            else:
+                c = tuple(_canon(v) for v in fn(carry, p))
+                head = (
+                    c
+                    if first is False
+                    else tuple(where(first, a, b) for a, b in zip(p, c))
+                )
+            outs.append(tuple(where(lead, h, a) for h, a in zip(head, after)))
+        state[(key, run, "out")] = (outs, nxt)
+    outs, nxt = state[(key, run, "out")]
+    return (*outs[e], *nxt)
+
+
+def _group_scan(fn, values, carry, first, tpr: int, lane):
+    xs = tuple(_canon(v) for v in values)
+    off = 1
+    while off < tpr:
+        ys = tuple(_shfl(x, off, WAVE, "up") for x in xs)
+        comb = fn(ys, xs)
+        ok = ge(lane, off)
+        xs = tuple(where(ok, c, x) for c, x in zip(comb, xs))
+        off *= 2
+    if tpr > 1:
+        last = tid() % WAVE - lane + (tpr - 1)
+        total = tuple(_shfl(x, last, WAVE, "idx") for x in xs)
+    else:
+        total = xs
+    if first is True:
+        return xs, total
+    full = tuple(_canon(v) for v in fn(carry, xs))
+    nxt = tuple(_canon(v) for v in fn(carry, total))
+    if first is False:
+        return full, nxt
+    return (
+        tuple(where(first, x, f) for x, f in zip(xs, full)),
+        tuple(where(first, t, n) for t, n in zip(total, nxt)),
+    )
+
+
 def barrier():
     gpu.barrier()
 
@@ -1043,8 +1440,15 @@ def smem_words(threads: int, components: int) -> int:
 
 def group_reduce(op: str, x, tpr: int, smem, threads: int, stride: int = 1):
     f = _combine_fn(op)
+    x = _canon(x)
     (out,) = _group_reduce(
-        (x,), lambda a, b: (_canon(f(a[0], b[0])),), tpr, smem, threads, stride
+        (x,),
+        lambda a, b: (_canon(f(a[0], b[0])),),
+        tpr,
+        smem,
+        threads,
+        stride,
+        (default(op, kind(x)),),
     )
     return out
 
@@ -1059,7 +1463,12 @@ def _arg_better(op: str, v1, i1, v2, i2):
     if op == "max":
         better = _cmp(v2, v1, _arith.CmpIPredicate.sgt, _arith.CmpFPredicate.OGT)
     else:
-        better = _cmp(v2, v1, _arith.CmpIPredicate.slt, _arith.CmpFPredicate.OLT)
+        better = _cmp(
+            v2,
+            v1,
+            _arith.CmpIPredicate.slt,
+            _arith.CmpFPredicate.OLT,  # codespell:ignore
+        )  # codespell:ignore
     tie = eq(v2, v1)
     if _is_f(k):
         n1, n2 = isnan(v1), isnan(v2)
@@ -1237,18 +1646,33 @@ def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
     return gm, group_reduce("sum", ls, tpr, smem, threads, stride)
 
 
-def group_welford_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
+def group_welford_twopass(
+    items, tpr: int, smem, threads: int, stride: int = 1, count=None
+):
     """(mean, m2, weight) over a row held entirely in registers: a (sum, count) pass, then
     a pass summing squared deviations from the mean -- no per-element divides, as
-    Triton's persistent reductions compute a variance."""
+    Triton's persistent reductions compute a variance. ``count``, the row length when
+    every element counts, drops the count reduction and the divide: the kernel is
+    vector-ALU-bound at LayerNorm widths."""
     xs = _masked_items(items, "f32", 0.0)
-    ones = _masked_items([(const(1.0, "f32"), m) for _, m in items], "f32", 0.0)
-    add2 = lambda a, b: (_canon(add(a[0], b[0])), _canon(add(a[1], b[1])))  # noqa: E731
-    s, n = _group_reduce(
-        (_tree(xs, add), _tree(ones, add)), add2, tpr, smem, threads, stride
-    )
     zero = const(0.0, "f32")
-    mean = _canon(where(eq(n, zero), zero, truediv(s, n)))
+    if count is not None:
+        s = group_reduce("sum", _tree(xs, add), tpr, smem, threads, stride)
+        n = const(float(count), "f32")
+        mean = _canon(mul(s, const(1.0 / count, "f32")))
+    else:
+        ones = _masked_items([(const(1.0, "f32"), m) for _, m in items], "f32", 0.0)
+        add2 = lambda a, b: (_canon(add(a[0], b[0])), _canon(add(a[1], b[1])))  # noqa: E731
+        s, n = _group_reduce(
+            (_tree(xs, add), _tree(ones, add)),
+            add2,
+            tpr,
+            smem,
+            threads,
+            stride,
+            (zero, zero),
+        )
+        mean = _canon(where(eq(n, zero), zero, truediv(s, n)))
     devs = []
     for (x, m), v in zip(items, xs):
         d = sub(v, mean)

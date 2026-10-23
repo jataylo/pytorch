@@ -7,7 +7,9 @@ fallback tests run without it and check the reason that was counted. The access
 classifier tests are pure sympy and run anywhere.
 """
 
+import contextlib
 import unittest
+from unittest.mock import patch
 
 import sympy
 
@@ -289,6 +291,176 @@ class TestFlyDSLSIMD(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
+    # -- atomics ---------------------------------------------------------------------
+
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64])
+    def test_atomic_add(self, dtype):
+        # 16-bit atomics are packed two-lane adds with -0.0 in the neighbour's lane, so
+        # bins nobody hits must keep their exact bits, -0.0 included.
+        v = torch.randn(1000, device="cuda", dtype=dtype)
+        ix = torch.randint(0, 64, (1000,), device="cuda")
+        base = torch.zeros(65, device="cuda", dtype=dtype)
+        base[1::2] = -0.0
+        out = torch.compile(
+            lambda b, v, ix: b.clone().index_put_((ix,), v, accumulate=True)
+        )(base, v, ix)
+        ref = base.double().index_put_((ix,), v.double(), accumulate=True)
+        # ~16 adds a bin, landing in any order, each rounded to dtype.
+        tol = {torch.bfloat16: 1e-1, torch.float16: 2e-2}.get(dtype, 1e-5)
+        torch.testing.assert_close(out.double(), ref, atol=tol, rtol=tol)
+        miss = torch.ones(65, dtype=torch.bool, device="cuda")
+        miss[ix] = False
+        self.assertEqual(
+            torch.signbit(out[miss]).tolist(), torch.signbit(base[miss]).tolist()
+        )
+        c = counters["flydsl_simd"]
+        self.assertGreater(c["flydsl_kernels"], 0)
+        self.assertEqual(c["triton_kernels"], 0)
+
+    # -- scans -----------------------------------------------------------------------
+
+    def test_group_widths(self):
+        # Rows of 8 to 4096 give row groups of 2 to 256 threads: DPP within a wave
+        # (with and without an identity), then LDS across waves. Argmax ties check the
+        # combine order.
+        for r in (8, 24, 64, 100, 300, 1000, 4096):
+            x = torch.randn(129, r, device="cuda")
+            ties = torch.randint(0, 5, (129, r), device="cuda").float()
+            for fn, a in (
+                (lambda t: t.sum(-1), x),
+                (lambda t: t.amax(-1), x),
+                (lambda t: t.argmax(-1), ties),
+                (lambda t: torch.var_mean(t, -1), x),
+                (lambda t: t.double().sum(-1), x),
+            ):
+                torch._dynamo.reset()
+                counters.clear()
+                self.check(fn, a)
+
+    def test_scan_runs(self):
+        # Runs of several elements a thread: scanned in registers, then across lanes.
+        for fn, a in (
+            (lambda x: (x * 0.01 + 1).cumprod(-1), torch.randn(33, 640)),
+            (lambda x: torch.cummax(x, -1)[0], torch.randn(50, 8192)),
+        ):
+            torch._dynamo.reset()
+            counters.clear()
+            self.check(fn, a.cuda(), atol=1e-3, rtol=1e-3)
+        # Eager accumulates a bf16 cumsum in bf16; Inductor in f32 either way.
+        tri, fly = self._vs_triton(
+            lambda x: x.cumsum(-1),
+            torch.randn(20, 4096, device="cuda", dtype=torch.bfloat16),
+        )
+        self.assertEqual(fly, tri, atol=0.25, rtol=1e-2)  # one bf16 ulp
+
+    def test_chained_scans_fall_back(self):
+        a = torch.randn(16, 1024, device="cuda")
+        fn = lambda x: x.cumsum(-1).cumsum(-1)  # noqa: E731
+        with config.patch({"flydsl.simd_strict": False}):
+            out = torch.compile(fn, dynamic=False)(a)
+        torch.testing.assert_close(out, fn(a), atol=1e-2, rtol=1e-3)
+        self.assertGreater(counters["flydsl_simd"]["fallback: chained scans"], 0)
+
+    def test_cumsum(self):
+        # One run per step, scanned across a wave with the carry of earlier runs: short
+        # rows (one run), several runs, a dynamic loop, and a column scan.
+        for shape, dim in (
+            ((1000, 20), -1),
+            ((100, 300), -1),
+            ((64, 5000), -1),
+            ((300, 500), 0),
+        ):
+            torch._dynamo.reset()
+            a = torch.randn(*shape, device="cuda")
+            self.check(lambda x: x.cumsum(dim), a, atol=1e-3, rtol=1e-3)
+        torch._dynamo.reset()
+        self.check(
+            lambda x: x.cumsum(-1), torch.randint(0, 5, (50, 777), device="cuda")
+        )
+
+    def test_tuple_scans(self):
+        a = torch.randn(64, 513, device="cuda")
+        self.check(lambda x: torch.cummax(x, -1), a)
+        torch._dynamo.reset()
+        self.check(lambda x: torch.logcumsumexp(x, -1), a, atol=1e-3, rtol=1e-3)
+        torch._dynamo.reset()
+        self.check(
+            lambda x: x.exp().cumsum(-1) / x.exp().sum(-1, keepdim=True),
+            torch.randn(128, 1000, device="cuda"),
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+    # -- random numbers --------------------------------------------------------------
+
+    def _compiled_random(self, fn, *args):
+        out = torch.compile(fn, dynamic=False)(*args)
+        c = counters["flydsl_simd"]
+        self.assertGreater(c["flydsl_kernels"], 0)
+        self.assertEqual(c["triton_kernels"], 0)
+        return out
+
+    def test_rand_distributions(self):
+        x = torch.empty(1 << 20, device="cuda")
+        u = self._compiled_random(lambda a: torch.rand_like(a), x)
+        self.assertAlmostEqual(u.mean().item(), 0.5, delta=5e-3)
+        self.assertGreaterEqual(u.min().item(), 0.0)
+        self.assertLess(u.max().item(), 1.0)
+        torch._dynamo.reset()
+        n = self._compiled_random(lambda a: torch.randn_like(a), x)
+        self.assertAlmostEqual(n.mean().item(), 0.0, delta=1e-2)
+        self.assertAlmostEqual(n.std().item(), 1.0, delta=1e-2)
+        torch._dynamo.reset()
+        i = self._compiled_random(
+            lambda a: torch.randint(3, 17, a.shape, device="cuda"), x
+        )
+        self.assertEqual((i.min().item(), i.max().item()), (3, 16))
+
+    def test_dropout(self):
+        x = torch.randn(4096, 1024, device="cuda")
+        y = self._compiled_random(
+            lambda a: torch.nn.functional.dropout(a, 0.25, True), x
+        )
+        kept = y != 0
+        self.assertAlmostEqual(kept.float().mean().item(), 0.75, delta=5e-3)
+        torch.testing.assert_close(y[kept], x[kept] / 0.75)
+
+    def _vs_triton(self, fn, x, patches=()):
+        outs = []
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            for fly in (False, True):
+                torch._dynamo.reset()
+                torch.manual_seed(0)
+                with config.patch({"flydsl.simd": fly, "flydsl.simd_strict": fly}):
+                    outs.append(torch.compile(fn)(x))
+        return outs
+
+    def test_rand_matches_triton_philox(self):
+        # The same Philox-4x32-10 stream as Triton: one call per four consecutive
+        # offsets as rand4x, and one per element as tl.rand where an odd size leaves
+        # FlyDSL scalar elements.
+        from torch._inductor.codegen.triton import TritonOverrides
+
+        x = torch.empty(1000, 1000, device="cuda")
+        t, f = self._vs_triton(lambda a: torch.rand_like(a), x)
+        self.assertTrue(torch.equal(t, f))
+        t, f = self._vs_triton(
+            lambda a: (
+                torch.rand_like(a),
+                torch.randint(0, 1 << 40, a.shape, device="cuda"),
+            ),
+            torch.empty(999, 1001, device="cuda"),
+            [
+                patch.object(
+                    TritonOverrides, "_can_use_4x_random", staticmethod(lambda: False)
+                )
+            ],
+        )
+        for a, b in zip(t, f):
+            self.assertTrue(torch.equal(a, b))
+
     # -- plumbing --------------------------------------------------------------------
 
     def test_source_carries_runtime_fingerprint(self):
@@ -319,38 +491,14 @@ class TestFlyDSLSIMDFallback(TestCase):
         self.assertGreater(c["triton_kernels"], 0)
         self.assertTrue(any(reason in k for k in c), dict(c))
 
-    def test_scan(self):
-        self._fallback(
-            lambda x: x.cumsum(1), torch.randn(100, 300, device="cuda"), reason="scan"
-        )
-
-    def test_random(self):
-        self._fallback(
-            lambda x: x + torch.rand_like(x) * 0,
-            torch.randn(1000, device="cuda"),
-            reason="load_seed",
-        )
-
-    def test_bf16_atomic(self):
-        v = torch.randn(1000, device="cuda", dtype=torch.bfloat16)
-        ix = torch.randint(0, 64, (1000,), device="cuda")
-        self._fallback(
-            lambda v, ix: torch.zeros(
-                64, device="cuda", dtype=torch.bfloat16
-            ).scatter_add(0, ix, v),
-            v,
-            ix,
-            reason="atomic_add of torch.bfloat16",
-            # ~16 bf16 atomics per bin, accumulated in whatever order they land.
-            tol=1e-1,
-        )
-
     def test_strict_raises(self):
         with config.patch(
             {"flydsl.simd": True, "flydsl.simd_strict": True, "fx_graph_cache": False}
         ):
             with self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"):
-                torch.compile(lambda x: x.cumsum(0))(torch.randn(100, device="cuda"))
+                torch.compile(lambda x: x + 1, dynamic=True)(
+                    torch.randn(100, device="cuda")
+                )
 
 
 if __name__ == "__main__":
