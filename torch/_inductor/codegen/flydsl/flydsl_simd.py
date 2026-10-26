@@ -987,6 +987,16 @@ class FlyDSLKernel(SIMDKernel):
                 )
         return roots
 
+    def _has_atomic(self) -> bool:
+        from ...loop_body import MemoryUsageType
+
+        return any(
+            e.mode == "atomic_add"
+            for node in self.features.scheduler_nodes()
+            if getattr(node, "_body", None) is not None
+            for e in node._body.memory_usage[MemoryUsageType.STORE]
+        )
+
     def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
         """Choose the thread layout -- ``ept``, ``unroll``, ``tpr``, ``stride``,
         ``xunroll``, persistence -- from the kernel's shape and access patterns."""
@@ -1001,6 +1011,12 @@ class FlyDSLKernel(SIMDKernel):
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
         if not self.is_reduction_kernel:
+            if self._has_atomic():
+                # Atomics are issued an element at a time, and a wave's spread over more
+                # than two elements a lane goes slower: an embedding-gradient scatter
+                # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
+                # 23us at 2 in bf16 (Triton 21us).
+                widest_vec = min(widest_vec, 2)
             self.ept = _tune("ept", _largest_pow2_dividing(self.xnumel, widest_vec))
             # Two runs per thread keep two vector loads in flight per input, as Triton's
             # default pointwise config does, once the grid is big enough to afford it.
