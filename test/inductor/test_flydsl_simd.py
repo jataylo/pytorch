@@ -145,10 +145,15 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 777, device="cuda")
         self.check(
             lambda x: (x * 30).clamp(-120, 120).to(torch.int8).float()
-            + x.to(torch.bfloat16).float()
             + (x > 0).to(torch.uint8),
             a,
         )
+        # A float cast inside a kernel computes in f32, as Triton's does: Inductor
+        # asks for eager's rounding only under emulate_precision_casts.
+        tri, fly = self._vs_triton(lambda x: x.to(torch.bfloat16).float() * 3, a)
+        self.assertEqual(tri, fly, atol=0, rtol=0)
+        with config.patch({"emulate_precision_casts": True}):
+            self.check(lambda x: x.to(torch.bfloat16).float() * 3, a)
 
     def test_bf16_rounding(self):
         # Round to nearest even, ties and the overflow to inf included; NaN stays NaN.
@@ -261,6 +266,19 @@ class TestFlyDSLSIMD(TestCase):
         self.check(lambda x: torch.softmax(x, -1), h, atol=tol, rtol=tol)
         torch._dynamo.reset()
         self.check(lambda x, w: F.layer_norm(x, (4096,), w), h, w, atol=tol, rtol=tol)
+
+    @parametrize("width", [1024, 700])
+    def test_stored_then_reread(self, width):
+        # The residual sum is stored in the first pass and read back in the second; 700
+        # leaves masked lanes, whose stored register must not stand in for the reload.
+        a, b = (torch.randn(256, width, device="cuda", dtype=torch.bfloat16) for _ in "ab")
+        w = torch.randn(width, device="cuda", dtype=torch.bfloat16)
+
+        def fn(a, b, w):
+            h = a + b
+            return h, h * torch.rsqrt(h.float().pow(2).mean(-1, keepdim=True) + 1e-6) * w
+
+        self.check(fn, a, b, w, atol=5e-2, rtol=5e-2)
 
     @parametrize("width", [768, 700, 96])
     def test_var_mean_in_registers(self, width):

@@ -424,11 +424,14 @@ class FlyDSLKernelOverrides(OpOverrides):
         k = storage_kind(dtype)
         if k in ("i8", "u8", "i16"):
             return f"fdp.to(fdp.to({x}, {k!r}), 'i32')"
-        if k in ("f16", "bf16") and not use_compute_types:
-            return f"fdp.to(fdp.to({x}, {k!r}), 'f32')"
         if k in ("f16", "bf16"):
-            # Inductor marks low-precision results that must round; do it.
-            return f"fdp.to(fdp.to({x}, {k!r}), 'f32')"
+            # Computed in f32, as Triton does: Inductor asks for a rounding explicitly
+            # (use_compute_types=False, then an upcast) where eager's must be kept --
+            # under emulate_precision_casts, or for a saved tensor. Rounding every cast
+            # cost a third more bf16 conversions on Llama's RMSNorm: 25us vs 20us.
+            if not use_compute_types:
+                return f"fdp.to(fdp.to({x}, {k!r}), 'f32')"
+            return f"fdp.to({x}, 'f32')"
         return f"fdp.to({x}, {_COMPUTE[k]!r})"
 
     @staticmethod
@@ -1352,9 +1355,13 @@ class FlyDSLKernel(SIMDKernel):
         mask = self._mask_arg(ms)
         buf = self.stores
         if contig:
+            seed = ""
+            if self._persistent_region() and not ms:
+                # A masked lane's register holds a value its reload would read as 0.
+                seed = f", seed=(_lc, {self._site_key(arg, index_str)})"
             line = (
                 f"fdp.vstore(_sc, {repr(f'st{self.load_site}_{name}')}, _j, {w}, _r_{arg}, "
-                f"{index_str}, {value}, {st!r}{mask})"
+                f"{index_str}, {value}, {st!r}{mask}{seed})"
             )
             self.load_site += 1
         else:

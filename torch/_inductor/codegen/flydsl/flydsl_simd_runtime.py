@@ -435,8 +435,12 @@ def memo(cache: dict, key, thunk):
     return cache[key]
 
 
+_FRESH = "__fresh__"
+
+
 def forget(cache: dict, arg: str) -> None:
-    """Drop every cached load of ``arg`` after a store to it."""
+    """Drop every cached load of ``arg`` after a store to it, but the stored values
+    themselves (vstore's ``seed``) entered since the last forget."""
 
     def owner(k):
         while isinstance(k, tuple) and k:
@@ -445,8 +449,12 @@ def forget(cache: dict, arg: str) -> None:
             k = k[0]
         return False
 
+    fresh = cache.get(_FRESH, set())
     for k in [k for k in cache if owner(k)]:
-        del cache[k]
+        if k in fresh:
+            fresh.discard(k)
+        else:
+            del cache[k]
 
 
 def store(r, off, value, st: str, mask=None):
@@ -455,8 +463,13 @@ def store(r, off, value, st: str, mask=None):
     buffer_ops.buffer_store(raw, r, idx(off), mask=_mask(mask))
 
 
-def vstore(cache: dict, key, j: int, w: int, r, off, value, st: str, mask=None):
-    """Element ``j`` of a ``w``-wide contiguous store; the vector goes out on the last one."""
+def vstore(
+    cache: dict, key, j: int, w: int, r, off, value, st: str, mask=None, seed=None
+):
+    """Element ``j`` of a ``w``-wide contiguous store; the vector goes out on the last one.
+
+    ``seed``, a ``(load cache, load key)`` pair, also enters the stored vector there.
+    """
     v = _val(_canon(value))
     raw = _cvt(v, kind_of_type(v.type), _MEM_KIND.get(st, st))
     if j % w == 0:
@@ -480,6 +493,12 @@ def vstore(cache: dict, key, j: int, w: int, r, off, value, st: str, mask=None):
             buffer_ops.buffer_store(
                 words, r, idiv(slot["off"], ratio), mask=slot["mask"]
             )
+        if seed is not None:
+            # A later unrolled loop reading the stored elements back takes the register,
+            # in exactly vload's form, instead of a round trip through memory.
+            lc, lkey = seed
+            lc[(lkey, j // w)] = vec
+            lc.setdefault(_FRESH, set()).add((lkey, j // w))
 
 
 def _packed_half(o, value, st: str):
