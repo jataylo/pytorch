@@ -150,6 +150,25 @@ class TestFlyDSLSIMD(TestCase):
             kinds=["pointwise"],
         )
 
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int8])
+    def test_wave_uniform_load(self, dtype):
+        # A per-channel operand is the same across a wave's lanes and is read with one
+        # scalar load from lane 0's offset; sub-dword elements come out of their word,
+        # and 3 * 8 * 1024 elements leave the last block partly masked. With 5 channels
+        # of a sub-dword type the last word is partial, out of a scalar load's reach.
+        from torch._inductor.utils import run_and_get_code
+
+        for c in (8, 5):
+            torch._dynamo.reset()
+            x = torch.randn(3, c, 16, 64, device="cuda").to(dtype)
+            w = (torch.arange(c, device="cuda") - 2).to(dtype)
+            fn = torch.compile(lambda a, b: a * b[:, None, None] + 1, dynamic=False)
+            out, (code,) = run_and_get_code(fn, x, w)
+            ref = (x.float() * w.float()[:, None, None] + 1).to(dtype)
+            torch.testing.assert_close(out, ref)
+            if c == 8:
+                self.assertIn("fdp.wload(", code)
+
     def test_integer_and_bool(self):
         i = torch.randint(-100, 100, (5000,), device="cuda")
         self.check(lambda x: (x // 3 + x % 7) * 2, i)
@@ -306,12 +325,16 @@ class TestFlyDSLSIMD(TestCase):
     def test_stored_then_reread(self, width):
         # The residual sum is stored in the first pass and read back in the second; 700
         # leaves masked lanes, whose stored register must not stand in for the reload.
-        a, b = (torch.randn(256, width, device="cuda", dtype=torch.bfloat16) for _ in "ab")
+        a, b = (
+            torch.randn(256, width, device="cuda", dtype=torch.bfloat16) for _ in "ab"
+        )
         w = torch.randn(width, device="cuda", dtype=torch.bfloat16)
 
         def fn(a, b, w):
             h = a + b
-            return h, h * torch.rsqrt(h.float().pow(2).mean(-1, keepdim=True) + 1e-6) * w
+            return h, h * torch.rsqrt(
+                h.float().pow(2).mean(-1, keepdim=True) + 1e-6
+            ) * w
 
         self.check(fn, a, b, w, atol=5e-2, rtol=5e-2)
 

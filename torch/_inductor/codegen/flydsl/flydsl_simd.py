@@ -1274,6 +1274,8 @@ class FlyDSLKernel(SIMDKernel):
         return arg
 
     def load(self, name: str, index: sympy.Expr):
+        """Emit a load of ``name`` at ``index``, choosing scalar, wave-uniform,
+        vectorized or gathered access from how the index varies with the lane."""
         arg = self.args.input(name)
         dtype = V.graph.get_dtype(name)
         st = storage_kind(dtype)
@@ -1328,13 +1330,16 @@ class FlyDSLKernel(SIMDKernel):
                 return self.cse.generate(self.loads, staged, dtype=dtype)
         self.load_site += 1
         key = self._site_key(arg, index_str)
-        if (
-            root.is_Integer
-            and not dependent
-            and not ms
-            and arg.startswith("in_ptr")
+        # Scalar loads read whole dwords at dword-aligned offsets, and a dword reaching
+        # past the descriptor reads as 0: a 5-channel bf16 scale lost its last channel.
+        nbytes = self._extent(name)
+        scalar_ok = (
+            arg.startswith("in_ptr")
             and dtype.itemsize <= 4
-        ):
+            and nbytes > 0
+            and nbytes % 4 == 0
+        )
+        if root.is_Integer and not dependent and not ms and scalar_ok:
             skey = repr(("s", arg, index_str)) if hoist else f"('s', {key})"
             line = f"fdp.memo({self._cache()}, {skey}, lambda: fdp.sload(_r_{arg}, {int(root)}, {st!r}))"
             result = self.cse.generate(buffer, line, dtype=dtype)
@@ -1344,6 +1349,17 @@ class FlyDSLKernel(SIMDKernel):
             return result
         if kind == "contig":
             line = f"fdp.vload({self._cache()}, {key}, _j, {w}, _r_{arg}, {index_str}, {st!r}{mask})"
+        elif (
+            kind == "uniform"
+            and not self.is_reduction_kernel
+            and not self.tile2d
+            and scalar_ok
+            and _tune("wload", 1)
+            and classify_access(root, var, WAVE * self.ept) == "uniform"
+        ):
+            # A wave's lanes cover an aligned WAVE * ept elements, all reading one
+            # address; a masked lane's value is unused, so the mask is not needed.
+            line = f"fdp.wload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r})"
         elif kind == "uniform":
             line = f"fdp.uload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r}{mask})"
         else:
@@ -1907,6 +1923,15 @@ class FlyDSLKernel(SIMDKernel):
         self.chunk_post.clear()
 
     # -- module -------------------------------------------------------------------------
+
+    @staticmethod
+    def _extent(name: str) -> int:
+        """Byte extent of buffer ``name``, or 0 when unknown."""
+        node = V.graph.try_get_buffer(name)
+        if node is None:
+            return 0
+        n = _int_or_none(V.graph.sizevars.simplify(node.get_layout().storage_size()))
+        return 0 if n is None else n * node.get_dtype().itemsize
 
     def _arg_extents(self, arg_defs) -> dict[str, int]:
         """Exact byte extent of each tensor argument, for its buffer descriptor."""

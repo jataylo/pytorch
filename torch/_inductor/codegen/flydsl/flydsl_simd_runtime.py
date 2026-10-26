@@ -42,6 +42,7 @@ from flydsl.expr import gpu, math as fmath
 from flydsl.expr.utils.arith import ArithValue
 
 from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
+from torch.utils._ordered_set import OrderedSet
 
 from . import flydsl_mod_runtime as fdu
 
@@ -468,7 +469,16 @@ def land(*ms):
     return out
 
 
-_ITEMSIZE = {"f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1}
+_ITEMSIZE = {
+    "f32": 4,
+    "i32": 4,
+    "f16": 2,
+    "bf16": 2,
+    "i16": 2,
+    "i8": 1,
+    "u8": 1,
+    "b1": 1,
+}
 
 
 def load(r, off, st: str, mask=None):
@@ -495,6 +505,30 @@ def sload(r, off: int, st: str):
         word = _arith.TruncIOp(ir.IntegerType.get_signless(8 * size), word).result
     raw = word if mem == word.type else _arith.BitcastOp(mem, word).result
     return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
+
+
+def wload(cache: dict, key, chunk: int, r, off, st: str):
+    """``sload`` at an offset computed at run time but the same across the wave: lane
+    0's offset, read into an SGPR. Read-only buffers only, as for ``sload``."""
+    if (key, "w", chunk) in cache:
+        return cache[(key, "w", chunk)]
+    size = _ITEMSIZE[st]
+    byte = _val(idx(off) * size)
+    byte = _rocdl.readfirstlane(T.i32(), byte)
+    two = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 2)).result
+    word = buffer_ops.buffer_load(
+        r, _arith.ShRUIOp(byte, two).result, vec_width=1, is_scalar=True
+    )
+    if size < 4:
+        three = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 3)).result
+        shift = _arith.ShLIOp(_arith.AndIOp(byte, three).result, three).result
+        word = _arith.ShRUIOp(word, shift).result
+        word = _arith.TruncIOp(ir.IntegerType.get_signless(8 * size), word).result
+    mem = _STORAGE_IR[st]()
+    raw = word if mem == word.type else _arith.BitcastOp(mem, word).result
+    out = ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
+    cache[(key, "w", chunk)] = out
+    return out
 
 
 def _packing(st: str, w: int):
@@ -582,7 +616,7 @@ def forget(cache: dict, arg: str) -> None:
             k = k[0]
         return False
 
-    fresh = cache.get(_FRESH, set())
+    fresh = cache.get(_FRESH, OrderedSet())
     for k in [k for k in cache if owner(k)]:
         if k in fresh:
             fresh.discard(k)
@@ -649,7 +683,7 @@ def vstore(
             # in exactly vload's form, instead of a round trip through memory.
             lc, lkey = seed
             lc[(lkey, j // w)] = vec
-            lc.setdefault(_FRESH, set()).add((lkey, j // w))
+            lc.setdefault(_FRESH, OrderedSet()).add((lkey, j // w))
 
 
 def _packed_half(o, value, st: str):
