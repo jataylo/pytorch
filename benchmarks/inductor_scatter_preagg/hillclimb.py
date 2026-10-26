@@ -207,7 +207,7 @@ def summarize(args):
             sp = [
                 best_ref(m, v) / m[v]["ms"]
                 for m in shapes.values()
-                if "ms" in m.get(v, {})
+                if "ms" in m.get(v, {}) and best_ref(m, v) is not None
             ]
             vs_cur = [
                 m["current"]["ms"] / m[v]["ms"]

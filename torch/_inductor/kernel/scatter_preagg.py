@@ -755,7 +755,8 @@ def _try_template(
 
     layout = ir.FixedLayout(device=device, dtype=dtype, size=[1], stride=[1])
     # On CDNA, fp32 atomics run ~1.7x faster at two elements per thread than at
-    # the four the compiler derives from load contiguity.
+    # the four the compiler derives from load contiguity, except for wide fp32
+    # rows into a handful of destinations.
     atomic_vec = 2 if torch.version.hip else 0
     # Skipping the scan for blocks with no repeated destination pays for its
     # check only on wide slices or 16-bit outputs (measured on gfx942).
@@ -780,7 +781,12 @@ def _try_template(
             NUM_KEYS=num_keys,
             KEY_DTYPE="tl.int32" if key_bits + log_block_t <= 31 else "tl.int64",
             OUT_DTYPE=triton_type(dtype),
-            ATOMIC_VEC=atomic_vec if cfg.block_d >= atomic_vec else 0,
+            ATOMIC_VEC=(
+                0
+                if cfg.block_d < atomic_vec
+                or (cfg.block_d >= 64 and num_keys <= 64 and dtype.itemsize >= 4)
+                else atomic_vec
+            ),
             SKIP_UNIQUE_SCAN=dtype.itemsize < 4 or cfg.block_d >= 64,
         )
     if not choices:
