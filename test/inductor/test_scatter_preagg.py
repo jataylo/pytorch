@@ -190,6 +190,16 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, src)
 
+    def test_single_destination(self):
+        x = torch.zeros(1, 64, device=GPU_TYPE)
+        idx = torch.zeros(65_536, dtype=torch.long, device=GPU_TYPE)
+        v = torch.randn(65_536, 64, device=GPU_TYPE)
+
+        def fn(x, i, v):
+            return x.index_put_((i,), v, accumulate=True)
+
+        self._check(fn, x, idx, v, atol=1e-2)
+
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_blocks_without_duplicates(self, dtype):
         # Consecutive tokens never repeat a destination within a block, which

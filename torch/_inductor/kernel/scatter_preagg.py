@@ -530,8 +530,11 @@ _TEMPLATE_SOURCE = r"""
             _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
         else:
             acc = val
+        # The address drops out_key when there is a single destination.
         tl.atomic_add(
-            OUT + ({{preagg_addr("out_key", "atomic_inner")}}),
+            tl.broadcast_to(
+                OUT + ({{preagg_addr("out_key", "atomic_inner")}}), [BLOCK_T, BLOCK_D]
+            ),
             acc.to(OUT_DTYPE),
             mask=seg_end[:, None] & inner_mask[None, :],
             sem="relaxed",
