@@ -1426,12 +1426,17 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         return ScatterPreaggConfig(block_t, block_d, d_iters, 1, num_warps)
 
     def get_scatter_preagg_configs(
-        self, num_tokens: int, num_inner: int, dtype: Any
+        self,
+        num_tokens: int,
+        num_inner: int,
+        dtype: Any,
+        inner_contiguous: bool = True,
     ) -> list[ScatterPreaggConfig]:
         configs: list[ScatterPreaggConfig] = []
+        block_ds = (32, 64) if inner_contiguous else (8, 16)
         if config.max_autotune:
             for max_block_d, tile_elems, num_warps in itertools.product(
-                (32, 64), (4096, 8192, 16384), (4, 8)
+                block_ds, (4096, 8192, 16384), (4, 8)
             ):
                 cfg = self._scatter_preagg_config(
                     num_tokens, num_inner, max_block_d, tile_elems, num_warps
@@ -1439,10 +1444,15 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
                 if cfg not in configs:
                     configs.append(cfg)
 
-        # Narrow slices for narrow rows; a full 16K-element tile when one slice
-        # covers the row, half that when the program loops over slices.
-        max_block_d = 32 if num_inner <= 128 else 64
-        tile_elems = 16384 if num_inner <= max_block_d else 8192
+        # Narrow slices for narrow rows; larger tiles make the per-block sort
+        # cost more than the extra pre-aggregation saves. When inner elements
+        # are strided in the output each one is its own memory transaction, so
+        # thin slices of many tokens keep sorted neighbours together instead.
+        if inner_contiguous:
+            max_block_d = 32 if num_inner <= 128 else 64
+            tile_elems = 8192
+        else:
+            max_block_d, tile_elems = 8, 4096
         default_config = self._scatter_preagg_config(
             num_tokens, num_inner, max_block_d, tile_elems, 4
         )

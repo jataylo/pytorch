@@ -190,6 +190,28 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, src)
 
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_blocks_without_duplicates(self, dtype):
+        # Consecutive tokens never repeat a destination within a block, which
+        # takes the path that skips the segmented scan.
+        x = torch.zeros(1024, 256, device=GPU_TYPE, dtype=dtype)
+        idx = torch.arange(65_536, device=GPU_TYPE) % 1024
+        v = torch.randn(65_536, 256, device=GPU_TYPE, dtype=dtype)
+
+        def fn(x, i, v):
+            return x.index_put_((i,), v, accumulate=True)
+
+        if dtype == torch.float32:
+            self._check(fn, x, idx, v)
+            return
+        ref = fn(x.float().clone(), idx, v.float())
+        out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0)
+        self.assertEqual(
+            counters["inductor"]["scatter_preagg_applied"],
+            1 if _has_native_bf16_atomics() else 0,
+        )
+
     def test_scatter_add_full_index(self):
         x = torch.zeros(16, 8, device=GPU_TYPE)
         idx = torch.randint(0, 16, (20_000, 8), device=GPU_TYPE)
@@ -342,7 +364,11 @@ class TestScatterPreagg(TestCase):
 
         default = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertEqual(len(default), 1)
-        self.assertEqual((default[0].block_t, default[0].block_d), (512, 32))
+        self.assertEqual((default[0].block_t, default[0].block_d), (256, 32))
+        strided = V.choices.get_scatter_preagg_configs(
+            50_000, 256, torch.float32, inner_contiguous=False
+        )
+        self.assertEqual((strided[0].block_t, strided[0].block_d), (512, 8))
         with config.patch(max_autotune=True):
             tuned = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertGreater(len(tuned), 1)

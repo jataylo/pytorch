@@ -467,11 +467,7 @@ class ScatterPreaggTemplate(TritonTemplate):
     kernel_type = ScatterPreaggTemplateKernel
 
 
-scatter_preagg_template = ScatterPreaggTemplate(
-    name="scatter_preagg",
-    grid=scatter_preagg_grid,
-    always_freeze_layout=True,
-    source=r"""
+_TEMPLATE_SOURCE = r"""
 {{preagg_def_kernel()}}
     pid_tok = tl.program_id(0).to(INDEX_DTYPE)
     pid_inner = tl.program_id(1).to(INDEX_DTYPE)
@@ -504,6 +500,11 @@ scatter_preagg_template = ScatterPreaggTemplate(
     seg_end = (skey < NUM_KEYS) & ((skey != next_key) | (pos == BLOCK_T - 1))
     out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
     seg_key = tl.broadcast_to(skey[:, None], (BLOCK_T, BLOCK_D))
+    if SKIP_UNIQUE_SCAN:
+        # Every valid token that does not end a segment has a duplicate.
+        has_dup = tl.max(((skey < NUM_KEYS) & ~seg_end).to(tl.int32), 0) > 0
+    else:
+        has_dup = True
 
     # The sort is amortized over D_ITERS inner blocks so BLOCK_T can stay
     # large (more pre-aggregation) while the register tile stays small.
@@ -513,14 +514,24 @@ scatter_preagg_template = ScatterPreaggTemplate(
         # Clamping also hides contiguity, which disables vectorized loads.
         if NUM_INNER % (BLOCK_D * D_ITERS) == 0:
             inner = inner_raw[None, :]
+            if ATOMIC_VEC:
+                atomic_inner = tl.max_contiguous(
+                    tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
+                )[None, :]
+            else:
+                atomic_inner = inner
         else:
             inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
+            atomic_inner = inner
 
         {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
 
-        _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
+        if has_dup:
+            _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
+        else:
+            acc = val
         tl.atomic_add(
-            OUT + ({{preagg_addr("out_key", "inner")}}),
+            OUT + ({{preagg_addr("out_key", "atomic_inner")}}),
             acc.to(OUT_DTYPE),
             mask=seg_end[:, None] & inner_mask[None, :],
             sem="relaxed",
@@ -530,7 +541,13 @@ scatter_preagg_template = ScatterPreaggTemplate(
 @triton.jit
 def _preagg_segmented_sum(key_a, val_a, key_b, val_b):
     return key_b, tl.where(key_a == key_b, val_a + val_b, val_b)
-""",
+"""
+
+scatter_preagg_template = ScatterPreaggTemplate(
+    name="scatter_preagg",
+    grid=scatter_preagg_grid,
+    always_freeze_layout=True,
+    source=_TEMPLATE_SOURCE,
 )
 
 
@@ -701,8 +718,18 @@ def _try_template(
             buf.freeze_layout()
         inputs.append(buf)
 
+    inner_contiguous = (
+        not plan.inner_out_dims
+        or V.graph.sizevars.statically_known_equals(
+            out_buf.get_layout().stride[plan.inner_out_dims[-1]], 1
+        )
+    )
     configs = V.choices.get_scatter_preagg_configs(
-        num_tokens, num_inner, dtype, device_type=device.type
+        num_tokens,
+        num_inner,
+        dtype,
+        device_type=device.type,
+        inner_contiguous=inner_contiguous,
     )
     # The sort packs (key, position) into one integer.
     key_bits = (num_keys + 1).bit_length()
@@ -727,6 +754,11 @@ def _try_template(
     value_subgraph.preagg_plan = plan  # type: ignore[attr-defined]
 
     layout = ir.FixedLayout(device=device, dtype=dtype, size=[1], stride=[1])
+    # On CDNA, fp32 atomics run ~1.7x faster at two elements per thread than at
+    # the four the compiler derives from load contiguity.
+    atomic_vec = 2 if torch.version.hip else 0
+    # Skipping the scan for blocks with no repeated destination pays for its
+    # check only on wide slices or 16-bit outputs (measured on gfx942).
     choices: list[Any] = []
     for cfg in configs:
         log_block_t = cfg.block_t.bit_length() - 1
@@ -748,6 +780,8 @@ def _try_template(
             NUM_KEYS=num_keys,
             KEY_DTYPE="tl.int32" if key_bits + log_block_t <= 31 else "tl.int64",
             OUT_DTYPE=triton_type(dtype),
+            ATOMIC_VEC=atomic_vec if cfg.block_d >= atomic_vec else 0,
+            SKIP_UNIQUE_SCAN=dtype.itemsize < 4 or cfg.block_d >= 64,
         )
     if not choices:
         _record_skip("codegen_failed")
