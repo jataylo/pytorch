@@ -98,6 +98,23 @@ def main():
             "ps vs base", [m["base"]["ms"] / m["ps"]["ms"] for m in full.values()]
         )
     )
+    # "both" enables preagg and ps together, as they would ship: ps takes the
+    # scatters preagg declines.
+    with_both = {k: m for k, m in full.items() if "ms" in m.get("both", {})}
+    if with_both:
+        both = {
+            k: min(m["base"]["ms"], m["ps"]["ms"]) / m["both"]["ms"]
+            for k, m in with_both.items()
+        }
+        print(summarize("both vs best(base,ps)", list(both.values())))
+        print(
+            summarize("both, preagg fired", [v for k, v in both.items() if k in fired])
+        )
+        print(
+            summarize(
+                "both, preagg declined", [v for k, v in both.items() if k not in fired]
+            )
+        )
 
     def table(title, keyfn, subset=full):
         groups = collections.defaultdict(list)
