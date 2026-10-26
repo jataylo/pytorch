@@ -553,6 +553,22 @@ class TestFlyDSLSIMD(TestCase):
         self.assertIn(f"# runtime {_runtime_fingerprint()}", code)
         self.assertIn("async_compile.flydsl(", code)
 
+    def test_autotuned_in_place(self):
+        # A pointwise kernel this large times its candidates on its first call; one that
+        # updates a buffer in place must be timed on a copy and applied exactly once.
+        from torch._inductor.utils import run_and_get_code
+
+        x = torch.randn(64, 64, 32, 32, device="cuda")
+        conv = torch.nn.Conv2d(64, 64, 3, padding=1).cuda()
+        with torch.no_grad():
+            ref = conv(x)
+            fn = torch.compile(conv)
+            out, (code,) = run_and_get_code(fn, x)
+            torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+            torch.testing.assert_close(fn(x), ref, atol=1e-4, rtol=1e-4)
+        self.assertIn("fdp.pick_fastest(", code)
+        self.assertIn("in_out_ptr0", code)
+
 
 @requires_flydsl
 class TestFlyDSLSIMDFallback(TestCase):

@@ -1771,4 +1771,39 @@ def group_welford_twopass(
     return mean, m2, n
 
 
+# ---------------------------------------------------------------------------------------
+# Host side
+# ---------------------------------------------------------------------------------------
+
+
+def pick_fastest(mains, args, mutated, stream=None):
+    """An autotuned kernel's first call: time every candidate's ``_main`` on copies of
+    the buffers it updates in place, run the fastest on the real arguments, and return
+    it. Under graph capture nothing can be timed: the first (heuristic) one runs, and
+    None leaves the choice to a later call.
+    """
+    import torch
+    from torch._inductor.runtime.benchmarking import benchmarker
+
+    if torch.cuda.is_current_stream_capturing():
+        mains[0](*args, stream=stream)
+        return None
+    scratch = list(args)
+    for i in mutated:
+        scratch[i] = args[i].clone()
+    times = []
+    for fn in mains:
+        fn(*scratch, stream=stream)  # compiles (and runs once)
+        times.append(
+            benchmarker.benchmark_gpu(
+                lambda fn=fn: fn(*scratch, stream=stream),
+                rep=40,
+                is_vetted_benchmarking=True,
+            )
+        )
+    best = mains[times.index(min(times))]
+    best(*args, stream=stream)
+    return best
+
+
 del _math

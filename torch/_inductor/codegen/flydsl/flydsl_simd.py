@@ -83,6 +83,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 THREADS = 256
+# Pointwise kernels this large time a few launch configurations on their first call.
+# At 2M elements the candidates tied on every Llama and GPT kernel, doubling their
+# compile time for nothing.
+AUTOTUNE_MIN_NUMEL = 1 << 22
 # A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
 TILE_THREADS = 128
 WAVE = 64
@@ -553,8 +557,25 @@ def _tune_table() -> dict[str, int]:
     return out
 
 
+_TUNE_OVERRIDE: dict[str, int] = {}
+
+
 def _tune(name: str, default: int = 0) -> int:
+    if name in _TUNE_OVERRIDE:
+        return _TUNE_OVERRIDE[name]
     return _tune_table().get(name, default)
+
+
+@contextlib.contextmanager
+def _tune_override(values: dict[str, int]):
+    """Launch parameters for one autotuning candidate, over the env's."""
+    saved = dict(_TUNE_OVERRIDE)
+    _TUNE_OVERRIDE.update(values)
+    try:
+        yield
+    finally:
+        _TUNE_OVERRIDE.clear()
+        _TUNE_OVERRIDE.update(saved)
 
 
 def _stage_enabled(stage: str) -> bool:
@@ -2224,17 +2245,17 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
         def {kname}_launch({launch_sig}, stream: fx.Stream = fx.Stream(None)):
             {kname}_kernel({", ".join(arg_names)}).launch(grid=(_grid, 1, 1), block=({threads}, 1, 1), stream=stream)
 {hints}
-        _compiled = None
+        {kname}_compiled = None
 
 
         def {kname}_main({", ".join(arg_names)}, stream=None):
-            global _compiled
+            global {kname}_compiled
             args = ({"".join(f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
-            if _compiled is None:
+            if {kname}_compiled is None:
                 # flyc.compile launches once while compiling, so this call is done.
-                _compiled = flyc.compile({kname}_launch, *args)
+                {kname}_compiled = flyc.compile({kname}_launch, *args)
                 return
-            _compiled(*args)
+            {kname}_compiled(*args)
 
 
         def {kname}_precompile(**_):
@@ -2291,6 +2312,39 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
             arg_names, start, kernels[0].threads, all(k.slp for k in kernels)
         )
     )
+    return code.getvalue()
+
+
+def _autotune_source(srcs: list[str], arg_names: list[str]) -> str:
+    """One module holding each candidate's kernel (``_c0`` the heuristic's) and a
+    ``_main`` that times them on the first call and keeps the fastest."""
+    kname = str(Placeholder.KERNEL_NAME)
+    names = [f"{kname}_c{i}" for i in range(len(srcs))]
+    parts = [s.replace(kname, n) for s, n in zip(srcs, names)]
+    args = ", ".join(arg_names)
+    mutated = tuple(i for i, a in enumerate(arg_names) if a.startswith("in_out_ptr"))
+    precompiles = "".join(f"\n            {n}_precompile(**kw)" for n in names)
+    parts.append(
+        f"""
+        {kname}_best = None
+
+
+        def {kname}_main({args}, stream=None):
+            global {kname}_best
+            if {kname}_best is None:
+                {kname}_best = fdp.pick_fastest(
+                    [{", ".join(f"{n}_main" for n in names)}], ({args},), {mutated!r}, stream
+                )
+                return
+            {kname}_best({args}, stream=stream)
+
+
+        def {kname}_precompile(**kw):{precompiles}
+        """
+    )
+    code = IndentedBuffer()
+    for p in parts:
+        code.splice(p)
     return code.getvalue()
 
 
@@ -2486,6 +2540,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                 src_code = kernel.codegen_kernel()
             if not _stage_enabled(kernel.stage):
                 raise FlyDSLUnsupported(f"stage {kernel.stage} disabled")
+            src_code = self._with_candidates(
+                kernel, src_code, kernel_features, node_schedule, tiling
+            )
         except FlyDSLUnsupported:
             metrics.generated_kernel_count = count_before
             raise
@@ -2511,6 +2568,57 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         ]
         self._launch_kernel_and_cleanup(kernel, base_nodes, free_buffers=False)
         self.free_buffers_in_scheduler()
+
+    @staticmethod
+    def _candidates(kernel: FlyDSLKernel) -> list[dict[str, int]]:
+        """Launch parameters to time against the heuristic's for a large pointwise
+        kernel. Which is fastest depends on what the kernel's inputs were last touched
+        by, so it is measured, as Triton autotunes these: in ResNet's training step an
+        in-place conv bias add takes 106us at 2048 elements a block, 84us at 256 (Triton
+        95us), while its BatchNorm backward takes 96us at 2048 and 84us at 8192 (Triton
+        76us) -- and 1024-element blocks of either take 150us."""
+        if (
+            kernel.is_reduction_kernel
+            or kernel.tile2d
+            or kernel.in_combo
+            or kernel.xnumel < AUTOTUNE_MIN_NUMEL
+            or kernel._has_atomic()
+            or not _tune("autotune", 1)
+            or any(k in _tune_table() for k in ("ept", "unroll", "threads"))
+        ):
+            return []
+        w = kernel.ept
+        # Each candidate costs a compile. 4096-element blocks won a few ResNet kernels
+        # by 3-9% over these, never by more.
+        cands = [
+            {"ept": max(1, w // 2), "unroll": 1, "threads": 128},
+            {"ept": w, "unroll": 8, "threads": THREADS},
+        ]
+        base = (kernel.ept, kernel.unroll, kernel.threads)
+        return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
+
+    def _with_candidates(
+        self, kernel, src_code, kernel_features, node_schedule, tiling
+    ) -> str:
+        cands = self._candidates(kernel)
+        if not cands:
+            return src_code
+        arg_names = kernel.arg_names()
+        srcs = [src_code]
+        count = metrics.generated_kernel_count
+        try:
+            for cand in cands:
+                with _tune_override(cand):
+                    k = FlyDSLKernel(tiling, features=kernel_features)
+                    self.codegen_node_schedule_with_kernel(node_schedule, k)
+                    with V.set_kernel_handler(k):
+                        srcs.append(k.codegen_kernel())
+                if k.arg_names() != arg_names:
+                    return src_code
+        finally:
+            # pyrefly: ignore [bad-assignment]
+            metrics.generated_kernel_count = count
+        return _autotune_source(srcs, arg_names)
 
     def _define_flydsl_kernel(self, src_code: str, node_schedule) -> str:
         wrapper = V.graph.wrapper_code
