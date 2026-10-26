@@ -552,6 +552,16 @@ def _tune(name: str, default: int = 0) -> int:
     return _tune_table().get(name, default)
 
 
+def _stage_enabled(stage: str) -> bool:
+    """``TORCHINDUCTOR_FLYDSL_SIMD_STAGES="pointwise,row"`` limits FlyDSL to those
+    kernel classes (see ``FlyDSLKernel.stage``; ``combo`` for combo kernels), the rest
+    going to Triton: what each class is worth to a model on its own."""
+    import os
+
+    stages = os.environ.get("TORCHINDUCTOR_FLYDSL_SIMD_STAGES")
+    return not stages or stage in stages.split(",")
+
+
 def _num_cus() -> int:
     try:
         return torch.cuda.get_device_properties(
@@ -754,6 +764,7 @@ class FlyDSLKernel(SIMDKernel):
         self.scan_runs = (
             False  # a scan over runs of ept > 1 elements: two traced passes
         )
+        self.has_scan = False
         self.rstep = 1
         self.load_site = 0
         self.region = 0  # bumped per flushed scf.for loop: see _site_key
@@ -1393,6 +1404,7 @@ class FlyDSLKernel(SIMDKernel):
         lanes and fold in the carry of the runs before it."""
         if not self.inside_reduction:
             raise FlyDSLUnsupported("scan outside a reduction loop")
+        self.has_scan = True
         if self._load_mask:
             raise FlyDSLUnsupported("scan inside ops.masked")
         if self.tpr * self.stride > self.threads or self.tpr > WAVE:
@@ -1807,6 +1819,19 @@ class FlyDSLKernel(SIMDKernel):
                 raise FlyDSLUnsupported("buffer of 2 GiB or more")
             extents[a] = nbytes
         return extents
+
+    @property
+    def stage(self) -> str:
+        """The kernel's class, for ``TORCHINDUCTOR_FLYDSL_SIMD_STAGES``."""
+        if self.tile2d:
+            return "tile"
+        if not self.is_reduction_kernel:
+            return "pointwise"
+        if self.has_scan:
+            return "scan"
+        if self.stride > 1:
+            return "column"
+        return "row" if self._pure_reduction() else "norm"
 
     @property
     def slp(self) -> bool:
@@ -2240,6 +2265,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         from ..common import KernelArgs
         from ..simd_kernel_features import SIMDKernelFeatures
 
+        if not _stage_enabled("combo"):
+            raise FlyDSLUnsupported("stage combo disabled")
         count_before = metrics.generated_kernel_count
         built = []
         try:
@@ -2343,6 +2370,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             self.codegen_node_schedule_with_kernel(node_schedule, kernel)
             with V.set_kernel_handler(kernel):
                 src_code = kernel.codegen_kernel()
+            if not _stage_enabled(kernel.stage):
+                raise FlyDSLUnsupported(f"stage {kernel.stage} disabled")
         except FlyDSLUnsupported:
             metrics.generated_kernel_count = count_before
             raise
