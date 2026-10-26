@@ -10,7 +10,7 @@ backend, so the difference is entirely the generated kernels. ``kern`` is Induct
 generated kernel count, which should match between backends when fusion is unchanged.
 The models live in models.py.
 
-    python benchmarks/inductor_backends/flydsl_simd/bench_models.py [--only NAME ...] [--quick] [--json out.json]
+    python benchmarks/inductor_backends/flydsl_simd/bench_models.py [--only NAME ...] [--quick] [--repeats N] [--json out.json]
 """
 
 from __future__ import annotations
@@ -89,11 +89,21 @@ def child(name, backend, env, cwd, mode="default"):
     raise RuntimeError(f"{name}/{backend} failed:\n{out.stderr[-4000:]}")
 
 
-def run_model(name, quick, gpu):
-    """Both backends for one model, on one GPU; returns (rows, printed lines)."""
-    rows, lines, base = [], [], None
-    for backend in ("triton", "flydsl"):
-        with tempfile.TemporaryDirectory() as d:
+def run_model(name, quick, gpu, repeats=1):
+    """Both backends for one model, on one GPU; returns (rows, printed lines).
+
+    With ``repeats`` > 1 the CUDA-graph step is timed that many times per backend, in
+    fresh processes alternating between the backends, and reported as the median with
+    the spread (max - min): a single run of a 10-30 ms step varies by up to ~0.8 ms.
+    """
+    import contextlib
+    import statistics
+
+    rows, lines = [], []
+    with contextlib.ExitStack() as stack:
+        envs, first, graphs, failed = {}, {}, {"triton": [], "flydsl": []}, {}
+        for backend in ("triton", "flydsl"):
+            d = stack.enter_context(tempfile.TemporaryDirectory())
             env = dict(os.environ)
             env.update(
                 TORCHINDUCTOR_CACHE_DIR=os.path.join(d, "inductor"),
@@ -102,23 +112,41 @@ def run_model(name, quick, gpu):
             )
             if gpu is not None:
                 env["HIP_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            envs[backend] = (env, d)
             try:
                 cold = child(name, backend, env, d)
                 warm = cold if quick else child(name, backend, env, d)
-                graphs = child(name, backend, env, d, "reduce-overhead")
+                first[backend] = (cold, warm)
             except RuntimeError as e:
-                lines.append(f"{name:18s} {backend:7s} FAILED: {str(e)[-300:]}")
-                rows.append(
-                    {"model": name, "backend": backend, "error": str(e)[-4000:]}
-                )
-                continue
+                failed[backend] = str(e)
+        for _ in range(repeats):
+            for backend in ("triton", "flydsl"):
+                if backend in failed:
+                    continue
+                env, d = envs[backend]
+                try:
+                    graphs[backend].append(
+                        child(name, backend, env, d, "reduce-overhead")["step_ms"]
+                    )
+                except RuntimeError as e:
+                    failed[backend] = str(e)
+    base = None
+    for backend in ("triton", "flydsl"):
+        if backend in failed:
+            lines.append(f"{name:18s} {backend:7s} FAILED: {failed[backend][-300:]}")
+            rows.append({"model": name, "backend": backend, "error": failed[backend][-4000:]})
+            continue
+        cold, warm = first[backend]
+        g = graphs[backend]
         row = {
             "model": name,
             "backend": backend,
             "cold_s": cold["first_s"],
             "warm_s": warm["first_s"],
             "step_ms": min(cold["step_ms"], warm["step_ms"]),
-            "graph_step_ms": graphs["step_ms"],
+            "graph_step_ms": statistics.median(g),
+            "graph_spread_ms": max(g) - min(g),
+            "graph_runs_ms": g,
             "kernels": cold["kernels"],
             "flydsl": cold["flydsl"],
             "triton": cold["triton"],
@@ -133,9 +161,10 @@ def run_model(name, quick, gpu):
             if backend == "triton"
             else f"flydsl={row['flydsl']} triton={row['triton']} {row['fallbacks'] or ''}"
         )
+        spread = f" ±{row['graph_spread_ms'] / 2:.2f}" if repeats > 1 else ""
         lines.append(
             f"{name:18s} {backend:7s} {row['cold_s']:7.1f} {row['warm_s']:7.1f} {row['step_ms']:8.2f}"
-            f" {row['graph_step_ms']:9.2f} {ratio:6.3f} {row['kernels']:5d}  {kern}"
+            f" {row['graph_step_ms']:9.2f} {ratio:6.3f} {row['kernels']:5d}  {kern}{spread}"
         )
     return rows, lines
 
@@ -153,6 +182,12 @@ def main():
         "--gpus",
         type=lambda s: [int(g) for g in s.split(",")],
         help="run models in parallel, one per listed GPU (both backends of a model share one)",
+    )
+    p.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="CUDA-graph timings per backend (fresh processes, alternating); median reported",
     )
     a = p.parse_args()
     names = [n for n in MODELS if not a.only or n in a.only]
@@ -173,7 +208,7 @@ def main():
         def job(name):
             g = free.get()
             try:
-                out = run_model(name, a.quick, g)
+                out = run_model(name, a.quick, g, a.repeats)
             finally:
                 free.put(g)
             print("\n".join(out[1]), flush=True)
@@ -183,7 +218,7 @@ def main():
             results.update(zip(names, ex.map(job, names)))
     else:
         for name in names:
-            results[name] = run_model(name, a.quick, None)
+            results[name] = run_model(name, a.quick, None, a.repeats)
             print("\n".join(results[name][1]), flush=True)
     rows = [r for n in names for r in results[n][0]]
     if a.json:

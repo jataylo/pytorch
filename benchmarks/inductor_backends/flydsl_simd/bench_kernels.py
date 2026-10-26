@@ -193,6 +193,13 @@ CASES = {
         [_r(64, 64, 64, 64)],
     ),
     # Llama pieces
+    # RMSNorm weight gradient: a sum over tokens, contiguous along the channels. In
+    # f32 and without Llama's bf16 rounding of the normalized input, so eager is a
+    # fair reference for both backends.
+    "rmsnorm_wgrad_bf16": (
+        lambda a, b, h, rs: ((a.float() + b.float()) * (h.float() * rs)).sum((0, 1)),
+        [_r(4, 1024, 1024, dtype=bf16)] * 3 + [_r(4, 1024, 1)],
+    ),
     "rope_bf16": (
         lambda x, c, s: x * c + torch.cat((-x[..., 32:], x[..., :32]), -1) * s,
         [

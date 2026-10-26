@@ -999,11 +999,15 @@ class FlyDSLKernel(SIMDKernel):
             self.unroll = 2 if self.xnumel >= 2 * per_block * enough_blocks else 1
             return
         x, r = self._x_sym(), self._r_sym()
+        # One vote per load: `indices` holds each distinct index once, so three inputs
+        # read at one x-contiguous index tied a small r-contiguous one and kept the
+        # row layout -- 184us vs Triton's 28us on Llama's RMSNorm weight gradient.
+        votes = self._memory_roots(stores=False) or roots
         r_contig = sum(
-            classify_access(e, r, 2) == "contig" for e in roots if r in e.free_symbols
+            classify_access(e, r, 2) == "contig" for e in votes if r in e.free_symbols
         )
         x_contig = sum(
-            classify_access(e, x, 2) == "contig" for e in roots if r in e.free_symbols
+            classify_access(e, x, 2) == "contig" for e in votes if r in e.free_symbols
         )
         if self.features.contains_op("scan"):
             self._finalize_scan(x_contig > r_contig, widest_vec)
