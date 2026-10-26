@@ -93,6 +93,8 @@ def _val(x):
     """Bare ``ir.Value`` behind anything the generated code can hold."""
     if isinstance(x, ir.Value):
         return x
+    if isinstance(x, Aff):
+        return _val(x.value())
     if hasattr(x, "ir_value"):
         return x.ir_value()
     return ArithValue(x)
@@ -281,12 +283,122 @@ def _float_kind(*xs) -> str:
 # ---------------------------------------------------------------------------------------
 
 
+class Aff:
+    """An i32 index ``base + c`` whose constant stays a Python int at trace time.
+
+    The generated code computes a thread's offsets from ``tid()``/``bid()`` and the
+    unrolled loop counters, so every run, row and chunk of a thread shares one ``base``
+    and differs only in ``c``. Added last, ``c`` is folded by the backend into the
+    buffer instruction's immediate offset; added where the expression happened to
+    put it, it was buried under the row stride's multiply -- a 32-wide sum's 16 loads
+    took 53 address instructions, 7 now. Anything not affine in the operands
+    (division, comparison, ...) folds the constant in and goes on as an ordinary
+    value. No ``ir_value``, so ``ArithValue`` operators defer to these.
+    """
+
+    __slots__ = ("base", "c")
+
+    def __init__(self, base, c: int = 0):
+        self.base = base
+        self.c = c
+
+    def value(self):
+        if self.base is None:
+            return const(self.c, "i32")
+        return self.base + self.c if self.c else self.base
+
+    @staticmethod
+    def _of(o):
+        """``o`` as an Aff, or None when it is not an i32 index."""
+        if isinstance(o, Aff):
+            return o
+        if isinstance(o, bool) or not isinstance(o, int):
+            v = _val(o) if not isinstance(o, float) else None
+            if v is None or kind_of_type(v.type) != "i32":
+                return None
+            return Aff(ArithValue(v))
+        return Aff(None, o)
+
+    def _join(self, o, sign: int):
+        a = Aff._of(o)
+        if a is None:
+            return add(self.value(), o) if sign > 0 else sub(self.value(), o)
+        if a.base is None:
+            base = self.base
+        elif self.base is None:
+            base = a.base if sign > 0 else ArithValue(fx.Int32(0)) - a.base
+        else:
+            base = self.base + a.base if sign > 0 else self.base - a.base
+        return Aff(base, self.c + sign * a.c)
+
+    def __add__(self, o):
+        return self._join(o, 1)
+
+    __radd__ = __add__
+
+    def __sub__(self, o):
+        return self._join(o, -1)
+
+    def __rsub__(self, o):
+        return Aff(None, 0)._join(o, 1)._join(self, -1)
+
+    def __neg__(self):
+        return Aff(None, 0)._join(self, -1)
+
+    def __mul__(self, o):
+        if isinstance(o, int) and not isinstance(o, bool):
+            return Aff(None if self.base is None else self.base * o, self.c * o)
+        a = Aff._of(o)
+        if a is not None and a.base is None:
+            return self * a.c
+        if self.base is None and a is not None:
+            return a * self.c
+        return Aff(ArithValue(_val(mul(self.value(), o))))
+
+    __rmul__ = __mul__
+
+    def _opaque(self, o, op):
+        o = o.value() if isinstance(o, Aff) else o
+        r = op(self.value(), o)
+        return Aff(r) if kind_of_type(_val(r).type) == "i32" else r
+
+    def __floordiv__(self, o):
+        return self._opaque(o, lambda a, b: a // b)
+
+    def __mod__(self, o):
+        return self._opaque(o, lambda a, b: a % b)
+
+    def __lt__(self, o):
+        return lt(self.value(), o)
+
+    def __le__(self, o):
+        return le(self.value(), o)
+
+    def __gt__(self, o):
+        return gt(self.value(), o)
+
+    def __ge__(self, o):
+        return ge(self.value(), o)
+
+    def __eq__(self, o):
+        return eq(self.value(), o)
+
+    def __ne__(self, o):
+        return ne(self.value(), o)
+
+    __hash__ = None
+
+
 def tid():
-    return fx.Int32(gpu.thread_idx.x)
+    return Aff(ArithValue(_val(_tid())))
 
 
 def bid():
-    return fx.Int32(gpu.block_idx.x)
+    return Aff(ArithValue(_val(fx.Int32(gpu.block_idx.x))))
+
+
+def _tid():
+    return fx.Int32(gpu.thread_idx.x)
 
 
 def rsrc(addr, nbytes: int):
@@ -356,15 +468,15 @@ def land(*ms):
     return out
 
 
+_ITEMSIZE = {"f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1}
+
+
 def load(r, off, st: str, mask=None):
     """Scalar masked load, widened to the compute kind. A masked lane reads 0."""
     raw = buffer_ops.buffer_load(
         r, idx(off), vec_width=1, dtype=_STORAGE_IR[st](), mask=_mask(mask)
     )
     return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
-
-
-_ITEMSIZE = {"f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1}
 
 
 def sload(r, off: int, st: str):
@@ -422,11 +534,11 @@ def vload(cache: dict, key, j: int, w: int, r, off, st: str, mask=None):
     if (key, j // w) not in cache:
         # Usually issued by the chunk's first element, but a store to the same buffer
         # (see forget) can drop the vector mid-chunk; the load always starts at the base.
-        base = idx(off) if j % w == 0 else sub(idx(off), j % w)
+        base = idx(off if j % w == 0 else off - j % w)
         word_t, n, ratio = _packing(st, w)
         if word_t is None:
             raw = buffer_ops.buffer_load(
-                r, idx(base), vec_width=w, dtype=_STORAGE_IR[st](), mask=_mask(mask)
+                r, base, vec_width=w, dtype=_STORAGE_IR[st](), mask=_mask(mask)
             )
         else:
             words = buffer_ops.buffer_load(
@@ -1278,7 +1390,7 @@ def _dpp_reduce(vals, comb, tpr: int, ident=None):
     through a select. The scan order keeps ``comb(earlier, later)``. Instruction count
     is what counts: a 768-wide LayerNorm is vector-ALU-bound, and went 141us -> 110us
     with the identity, where DPP alone measured even with ``ds_bpermute``."""
-    lane = imod(tid(), WAVE)
+    lane = imod(_tid(), WAVE)
 
     def step(ctrl, row_mask, ok):
         if ident is not None:
@@ -1366,7 +1478,7 @@ def _group_reduce(
             off *= 2
     if stride * tpr <= WAVE:
         return vals
-    t = tid()
+    t = _tid()
     kinds = [kind(v) for v in vals]
     words = [_to_words(v) for v in vals]
     slot = 0
@@ -1483,7 +1595,7 @@ def _group_scan(fn, values, carry, first, tpr: int, lane):
         xs = tuple(where(ok, c, x) for c, x in zip(comb, xs))
         off *= 2
     if tpr > 1:
-        last = tid() % WAVE - lane + (tpr - 1)
+        last = _tid() % WAVE - lane + (tpr - 1)
         total = tuple(_shfl(x, last, WAVE, "idx") for x in xs)
     else:
         total = xs
