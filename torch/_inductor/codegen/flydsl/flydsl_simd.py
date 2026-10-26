@@ -991,6 +991,29 @@ class FlyDSLKernel(SIMDKernel):
                 )
         return roots
 
+    def _stream_itemsizes(self) -> list[int]:
+        """Element sizes of the buffers a pointwise kernel streams: those whose index
+        runs contiguously with x, which broadcast operands do not."""
+        from ...loop_body import MemoryUsageType
+
+        nodes = list(self.features.scheduler_nodes())
+        calls = self._node_index_vars
+        x = self._x_sym()
+        if len(calls) < len(nodes) or x is None:
+            return []
+        sizes = []
+        for node, index_vars in zip(nodes, calls):
+            body = getattr(node, "_body", None)
+            if body is None:
+                return []
+            exprs = body.indexing_from_args(index_vars)
+            for t in (MemoryUsageType.LOAD, MemoryUsageType.STORE):
+                for e in body.memory_usage[t]:
+                    root = self._root_expr(exprs[e.index_name])
+                    if classify_access(root, x, 2) == "contig":
+                        sizes.append(V.graph.get_dtype(e.buffer_name).itemsize)
+        return sizes
+
     def _has_atomic(self) -> bool:
         from ...loop_body import MemoryUsageType
 
@@ -1021,6 +1044,13 @@ class FlyDSLKernel(SIMDKernel):
                 # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
                 # 23us at 2 in bf16 (Triton 21us).
                 widest_vec = min(widest_vec, 2)
+            streams = self._stream_itemsizes()
+            if streams:
+                # Runs as wide as the widest stream's 16-byte vector: wider ones split
+                # its loads into strided halves, each instruction a wave's 64 lanes over
+                # twice the lines -- 136us vs 105us on ResNet's f32 threshold backward,
+                # whose bool mask alone would allow eight a lane (Triton 100us).
+                widest_vec = min(widest_vec, max(1, 16 // max(streams)))
             self.ept = _tune("ept", _largest_pow2_dividing(self.xnumel, widest_vec))
             # Two runs per thread keep two vector loads in flight per input, as Triton's
             # default pointwise config does, once the grid is big enough to afford it.
