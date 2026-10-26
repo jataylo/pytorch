@@ -83,7 +83,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 THREADS = 256
-# A transposing tile's block: 54us vs 57us at 256 threads on an NCHW -> NHWC copy.
+# A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
 TILE_THREADS = 128
 WAVE = 64
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
@@ -91,8 +91,10 @@ WAVE = 64
 PERSISTENT_MAX_UNROLL = 16
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
 SCAN_PHASE = "__scan_phase__"  # replaced per traced pass of a multi-element scan
-# Edge of the square tile a block covers in a {y, x} (transposing) pointwise kernel.
-TILE = 64
+# Edge of the square tile a block covers in a {y, x} (transposing) pointwise kernel. A
+# 64-wide f32 tile's 16.6 KiB of LDS leaves room for three blocks a CU: 54us vs 47us
+# on an NCHW -> NHWC copy (Triton 47us), 54us vs 50us on a 4096^2 transpose.
+TILE = 32
 # LDS words a staged tile row takes: one word of padding spreads the transposed reads
 # over the banks.
 TILE_PITCH = TILE + 1
@@ -904,6 +906,8 @@ class FlyDSLKernel(SIMDKernel):
         ):
             ept //= 2
         self.ept = _tune("ept", ept)
+        while self.ept > 1 and self.threads * self.ept > TILE * TILE:
+            self.ept //= 2
         # Runs of a pass: TILE // ept threads across the fast dimension, the block's
         # remaining threads down the slow one; `unroll` passes cover the tile.
         self.unroll = TILE * TILE // (self.threads * self.ept)
