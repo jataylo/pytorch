@@ -200,19 +200,10 @@ def _evaluate_candidate(
         return None
 
     if config.scatter_preagg_enabled:
-        from torch._inductor.kernel.scatter_preagg import would_claim_fx
+        from torch._inductor.kernel.scatter_preagg import claims_index_put
 
-        shapes_static = not any(
-            isinstance(s, torch.SymInt)
-            for s in (*input_meta["shape"], *index_meta["shape"])
-        )
-        if would_claim_fx(
-            input_meta["device"],
-            input_meta["dtype"],
-            shapes_static,
-            index_size,
-            output_size // scatter_dim_size,
-            scatter_dim_size,
+        if claims_index_put(
+            input_meta, index_meta, index_size, output_size, scatter_dim_size
         ):
             _record_skip(ctx, "scatter_preagg", node_name)
             return None

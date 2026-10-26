@@ -1,6 +1,7 @@
 """One config per process: python bench_matrix.py <mode> <op> <V> <dist> <D>
 mode: base | ps | preagg
 dist: hot50 (half the tokens on row 0, rest uniform) | zipf (p_k ~ 1/k) | uniform"""
+
 import sys
 
 import torch
@@ -8,7 +9,13 @@ import torch._inductor.config as icfg
 from torch._dynamo.utils import counters
 from triton.testing import do_bench
 
-mode, op, V, dist, D = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+mode, op, V, dist, D = (
+    sys.argv[1],
+    sys.argv[2],
+    int(sys.argv[3]),
+    sys.argv[4],
+    int(sys.argv[5]),
+)
 icfg.partitioned_scatter_enabled = mode == "ps"
 icfg.scatter_preagg_enabled = mode == "preagg"
 
@@ -35,11 +42,17 @@ else:
     def f(a):
         return torch.zeros(V, D, device="cuda").index_add_(0, idx, a)
 
-ref = torch.zeros(V, D, device="cuda", dtype=torch.float64).index_add_(0, idx, x.double())
+
+ref = torch.zeros(V, D, device="cuda", dtype=torch.float64).index_add_(
+    0, idx, x.double()
+)
 c = torch.compile(f, fullgraph=True)
 out = c(x)
 err = (out.double() - ref).abs().max().item() / ref.abs().max().item()
 t = do_bench(lambda: c(x), warmup=10, rep=100)
 applied = counters["inductor"]["scatter_preagg_applied"]
 ps = counters["inductor"]["partitioned_scatter_applied"]
-print(f"RESULT {op},{V},{dist},{D},{mode},{t:.3f},{err:.1e},preagg={applied},ps={ps}", flush=True)
+print(
+    f"RESULT {op},{V},{dist},{D},{mode},{t:.3f},{err:.1e},preagg={applied},ps={ps}",
+    flush=True,
+)

@@ -6,7 +6,10 @@ from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
-from torch.testing._internal.common_utils import instantiate_parametrized_tests, parametrize
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 
@@ -283,9 +286,7 @@ class TestScatterPreagg(TestCase):
                 out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0
             )
             expected = 1 if dtype == torch.float16 or _has_native_bf16_atomics() else 0
-            self.assertEqual(
-                counters["inductor"]["scatter_preagg_applied"], expected
-            )
+            self.assertEqual(counters["inductor"]["scatter_preagg_applied"], expected)
             return
         self._check(fn, x, idx, v, atol=tol, rtol=tol)
 
@@ -372,7 +373,9 @@ class TestScatterPreagg(TestCase):
             return torch.index_put(x, (i,), v, accumulate=True)
 
         self._check(fn, x, idx, v, applied=False)
-        self.assertEqual(counters["inductor"]["scatter_preagg_skipped_low_contention"], 1)
+        self.assertEqual(
+            counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
+        )
 
     def test_skip_values_read_output(self):
         # values is realized (it reads the scatter target) with a flexible
@@ -407,7 +410,9 @@ class TestScatterPreagg(TestCase):
             )
 
         self._check(fn, x, idx, v, applied=False)
-        self.assertEqual(counters["inductor"]["scatter_preagg_skipped_unsupported_op"], 1)
+        self.assertEqual(
+            counters["inductor"]["scatter_preagg_skipped_unsupported_op"], 1
+        )
 
     @config.patch(partitioned_scatter_enabled=True)
     def test_partitioned_scatter_defers(self):

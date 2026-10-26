@@ -16,7 +16,9 @@ from bench_local_reduce import _seg_combine, k_sortseg, make_idx, N, D, COL0, LD
 
 
 @triton.jit
-def k_sortseg_gather(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr):
+def k_sortseg_gather(
+    idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr
+):
     LOG: tl.constexpr = CHUNK.bit_length() - 1
     pos = tl.arange(0, CHUNK)
     tok = tl.program_id(0) * CHUNK + pos
@@ -26,7 +28,9 @@ def k_sortseg_gather(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.cons
     i = tl.load(idx_ptr + tok, m, other=0)
     i = tl.where(i < 0, i + V, i)
     valid = m & (i >= 0) & (i < V)
-    g = tl.load(x_ptr + (184 + d[None, :] + 224 * tok[:, None]), m[:, None], other=0.0).to(tl.float32)
+    g = tl.load(
+        x_ptr + (184 + d[None, :] + 224 * tok[:, None]), m[:, None], other=0.0
+    ).to(tl.float32)
     # pre-aggregation that a codegen'd atomic store would emit
     dest = tl.where(valid, i, V)
     key = tl.sort((dest << LOG) | pos)
@@ -37,7 +41,9 @@ def k_sortseg_gather(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.cons
     _, acc = tl.associative_scan((k2, gs), 0, _seg_combine)
     nxt = tl.gather(sdest, tl.minimum(pos + 1, CHUNK - 1), 0)
     last = (sdest < V) & ((sdest != nxt) | (pos == CHUNK - 1))
-    tl.atomic_add(out_ptr + sdest[:, None] * D + d[None, :], acc, last[:, None], sem="relaxed")
+    tl.atomic_add(
+        out_ptr + sdest[:, None] * D + d[None, :], acc, last[:, None], sem="relaxed"
+    )
 
 
 def _combine(a, b):
@@ -51,7 +57,9 @@ def fx_sortseg(idx, x, V, C=512):
     i = idx.long()
     i = torch.where(i < 0, i + V, i)
     pad = (-N) % C
-    dest = torch.nn.functional.pad(torch.where((i >= 0) & (i < V), i, V), (0, pad), value=V)
+    dest = torch.nn.functional.pad(
+        torch.where((i >= 0) & (i < V), i, V), (0, pad), value=V
+    )
     g = torch.nn.functional.pad(g, (0, 0, 0, pad)).view(-1, C, D)
     sdest, perm = torch.sort(dest.view(-1, C), dim=1, stable=True)
     gs = torch.gather(g, 1, perm[..., None].expand(-1, -1, D))

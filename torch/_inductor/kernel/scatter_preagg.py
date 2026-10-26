@@ -26,7 +26,8 @@ it in sorted order.
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import sympy
 
@@ -45,24 +46,24 @@ from ..select_algorithm import (
     TritonTemplate,
     TritonTemplateKernel,
 )
-from ..utils import sympy_index_symbol, sympy_product, triton_type
+from ..utils import (
+    needs_fallback_due_to_atomic_add_limitations,
+    sympy_index_symbol,
+    sympy_product,
+    triton_type,
+)
 from ..virtualized import V
 
 
 log = logging.getLogger(__name__)
 
-# Output dtype -> (accumulation dtype, Triton name of the output dtype).
-_SUPPORTED_DTYPES: dict[torch.dtype, tuple[torch.dtype, str]] = {
-    torch.float16: (torch.float32, "tl.float16"),
-    torch.bfloat16: (torch.float32, "tl.bfloat16"),
-    torch.float32: (torch.float32, "tl.float32"),
-    torch.float64: (torch.float64, "tl.float64"),
-    torch.int32: (torch.int32, "tl.int32"),
-}
-_TRITON_DTYPE = {
-    torch.float32: "tl.float32",
-    torch.float64: "tl.float64",
-    torch.int32: "tl.int32",
+# Output dtype -> dtype the per-chunk segment sums accumulate in.
+_ACC_DTYPE: dict[torch.dtype, torch.dtype] = {
+    torch.float16: torch.float32,
+    torch.bfloat16: torch.float32,
+    torch.float32: torch.float32,
+    torch.float64: torch.float64,
+    torch.int32: torch.int32,
 }
 
 # Ops that the template's subgraph codegen (ModificationWrapper) cannot express
@@ -84,13 +85,10 @@ _UNSUPPORTED_OPS = frozenset(
     }
 )
 
+
 def _record_skip(reason: str) -> None:
     counters["inductor"][f"scatter_preagg_skipped_{reason}"] += 1
     log.debug("scatter_preagg: skip reason=%s", reason)
-
-
-def dtype_supported(dtype: torch.dtype) -> bool:
-    return dtype in _SUPPORTED_DTYPES
 
 
 def _has_native_bf16_atomics(device: torch.device) -> bool:
@@ -100,20 +98,33 @@ def _has_native_bf16_atomics(device: torch.device) -> bool:
     return torch.cuda.get_device_capability(device) >= (9, 0)
 
 
+def _ineligible(device: torch.device | None, dtype: torch.dtype) -> str | None:
+    """Skip reason from the device, dtype and determinism alone, or None."""
+    if device is None or device.type != "cuda":
+        return "device"
+    if dtype not in _ACC_DTYPE:
+        return "dtype"
+    if dtype == torch.bfloat16 and not _has_native_bf16_atomics(device):
+        return "bf16_atomics"
+    if config.deterministic or torch.are_deterministic_algorithms_enabled():
+        return "deterministic"
+    return None
+
+
 def can_bypass_atomic_fallback(dtype: torch.dtype, device: torch.device | None) -> bool:
     """
     True when an accumulating scatter that Inductor would otherwise send to the
     eager fallback because of atomic_add dtype limitations may be offered to this
     template instead. The template sums each chunk in fp32 and issues one
     output-dtype atomic per destination per chunk, so it only needs the
-    hardware to have native atomics for the output dtype. Callers must still
-    fall back when the template declines.
+    hardware to have native atomics for the output dtype (plain Triton bf16
+    atomics are a CAS loop and serialize badly under contention).
     """
-    if not config.scatter_preagg_enabled or device is None or device.type != "cuda":
-        return False
-    if config.deterministic or torch.are_deterministic_algorithms_enabled():
-        return False
-    return dtype == torch.bfloat16 and _has_native_bf16_atomics(device)
+    return (
+        config.scatter_preagg_enabled
+        and dtype == torch.bfloat16
+        and _ineligible(device, dtype) is None
+    )
 
 
 def _passes_size_gates(num_tokens: int, num_inner: int, num_keys: int) -> str | None:
@@ -126,28 +137,32 @@ def _passes_size_gates(num_tokens: int, num_inner: int, num_keys: int) -> str | 
     return None
 
 
-def would_claim_fx(
-    device: torch.device,
-    dtype: torch.dtype,
-    shapes_static: bool,
-    num_tokens: int,
-    num_inner: int,
-    num_keys: int,
+def claims_index_put(
+    input_meta: dict[str, Any],
+    index_meta: dict[str, Any],
+    index_size: int,
+    output_size: int,
+    scatter_dim_size: int,
 ) -> bool:
     """
-    Static approximation of the lowering-time gates, for graph passes that must
-    decide before lowering whether this template will take an accumulating
-    scatter (the partitioned scatter pass defers to it).
+    Static approximation of the lowering-time gates for an FX index_put, so the
+    partitioned scatter pass can leave the scatters this template will take.
     """
-    if not config.scatter_preagg_enabled:
+    if not config.scatter_preagg_enabled or scatter_dim_size <= 0:
         return False
-    if device.type != "cuda" or not dtype_supported(dtype) or not shapes_static:
+    if any(
+        isinstance(s, torch.SymInt)
+        for s in (*input_meta["shape"], *index_meta["shape"])
+    ):
         return False
-    if dtype == torch.bfloat16 and not _has_native_bf16_atomics(device):
+    if _ineligible(input_meta["device"], input_meta["dtype"]) is not None:
         return False
-    if num_keys <= 0:
-        return False
-    return _passes_size_gates(num_tokens, num_inner, num_keys) is None
+    return (
+        _passes_size_gates(
+            index_size, output_size // scatter_dim_size, scatter_dim_size
+        )
+        is None
+    )
 
 
 class _Placeholder:
@@ -340,7 +355,8 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
 
     @property
     def _plan(self) -> _ScatterPlan:
-        assert self.subgraphs is not None
+        if self.subgraphs is None:
+            raise AssertionError("scatter_preagg kernel has no value subgraph")
         return self.subgraphs[0].preagg_plan  # type: ignore[attr-defined]
 
     def preagg_def_kernel(self) -> str:
@@ -421,13 +437,13 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
             with V.set_ops_handler(indirect):
                 value = plan.value_fn(coords_in)
             value = getattr(value, "value", value)
-            acc = _TRITON_DTYPE[plan.acc_dtype]
+            acc = triton_type(plan.acc_dtype)
             return [
                 f"{out} = tl.broadcast_to(({value}).to({acc}), [BLOCK_T, BLOCK_D])",
             ]
 
         return self._codegen_subgraph(
-            f"preagg_value_{ptok}",
+            "preagg_value",
             {"ptok": ptok, "inner": inner},
             {"ptok": ("BLOCK_T", "1"), "inner": ("1", "BLOCK_D")},
             emit,
@@ -584,29 +600,43 @@ def maybe_preaggregated_scatter(
     value_fn: Callable[[list[sympy.Expr]], Any],
     iter_sizes: Any,
     output_indexer: Callable[[list[sympy.Expr]], list[sympy.Expr]],
-    read_names: OrderedSet[str],
+    inputs: list[Any],
+    atomic_fallback: Callable[[], Any],
 ) -> bool:
     """
-    Emit the pre-aggregating template for ``out[output_indexer(i)] += value_fn(i)``
-    over ``iter_sizes``. Returns False (emitting nothing) when the scatter is not
-    eligible, in which case the caller lowers it as a regular atomic Scatter.
+    Lower ``out[output_indexer(i)] += value_fn(i)`` over ``iter_sizes`` with the
+    pre-aggregating template. ``inputs`` are the IR nodes value_fn and
+    output_indexer read. If the template declines a scatter whose dtype reached
+    the caller only through can_bypass_atomic_fallback, ``atomic_fallback()`` is
+    emitted instead. Returns False (emitting nothing) when the caller should
+    lower a regular atomic Scatter.
     """
     if not config.scatter_preagg_enabled:
         return False
+    read_names: OrderedSet[str] = OrderedSet()
+    for x in inputs:
+        if isinstance(x, ir.IRNode):
+            read_names |= x.get_read_names()
+    if _try_template(out, value_fn, iter_sizes, output_indexer, read_names):
+        return True
+    if needs_fallback_due_to_atomic_add_limitations(out.get_dtype()):
+        atomic_fallback()
+        return True
+    return False
 
+
+def _try_template(
+    out: ir.TensorBox,
+    value_fn: Callable[[list[sympy.Expr]], Any],
+    iter_sizes: Any,
+    output_indexer: Callable[[list[sympy.Expr]], list[sympy.Expr]],
+    read_names: OrderedSet[str],
+) -> bool:
     device = out.get_device()
     dtype = out.get_dtype()
-    if device is None or device.type != "cuda":
-        _record_skip("device")
-        return False
-    if not dtype_supported(dtype):
-        _record_skip("dtype")
-        return False
-    if dtype == torch.bfloat16 and not _has_native_bf16_atomics(device):
-        _record_skip("bf16_atomics")
-        return False
-    if config.deterministic or torch.are_deterministic_algorithms_enabled():
-        _record_skip("deterministic")
+    reason = _ineligible(device, dtype)
+    if reason is not None:
+        _record_skip(reason)
         return False
 
     if not (
@@ -639,8 +669,9 @@ def maybe_preaggregated_scatter(
     if isinstance(out_buf.layout, ir.FlexibleLayout):
         out_buf.freeze_layout()
 
-    acc_dtype, out_triton_dtype = _SUPPORTED_DTYPES[dtype]
-    analyzed = _analyze(out_buf, out_sizes, sizes, value_fn, output_indexer, acc_dtype)
+    analyzed = _analyze(
+        out_buf, out_sizes, sizes, value_fn, output_indexer, _ACC_DTYPE[dtype]
+    )
     if isinstance(analyzed, str):
         _record_skip(analyzed)
         return False
@@ -675,9 +706,7 @@ def maybe_preaggregated_scatter(
     )
     # The sort packs (key, position) into one integer.
     key_bits = (num_keys + 1).bit_length()
-    configs = [
-        c for c in configs if key_bits + c.block_t.bit_length() - 1 <= 62
-    ]
+    configs = [c for c in configs if key_bits + c.block_t.bit_length() - 1 <= 62]
     if not configs:
         _record_skip("key_space")
         return False
@@ -718,7 +747,7 @@ def maybe_preaggregated_scatter(
             NUM_INNER=num_inner,
             NUM_KEYS=num_keys,
             KEY_DTYPE="tl.int32" if key_bits + log_block_t <= 31 else "tl.int64",
-            OUT_DTYPE=out_triton_dtype,
+            OUT_DTYPE=triton_type(dtype),
         )
     if not choices:
         _record_skip("codegen_failed")

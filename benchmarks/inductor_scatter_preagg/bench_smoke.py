@@ -27,7 +27,13 @@ ref = torch.zeros(V, D, device="cuda", dtype=torch.float64).index_add_(
     0, idx.long(), x[:, 184:216].double()
 )
 err = (out.double() - ref).abs().max().item() / ref.abs().max().item()
-print({k: v for k, v in counters["inductor"].items() if "preagg" in k or "partitioned" in k})
+print(
+    {
+        k: v
+        for k, v in counters["inductor"].items()
+        if "preagg" in k or "partitioned" in k
+    }
+)
 print(
     f"V={V} preagg={icfg.scatter_preagg_enabled} rel_err={err:.2e} "
     f"time={do_bench(lambda: c(idx, x), warmup=5, rep=50):.3f} ms"

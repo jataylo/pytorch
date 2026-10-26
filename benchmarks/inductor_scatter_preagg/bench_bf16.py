@@ -26,9 +26,13 @@ def f(a):
 
 c = torch.compile(f)
 out = c(x)
-ref = torch.zeros(V, D, device="cuda", dtype=torch.float64).index_add_(0, idx, x.double())
+ref = torch.zeros(V, D, device="cuda", dtype=torch.float64).index_add_(
+    0, idx, x.double()
+)
 err = ((out.double() - ref).abs().max() / ref.abs().max()).item()
 t = do_bench(lambda: c(x), warmup=10, rep=100)
 applied = counters["inductor"]["scatter_preagg_applied"]
 ps = counters["inductor"]["partitioned_scatter_applied"]
-print(f"V={V:5d} D={D:3d} {dist:7s} {mode:6s} {t:7.3f} ms  err={err:.1e}  preagg={applied} ps={ps}")
+print(
+    f"V={V:5d} D={D:3d} {dist:7s} {mode:6s} {t:7.3f} ms  err={err:.1e}  preagg={applied} ps={ps}"
+)

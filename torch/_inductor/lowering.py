@@ -5008,26 +5008,20 @@ def _unsafe_index_put_(self, indices, values, accumulate=False):
     )
 
 
-def _maybe_preaggregated_scatter(out, value_fn, ranges, output_indexer, inputs) -> bool:
-    if not config.scatter_preagg_enabled:
-        return False
-    from .kernel.scatter_preagg import maybe_preaggregated_scatter
-
-    read_names: OrderedSet[str] = OrderedSet()
-    for x in inputs:
-        if isinstance(x, ir.IRNode):
-            read_names |= x.get_read_names()
-    return maybe_preaggregated_scatter(
-        out, value_fn, ranges, output_indexer, read_names
-    )
-
-
-def _preagg_can_bypass_atomic_fallback(dtype, device) -> bool:
+def _preagg_lifts_atomic_fallback(dtype, device) -> bool:
     if not config.scatter_preagg_enabled:
         return False
     from .kernel.scatter_preagg import can_bypass_atomic_fallback
 
     return can_bypass_atomic_fallback(dtype, device)
+
+
+def _maybe_preaggregated_scatter(*args) -> bool:
+    if not config.scatter_preagg_enabled:
+        return False
+    from .kernel.scatter_preagg import maybe_preaggregated_scatter
+
+    return maybe_preaggregated_scatter(*args)
 
 
 def index_put_impl_(self, indices, values, accumulate, check, may_realize=False):
@@ -5081,14 +5075,12 @@ def index_put_impl_(self, indices, values, accumulate, check, may_realize=False)
     x_ndim = len(x_size)
 
     device = self.get_device()
-    atomic_fallback = (
+    if (
         accumulate
         and device is not None
         and is_gpu(device.type)
         and needs_fallback_due_to_atomic_add_limitations(self.get_dtype())
-    )
-    if atomic_fallback and not _preagg_can_bypass_atomic_fallback(
-        self.get_dtype(), device
+        and not _preagg_lifts_atomic_fallback(self.get_dtype(), device)
     ):
         # self is an scalar Tensor
         if x_ndim == 0:
@@ -5141,13 +5133,13 @@ def index_put_impl_(self, indices, values, accumulate, check, may_realize=False)
     if device is None:
         raise AssertionError("expected: device is not None")
     if accumulate and _maybe_preaggregated_scatter(
-        self, values.make_loader(), expected_vals_size, inner_fn, [values, *indices]
+        self,
+        values.make_loader(),
+        expected_vals_size,
+        inner_fn,
+        [values, *indices],
+        lambda: index_put_fallback(self, orig_indices, orig_values, accumulate),
     ):
-        if x_ndim == 0:
-            self = view(self, [])
-        return self
-    if atomic_fallback:
-        self = index_put_fallback(self, orig_indices, orig_values, accumulate)
         if x_ndim == 0:
             self = view(self, [])
         return self
@@ -5320,18 +5312,16 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
     if isinstance(src, Number):
         src = full_like(self, src)
 
-    # The only scatter_fallback reason for a same-dtype GPU sum outside
-    # deterministic mode is atomic_add dtype support, which the template may lift.
-    atomic_fallback = (
+    # For a same-dtype GPU sum, atomic_add dtype support is the only reason
+    # scatter_fallback would fire, and the template may lift it.
+    preagg_lifts = (
         reduce == "sum"
         and isinstance(src, TensorBox)
         and src.get_dtype() == self.get_dtype()
-        and self.get_device() is not None
-        and is_gpu(self.get_device().type)
-        and needs_fallback_due_to_atomic_add_limitations(self.get_dtype())
-        and _preagg_can_bypass_atomic_fallback(self.get_dtype(), self.get_device())
+        and _preagg_lifts_atomic_fallback(self.get_dtype(), self.get_device())
     )
-    if not atomic_fallback:
+    fallback_result = None
+    if not preagg_lifts:
         fallback_result = scatter_fallback(
             aten.scatter_reduce_.two,
             self,
@@ -5341,8 +5331,9 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
             reduce=reduce,
             include_self=include_self,
         )
-        if fallback_result:
-            return fallback_result
+
+    if fallback_result:
+        return fallback_result
     orig_self, orig_index, orig_src = self, index, src
 
     if not (isinstance(self, TensorBox)):
@@ -5423,13 +5414,12 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
     # self[i][index[i][j][k]][k] += src[i][j][k]  # if dim == 1
     # self[i][j][index[i][j][k]] += src[i][j][k]  # if dim == 2
     if backend_reduce_str(reduce) == "atomic_add" and _maybe_preaggregated_scatter(
-        self, fn, index.get_size(), output_indexer, [src, index]
-    ):
-        if ndim == 0:
-            self = view(self, [])
-        return self
-    if atomic_fallback:
-        ir.ScatterFallback(
+        self,
+        fn,
+        index.get_size(),
+        output_indexer,
+        [src, index],
+        lambda: scatter_fallback(
             aten.scatter_reduce_.two,
             orig_self,
             dim,
@@ -5437,8 +5427,11 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
             orig_src,
             reduce=reduce,
             include_self=include_self,
-        )
-        return orig_self
+        ),
+    ):
+        if ndim == 0:
+            self = view(self, [])
+        return self
     scatter = ir.Scatter(
         device=device,
         dtype=self.get_dtype(),

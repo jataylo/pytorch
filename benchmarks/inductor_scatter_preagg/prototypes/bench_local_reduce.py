@@ -30,13 +30,17 @@ def k_orig(idx_ptr, x_ptr, out_ptr, xnumel, V: tl.constexpr, XBLOCK: tl.constexp
 
 
 @triton.jit
-def k_unroll(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr):
+def k_unroll(
+    idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr
+):
     tok = tl.program_id(0) * CHUNK + tl.arange(0, CHUNK)
     m = tok < n
     i = tl.load(idx_ptr + tok, m, other=0).to(tl.int64)
     valid = m & (i >= 0) & (i < V)
     d = tl.arange(0, D)
-    g = tl.load(x_ptr + (184 + d[None, :] + 224 * tok[:, None]), m[:, None]).to(tl.float32)
+    g = tl.load(x_ptr + (184 + d[None, :] + 224 * tok[:, None]), m[:, None]).to(
+        tl.float32
+    )
     g = tl.where(valid[:, None], g, 0.0)
     for v in tl.static_range(V):
         s = tl.sum(tl.where((i == v)[:, None], g, 0.0), axis=0)
@@ -49,7 +53,9 @@ def _seg_combine(ka, va, kb, vb):
 
 
 @triton.jit
-def k_sortseg(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr):
+def k_sortseg(
+    idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, D: tl.constexpr
+):
     # Sort the chunk's rows by destination, segmented-sum equal destinations, and
     # issue one atomic per (distinct destination, d) instead of one per element.
     # Cost is O(CHUNK log CHUNK), independent of V.
@@ -66,12 +72,16 @@ def k_sortseg(idx_ptr, x_ptr, out_ptr, n, V: tl.constexpr, CHUNK: tl.constexpr, 
     stok = tl.program_id(0) * CHUNK + (key & (CHUNK - 1))
     smask = sdest < V
     d = tl.arange(0, D)
-    g = tl.load(x_ptr + (184 + d[None, :] + 224 * stok[:, None]), smask[:, None], other=0.0).to(tl.float32)
+    g = tl.load(
+        x_ptr + (184 + d[None, :] + 224 * stok[:, None]), smask[:, None], other=0.0
+    ).to(tl.float32)
     k2 = tl.broadcast_to(sdest[:, None], (CHUNK, D))
     _, acc = tl.associative_scan((k2, g), 0, _seg_combine)
     nxt = tl.gather(sdest, tl.minimum(pos + 1, CHUNK - 1), 0)
     last = smask & ((sdest != nxt) | (pos == CHUNK - 1))
-    tl.atomic_add(out_ptr + sdest[:, None] * D + d[None, :], acc, last[:, None], sem="relaxed")
+    tl.atomic_add(
+        out_ptr + sdest[:, None] * D + d[None, :], acc, last[:, None], sem="relaxed"
+    )
 
 
 def launch(kind, idx, x, V, chunk=512):
@@ -80,14 +90,20 @@ def launch(kind, idx, x, V, chunk=512):
         xn = N * D
         k_orig[(triton.cdiv(xn, 64),)](idx, x, out, xn, V=V, XBLOCK=64, num_warps=1)
     elif kind == "unroll":
-        k_unroll[(triton.cdiv(N, chunk),)](idx, x, out, N, V=V, CHUNK=chunk, D=D, num_warps=4)
+        k_unroll[(triton.cdiv(N, chunk),)](
+            idx, x, out, N, V=V, CHUNK=chunk, D=D, num_warps=4
+        )
     elif kind == "sortseg":
-        k_sortseg[(triton.cdiv(N, chunk),)](idx, x, out, N, V=V, CHUNK=chunk, D=D, num_warps=4)
+        k_sortseg[(triton.cdiv(N, chunk),)](
+            idx, x, out, N, V=V, CHUNK=chunk, D=D, num_warps=4
+        )
     return out
 
 
 def eager_ref(idx, x, V):
-    return torch.ops.aten.embedding_dense_backward(x[:, COL0 : COL0 + D], idx, V, -1, False)
+    return torch.ops.aten.embedding_dense_backward(
+        x[:, COL0 : COL0 + D], idx, V, -1, False
+    )
 
 
 def onehot_ref(idx, x, V):
@@ -129,9 +145,10 @@ def main():
             if V <= 128:
                 cases.append(("triton_unroll", lambda: launch("unroll", idx, x, V)))
             cases.append(("triton_sortseg", lambda: launch("sortseg", idx, x, V)))
-            for name, fn, ps in [("ind_base", eager_ref, False), ("ind_ps", eager_ref, True)] + (
-                [("ind_onehot", onehot_ref, False)] if V <= 128 else []
-            ):
+            for name, fn, ps in [
+                ("ind_base", eager_ref, False),
+                ("ind_ps", eager_ref, True),
+            ] + ([("ind_onehot", onehot_ref, False)] if V <= 128 else []):
                 c = compiled(fn, V, ps, idx, x)
                 cases.append((name, lambda c=c: c(idx, x)))
             row = []
