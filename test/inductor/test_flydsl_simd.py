@@ -281,6 +281,17 @@ class TestFlyDSLSIMD(TestCase):
         torch._dynamo.reset()
         self.check(lambda x, w: F.layer_norm(x, (4096,), w), h, w, atol=tol, rtol=tol)
 
+    @parametrize("width", [32, 8])
+    def test_short_rows_stored_together(self, width):
+        # Each row group's results go out in one store, a lane a row.
+        x = torch.randn(1 << 17, width, device="cuda")
+        self.check(lambda x: (x.sum(-1), x.amax(-1), x.argmax(-1)), x)
+        torch._dynamo.reset()
+        self.check(lambda x: torch.var_mean(x, -1), x)
+        torch._dynamo.reset()
+        i = torch.randint(-(1 << 40), 1 << 40, (1 << 17, width), device="cuda")
+        self.check(lambda i: i.sum(-1), i)
+
     @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int8, torch.bool])
     def test_constant_index_load(self, dtype):
         # A broadcast element goes through the scalar cache, the sub-dword ones shifted

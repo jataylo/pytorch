@@ -1114,6 +1114,11 @@ class FlyDSLKernel(SIMDKernel):
                 tpr = WAVE
                 self.one_step = True
             self.tpr = _tune("row_tpr", tpr)
+            if self.tpr <= WAVE and not self.in_combo and not _tune("threads", 0):
+                # Rows that stay within a wave share nothing across it, and one-wave
+                # blocks schedule and retire independently: 40us vs 45us on a 512-wide
+                # bf16 softmax backward, as Triton's num_warps=1 there.
+                self.threads = WAVE
             self.rpb = self.threads // self.tpr
         iters = -(-self.rnumel // (self.tpr * self.ept))
         self.persistent = iters * self.ept <= PERSISTENT_MAX_UNROLL
@@ -1379,7 +1384,9 @@ class FlyDSLKernel(SIMDKernel):
             self.stored_args.add(arg)
             return
         ms = self._masks(include_r=in_loop)
+        merged = False
         if self.is_reduction_kernel and not in_loop and self.tpr > 1:
+            merged = self.merged_rows and not ms
             # Every thread of the row group holds the value; one of them writes it.
             ms.append("_lane0")
         var = self._vector_var()
@@ -1392,7 +1399,12 @@ class FlyDSLKernel(SIMDKernel):
         )
         mask = self._mask_arg(ms)
         buf = self.stores
-        if contig:
+        if merged:
+            line = (
+                f"fdp.xstore(_xs, {name!r}, _xr, {self.xunroll}, {self.tpr}, _rl, "
+                f"_r_{arg}, {index_str}, {value}, {st!r})"
+            )
+        elif contig:
             seed = ""
             if self._persistent_region() and not ms:
                 # A masked lane's register holds a value its reload would read as 0.
@@ -1883,6 +1895,23 @@ class FlyDSLKernel(SIMDKernel):
         return "row" if self._pure_reduction() else "norm"
 
     @property
+    def merged_rows(self) -> bool:
+        """Whether a row group's ``xunroll`` results are stored together (fdp.xstore),
+        every lane writing one, instead of one store a row from lane 0: short rows
+        otherwise take as many partial store instructions as loads -- 42us vs 37us on
+        a 32-wide sum (Triton 35us), 52us vs 38us at 8 lanes a row."""
+        return bool(
+            self.is_reduction_kernel
+            and self.persistent
+            and self.stride == 1
+            and self.tpr > 1
+            and self.xunroll > 1
+            and self._pure_reduction()
+            and not self._xmask()
+            and _tune("merge_rows", 1)
+        )
+
+    @property
     def slp(self) -> bool:
         """Whether LLVM's SLP vectorizer runs. It pairs a reduction's f32 math into
         ``v_pk_*`` ops whose operands need a ``v_mov`` each to line up -- 44us vs 49us
@@ -1970,6 +1999,8 @@ class FlyDSLKernel(SIMDKernel):
                 code.writeline(f"_rl = _t // {self.stride}")
                 lane_x = f"_t % {self.stride}"
             code.writeline("_lane0 = _rl == 0")
+            if self.merged_rows:
+                code.writeline("_xs = {}")
 
             def row_start() -> None:
                 code.writeline(

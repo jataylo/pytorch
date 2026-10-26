@@ -484,6 +484,24 @@ def store(r, off, value, st: str, mask=None):
     buffer_ops.buffer_store(raw, r, idx(off), mask=_mask(mask))
 
 
+def xstore(cache: dict, key, xr: int, n: int, tpr: int, rl, r, off, value, st: str):
+    """Row ``xr``'s result -- held by every lane of the row group -- of the group's
+    ``n`` rows, stored once the last is in: lane ``k`` takes rows ``k``, ``k + tpr``,
+    and so on, so a wave stores with every lane rather than one in ``tpr``."""
+    slot = cache.setdefault(key, [])
+    slot.append((idx(off), value))
+    if xr != n - 1:
+        return
+    del cache[key]
+    for s in range(0, n, tpr):
+        group = slot[s : s + tpr]
+        o, v = group[0]
+        for k in range(1, len(group)):
+            take = eq(rl, k)
+            o, v = where(take, group[k][0], o), where(take, group[k][1], v)
+        store(r, o, v, st, mask=lt(rl, len(group)) if len(group) < tpr else None)
+
+
 def vstore(
     cache: dict, key, j: int, w: int, r, off, value, st: str, mask=None, seed=None
 ):
