@@ -93,6 +93,20 @@ class TestClassifyAccess(TestCase):
             self.classify(ModularIndexing(r + 87383 * x1, 1, 4096), r, 2), "other"
         )
 
+    def test_nested_view(self):
+        # Llama's head permute reads (B, H, S, D) through the output's x % (H * D).
+        x = self.x
+        x0, x1 = ModularIndexing(x, 1, 1024), FloorDiv(x, 1024)
+        e = (
+            64 * ModularIndexing(x1, 1, 1024)
+            + 65536 * FloorDiv(x0, 64)
+            + 1048576 * FloorDiv(x1, 1024)
+            + ModularIndexing(x0, 1, 64)
+        )
+        self.assertEqual(self.classify(e, x, 8), "contig")
+        self.assertEqual(self.classify(ModularIndexing(x0, 1, 60), x, 8), "other")
+        self.assertEqual(self.classify(FloorDiv(x0, 4), x, 8), "other")
+
 
 @requires_flydsl
 @instantiate_parametrized_tests
@@ -266,6 +280,16 @@ class TestFlyDSLSIMD(TestCase):
         self.check(lambda x: torch.softmax(x, -1), h, atol=tol, rtol=tol)
         torch._dynamo.reset()
         self.check(lambda x, w: F.layer_norm(x, (4096,), w), h, w, atol=tol, rtol=tol)
+
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int8, torch.bool])
+    def test_constant_index_load(self, dtype):
+        # A broadcast element goes through the scalar cache, the sub-dword ones shifted
+        # out of their dword.
+        x = torch.randn(4096, 64, device="cuda")
+        s = torch.arange(-3, 9, device="cuda").to(dtype)
+        for i in (0, 3, 5):
+            torch._dynamo.reset()
+            self.check(lambda x, s: x * s[i] + s[i + 1], x, s)
 
     @parametrize("width", [1024, 700])
     def test_stored_then_reread(self, width):

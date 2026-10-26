@@ -646,6 +646,14 @@ def classify_access(
     if w <= 1:
         return "uniform" if var not in expr.free_symbols else "other"
     expr = sympy.expand(expr)
+
+    def runs(arg):
+        # An aligned run of ``arg`` -- ``var`` shifted, or itself such a run, as in a
+        # view's ``(x % 1024) // 64`` -- divides and wraps exactly as ``var`` would.
+        return _aligned_shift(arg, var, w) or (
+            classify_access(arg, var, w, uniform) == "contig"
+        )
+
     linear = 0
     aligned = True
     for term in sympy.Add.make_args(expr):
@@ -663,9 +671,7 @@ def classify_access(
         if factor == var:
             linear += c
             continue
-        if isinstance(factor, ModularIndexing) and _aligned_shift(
-            factor.args[0], var, w
-        ):
+        if isinstance(factor, ModularIndexing) and runs(factor.args[0]):
             d, m = (_int_or_none(a) for a in factor.args[1:])
             if d is None or m is None:
                 return "other"
@@ -677,7 +683,7 @@ def classify_access(
                 linear += c
                 continue
             return "other"
-        if isinstance(factor, FloorDiv) and _aligned_shift(factor.args[0], var, w):
+        if isinstance(factor, FloorDiv) and runs(factor.args[0]):
             d = _int_or_none(factor.args[1])
             if d is not None and d % w == 0:
                 if c % w:
@@ -995,11 +1001,13 @@ class FlyDSLKernel(SIMDKernel):
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
         if not self.is_reduction_kernel:
-            self.ept = _largest_pow2_dividing(self.xnumel, widest_vec)
+            self.ept = _tune("ept", _largest_pow2_dividing(self.xnumel, widest_vec))
             # Two runs per thread keep two vector loads in flight per input, as Triton's
             # default pointwise config does, once the grid is big enough to afford it.
             per_block = self.threads * self.ept
-            self.unroll = 2 if self.xnumel >= 2 * per_block * enough_blocks else 1
+            self.unroll = _tune(
+                "unroll", 2 if self.xnumel >= 2 * per_block * enough_blocks else 1
+            )
             return
         x, r = self._x_sym(), self._r_sym()
         # One vote per load: `indices` holds each distinct index once, so three inputs
@@ -1244,6 +1252,20 @@ class FlyDSLKernel(SIMDKernel):
                 return self.cse.generate(self.loads, staged, dtype=dtype)
         self.load_site += 1
         key = self._site_key(arg, index_str)
+        if (
+            root.is_Integer
+            and not dependent
+            and not ms
+            and arg.startswith("in_ptr")
+            and dtype.itemsize <= 4
+        ):
+            skey = repr(("s", arg, index_str)) if hoist else f"('s', {key})"
+            line = f"fdp.memo({self._cache()}, {skey}, lambda: fdp.sload(_r_{arg}, {int(root)}, {st!r}))"
+            result = self.cse.generate(buffer, line, dtype=dtype)
+            self.uniform_vars.add(str(result))
+            if hoist or not self._in_loop_region():
+                self.outside_loop_vars.add(result)
+            return result
         if kind == "contig":
             line = f"fdp.vload({self._cache()}, {key}, _j, {w}, _r_{arg}, {index_str}, {st!r}{mask})"
         elif kind == "uniform":

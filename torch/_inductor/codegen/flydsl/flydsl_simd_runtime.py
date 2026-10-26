@@ -364,6 +364,27 @@ def load(r, off, st: str, mask=None):
     return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
 
 
+_ITEMSIZE = {"f32": 4, "i32": 4, "f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1}
+
+
+def sload(r, off: int, st: str):
+    """A load at a constant offset, through the scalar cache into an SGPR, as Triton's
+    ``s_load`` of a broadcast operand: a vector load would hold every wave's stores on
+    its round trip. The scalar cache does not see this kernel's own stores, so only
+    for buffers the kernel only reads."""
+    size = _ITEMSIZE[st]
+    byte = off * size
+    word = buffer_ops.buffer_load(r, fx.Int32(byte // 4), vec_width=1, is_scalar=True)
+    if byte % 4:
+        shift = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), byte % 4 * 8))
+        word = _arith.ShRUIOp(word, shift.result).result
+    mem = _STORAGE_IR[st]()
+    if size < 4:
+        word = _arith.TruncIOp(ir.IntegerType.get_signless(8 * size), word).result
+    raw = word if mem == word.type else _arith.BitcastOp(mem, word).result
+    return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
+
+
 def _packing(st: str, w: int):
     """How a ``w``-wide vector of a sub-dword kind travels through the buffer intrinsic.
 
