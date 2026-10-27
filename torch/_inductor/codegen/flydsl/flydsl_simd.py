@@ -1067,9 +1067,10 @@ class FlyDSLKernel(SIMDKernel):
                 )
         return roots
 
-    def _stream_itemsizes(self) -> list[int]:
+    def _stream_itemsizes(self, loads: bool = True) -> list[int]:
         """Element sizes of the buffers a pointwise kernel streams: those whose index
-        runs contiguously with x, which broadcast operands do not."""
+        runs contiguously with x, which broadcast operands do not. Only the stored
+        ones without ``loads``."""
         from ...loop_body import MemoryUsageType
 
         nodes = list(self.features.scheduler_nodes())
@@ -1078,12 +1079,15 @@ class FlyDSLKernel(SIMDKernel):
         if len(calls) < len(nodes) or x is None:
             return []
         sizes = []
+        kinds = [MemoryUsageType.STORE]
+        if loads:
+            kinds.insert(0, MemoryUsageType.LOAD)
         for node, index_vars in zip(nodes, calls):
             body = getattr(node, "_body", None)
             if body is None:
                 return []
             exprs = body.indexing_from_args(index_vars)
-            for t in (MemoryUsageType.LOAD, MemoryUsageType.STORE):
+            for t in kinds:
                 for e in body.memory_usage[t]:
                     root = self._root_expr(exprs[e.index_name])
                     if classify_access(root, x, 2) == "contig":
@@ -1146,6 +1150,12 @@ class FlyDSLKernel(SIMDKernel):
                 # twice the lines -- 136us vs 105us on ResNet's f32 threshold backward,
                 # whose bool mask alone would allow eight a lane (Triton 100us).
                 widest_vec = min(widest_vec, max(1, 16 // max(streams)))
+                # Unless that leaves every store short of a 16-byte vector: twice as
+                # wide, an f32 -> bf16 cast stores 16 bytes a lane for two strided
+                # loads, 44.7us -> 41.3us on 24M elements (Triton 41.9us).
+                stores = self._stream_itemsizes(loads=False)
+                if stores and 16 // max(stores) > widest_vec:
+                    widest_vec = min(2 * widest_vec, 16 // max(stores))
             self.ept = _tune("ept", _largest_pow2_dividing(self.xnumel, widest_vec))
             # Two runs per thread keep two vector loads in flight per input, as Triton's
             # default pointwise config does, once the grid is big enough to afford it.
