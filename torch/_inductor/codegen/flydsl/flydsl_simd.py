@@ -95,6 +95,9 @@ TILE_THREADS = 128
 # gradient's second stage (128 columns x 319 partial sums) took 37.6us end to end at
 # 256 threads, 33.8us at this many (Triton 32.5us); 34.8us at 512.
 SMALL_COLUMN_THREADS = 1024
+# Buffers written or read within this many bytes of traffic before a kernel count as
+# still in the 256 MB last-level cache when its autotune candidates are timed.
+WARM_BYTES = 128 << 20
 WAVE = 64
 # Rows a wave interleaves when they are read through a transpose (see
 # finalize_indexing): 101us at 8 (8 lanes a row), 107us at 16, 124us at 4.
@@ -2724,7 +2727,9 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
     return code.getvalue()
 
 
-def _autotune_source(srcs: list[str], arg_names: list[str]) -> str:
+def _autotune_source(
+    srcs: list[str], arg_names: list[str], warm: tuple[int, ...] = ()
+) -> str:
     """One module holding each candidate's kernel (``_c0`` the heuristic's) and a
     ``_main`` that times them on the first call and keeps the fastest."""
     kname = str(Placeholder.KERNEL_NAME)
@@ -2745,7 +2750,8 @@ def _autotune_source(srcs: list[str], arg_names: list[str]) -> str:
             global {kname}_best
             if {kname}_best is None:
                 {kname}_best = fdp.pick_fastest(
-                    [{", ".join(f"{n}_main" for n in names)}], ({args},), {mutated!r}, stream
+                    [{", ".join(f"{n}_main" for n in names)}], ({args},), {mutated!r}, stream,
+                    warm={warm!r},
                 )
                 return
             {kname}_best({args}, stream=stream)
@@ -3074,10 +3080,63 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         )
         return memo[src_code]
 
+    def _recent_buffers(self, kernel_features) -> OrderedSet[str]:
+        """The buffers the nodes just before this kernel's wrote or read, back through
+        WARM_BYTES of them: what is likely still in the last-level cache when it runs."""
+        nodes = self.scheduler.nodes
+        cache = self.__dict__.get("_node_pos")
+        if cache is None or cache[0] is not nodes or len(cache[1]) < len(nodes):
+            pos = {}
+            for i, n in enumerate(nodes):
+                for sub in n.get_nodes():
+                    pos[sub.get_name()] = i
+            cache = self.__dict__["_node_pos"] = (nodes, pos)
+        pos = cache[1]
+        mine = [
+            pos[n.get_name()]
+            for n in kernel_features.scheduler_nodes()
+            if n.get_name() in pos
+        ]
+        recent: OrderedSet[str] = OrderedSet()
+        if not mine:
+            return recent
+        total = 0
+        for j in range(min(mine) - 1, -1, -1):
+            names = [b.get_name() for b in nodes[j].get_outputs()]
+            names += [d.name for d in nodes[j].read_writes.reads]
+            for name in names:
+                if name in recent:
+                    continue
+                try:
+                    buf = V.graph.get_buffer(name)
+                    nbytes = int(buf.get_numel()) * buf.get_dtype().itemsize
+                except (AttributeError, KeyError, NotImplementedError, TypeError):
+                    continue
+                recent.add(name)
+                total += nbytes
+            if total >= WARM_BYTES:
+                break
+        return recent
+
+    def _warm_args(self, kernel, kernel_features, arg_names) -> tuple[int, ...]:
+        """Positions in ``arg_names`` of the buffers ``pick_fastest`` should time with
+        the last-level cache holding."""
+        recent = self._recent_buffers(kernel_features)
+        inner = dict(kernel.args.input_buffers)
+        for name, buf in kernel.args.inplace_buffers.items():
+            if not isinstance(buf, str):
+                inner[name] = buf.inner_name
+        real = getattr(self.scheduler, "mutation_real_name", {})
+        warm = OrderedSet(
+            inner[n] for n in inner if n in recent or real.get(n, n) in recent
+        )
+        return tuple(i for i, a in enumerate(arg_names) if a in warm)
+
     def _lower_candidates(
         self, cands, kernel, src_code, kernel_features, node_schedule, tiling
     ) -> str:
         arg_names = kernel.arg_names()
+        warm = self._warm_args(kernel, kernel_features, arg_names)
         srcs = [src_code]
         count = metrics.generated_kernel_count
         try:
@@ -3092,7 +3151,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         finally:
             # pyrefly: ignore [bad-assignment]
             metrics.generated_kernel_count = count
-        return _autotune_source(srcs, arg_names)
+        return _autotune_source(srcs, arg_names, warm)
 
     def _define_flydsl_kernel(self, src_code: str, node_schedule) -> str:
         _warm_compile_workers()

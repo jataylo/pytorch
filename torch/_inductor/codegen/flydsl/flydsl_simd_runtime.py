@@ -2156,7 +2156,7 @@ def group_welford_twopass(
 # ---------------------------------------------------------------------------------------
 
 
-def pick_fastest(mains, args, mutated, stream=None):
+def pick_fastest(mains, args, mutated, stream=None, warm=None):
     """An autotuned kernel's first call: time every candidate's ``_main`` on copies of
     the buffers it updates in place, run the fastest on the real arguments, and return
     it. Under graph capture nothing can be timed: the first (heuristic) one runs, and
@@ -2185,14 +2185,32 @@ def pick_fastest(mains, args, mutated, stream=None):
     # candidate with a high variance, a 16x64 transpose tile 10% slower on average.
     # Each round is queued behind a GPU sleep: a launch from Python takes longer than
     # a 20us kernel, and unqueued the GPU would idle between them, timing the launches.
-    # Every call starts with L2 (4 MB) flushed, as in a model, where a kernel's inputs
-    # were written a kernel or more ago: back to back, a 4-element-a-lane GPT-2 softmax
-    # backward timed fastest and ran 15% slower in the model than an 8-element one.
-    # Not the 256 MB last-level cache (Triton's benchmarker flushes that), which a
-    # model's inputs usually still occupy: flushed, ResNet's BatchNorm backward
-    # picked variants 0.1 ms a step slower.
+    # Every call starts from the cache state the kernel meets in the model, as far as
+    # the scheduler can tell: the 256 MB last-level cache flushed, then the inputs that
+    # the kernels just before it wrote or read (`warm`) rewritten in place, leaving
+    # them there dirty, as their producer would. Timed back to back instead, every
+    # input is cached: BERT's softmax-dropout backward, whose matmul-written gradient
+    # alone is, picked a variant 115us in the model against 100us. Flushed with nothing
+    # rewritten, ResNet's BatchNorm backward, whose saved activations the convolution
+    # backward had just read, picked variants 0.1 ms a step slower; rewarmed by reading
+    # (clean lines), its in-place conv bias add 95us against 84us. Without `warm` (an
+    # older module), only L2 is flushed.
     device = next(a.device for a in args if isinstance(a, torch.Tensor))
-    flush = torch.empty(16 << 20, dtype=torch.int8, device=device)
+    flush = torch.empty(
+        (256 if warm is not None else 16) << 20, dtype=torch.int8, device=device
+    )
+    warm_bufs = [
+        torch.empty(0, dtype=torch.uint8, device=device).set_(
+            scratch[i].untyped_storage()
+        )
+        for i in (warm or ())
+        if isinstance(scratch[i], torch.Tensor)
+    ]
+
+    def before():
+        flush.zero_()
+        for t in warm_bufs:
+            t.add_(0)
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     ev[0].record()
     mains[0](*scratch, stream=stream)
@@ -2211,7 +2229,7 @@ def pick_fastest(mains, args, mutated, stream=None):
         for fn in mains:
             pairs = []
             for _ in range(reps):
-                flush.zero_()
+                before()
                 pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
                 pair[0].record()
                 fn(*scratch, stream=stream)
