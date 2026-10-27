@@ -9,6 +9,7 @@ Variant specs (combine with "+"):
                    bd (max BLOCK_D), tile (tile elements), bt (BLOCK_T), di (D_ITERS),
                    w (num_warps), s (num_stages)
   tpl:<name>       template source rewrite from TEMPLATE_VARIANTS
+  icfg:<name>=<v>  patch an inductor config value (e.g. a preagg gate)
   mode:<base|ps>   a reference mode; when present it replaces the set's stored
                    best_ref_ms in the summary
 
@@ -143,6 +144,9 @@ def variant_ctx(spec: str):
                 stack.enter_context(_config_patch(arg))
             elif kind == "tpl":
                 stack.enter_context(_template_patch(arg))
+            elif kind == "icfg":
+                name, _, value = arg.partition("=")
+                stack.enter_context(icfg.patch(**{name: type(getattr(icfg, name))(value)}))
             else:
                 raise ValueError(part)
         yield

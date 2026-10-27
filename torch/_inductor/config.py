@@ -1420,8 +1420,8 @@ scatter_preagg_min_index_size: int = 4096
 # Skip scatters with fewer writes per destination than this (tokens / destinations,
 # assuming uniformly spread indices). Below it the per-chunk sort costs more than
 # the contention it removes. Skewed indices raise real contention above this
-# estimate, so the threshold is deliberately low.
-scatter_preagg_min_contention_ratio: float = 16.0
+# estimate, so the threshold is deliberately low (the same as partitioned scatter).
+scatter_preagg_min_contention_ratio: float = 4.0
 
 # Bypass the size and contention gates. Enable via TORCHINDUCTOR_SCATTER_PREAGG_FORCE=1
 scatter_preagg_force: bool = (
