@@ -601,6 +601,16 @@ def _num_cus() -> int:
         return 304
 
 
+@functools.cache
+def _gpu_arch() -> str | None:
+    """The device's gfx target, handed to the compile workers (see fdp._set_arch)."""
+    try:
+        name = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    except Exception:
+        return None
+    return name.split(":", 1)[0] if name.startswith("gfx") else None
+
+
 def _int_or_none(e) -> int | None:
     try:
         return int(e)
@@ -2358,7 +2368,7 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
             if fdp.have_binary({kname}_binary):
                 return
             launch = {kname}_flydsl()
-            fdp.compile_only(launch, {"0, " * len(arg_names)}0, 0)
+            fdp.compile_only(launch, {"0, " * len(arg_names)}0, 0, arch={_gpu_arch()!r})
             fdp.save_binary(launch, {kname}_binary, "{kname}_kernel_0")
         """
 
@@ -2547,6 +2557,12 @@ def flydsl_simd_counters():
 
 class FlyDSLSIMDScheduling(TritonScheduling):
     """TritonScheduling whose pointwise/reduction kernels are FlyDSL where possible."""
+
+    def __init__(self, scheduler) -> None:
+        super().__init__(scheduler)
+        # Before fusion rather than at the first kernel: ViT inference's first step
+        # waited 3.8 s on workers still importing FlyDSL.
+        _warm_compile_workers()
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
         reason = self._precheck(kernel_features)
@@ -2924,7 +2940,7 @@ def _warm_compile_workers() -> None:
 
     pool = async_compile.AsyncCompile.process_pool()
     for _ in range(threads):
-        pool.submit(warm_worker)
+        pool.submit(warm_worker, _gpu_arch())
 
 
 @functools.cache

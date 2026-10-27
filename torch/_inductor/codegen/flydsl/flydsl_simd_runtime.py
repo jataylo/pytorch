@@ -44,8 +44,18 @@ from flydsl._mlir.extras import types as T
 from flydsl.expr import gpu, math as fmath
 from flydsl.expr.utils.arith import ArithValue
 
-from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
 from torch.utils._ordered_set import OrderedSet
+
+
+try:
+    from flydsl.expr import buffer_ops
+except ImportError:
+    # FlyDSL 0.3 moved it kernel-side. The shim's package imports torch._inductor's
+    # kernel templates, flex attention, and the lowerings: 0.45 s of a compile
+    # worker's warm-up, so only when the library has none.
+    from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import (
+        buffer_ops,
+    )
 
 from . import flydsl_mod_runtime as fdu
 
@@ -2107,13 +2117,21 @@ def save_binary(launch, path: str, kernel: str) -> None:
     _os.replace(tmp, path)
 
 
-def compile_only(launch, *args) -> None:
+def _set_arch(arch: str | None) -> None:
+    # Otherwise FlyDSL runs rocm_agent_enumerator in every compile worker: 0.2 s
+    # alone, over a second with the pool's workers all querying the driver at once.
+    if arch:
+        _os.environ.setdefault("FLYDSL_GPU_ARCH", arch)
+
+
+def compile_only(launch, *args, arch: str | None = None) -> None:
     """Compile ``launch`` for ``args`` into its caches without building the host
     launcher (~18 ms) or launching."""
     import io
 
     from flydsl.utils import env
 
+    _set_arch(arch)
     var = type(env.compile).__dict__["compile_only"].env_var  # "COMPILE_ONLY"
     old = _os.environ.get(var)
     _os.environ[var] = "1"
@@ -2128,11 +2146,13 @@ def compile_only(launch, *args) -> None:
             _os.environ[var] = old
 
 
-def warm_worker() -> None:
+def warm_worker(arch: str | None = None) -> None:
     """A compile worker's first FlyDSL kernel paid ~1.4 s of imports and ~0.5 s of
     one-time compiler setup; run ahead of the kernels, while Inductor is still
     generating them."""
     import flydsl.compiler as flyc
+
+    _set_arch(arch)
 
     @flyc.kernel
     def _warm_kernel(p: fx.Int64):
