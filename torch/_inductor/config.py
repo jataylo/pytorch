@@ -1428,6 +1428,16 @@ scatter_preagg_force: bool = (
     os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_FORCE", "0") == "1"
 )
 
+# Prototype: each block estimates its own duplicate destinations and only sorts
+# when that saves at least scatter_preagg_adaptive_min_saved of its atomics,
+# otherwise issuing plain atomics. Replaces the contention gate.
+scatter_preagg_adaptive: bool = (
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE", "0") == "1"
+)
+scatter_preagg_adaptive_min_saved: float = float(
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE_MIN_SAVED", "0.125")
+)
+
 
 class _collective:
     auto_select: bool = False

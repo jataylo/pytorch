@@ -143,6 +143,9 @@ def _size_gate(
         return None
     if num_tokens * num_inner < config.scatter_preagg_min_index_size:
         return "too_small"
+    # Adaptive blocks fall back to plain atomics where sorting does not pay.
+    if config.scatter_preagg_adaptive:
+        return None
     # On gfx942, bf16 atomics are slower and less accurate than the fp32 copy
     # at any contention, while plain atomics win for other dtypes below it.
     if dtype == torch.bfloat16 and torch.version.hip:
@@ -508,8 +511,15 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
     def _symbol_of(value: Any) -> sympy.Symbol:
         return sympy_index_symbol(str(getattr(value, "value", value)))
 
-    def preagg_key(self, tok: str, key_out: str, valid_out: str) -> str:
-        """Destination key and validity of each token in ``tok`` (shape [BLOCK_T])."""
+    def preagg_key(
+        self,
+        tok: str,
+        key_out: str,
+        valid_out: str,
+        body: str = "preagg_key",
+        rows: str = "BLOCK_T",
+    ) -> str:
+        """Destination key and validity of each token in ``tok`` (shape [rows])."""
         plan = self._plan
 
         def emit() -> list[str]:
@@ -521,20 +531,26 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
                 out_coords = list(plan.output_indexer(coords))
             key = self.kexpr(self.rename_indexing(plan.key_expr(out_coords)))
             valid = " & ".join(
-                ["tl.full([BLOCK_T], 1, tl.int1)"]
+                [f"tl.full([{rows}], 1, tl.int1)"]
                 + [f"({getattr(v, 'value', v)})" for v in indirect.valid]
             )
             return [
-                f"{key_out} = tl.full([BLOCK_T], 0, tl.int64) + ({key})",
+                f"{key_out} = tl.full([{rows}], 0, tl.int64) + ({key})",
                 f"{valid_out} = {valid}",
             ]
 
-        return self._codegen_subgraph(
-            "preagg_key", {"tok": tok}, {"tok": ("BLOCK_T",)}, emit
-        )
+        return self._codegen_subgraph(body, {"tok": tok}, {"tok": (rows,)}, emit)
 
-    def preagg_value(self, ptok: str, inner: str, out: str) -> str:
-        """Value at sorted tokens ``ptok`` ([BLOCK_T, 1]) and inner ids ([1, BLOCK_D])."""
+    def preagg_value(
+        self,
+        ptok: str,
+        inner: str,
+        out: str,
+        body: str = "preagg_value",
+        rows: str = "BLOCK_T",
+        cols: str = "BLOCK_D",
+    ) -> str:
+        """Value at tokens ``ptok`` ([rows, 1]) and inner ids ([1, cols])."""
         plan = self._plan
 
         def emit() -> list[str]:
@@ -546,12 +562,12 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
                 value = plan.value_fn(coords)
             value = getattr(value, "value", value)
             acc = triton_type(plan.acc_dtype)
-            return [f"{out} = tl.broadcast_to(({value}).to({acc}), [BLOCK_T, BLOCK_D])"]
+            return [f"{out} = tl.broadcast_to(({value}).to({acc}), [{rows}, {cols}])"]
 
         return self._codegen_subgraph(
-            "preagg_value",
+            body,
             {"ptok": ptok, "inner": inner},
-            {"ptok": ("BLOCK_T", "1"), "inner": ("1", "BLOCK_D")},
+            {"ptok": (rows, "1"), "inner": ("1", cols)},
             emit,
         )
 
@@ -611,6 +627,66 @@ _TEMPLATE_SOURCE = (
     {{preagg_key("tok", "key", "valid") | indent_except_first(1)}}
 
     dest = tl.where(tok_mask & valid, key, NUM_KEYS).to(KEY_DTYPE)
+{% if ADAPTIVE %}
+    # Estimate the block's distinct destinations from a histogram of hashed
+    # keys (linear counting), and skip the sort when it saves few atomics.
+    live = tok_mask & valid
+    hashed = ((dest.to(tl.int64) * 2654435761) >> (32 - LOG_HIST_BINS)) & (
+        HIST_BINS - 1
+    )
+    counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
+    empty = tl.maximum(tl.sum((counts == 0).to(tl.float32), 0), 1.0)
+    distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
+    n_live = tl.sum(live.to(tl.float32), 0)
+    if n_live - distinct < n_live * MIN_SAVED:
+        # Plain atomics in token order, like regular Inductor. Rows of PLAIN_D
+        # put fewer tokens in each atomic instruction than BLOCK_D-wide tiles,
+        # which matters when hot keys collide within one.
+        for chunk in tl.range(0, BLOCK_T // PLAIN_T):
+            chunk_block = tok_block + chunk * PLAIN_T
+            chunk_pos = tl.arange(0, PLAIN_T).to(INDEX_DTYPE)
+            if TOK_SHIFT:
+                ctok = tl.minimum(chunk_block, NUM_TOKENS - PLAIN_T) + chunk_pos
+                ctok_mask = ctok >= chunk_block
+            else:
+                ctok = tl.minimum(chunk_block + chunk_pos, NUM_TOKENS - 1)
+                ctok_mask = chunk_block + chunk_pos < NUM_TOKENS
+
+            {{preagg_key("ctok", "ckey", "cvalid", "preagg_plain_key", "PLAIN_T") | indent_except_first(3)}}
+
+            clive = ctok_mask & cvalid
+            ckey = tl.where(clive, ckey, 0).to(INDEX_DTYPE)[:, None]
+            ctok = ctok[:, None]
+            for it in tl.range(0, PLAIN_ITERS):
+                inner_raw = (pid_inner * PLAIN_ITERS + it) * PLAIN_D + tl.arange(
+                    0, PLAIN_D
+                )
+                inner_mask = inner_raw < NUM_INNER
+                if INNER_MODE == 0:
+                    inner = inner_raw[None, :]
+                    if ATOMIC_VEC:
+                        atomic_inner = tl.max_contiguous(
+                            tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
+                        )[None, :]
+                    else:
+                        atomic_inner = inner
+                else:
+                    inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
+                    atomic_inner = inner
+
+                {{preagg_value("ctok", "inner", "val", "preagg_plain_value", "PLAIN_T", "PLAIN_D") | indent_except_first(4)}}
+
+                tl.atomic_add(
+                    tl.broadcast_to(
+                        OUT + ({{preagg_addr("ckey", "atomic_inner")}}),
+                        [PLAIN_T, PLAIN_D],
+                    ),
+                    val.to(OUT_DTYPE),
+                    mask=clive[:, None] & inner_mask[None, :],
+                    sem="relaxed",
+                )
+        return
+{% endif %}
     packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
     skey = packed >> LOG_BLOCK_T
     sorted_pos = (packed & (BLOCK_T - 1)).to(INDEX_DTYPE)
@@ -668,6 +744,10 @@ _TEMPLATE_SOURCE = (
 )
 
 scatter_preagg_template = ScatterPreaggTemplate("scatter_preagg", _TEMPLATE_SOURCE)
+
+# Widest row of the adaptive plain path, about one wavefront's worth of a
+# regular Inductor scatter's elements.
+_PLAIN_MAX_D = 256
 
 # The sorted lowering. Tokens arrive sorted by destination (SKEYS, with PERM
 # their original positions), so each destination is one contiguous segment.
@@ -1217,12 +1297,43 @@ def _lower_atomic(
     # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
     atomic_vec = 2 if torch.version.hip else 0
+
+    def adaptive_kwargs(cfg, inner_mode) -> dict[str, Any]:
+        min_saved = config.scatter_preagg_adaptive_min_saved
+        if not config.scatter_preagg_adaptive or (
+            # With fewer keys than tokens per block, full blocks always save
+            # enough atomics to sort.
+            isinstance(plan.num_keys, (int, sympy.Integer))
+            and plan.num_keys <= cfg.block_t * (1 - min_saved)
+        ):
+            return {"ADAPTIVE": False}
+        hist_bins = min(2 * cfg.block_t, 2048)
+        # Widen the plain path's rows by a power of two that divides D_ITERS,
+        # so each program still covers exactly its own inner range.
+        widen = 1
+        if inner_mode == 0:
+            widen = cfg.d_iters & -cfg.d_iters
+            while widen > 1 and (
+                cfg.block_d * widen > _PLAIN_MAX_D or widen > cfg.block_t
+            ):
+                widen //= 2
+        return {
+            "ADAPTIVE": True,
+            "HIST_BINS": hist_bins,
+            "LOG_HIST_BINS": hist_bins.bit_length() - 1,
+            "MIN_SAVED": min_saved,
+            "PLAIN_T": cfg.block_t // widen,
+            "PLAIN_D": cfg.block_d * widen,
+            "PLAIN_ITERS": cfg.d_iters // widen,
+        }
+
     layout = _placeholder_layout(out)
     choices: list[Any] = []
     for cfg in configs:
         log_block_t = cfg.block_t.bit_length() - 1
         int32_keys = _guarded(sympy.Lt(plan.num_keys + 1, 2 ** (31 - log_block_t)))
         wide_few_keys = cfg.block_d >= 64 and few_keys
+        inner_mode = _inner_mode(plan.num_inner, cfg.block_d, cfg.d_iters)
         scatter_preagg_template.maybe_append_choice(
             choices,
             input_nodes=(out, *inputs),
@@ -1237,7 +1348,7 @@ def _lower_atomic(
             D_ITERS=cfg.d_iters,
             LOG_BLOCK_T=log_block_t,
             KEY_DTYPE="tl.int32" if int32_keys else "tl.int64",
-            INNER_MODE=_inner_mode(plan.num_inner, cfg.block_d, cfg.d_iters),
+            INNER_MODE=inner_mode,
             OUT_DTYPE=triton_type(dtype),
             ATOMIC_VEC=(0 if cfg.block_d < atomic_vec or wide_few_keys else atomic_vec),
             # Skipping the scan for blocks without a repeated destination pays
@@ -1246,6 +1357,7 @@ def _lower_atomic(
             # The shifted token block needs one full block; the clamped one
             # handles any size.
             TOK_SHIFT=_guarded(sympy.Ge(plan.num_tokens, cfg.block_t)),
+            **adaptive_kwargs(cfg, inner_mode),
             **plan.static_sizes(),
         )
     if not choices:
