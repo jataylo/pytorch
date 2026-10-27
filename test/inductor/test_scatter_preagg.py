@@ -281,12 +281,12 @@ class TestScatterPreagg(TestCase):
 
     @parametrize("op", ["index_put", "scatter_reduce"])
     def test_bf16_declined_falls_back(self, op):
-        # Too little contention for the template: where bf16 atomics need the
-        # eager fallback, the scatter must still go to it.
+        # Too small for the template: where bf16 atomics need the eager
+        # fallback, the scatter must still go to it.
         fn = _BF16_SCATTER_FNS[op]
-        x = torch.randn(10_000, 8, device=GPU_TYPE).bfloat16()
-        idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
-        v = torch.randn(20_000, 8, device=GPU_TYPE).bfloat16()
+        x = torch.randn(1000, 8, device=GPU_TYPE).bfloat16()
+        idx = torch.randint(0, 1000, (400,), device=GPU_TYPE)
+        v = torch.randn(400, 8, device=GPU_TYPE).bfloat16()
 
         _, (code,) = run_and_get_code(
             torch.compile(fn, fullgraph=True), x.clone(), idx, v
@@ -294,6 +294,16 @@ class TestScatterPreagg(TestCase):
         self._check(fn, x, idx, v, applied=False, atol=2e-2, rtol=2e-2)
         if needs_fallback_due_to_atomic_add_limitations(torch.bfloat16):
             self.assertNotIn("tl.atomic_add(", code)
+
+    def test_bf16_low_contention(self):
+        # About two writes per destination: on ROCm the fp32 copy still beats
+        # bf16 atomics, elsewhere the contention gate declines.
+        fn = _BF16_SCATTER_FNS["index_put"]
+        x = torch.randn(10_000, 8, device=GPU_TYPE).bfloat16()
+        idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
+        v = torch.randn(20_000, 8, device=GPU_TYPE).bfloat16()
+        applied = torch.version.hip is not None
+        self._check(fn, x, idx, v, applied=applied, atol=2e-2, rtol=2e-2)
 
     @parametrize(
         "dtype",
@@ -328,15 +338,13 @@ class TestScatterPreagg(TestCase):
             return
 
         if dtype in (torch.float16, torch.bfloat16):
-            # fp16 blocks are summed in fp32 but combined with fp16 atomics;
-            # bf16 accumulates in fp32 throughout.
+            # Accumulated in an fp32 copy, so each destination is rounded once.
             ref = fn(x.float(), idx, v.float())
             out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
-            rel = 8e-2 if dtype == torch.float16 else 1e-2
             self.assertEqual(
-                out.float(), ref, atol=ref.abs().max().item() * rel, rtol=0
+                out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0
             )
-            self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
+            self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 1)
             return
         self._check(fn, x, idx, v, atol=1e-6, rtol=1e-6)
 
@@ -390,15 +398,18 @@ class TestScatterPreagg(TestCase):
     def test_configs(self):
         from torch._inductor.virtualized import V
 
+        def block(*args, **kwargs):
+            (cfg,) = V.choices.get_scatter_preagg_configs(*args, **kwargs)
+            return cfg.block_t, cfg.block_d
+
         default = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertEqual(len(default), 1)
-        self.assertEqual((default[0].block_t, default[0].block_d), (256, 32))
-        strided = V.choices.get_scatter_preagg_configs(
-            50_000, 256, torch.float32, inner_contiguous=False
-        )
-        self.assertEqual((strided[0].block_t, strided[0].block_d), (512, 8))
-        half = V.choices.get_scatter_preagg_configs(50_000, 64, torch.bfloat16)
-        self.assertEqual((half[0].block_t, half[0].block_d), (64, 64))
+        self.assertEqual(block(50_000, 32, torch.float32), (256, 16))
+        self.assertEqual(block(50_000, 128, torch.bfloat16), (128, 32))
+        self.assertEqual(block(50_000, 512, torch.float32), (64, 64))
+        self.assertEqual(block(50_000, 512, torch.float32, num_keys=16), (64, 32))
+        strided = (50_000, 256, torch.float32)
+        self.assertEqual(block(*strided, inner_contiguous=False), (512, 8))
         with config.patch(max_autotune=True):
             tuned = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertGreater(len(tuned), 1)

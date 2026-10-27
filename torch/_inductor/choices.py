@@ -193,10 +193,47 @@ class InductorChoices:
         dtype: torch.dtype,
         device_type: str | None = "cuda",
         inner_contiguous: bool = True,
+        num_keys: int | None = None,
     ) -> list[Any]:
         heuristics = self.get_config_heuristics(device_type)
         return heuristics.get_scatter_preagg_configs(
-            num_tokens, num_inner, dtype, inner_contiguous
+            num_tokens, num_inner, dtype, inner_contiguous, num_keys
+        )
+
+    def lowers_scatter_fallbacks(
+        self, dtype: torch.dtype, device: torch.device | None
+    ) -> bool:
+        """
+        Whether accumulating scatters that would otherwise take the eager
+        fallback (atomic_add dtype support, deterministic algorithms) should be
+        offered to lower_accumulating_scatter first.
+        """
+        if not config.scatter_preagg_enabled:
+            return False
+        from .kernel.scatter_preagg import can_bypass_atomic_fallback
+
+        return can_bypass_atomic_fallback(dtype, device)
+
+    def lower_accumulating_scatter(
+        self,
+        out: Any,
+        value_fn: Any,
+        iter_sizes: Any,
+        output_indexer: Any,
+        inputs: list[Any],
+        fallback: Any,
+    ) -> bool:
+        """
+        Lower ``out[output_indexer(i)] += value_fn(i)`` over ``iter_sizes``.
+        Returns False, emitting nothing, to lower a regular atomic Scatter;
+        ``fallback()`` emits the eager kernel.
+        """
+        if not config.scatter_preagg_enabled:
+            return False
+        from .kernel.scatter_preagg import maybe_preaggregated_scatter
+
+        return maybe_preaggregated_scatter(
+            out, value_fn, iter_sizes, output_indexer, inputs, fallback
         )
 
     def append_flex_attention_choices(

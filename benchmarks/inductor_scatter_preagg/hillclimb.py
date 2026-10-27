@@ -90,13 +90,17 @@ def _config_patch(spec: str):
 
     kv = {k: int(v) for k, v in (item.split("=") for item in spec.split(","))}
 
-    def configs(self, num_tokens, num_inner, dtype, inner_contiguous=True):
-        if inner_contiguous:
-            default_bd, default_tile = (32 if num_inner <= 128 else 64), 8192
-        else:
-            default_bd, default_tile = 8, 4096
-        max_block_d = kv.get("bd", default_bd)
-        tile = kv.get("tile", default_tile)
+    real = heur.BaseConfigHeuristic.get_scatter_preagg_configs
+
+    def configs(
+        self, num_tokens, num_inner, dtype, inner_contiguous=True, num_keys=None
+    ):
+        with icfg.patch(max_autotune=False):
+            (default,) = real(
+                self, num_tokens, num_inner, dtype, inner_contiguous, num_keys
+            )
+        max_block_d = kv.get("bd", default.block_d)
+        tile = kv.get("tile", default.block_t * default.block_d)
         if "bt" in kv:
             tile = kv["bt"] * min(next_power_of_2(num_inner), max_block_d)
         cfg = self._scatter_preagg_config(
@@ -141,7 +145,9 @@ def variant_ctx(spec: str):
                 stack.enter_context(_template_patch(arg))
             elif kind == "icfg":
                 name, _, value = arg.partition("=")
-                stack.enter_context(icfg.patch(**{name: type(getattr(icfg, name))(value)}))
+                stack.enter_context(
+                    icfg.patch(**{name: type(getattr(icfg, name))(value)})
+                )
             else:
                 raise ValueError(part)
         yield

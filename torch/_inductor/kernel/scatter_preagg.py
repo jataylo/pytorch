@@ -22,8 +22,9 @@ Values are loaded after the sort, at the permuted tokens: permuting a computed
 
 Where atomics are not wanted (deterministic algorithms) or not available (8- and
 16-bit integers), a sorted lowering sorts all tokens by destination first and
-sums every destination's run in a fixed order without atomics. bf16 outputs
-accumulate into an fp32 copy, so each destination is rounded once, as in eager.
+sums every destination's run in a fixed order without atomics. fp16 and bf16
+outputs accumulate into an fp32 copy, so each destination is rounded once, as
+in eager.
 """
 
 import dataclasses
@@ -45,6 +46,7 @@ from .. import config, ir
 from ..codegen.triton import TritonSymbols
 from ..ops_handler import DefaultHandler, WrapperHandler
 from ..select_algorithm import (
+    AlgorithmSelectorCache,
     autotune_select_algorithm,
     ModificationWrapper,
     SymbolicGridFn,
@@ -134,11 +136,17 @@ def can_bypass_atomic_fallback(dtype: torch.dtype, device: torch.device | None) 
     )
 
 
-def _size_gate(num_tokens: int, num_inner: int, num_keys: int) -> str | None:
+def _size_gate(
+    num_tokens: int, num_inner: int, num_keys: int, dtype: torch.dtype
+) -> str | None:
     if config.scatter_preagg_force:
         return None
     if num_tokens * num_inner < config.scatter_preagg_min_index_size:
         return "too_small"
+    # On gfx942, bf16 atomics are slower and less accurate than the fp32 copy
+    # at any contention, while plain atomics win for other dtypes below it.
+    if dtype == torch.bfloat16 and torch.version.hip:
+        return None
     if num_tokens / num_keys < config.scatter_preagg_min_contention_ratio:
         return "low_contention"
     return None
@@ -161,7 +169,7 @@ def claims_index_put(
         return False
     # The sorted lowering has no contention gate.
     return _use_sorted(dtype) or (
-        _size_gate(index_size, output_size // scatter_dim_size, scatter_dim_size)
+        _size_gate(index_size, output_size // scatter_dim_size, scatter_dim_size, dtype)
         is None
     )
 
@@ -287,6 +295,8 @@ class _ScatterPlan:
     output_indexer: IndexFn
     value_fn: ValueFn
     acc_dtype: torch.dtype
+    # Buffers only the destination keys read.
+    index_reads: OrderedSet[str] = dataclasses.field(default_factory=OrderedSet)
     # Size symbols guarded to be multiples of 16 (see _align_strides).
     aligned_symbols: OrderedSet[sympy.Symbol] = dataclasses.field(
         default_factory=OrderedSet
@@ -949,6 +959,7 @@ def _plan(
     reads = key_rec.read_names | value_rec.read_names
     if out_name in reads:
         return "reads_output"
+    plan.index_reads = key_rec.read_names - value_rec.read_names
     return plan, reads
 
 
@@ -968,8 +979,6 @@ def maybe_preaggregated_scatter(
     emitted instead. Returns False, emitting nothing, when the caller should
     lower a regular atomic Scatter.
     """
-    if not config.scatter_preagg_enabled:
-        return False
     read_names: OrderedSet[str] = OrderedSet()
     for x in inputs:
         if isinstance(x, ir.IRNode):
@@ -1011,13 +1020,17 @@ def _scatter_into_copy(
     sizes: list[sympy.Expr],
     output_indexer: IndexFn,
     read_names: OrderedSet[str],
+    gated: bool = False,
 ) -> bool:
-    """Scatter into a contiguous ``dtype`` copy of ``out``, then copy it back."""
+    """
+    Scatter into a contiguous ``dtype`` copy of ``out``, then copy it back.
+    ``gated`` when the size gates already passed for ``out``.
+    """
     from ..lowering import lowerings, to_dtype
 
     tmp = _realize(to_dtype(out, dtype, copy=True))
     if _output_storage(tmp) is None or not _try_template(
-        tmp, value_fn, sizes, output_indexer, read_names, out.get_dtype()
+        tmp, value_fn, sizes, output_indexer, read_names, gated
     ):
         return False
     lowerings[torch.ops.aten.copy_.default](out, tmp)
@@ -1031,9 +1044,8 @@ def _try_template(
     sizes: list[sympy.Expr],
     output_indexer: IndexFn,
     read_names: OrderedSet[str],
-    row_dtype: torch.dtype | None = None,
+    gated: bool = False,
 ) -> bool:
-    """``row_dtype`` is the dtype rows are loaded in when ``out`` is a staging copy."""
     device, dtype = out.get_device(), out.get_dtype()
     if (reason := _ineligible(device, dtype)) is not None:
         _record_skip(reason)
@@ -1071,11 +1083,13 @@ def _try_template(
     )
     # The sorted lowering replaces the eager fallback rather than atomics, so
     # the contention gates do not apply to it.
-    if not use_sorted and (reason := _size_gate(num_tokens, num_inner, num_keys)):
+    if not (use_sorted or gated) and (
+        reason := _size_gate(num_tokens, num_inner, num_keys, dtype)
+    ):
         _record_skip(reason)
         return False
-    if dtype == torch.bfloat16 and not use_sorted:
-        # bf16 atomics would round every block's partial sum.
+    if dtype in (torch.float16, torch.bfloat16) and not use_sorted:
+        # 16-bit atomics would round every block's partial sum.
         return _scatter_into_copy(
             "fp32_copy",
             out,
@@ -1084,6 +1098,7 @@ def _try_template(
             sizes,
             plan.output_indexer,
             read_names,
+            gated=True,
         )
 
     inputs: list[ir.IRNode] = []
@@ -1106,9 +1121,10 @@ def _try_template(
         configs = V.choices.get_scatter_preagg_configs(
             num_tokens,
             num_inner,
-            row_dtype or dtype,
+            dtype,
             device_type=device.type,
             inner_contiguous=inner_contiguous,
+            num_keys=num_keys,
         )
     if not use_sorted:
         # The atomic template packs (key, position) into one integer; the
@@ -1161,6 +1177,32 @@ def _placeholder_layout(out: ir.TensorBox) -> ir.FixedLayout:
     )
 
 
+def _index_gen_fns(
+    plan: _ScatterPlan, input_nodes: list[ir.IRNode]
+) -> dict[int, Callable[[ir.Buffer], torch.Tensor]]:
+    """
+    Autotuning benchmarks integer inputs as zeros, which sends every write to
+    one destination. Configs that win there lose on spread indices and vice
+    versa, so give index tensors both: half spread uniformly, half on one
+    destination.
+    """
+    bound = min((_hint(s) for s in plan.key_sizes), default=1)
+
+    def mixed(node: ir.Buffer) -> torch.Tensor:
+        t = AlgorithmSelectorCache.benchmark_example_value(node)
+        flat = t.view(-1) if t.is_contiguous() else t
+        flat[: flat.shape[0] // 2].random_(0, bound)
+        return t
+
+    return {
+        i: mixed
+        for i, node in enumerate(input_nodes)
+        if node.get_name() in plan.index_reads
+        and not node.get_dtype().is_floating_point
+        and node.get_dtype() != torch.bool
+    }
+
+
 def _lower_atomic(
     out: ir.TensorBox,
     plan: _ScatterPlan,
@@ -1168,10 +1210,11 @@ def _lower_atomic(
     inputs: list[ir.IRNode],
     configs: list[Any],
 ) -> bool:
+    # 16-bit floats are staged in fp32, so atomics here are 32 or 64 bits.
     dtype = out.get_dtype()
-    num_keys = _hint(plan.num_keys)
-    # On CDNA, fp32 atomics run ~1.7x faster at two elements per thread than at
-    # the four the compiler derives from load contiguity, except for wide fp32
+    few_keys = _hint(plan.num_keys) <= 64
+    # On CDNA, 32-bit atomics run ~1.7x faster at two elements per thread than
+    # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
     atomic_vec = 2 if torch.version.hip else 0
     layout = _placeholder_layout(out)
@@ -1179,9 +1222,7 @@ def _lower_atomic(
     for cfg in configs:
         log_block_t = cfg.block_t.bit_length() - 1
         int32_keys = _guarded(sympy.Lt(plan.num_keys + 1, 2 ** (31 - log_block_t)))
-        wide_fp32_few_keys = (
-            cfg.block_d >= 64 and num_keys <= 64 and dtype.itemsize >= 4
-        )
+        wide_few_keys = cfg.block_d >= 64 and few_keys
         scatter_preagg_template.maybe_append_choice(
             choices,
             input_nodes=(out, *inputs),
@@ -1198,12 +1239,10 @@ def _lower_atomic(
             KEY_DTYPE="tl.int32" if int32_keys else "tl.int64",
             INNER_MODE=_inner_mode(plan.num_inner, cfg.block_d, cfg.d_iters),
             OUT_DTYPE=triton_type(dtype),
-            ATOMIC_VEC=(
-                0 if cfg.block_d < atomic_vec or wide_fp32_few_keys else atomic_vec
-            ),
+            ATOMIC_VEC=(0 if cfg.block_d < atomic_vec or wide_few_keys else atomic_vec),
             # Skipping the scan for blocks without a repeated destination pays
-            # for its check only on wide slices or 16-bit outputs (gfx942).
-            SKIP_UNIQUE_SCAN=dtype.itemsize < 4 or cfg.block_d >= 64,
+            # for its check only on wide slices (gfx942).
+            SKIP_UNIQUE_SCAN=cfg.block_d >= 64,
             # The shifted token block needs one full block; the clamped one
             # handles any size.
             TOK_SHIFT=_guarded(sympy.Ge(plan.num_tokens, cfg.block_t)),
@@ -1213,8 +1252,14 @@ def _lower_atomic(
         return False
     # MultiTemplateBuffer (deferred selection) does not track mutated inputs, so
     # the in-place result would be dropped.
+    input_nodes = [out, *inputs]
     autotune_select_algorithm(
-        "scatter_preagg", choices, [out, *inputs], layout, return_multi_template=False
+        "scatter_preagg",
+        choices,
+        input_nodes,
+        layout,
+        input_gen_fns=_index_gen_fns(plan, input_nodes),
+        return_multi_template=False,
     )
     return True
 

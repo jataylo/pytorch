@@ -1431,32 +1431,35 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         num_inner: int,
         dtype: Any,
         inner_contiguous: bool = True,
+        num_keys: int | None = None,
     ) -> list[ScatterPreaggConfig]:
         configs: list[ScatterPreaggConfig] = []
-        block_ds = (32, 64) if inner_contiguous else (8, 16)
         if config.max_autotune:
-            for max_block_d, tile_elems, num_warps in itertools.product(
-                block_ds, (4096, 8192, 16384), (4, 8)
+            block_ds = (16, 32, 64, 128) if inner_contiguous else (8, 16)
+            for max_block_d, tile_elems in itertools.product(
+                block_ds, (2048, 4096, 8192)
             ):
                 cfg = self._scatter_preagg_config(
-                    num_tokens, num_inner, max_block_d, tile_elems, num_warps
+                    num_tokens, num_inner, max_block_d, tile_elems, 4
                 )
                 if cfg not in configs:
                     configs.append(cfg)
 
-        # Narrow slices for narrow rows; larger tiles make the per-block sort
-        # cost more than the extra pre-aggregation saves. When inner elements
-        # are strided in the output each one is its own memory transaction, so
-        # thin slices of many tokens keep sorted neighbours together instead.
-        # 16-bit rows move half the bytes per sorted token, so the sort weighs
-        # more and smaller blocks of wider slices win (measured on gfx942).
-        if inner_contiguous and dtype.itemsize < 4:
-            max_block_d, tile_elems = 64, 4096
-        elif inner_contiguous:
-            max_block_d = 32 if num_inner <= 128 else 64
-            tile_elems = 8192
-        else:
+        # Fit on gfx942 with benchmarks/inductor_scatter_preagg/tune.py, over
+        # row widths, destination counts and index distributions: 4K-element
+        # tiles (larger ones make the per-block sort cost more than the extra
+        # pre-aggregation saves) of slices growing with the row. Wide rows into
+        # a handful of destinations prefer narrower slices of fewer tokens.
+        # When inner elements are strided in the output each one is its own
+        # memory transaction, so thin slices of many tokens keep sorted
+        # neighbours together instead.
+        if not inner_contiguous:
             max_block_d, tile_elems = 8, 4096
+        elif num_inner >= 256 and num_keys is not None and num_keys <= 64:
+            max_block_d, tile_elems = 32, 2048
+        else:
+            max_block_d = 16 if num_inner <= 32 else 32 if num_inner <= 128 else 64
+            tile_elems = 4096
         default_config = self._scatter_preagg_config(
             num_tokens, num_inner, max_block_d, tile_elems, 4
         )
