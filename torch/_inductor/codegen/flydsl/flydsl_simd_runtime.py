@@ -1967,10 +1967,14 @@ def pick_fastest(mains, args, mutated, stream=None):
     times = []
     for fn in mains:
         fn(*scratch, stream=stream)  # compiles (and runs once)
+        # The scheduler's settings for timing fusion choices: the defaults (100 cache
+        # flushes and up to 25 ms a candidate) took 9 s of a Qwen3 prefill's compile.
         times.append(
             benchmarker.benchmark_gpu(
                 lambda fn=fn: fn(*scratch, stream=stream),
-                rep=40,
+                memory_warmup_iters=5,
+                benchmark_iters=10,
+                max_benchmark_duration=10,
                 is_vetted_benchmarking=True,
             )
         )
