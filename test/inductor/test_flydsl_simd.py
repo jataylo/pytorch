@@ -475,6 +475,37 @@ class TestFlyDSLSIMD(TestCase):
         self.assertGreater(c["flydsl_kernels"], 0)
         self.assertEqual(c["triton_kernels"], 0)
 
+    @unittest.skipIf(
+        not HAS_GPU or torch.cuda.get_device_properties(0).total_memory < 32 << 30,
+        "needs 32 GiB",
+    )
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_buffer_past_2gib(self, dtype):
+        # Past a buffer descriptor's 2 GiB range loads, stores and atomics take 64-bit
+        # global pointers; the odd sizes leave a masked tail.
+        cols = 151936
+        rows = (3 << 30) // (cols * dtype.itemsize) + 1
+        x = torch.randn(rows, cols, device="cuda", dtype=dtype)
+        self.check(lambda x: x * 2, x, atol=0, rtol=0, kinds=["pointwise"])
+        self.check(
+            lambda x: torch.logsumexp(x.float(), -1), x, atol=1e-4, kinds=["reduction"]
+        )
+        del x
+        n = rows * cols + 7
+        ix = torch.randint(n - 3000, n, (5000,), device="cuda")
+        v = torch.randn(5000, device="cuda", dtype=dtype)
+        base = torch.zeros(n, device="cuda", dtype=dtype)
+        out = torch.compile(lambda b, v, ix: b.index_put_((ix,), v, accumulate=True))(
+            base, v, ix
+        )
+        ref = torch.zeros(3000, device="cuda", dtype=torch.float64).index_put_(
+            (ix - (n - 3000),), v.double(), accumulate=True
+        )
+        tol = 1e-1 if dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(out[-3000:].double(), ref, atol=tol, rtol=tol)
+        self.assertEqual(out[: n - 3000].count_nonzero().item(), 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     # -- scans -----------------------------------------------------------------------
 
     def test_group_widths(self):

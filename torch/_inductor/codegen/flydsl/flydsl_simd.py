@@ -29,9 +29,10 @@ than refused. A block is 256 threads.
   combines are shuffles within a wave plus one LDS round across waves.
 
 Indices are 32-bit and masking goes through AMD buffer descriptors (see
-``flydsl_simd_runtime``), so buffers of 2 GiB or more are refused, as are dynamic shapes:
-a buffer descriptor needs an exact byte extent, and with symbolic sizes it would have to
-be computed on the device with no way to refuse an oversized one.
+``flydsl_simd_runtime``); buffers of 2 GiB or more, past a descriptor's range, take
+64-bit global pointers instead. Dynamic shapes are refused: a buffer descriptor needs an
+exact byte extent, and with symbolic sizes it would have to be computed on the device
+with no way to refuse an oversized one.
 """
 
 from __future__ import annotations
@@ -771,7 +772,8 @@ class FlyDSLKernel(SIMDKernel):
         self.tile2d = "y" in self.numels
         self.ynumel = self._static(self.numels["y"], "ynumel") if self.tile2d else 1
         self.fast = "x"  # the dimension a thread's vector runs follow
-        self.tile_f = self.tile_s = TILE  # tile edges along the fast and slow dimensions
+        # Tile edges along the fast and slow dimensions.
+        self.tile_f = self.tile_s = TILE
         self.staged: list[dict[str, Any]] = []
         if self.xnumel * self.rnumel * self.ynumel > _I32_LIMIT:
             raise FlyDSLUnsupported("more than 2**31 elements")
@@ -2011,10 +2013,11 @@ class FlyDSLKernel(SIMDKernel):
             n = _int_or_none(V.graph.sizevars.simplify(layout.storage_size()))
             if n is None:
                 raise FlyDSLUnsupported("dynamic buffer extent")
-            nbytes = max(1, n) * node.get_dtype().itemsize
-            if nbytes >= _I32_LIMIT:
-                raise FlyDSLUnsupported("buffer of 2 GiB or more")
-            extents[a] = nbytes
+            if n > _I32_LIMIT:
+                # Offsets are 32-bit element indices; 2 GiB or more is addressed
+                # with 64-bit pointers (fdp._Flat), but 2**31 elements is past them.
+                raise FlyDSLUnsupported("buffer of 2**31 elements or more")
+            extents[a] = max(1, n) * node.get_dtype().itemsize
         return extents
 
     @property
@@ -2059,9 +2062,7 @@ class FlyDSLKernel(SIMDKernel):
     @property
     def smem_words(self) -> int:
         if self.staged:
-            return sum(
-                s["words"] * self.tile_f * self._tile_pitch for s in self.staged
-            )
+            return sum(s["words"] * self.tile_f * self._tile_pitch for s in self.staged)
         # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
         return self.threads * 2 * self.max_components if self.uses_smem else 0
 
@@ -2376,14 +2377,16 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
 _PTR_RE = re.compile(r"(?<![A-Za-z0-9])(_r_)?((?:in_out_ptr|in_ptr|out_ptr)\d+)\b")
 
 
-def _merge_identical(kernels, inners) -> list[tuple[int, str, list[tuple[str, ...]]]]:
+def _merge_identical(
+    kernels, inners, flat: OrderedSet[str] = OrderedSet()
+) -> list[tuple[int, str, list[tuple[str, ...]]]]:
     """Group a combo's sub-kernels whose bodies differ only in their buffers, as a
     foreach's per-parameter kernels do (6 distinct of GPT's 22 AdamW sub-kernels).
     Each group is ``(blocks per member, body, members)``: the body names its j-th
     buffer ``_g{j}`` (descriptor ``_r__g{j}``), a member lists its buffers in that
     order. One traced body a group: GPT's largest AdamW kernel compiles in 2.4 s
     rather than 4.7 s, and runs faster for its smaller code."""
-    groups: dict[tuple[int, str], tuple[int, str, list[tuple[str, ...]]]] = {}
+    groups: dict[tuple, tuple[int, str, list[tuple[str, ...]]]] = {}
     for k, inner in zip(kernels, inners):
         names: list[str] = []
 
@@ -2393,7 +2396,10 @@ def _merge_identical(kernels, inners) -> list[tuple[int, str, list[tuple[str, ..
             return f"{m.group(1) or ''}_g{names.index(m.group(2))}"
 
         body = _PTR_RE.sub(rename, inner)
-        key = (k.num_blocks, body if _tune("combo_merge", 1) else inner)
+        # A buffer of 2 GiB or more is a raw address rather than a descriptor (see
+        # fdp._Flat): members switch between buffers of one kind.
+        kinds = tuple(n in flat for n in names)
+        key = (k.num_blocks, kinds, body if _tune("combo_merge", 1) else inner)
         if key not in groups:
             groups[key] = (k.num_blocks, body, [])
         groups[key][2].append(tuple(names))
@@ -2434,7 +2440,9 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
         helpers,
         kernels[0].threads,
     )
-    groups = _merge_identical(kernels, inners)
+    groups = _merge_identical(
+        kernels, inners, OrderedSet(a for a, n in extents.items() if n >= _I32_LIMIT)
+    )
     start = 0
     with code.indent():
         code.writeline("_bid = fdp.bid()")

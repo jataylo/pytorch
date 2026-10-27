@@ -207,8 +207,9 @@ cache once.)
 
 FlyDSL cuts the generated kernels' time by 40% on Qwen3-8B training, 109 of the 121 ms
 in AdamW's foreach kernels, the rest in SwiGLU forward and backward (79.5 -> 56.9 ms over
-5 steps), RMSNorm forward and backward and the RoPE backward. The three kernels on the
-fp32 logits (5 GB) stay on Triton: buffers of 2 GiB or more need 64-bit offsets.
+5 steps), RMSNorm forward and backward and the RoPE backward. (In this run the three kernels on
+the fp32 logits (5 GB) stayed on Triton; buffers of 2 GiB or more now take 64-bit
+pointers, see below.)
 
 Two kernels still lose. The q/k RMSNorm + RoPE in prefill computes the rotary sin/cos
 itself, 74 vs 69 µs a call (`k_norm_rope_pos_bf16`: 116 vs 100 µs): both backends call
@@ -360,12 +361,20 @@ AST. Helpers in `fdp` are not rewritten, so a dynamic branch there (the masked a
 a hand-built `scf.IfOp`, and anything else that would branch on a runtime value is
 expressed as selects.
 
-### Static shapes and 32-bit offsets only
+### Static shapes and 32-bit indices only
 
-AMD buffer descriptors carry an exact byte extent and take 32-bit offsets. The extent
-comes from the buffer layout at codegen time, so dynamic shapes are refused, as are
-buffers of 2 GiB or more and kernels of 2^31 elements or more. Lifting either needs the
-extent passed at launch and 64-bit address arithmetic outside the descriptor.
+AMD buffer descriptors carry an exact byte extent and take 32-bit byte offsets. The
+extent comes from the buffer layout at codegen time, so dynamic shapes are refused, as
+are kernels and buffers of 2^31 elements or more (indices are 32-bit).
+
+A buffer of 2 GiB or more is past a descriptor's range. `fdp.rsrc` hands it back as a
+raw 64-bit address (`fdp._Flat`), and loads, stores and atomics on it go through LLVM
+global pointers: `base + zext(index) * itemsize`, with a select (loads) or a branch
+(stores, atomics) for the mask that the descriptor would otherwise apply. Code
+generation is the same; the choice happens at trace time from the extent. On Qwen3's
+cross entropy over [8192, 151936] bf16 logits (2.5 GB, `bigce.py`), the three kernels
+that used to fall back now run on FlyDSL: 8.4 ms a forward+backward step against
+Triton's 14.4 (noisy GPUs).
 
 ### Compile time and caching
 
@@ -400,7 +409,6 @@ kernel, or raise under `flydsl.simd_strict`.
   another; submitting them as separate jobs (in `async_compile`) would overlap them.
   FlyDSL's per-kernel compile (~1 s, 4.5 s for a foreach AdamW kernel) is the rest.
 - `sin`/`cos` with branch-free argument reduction, for RoPE computed in the kernel.
-- Buffers of 2 GiB or more (large-vocabulary logits) fall back to Triton.
 - An NCHW -> NHWC copy stays 10% behind Triton at every tile size and block size tried.
 
 ## Reproducing

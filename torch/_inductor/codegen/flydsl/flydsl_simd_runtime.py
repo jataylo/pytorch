@@ -415,15 +415,95 @@ def _tid():
     return fx.Int32(gpu.thread_idx.x)
 
 
+class _Flat:
+    """A buffer of 2 GiB or more, beyond a descriptor: there a masked lane's offset
+    (0x7FFFFFFF) would land inside it. Addressed through 64-bit global pointers
+    instead, masked by selects and branches -- the logits a Qwen3 cross-entropy
+    reads (8192 x 151936 bf16) are 2.5 GB."""
+
+    __slots__ = ("addr",)
+
+    def __init__(self, addr):
+        self.addr = addr  # i64
+
+
 def rsrc(addr, nbytes: int):
-    """Buffer resource over ``nbytes`` from a raw device address.
+    """Buffer resource over ``nbytes`` from a raw device address (or a ``_Flat`` for
+    one too large for it).
 
     ``nbytes`` must be exact: it is what makes a masked access (offset 0x7FFFFFFF) fall
-    out of range. The codegen refuses buffers of 2 GiB or more for the same reason.
+    out of range.
     """
+    if nbytes >= 2**31 - 1:
+        return _Flat(_val(addr))
     return buffer_ops.create_buffer_resource_from_addr(
         _val(addr), num_records_bytes=int(nbytes)
     )
+
+
+def _type_bytes(t) -> int:
+    if isinstance(t, ir.VectorType):
+        return _type_bytes(t.element_type) * t.shape[0]
+    return t.width // 8
+
+
+def _flat_ptr(r: _Flat, off, unit: int, mask=None):
+    """``r + off * unit`` bytes as a global pointer, ``off`` an unsigned i32 element
+    offset; a masked lane points at the buffer's start instead."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    o = _val(idx(off))
+    if mask is not None:
+        o = _arith.SelectOp(mask, o, _val(fx.Int32(0))).result
+    scaled = _arith.MulIOp(
+        _arith.ExtUIOp(T.i64(), o).result,
+        _arith.ConstantOp(T.i64(), ir.IntegerAttr.get(T.i64(), unit)).result,
+    ).result
+    a = _arith.AddIOp(r.addr, scaled).result
+    return _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), a).result
+
+
+def _bload(r, off, vec_width: int, dtype, mask=None, is_scalar: bool = False):
+    """``buffer_ops.buffer_load``, or its 64-bit global form for a ``_Flat``."""
+    if not isinstance(r, _Flat):
+        if is_scalar:
+            return buffer_ops.buffer_load(r, off, vec_width=1, is_scalar=True)
+        return buffer_ops.buffer_load(
+            r, off, vec_width=vec_width, dtype=dtype, mask=mask
+        )
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    t = dtype if vec_width == 1 else ir.VectorType.get([vec_width], dtype)
+    unit = _type_bytes(dtype)
+    v = _llvm.LoadOp(t, _flat_ptr(r, off, unit, mask), alignment=unit).result
+    if mask is None:
+        return v
+    if isinstance(t, ir.VectorType):
+        zero = _arith.ConstantOp(
+            t, ir.DenseElementsAttr.get_splat(t, _zero_attr(dtype))
+        ).result
+    else:
+        zero = _arith.ConstantOp(t, _zero_attr(dtype)).result
+    return _arith.SelectOp(mask, v, zero).result
+
+
+def _zero_attr(t):
+    if isinstance(t, ir.IntegerType):
+        return ir.IntegerAttr.get(t, 0)
+    return ir.FloatAttr.get(t, 0.0)
+
+
+def _bstore(value, r, off, mask=None):
+    """``buffer_ops.buffer_store``, or its 64-bit global form for a ``_Flat``."""
+    if not isinstance(r, _Flat):
+        buffer_ops.buffer_store(value, r, off, mask=mask)
+        return
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    t = value.type
+    unit = _type_bytes(t.element_type if isinstance(t, ir.VectorType) else t)
+    ptr = _flat_ptr(r, off, unit)
+    _when(mask, lambda: _llvm.StoreOp(value, ptr, alignment=unit))
 
 
 def pick(s, *members):
@@ -435,15 +515,25 @@ def pick(s, *members):
     select chains: selects keep every candidate descriptor live at once, which spills
     SGPRs once a group has a few dozen."""
     s = _arith.IndexCastOp(T.index(), _val(idx(s))).result
-    wrap: list[bool] = []
+    wrap: list = []
+
+    def raw(v):
+        return v.addr if isinstance(v, _Flat) else _val(v)
 
     def emit(member):
         vals = member()
-        wrap[:] = [not isinstance(v, ir.Value) for v in vals]
-        _scf.YieldOp([_val(v) for v in vals])
+        wrap[:] = [
+            _Flat
+            if isinstance(v, _Flat)
+            else None
+            if isinstance(v, ir.Value)
+            else ArithValue
+            for v in vals
+        ]
+        _scf.YieldOp([raw(v) for v in vals])
 
     # The switch needs its result types up front; this trace of member 0 is left dead.
-    types = [_val(v).type for v in members[0]()]
+    types = [raw(v).type for v in members[0]()]
     op = _scf.IndexSwitchOp(
         types,
         s,
@@ -451,7 +541,7 @@ def pick(s, *members):
         lambda op, i, _c: emit(members[i + 1]),
         lambda op: emit(members[0]),
     )
-    return tuple(ArithValue(r) if w else r for w, r in zip(wrap, op.results))
+    return tuple(w(r) if w else r for w, r in zip(wrap, op.results))
 
 
 def idx(x):
@@ -524,9 +614,7 @@ _ITEMSIZE = {
 
 def load(r, off, st: str, mask=None):
     """Scalar masked load, widened to the compute kind. A masked lane reads 0."""
-    raw = buffer_ops.buffer_load(
-        r, idx(off), vec_width=1, dtype=_STORAGE_IR[st](), mask=_mask(mask)
-    )
+    raw = _bload(r, idx(off), 1, _STORAGE_IR[st](), _mask(mask))
     return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
 
 
@@ -535,9 +623,11 @@ def sload(r, off: int, st: str):
     ``s_load`` of a broadcast operand: a vector load would hold every wave's stores on
     its round trip. The scalar cache does not see this kernel's own stores, so only
     for buffers the kernel only reads."""
+    if isinstance(r, _Flat):
+        return load(r, off, st)
     size = _ITEMSIZE[st]
     byte = off * size
-    word = buffer_ops.buffer_load(r, fx.Int32(byte // 4), vec_width=1, is_scalar=True)
+    word = _bload(r, fx.Int32(byte // 4), 1, T.i32(), is_scalar=True)
     if byte % 4:
         shift = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), byte % 4 * 8))
         word = _arith.ShRUIOp(word, shift.result).result
@@ -553,13 +643,14 @@ def wload(cache: dict, key, chunk: int, r, off, st: str):
     0's offset, read into an SGPR. Read-only buffers only, as for ``sload``."""
     if (key, "w", chunk) in cache:
         return cache[(key, "w", chunk)]
+    if isinstance(r, _Flat):
+        cache[(key, "w", chunk)] = load(r, off, st)
+        return cache[(key, "w", chunk)]
     size = _ITEMSIZE[st]
     byte = _val(idx(off) * size)
     byte = _rocdl.readfirstlane(T.i32(), byte)
     two = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 2)).result
-    word = buffer_ops.buffer_load(
-        r, _arith.ShRUIOp(byte, two).result, vec_width=1, is_scalar=True
-    )
+    word = _bload(r, _arith.ShRUIOp(byte, two).result, 1, T.i32(), is_scalar=True)
     if size < 4:
         three = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 3)).result
         shift = _arith.ShLIOp(_arith.AndIOp(byte, three).result, three).result
@@ -612,13 +703,9 @@ def vload(cache: dict, key, j: int, w: int, r, off, st: str, mask=None):
         base = idx(off if j % w == 0 else off - j % w)
         word_t, n, ratio = _packing(st, w)
         if word_t is None:
-            raw = buffer_ops.buffer_load(
-                r, base, vec_width=w, dtype=_STORAGE_IR[st](), mask=_mask(mask)
-            )
+            raw = _bload(r, base, w, _STORAGE_IR[st](), _mask(mask))
         else:
-            words = buffer_ops.buffer_load(
-                r, idiv(base, ratio), vec_width=n, dtype=word_t, mask=_mask(mask)
-            )
+            words = _bload(r, idiv(base, ratio), n, word_t, _mask(mask))
             raw = _vector.BitCastOp(
                 ir.VectorType.get([w], _STORAGE_IR[st]()), _as_vector(words, n, word_t)
             ).result
@@ -668,7 +755,7 @@ def forget(cache: dict, arg: str) -> None:
 def store(r, off, value, st: str, mask=None):
     v = _val(_canon(value))
     raw = _cvt(v, kind_of_type(v.type), _MEM_KIND.get(st, st))
-    buffer_ops.buffer_store(raw, r, idx(off), mask=_mask(mask))
+    _bstore(raw, r, idx(off), _mask(mask))
 
 
 def xstore(cache: dict, key, xr: int, n: int, tpr: int, rl, r, off, value, st: str):
@@ -709,16 +796,14 @@ def vstore(
         vec = _vector.FromElementsOp(vt, slot["elems"]).result
         word_t, n, ratio = _packing(st, w)
         if word_t is None:
-            buffer_ops.buffer_store(vec, r, slot["off"], mask=slot["mask"])
+            _bstore(vec, r, slot["off"], slot["mask"])
         else:
             words = _vector.BitCastOp(ir.VectorType.get([n], word_t), vec).result
             if n == 1:
                 words = _vector.ExtractOp(
                     words, static_position=[0], dynamic_position=[]
                 ).result
-            buffer_ops.buffer_store(
-                words, r, idiv(slot["off"], ratio), mask=slot["mask"]
-            )
+            _bstore(words, r, idiv(slot["off"], ratio), slot["mask"])
         if seed is not None:
             # A later unrolled loop reading the stored elements back takes the register,
             # in exactly vload's form, instead of a round trip through memory.
@@ -728,8 +813,8 @@ def vstore(
 
 
 def _packed_half(o, value, st: str):
-    """(two-lane vector, byte offset of its 32-bit word) for a 16-bit atomic add at
-    element ``o``: the value in its lane and -0.0 in the neighbour's."""
+    """(two-lane vector, element offset of its 32-bit word) for a 16-bit atomic add
+    at element ``o``: the value in its lane and -0.0 in the neighbour's."""
     h = _cvt(_val(to(value, "f32")), "f32", st)
     et = _STORAGE_IR[st]()
     negz = _arith.ConstantOp(et, ir.FloatAttr.get(et, -0.0)).result
@@ -737,8 +822,7 @@ def _packed_half(o, value, st: str):
     lo = _arith.SelectOp(odd, negz, h).result
     hi = _arith.SelectOp(odd, h, negz).result
     v = _vector.FromElementsOp(ir.VectorType.get([2], et), [lo, hi]).result
-    word = _arith.AndIOp(_val(o), _val(fx.Int32(-2))).result
-    return v, _val(mul(ArithValue(word), 2))
+    return v, _arith.AndIOp(_val(o), _val(fx.Int32(-2))).result
 
 
 def _when(m, emit):
@@ -756,8 +840,8 @@ def atomic_add_global(addr, off, value, st: str, mask=None):
     """bf16 ``*(addr + off) += value``: gfx942 has a packed bf16 atomic add only on
     global pointers (``buffer_atomic_pk_add_bf16`` is gfx950), so this one goes through
     an LLVM ``atomicrmw`` on the raw address instead of the buffer descriptor."""
-    v, byte_off = _packed_half(idx(off), value, st)
-    _packed_add_global(addr, byte_off, v, mask)
+    v, word = _packed_half(idx(off), value, st)
+    _global_fadd(_Flat(_val(to(addr, "i64"))), word, 2, v, mask)
 
 
 def atomic_add_pair(cache, key, j: int, target, off, value, st: str, mask=None):
@@ -772,29 +856,25 @@ def atomic_add_pair(cache, key, j: int, target, off, value, st: str, mask=None):
     et = _STORAGE_IR[st]()
     halves = [_cvt(_val(to(x, "f32")), "f32", st) for x in (first, value)]
     v = _vector.FromElementsOp(ir.VectorType.get([2], et), halves).result
-    byte_off = _val(mul(o, 2))
-    if st == "bf16":
-        _packed_add_global(target, byte_off, v, mask)
-    else:
-        _buffer_add(target, byte_off, v, mask)
+    if st == "bf16" and not isinstance(target, _Flat):
+        target = _Flat(_val(to(target, "i64")))
+    _buffer_add(target, _val(o), 2, v, mask)
 
 
-def _packed_add_global(addr, byte_off, v, mask):
+def _global_fadd(r: _Flat, off, unit: int, v, mask):
+    """``atomicrmw fadd`` at ``r + off * unit`` bytes; a masked lane does nothing."""
     from flydsl._mlir.dialects import llvm as _llvm
 
-    a = _arith.AddIOp(
-        _val(to(addr, "i64")), _arith.ExtUIOp(T.i64(), byte_off).result
-    ).result
+    ptr = _flat_ptr(r, off, unit)
 
     def emit():
-        ptr = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), a).result
         _llvm.AtomicRMWOp(
             _llvm.AtomicBinOp.fadd,
             ptr,
             v,
             _llvm.AtomicOrdering.monotonic,
             syncscope="agent",
-            alignment=4,
+            alignment=_type_bytes(v.type),
         )
 
     _when(_mask(mask), emit)
@@ -810,15 +890,21 @@ def atomic_add(r, off, value, st: str, mask=None):
     o = idx(off)
     if st in ("f32", "f64"):
         v = _val(to(value, st))
-        byte_off = _val(mul(o, 4 if st == "f32" else 8))
-    elif st == "f16":
-        v, byte_off = _packed_half(o, value, st)
+        _buffer_add(r, _val(o), 4 if st == "f32" else 8, v, mask)
+    elif st == "f16" or (st == "bf16" and isinstance(r, _Flat)):
+        v, word = _packed_half(o, value, st)
+        _buffer_add(r, word, 2, v, mask)
     else:
         raise NotImplementedError(f"atomic_add of {st}")
-    _buffer_add(r, byte_off, v, mask)
 
 
-def _buffer_add(r, byte_off, v, mask):
+def _buffer_add(r, off, unit: int, v, mask):
+    """``*(r + off * unit bytes) += v``, the buffer atomic or, for a ``_Flat``, the
+    global one."""
+    if isinstance(r, _Flat):
+        _global_fadd(r, off, unit, v, mask)
+        return
+    byte_off = _val(mul(ArithValue(off), unit))
     m = _mask(mask)
     if m is None:
         zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
