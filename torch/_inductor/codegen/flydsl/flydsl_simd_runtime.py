@@ -723,6 +723,20 @@ def uload(cache: dict, key, chunk: int, r, off, st: str, mask=None):
     return cache[(key, "u", chunk)]
 
 
+def pair_load(k, r, off, st: str, mask=None, cache=None, key=None):
+    """Column ``k`` (0 or 1) of a lane's two adjacent columns, from one two-element load
+    issued by column 0 at its (pair-aligned) offset. The load is unmasked -- the
+    descriptor reads 0 past its extent -- and each column applies its own mask, so
+    column 1 never depends on column 0's. ``k`` None is a plain ``load``."""
+    if k is None or isinstance(r, _Flat):
+        return load(r, off, st, mask=mask)
+    v = vload(cache, key, k, 2, r, off, st)
+    m = _mask(mask)
+    if m is None:
+        return v
+    return ArithValue(_arith.SelectOp(m, _val(v), _val(const(0, kind(v)))).result)
+
+
 def memo(cache: dict, key, thunk):
     """Trace-time load reuse in an unrolled region: the first trace of ``key`` loads."""
     if key not in cache:
@@ -2170,12 +2184,14 @@ def pick_fastest(mains, args, mutated, stream=None):
     # candidate with a high variance, a 16x64 transpose tile 10% slower on average.
     # Each round is queued behind a GPU sleep: a launch from Python takes longer than
     # a 20us kernel, and unqueued the GPU would idle between them, timing the launches.
-    # Every call starts from a flushed cache, as Triton's benchmarker does: repeated
-    # back to back, a kernel's 100 MB of inputs stay in the 256 MB last-level cache,
-    # where a 4-element-a-lane GPT-2 softmax backward timed fastest and ran 15%
-    # slower in the model than the 8-element one it beat.
+    # Every call starts with L2 (4 MB) flushed, as in a model, where a kernel's inputs
+    # were written a kernel or more ago: back to back, a 4-element-a-lane GPT-2 softmax
+    # backward timed fastest and ran 15% slower in the model than an 8-element one.
+    # Not the 256 MB last-level cache (Triton's benchmarker flushes that), which a
+    # model's inputs usually still occupy: flushed, ResNet's BatchNorm backward
+    # picked variants 0.1 ms a step slower.
     device = next(a.device for a in args if isinstance(a, torch.Tensor))
-    flush = torch.empty(256 << 20, dtype=torch.int8, device=device)
+    flush = torch.empty(16 << 20, dtype=torch.int8, device=device)
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     ev[0].record()
     mains[0](*scratch, stream=stream)

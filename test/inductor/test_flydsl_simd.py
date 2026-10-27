@@ -424,6 +424,26 @@ class TestFlyDSLSIMD(TestCase):
         self.assertIn(f"stride={8}", code)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
+    @parametrize("cols", [3072, 1000])
+    def test_column_pairs(self, cols):
+        # bf16 column sums read two adjacent columns a lane: a split reduction's
+        # masked first stage (6304 rows), and 1000 columns leaving a masked pair.
+        # Adding an f32 operand makes one load unpairable: one column a lane.
+        from torch._inductor.utils import run_and_get_code
+
+        g = torch.randn(6304, cols, device="cuda", dtype=torch.bfloat16)
+        fn = lambda g: g.float().sum(0)  # noqa: E731
+        out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), g)
+        torch.testing.assert_close(out, fn(g), atol=1e-3, rtol=1e-4)
+        self.assertIn("column_pairs=True", code)
+        h = torch.randn(6304, cols, device="cuda")
+        fn = lambda g, h: (g.float() * h).sum(0)  # noqa: E731
+        out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), g, h)
+        torch.testing.assert_close(out, fn(g, h), atol=1e-3, rtol=1e-4)
+        self.assertNotIn("column_pairs=True", code)
+        self.assertNotIn("_K_", code)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     def test_cross_entropy(self):
         x = torch.randn(512, 32000, device="cuda")
         t = torch.randint(0, 32000, (512,), device="cuda")

@@ -56,6 +56,7 @@ from ... import config, ir, metrics
 from ...codecache import code_hash, get_path
 from ...dependencies import MemoryDep
 from ...utils import (
+    DeferredLineBase,
     get_fused_kernel_name,
     get_kernel_metadata,
     Placeholder,
@@ -815,6 +816,10 @@ class FlyDSLKernel(SIMDKernel):
         self.in_combo = False
         self.rpb = self.threads
         self.xunroll = 1
+        # Adjacent columns a lane in a column reduction (see finalize_indexing).
+        self.cpair = 1
+        self.cpair_failed = False  # a load of the row could not be paired
+        self._pair_lines: IndentedBuffer | None = None
         self.persistent = False
         self.one_step = False  # a looped row reduction that covers the row in one step
         self.scan_runs = (
@@ -920,10 +925,11 @@ class FlyDSLKernel(SIMDKernel):
         if not self.is_reduction_kernel:
             return f"pointwise xnumel={self.xnumel} ept={self.ept} unroll={self.unroll}"
         mode = "column" if self.stage == "column" else "row"
+        pairs = " column_pairs=True" if self._pair_lines is not None else ""
         return (
             f"{mode} reduction xnumel={self.xnumel} rnumel={self.rnumel} ept={self.ept} "
             f"unroll={self.unroll} tpr={self.tpr} stride={self.stride} xunroll={self.xunroll} "
-            f"persistent={self.persistent}"
+            f"persistent={self.persistent}{pairs}"
         )
 
     def _finalize_tile2d(self, widest_vec: int) -> None:
@@ -1305,6 +1311,22 @@ class FlyDSLKernel(SIMDKernel):
             self.unroll = _tune(
                 "col_unroll" if self.stride > 1 else "row_unroll", self.unroll
             )
+        if (
+            self.stride > 1
+            and not self.interleaved
+            and not self.persistent
+            and not self.in_combo
+            and not atomic
+            and self.xnumel % 2 == 0
+            and _tune("col_pair", 1)
+        ):
+            r_roots = [e for e in votes if r in e.free_symbols]
+            if r_roots and all(classify_access(e, x, 2) == "contig" for e in r_roots):
+                # Two adjacent columns a lane, one load for both: a bf16 column
+                # reads a dword a lane, not a short. ViT's MLP bias gradient (first
+                # stage) 33.8us -> 23.1us (Triton 26.8us). Settled in emit_inner,
+                # which falls back to one column if the body has other control flow.
+                self.cpair = 2
         self.rstep = self.tpr * self.ept * self.unroll
 
     # -- range trees --------------------------------------------------------------------
@@ -1328,7 +1350,7 @@ class FlyDSLKernel(SIMDKernel):
         if self.tile2d:
             return None if self.xnumel % self._tile_edge("x") == 0 else "xmask"
         if self.is_reduction_kernel:
-            block = self.rpb * self.xunroll
+            block = self.rpb * self.xunroll * self.cpair
         else:
             block = self.threads * self.ept * self.unroll
         return None if self.xnumel % block == 0 else "xmask"
@@ -1461,6 +1483,24 @@ class FlyDSLKernel(SIMDKernel):
             line = f"fdp.wload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r})"
         elif kind == "uniform":
             line = f"fdp.uload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r}{mask})"
+        elif self.cpair > 1 and not hoist and r is not None and r in root.free_symbols:
+            x = self._x_sym()
+            # Only 2-byte loads: f32 pairs (dwordx2) took an 8192^2 column sum 85us ->
+            # 119us.
+            if (
+                not indirect
+                and dtype.itemsize == 2
+                and nbytes % 4 == 0
+                and classify_access(root, x, 2) == "contig"
+            ):
+                # Column `_K_` of the lane's pair: see emit_inner.
+                line = (
+                    f"fdp.pair_load(_K_, _r_{arg}, {index_str}, {st!r}{mask}, "
+                    f"cache=_pc, key={self.load_site})"
+                )
+            else:
+                self.cpair_failed = True
+                line = f"fdp.load(_r_{arg}, {index_str}, {st!r}{mask})"
         else:
             line = f"fdp.load(_r_{arg}, {index_str}, {st!r}{mask})"
             if self._persistent_region() and not hoist and not dependent:
@@ -2137,7 +2177,8 @@ class FlyDSLKernel(SIMDKernel):
             return nf * ns
         if not self.is_reduction_kernel:
             return -(-self.xnumel // (self.threads * self.ept * self.unroll))
-        return -(-self.xnumel // (self.rpb * self.xunroll))
+        pairs = 2 if self._pair_lines is not None else 1
+        return -(-self.xnumel // (self.rpb * self.xunroll * pairs))
 
     def arg_names(self) -> list[str]:
         arg_defs, _, _, _ = self.args.python_argdefs()
@@ -2150,6 +2191,7 @@ class FlyDSLKernel(SIMDKernel):
         """The module source: the ``@flyc.kernel``, its ``@flyc.jit`` launcher, and the
         ``_main`` / ``_precompile`` entry points the wrapper calls."""
         self.codegen_body()
+        self._pair_lines = self._column_pairs()
         arg_names = self.arg_names()
         extents = self._arg_extents(arg_names)
         code = _module_prologue(
@@ -2167,6 +2209,114 @@ class FlyDSLKernel(SIMDKernel):
             _module_epilogue(arg_names, self.num_blocks, self.threads, self.slp)
         )
         return code.getvalue()
+
+    def _column_pairs(self) -> IndentedBuffer | None:
+        """A column reduction's body for two adjacent columns a lane (``cpair``), or
+        None for one.
+
+        Each column gets its own copy of the body's statements, names suffixed
+        ``_k0``/``_k1`` (accumulators are loop-carried by name), sharing the row loops:
+        within a step column 0's ``pair_load`` issues the load both columns read.
+        Bodies with any other control flow keep one column a lane."""
+        lines = self.body.get_lines_ref()
+
+        def text_of(li) -> str:
+            return li.line if isinstance(li, DeferredLineBase) else li
+
+        def unpaired() -> None:
+            for i, li in enumerate(lines):
+                text = text_of(li)
+                if not isinstance(text, str) or "_K_" not in text:
+                    continue
+                text = re.sub(r", cache=_pc, key=\d+\)", ")", text)
+                text = text.replace("fdp.pair_load(_K_, ", "fdp.load(")
+                lines[i] = li._new_line(text) if isinstance(li, DeferredLineBase) else text
+
+        if self.cpair < 2:
+            return None
+        if self.cpair_failed or self.xunroll > 1 or self.preload_lines:
+            unpaired()
+            return None
+        lane_x = f"(_t % {self.stride}) * 2 + _K_"
+        template: list[tuple[int, Any]] = [
+            (0, line)
+            for line in ("_vc = {}", "_sc = {}", "_lc = {}")
+        ]
+        template.append((0, f"xindex = _b * {self.rpb * 2} + {lane_x}"))
+        if self._xmask():
+            template.append((0, f"xmask = xindex < {self.xnumel}"))
+        body = [li for li in lines if not isinstance(text_of(li), str) or text_of(li).strip()]
+        if any(not isinstance(text_of(li), str) for li in body):
+            unpaired()
+            return None
+        indents = [len(text_of(li)) - len(text_of(li).lstrip()) for li in body]
+        base = min(indents, default=0)
+        template.extend(((i - base) // 4, li) for i, li in zip(indents, body))
+        shared = ("for r0_offset in ", "for _j in range_constexpr(")
+
+        # Parse into statements and shared loops by indentation.
+        def parse(i: int, d: int):
+            nodes = []
+            while i < len(template):
+                di, li = template[i]
+                if di < d:
+                    break
+                stmt = text_of(li).strip()
+                if stmt.endswith(":"):
+                    if not stmt.startswith(shared):
+                        return None, i
+                    kids, i = parse(i + 1, d + 1)
+                    if kids is None:
+                        return None, i
+                    nodes.append((li, kids))
+                    continue
+                nodes.append(li)
+                i += 1
+            return nodes, i
+
+        tree, _ = parse(0, 0)
+        if tree is None:
+            unpaired()
+            return None
+        assigned = OrderedSet(
+            m.group(1)
+            for _, li in template
+            for m in [re.match(r"\s*([A-Za-z_]\w*)\s*=(?!=)", text_of(li))]
+            if m and m.group(1) not in ("r0_offset", "_j", "_pc")
+        )
+        names = re.compile(r"\b(" + "|".join(map(re.escape, assigned)) + r")\b")
+
+        def copy(li, k: int):
+            text = names.sub(lambda m: f"{m.group(1)}_k{k}", text_of(li).strip())
+            text = text.replace("_K_", str(k))
+            return li._new_line(text) if isinstance(li, DeferredLineBase) else text
+
+        out = IndentedBuffer()
+
+        def emit(nodes) -> None:
+            run: list[Any] = []
+
+            def flush() -> None:
+                for k in (0, 1):
+                    for li in run:
+                        out.writeline(copy(li, k))
+                run.clear()
+
+            for node in nodes:
+                if not isinstance(node, tuple):
+                    run.append(node)
+                    continue
+                flush()
+                head, kids = node
+                out.writeline(text_of(head).strip())
+                with out.indent():
+                    if text_of(head).strip().startswith("for _j"):
+                        out.writeline("_pc = {}")
+                    emit(kids)
+            flush()
+
+        emit(tree)
+        return out
 
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
@@ -2202,6 +2352,9 @@ class FlyDSLKernel(SIMDKernel):
                 code.writeline(f"_rl = _t // {self.stride}")
                 lane_x = f"_t % {self.stride}"
             code.writeline("_lane0 = _rl == 0")
+            if self._pair_lines is not None:
+                code.splice(self._pair_lines)
+                return
             if self.merged_rows:
                 code.writeline("_xs = {}")
 
@@ -2881,13 +3034,12 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             and "row_tpr" not in tuned
             and "xunroll" not in tuned
         ):
-            # A whole wave on a row the heuristic gave fewer lanes: GPT-2's masked
-            # softmax backward (512 bf16) 62.5us -> 58.4us in the model (Triton 61us).
-            # Otherwise fewer lanes: ViT's LayerNorm through a transpose 180us -> 139us.
+            # Fewer lanes a row: Qwen3's q-norm + RoPE (128 wide) 134us -> 85us at 8.
+            cands = [{"row_tpr": kernel.tpr // 2}] if kernel.tpr > 1 else []
             if kernel.tpr < WAVE:
-                cands = [{"row_tpr": 2 * kernel.tpr}]
-            else:
-                cands = [{"row_tpr": kernel.tpr // 2}]
+                # Or more, up to a wave: GPT-2's masked softmax backward (512 bf16)
+                # 62.5us -> 58.4us in the model (Triton 61us).
+                cands.append({"row_tpr": 2 * kernel.tpr})
             # Or more: an ALU-bound row (Qwen3's k-norm + RoPE, angles computed in the
             # kernel) 70us -> 61us at 4 elements a lane rather than 8 (Triton 101us).
             if kernel.ept > 2 and "ept" not in tuned:
