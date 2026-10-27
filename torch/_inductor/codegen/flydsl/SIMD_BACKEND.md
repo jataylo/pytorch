@@ -86,6 +86,9 @@ experiments:
 | `slp` | all | LLVM's SLP vectorizer on (`1`) or off (`0`); default on for pointwise and tile kernels, off for reductions, where it costs 5-15% |
 | `merge_rows` | row | `0` stores short rows' results one row at a time from lane 0 |
 | `force_flat` | tile | `1` runs a transpose with the flat layout |
+| `autotune` | pointwise, tile, short rows | `0` keeps the heuristic's launch parameters instead of timing candidates on the first call |
+| `wload` | pointwise | `0` turns off the wave-uniform scalar load of per-channel operands |
+| `atomic_pair` | pointwise | `0` issues 16-bit atomic adds one element at a time |
 
 ## Results
 
@@ -154,26 +157,55 @@ with stores as wide as Triton's.
 `bench_models.py --quick --repeats 3`: each model and backend in a fresh process with
 empty caches; *compile* is the first step including compilation, *graph* the
 `mode="reduce-overhead"` step (median of 3 alternating runs; the spread between runs was
-at most 0.04 ms).
+at most 0.15 ms but for one Triton MoE outlier).
 
 | model | Triton graph ms | FlyDSL graph ms | FlyDSL/Triton | FlyDSL kernels | compile s Triton / FlyDSL |
 | --- | ---: | ---: | ---: | ---: | --- |
-| GPT train (bf16, AdamW) | 16.69 | 14.85 | **0.889** | 129 | 23.9 / 31.7 |
-| BERT train (f16) | 34.70 | 30.50 | **0.879** | 112 | 25.6 / 32.1 |
-| Llama train (bf16) | 30.94 | 28.81 | **0.931** | 83 | 21.5 / 31.8 |
-| MoE train (bf16) | 11.41 | 10.81 | **0.948** | 42 | 15.7 / 20.9 |
-| ViT train (bf16) | 16.38 | 15.90 | **0.970** | 102 | 23.6 / 32.6 |
-| GPT inference (bf16) | 10.13 | 9.86 | **0.973** | 33 | 9.3 / 12.4 |
-| Llama inference (bf16) | 15.33 | 15.25 | 0.994 | 25 | 8.0 / 13.1 |
-| ViT inference (f16) | 8.23 | 8.34 | 1.013 | 13 | 5.7 / 8.1 |
-| ResNet train (f32, channels_last) | 26.84 | 26.88 | 1.001 | 119 | 14.7 / 18.3 |
-| ResNet train (f32, NCHW) | 26.48 | 26.48 | 1.000 | 100 | 13.3 / 17.7 |
+| GPT train (bf16, AdamW) | 16.70 | 14.80 | **0.886** | 129 | 23.9 / 31.7 |
+| BERT train (f16) | 34.70 | 30.45 | **0.878** | 112 | 25.6 / 32.1 |
+| Llama train (bf16) | 30.94 | 28.76 | **0.930** | 83 | 21.5 / 31.8 |
+| MoE train (bf16) | 11.41 | 10.82 | **0.948** | 42 | 15.7 / 20.9 |
+| ViT train (bf16) | 16.36 | 15.83 | **0.967** | 102 | 23.6 / 32.6 |
+| GPT inference (bf16) | 10.13 | 9.76 | **0.964** | 33 | 9.3 / 12.4 |
+| Llama inference (bf16) | 15.29 | 15.21 | 0.995 | 25 | 8.0 / 13.1 |
+| ViT inference (f16) | 8.23 | 8.27 | 1.005 | 13 | 5.7 / 8.1 |
+| ResNet train (f32, channels_last) | 26.98 | 26.52 | **0.983** | 119 | 14.7 / 18.3 |
+| ResNet train (f32, NCHW) | 27.05 | 26.20 | **0.969** | 100 | 13.3 / 17.7 |
 
-Geomean **0.959**; 9.5 ms a step saved summed over the ten models. Graph time tracks
+Geomean **0.952**; 11.2 ms a step saved summed over the ten models. (Compile times are
+from an earlier, quieter run; first-call autotuning adds about 0-2 s to each of these.) Graph time tracks
 eager step time, so the differences are kernel time, not launch overhead. The models
 spend most of their time in matmuls and attention, which neither backend generates; of
 the time in generated kernels, FlyDSL saves a third on Llama training (21.2 ms against
 31.6 ms by `rocprofv3 --kernel-trace`).
+
+### HuggingFace Qwen3
+
+Full-size `transformers` Qwen3 models, randomly initialized from their configs (SDPA
+attention, bf16; training is forward, backward and a foreach AdamW step), through the
+same `bench_models.py --only qwen3_...` runs. *gen ms* is the time in Inductor-generated
+kernels a step, by `rocprofv3 --kernel-trace`; everything else is matmuls and attention.
+
+| model | Triton graph ms | FlyDSL graph ms | FlyDSL/Triton | gen ms Triton / FlyDSL | FlyDSL kernels | compile s Triton / FlyDSL |
+| --- | ---: | ---: | ---: | --- | ---: | --- |
+| Qwen3-8B train (2 x 2048) | 2469.2 | 2347.4 | **0.951** | 301.6 / 180.2 | 789 | 184 / 263 |
+| Qwen3-0.6B train (8 x 1024) | 655.6 | 643.9 | **0.982** | 61.4 / 49.4 | 364 | 137 / 187 |
+| Qwen3-0.6B prefill (16 x 1024) | 366.2 | 364.0 | 0.994 | 25.6 / 23.5 | 186 | 26 / 64 |
+| Qwen3-8B prefill (4 x 2048) | 1153.9 | 1148.4 | 0.995 | | 238 | 35 / 69 |
+
+FlyDSL cuts the generated kernels' time by 40% on Qwen3-8B training, 109 of the 121 ms
+in AdamW's foreach kernels, the rest in SwiGLU forward and backward (79.5 -> 56.9 ms over
+5 steps), RMSNorm forward and backward and the RoPE backward. The three kernels on the
+fp32 logits (5 GB) stay on Triton: buffers of 2 GiB or more need 64-bit offsets. Two
+kernels lose in every Qwen3 run: the fused q/k RMSNorm + RoPE (74 vs 69 µs a call in
+prefill, though faster than Triton in isolation) and the RMSNorm weight gradient's
+column sum, together about 0.3 ms a step.
+
+Compile time is the weak point here. The compile times above predate cheaper candidate
+timing, which cut the 0.6B prefill from 64 s to 54 s (Triton 25 s). Of what remains,
+about 20 s is first-call autotuning of 183 kernels, mostly loading three variants' host
+launch stubs; with `autotune=0` the prefill compiles in 34 s but runs 1.3% slower
+(1.007 against 0.995 of Triton).
 
 ### Which stages to upstream first
 
@@ -238,6 +270,15 @@ each found by profiling a case that lost:
 - pointwise vectors as wide as the widest stream allows (16 bytes), not the narrowest,
   and two elements a lane when the kernel has atomic adds.
 
+Where the best choice depends on context the rules cannot see -- what last touched the
+inputs, mostly -- a kernel times a few candidates on its first call and keeps the fastest
+(`fdp.pick_fastest`, on copies of the buffers it updates in place; skipped under CUDA
+graph capture), as Triton autotunes: large pointwise kernels try half-width vectors at
+128 threads and 8 runs a thread, tile kernels 64 and 256 threads, short-row reductions
+twice the rows a lane group and half the lanes a row. In ResNet's training step an
+in-place conv bias add went 106 -> 84 µs this way (Triton 95), and a 64-wide softmax
+71 -> 65 µs.
+
 The access classifier that drives these sees through nested views
 (`ModularIndexing`/`FloorDiv` of a contiguous index) and uses only the load/store
 indices, recovered per node from `LoopBody.memory_usage`, because `finalize_indexing`
@@ -276,7 +317,15 @@ are bitcast to i32/i16 words around every load and store. `torch.bool` is stored
 but computed as i1, so storage and compute kinds are tracked separately. bf16/f16 values
 are computed in f32 and rounded through their storage type exactly where Triton rounds,
 so results match Triton bit for bit. Loads at a constant offset (a scalar parameter in a
-buffer) are a single scalar load shared by every use.
+buffer) are a single scalar load shared by every use, and a load the same across a
+wave's lanes (a per-channel scale) is one scalar load from lane 0's offset
+(`readfirstlane`): 86 -> 82 µs on ResNet's BatchNorm backward. Scalar loads read whole
+dwords at aligned offsets, and a dword reaching past the descriptor reads as 0, so they
+need a buffer extent that is a multiple of 4 bytes.
+
+Constant offsets are kept apart from the lane-dependent part of an index (`fdp.Aff`) and
+added last, so LLVM folds them into the buffer instruction's immediate: 53 address
+instructions to 7 in a pointwise kernel's loop, though no measurable time.
 
 ### Atomics
 
@@ -286,7 +335,9 @@ atomics are wrapped in an explicit `scf.if`. f32 uses the buffer atomic add. f16
 have only packed two-element atomic adds: the element's half gets the value and its
 neighbour -0.0, the additive identity, so the neighbour is left bit-for-bit unchanged.
 gfx942 has the packed bf16 add only on global pointers (`buffer_atomic_pk_add_bf16` is
-gfx950), so bf16 goes through an LLVM `atomicrmw` on the raw address.
+gfx950), so bf16 goes through an LLVM `atomicrmw` on the raw address. When a thread's two
+elements are an aligned contiguous pair under one mask, they go out as one packed add:
+a bf16 `index_put_(accumulate=True)` of 65536 x 1024 went 258 -> 184 µs (Triton 244).
 
 ### Writing control flow from helpers
 
@@ -320,15 +371,12 @@ kernel, or raise under `flydsl.simd_strict`.
 
 ### Next
 
-- In-model ResNet pointwise kernels (BatchNorm backward, threshold backward) lose
-  0.2-0.3 ms a step but are at parity measured alone, hot or cold cache: the next
-  profile target.
-- Immediate offsets: per-run address arithmetic is recomputed in VGPRs where Triton
-  folds constant run offsets into the instruction's immediate; needs affine offset
-  tracking in the index printer.
-- A wave-uniform (`readfirstlane`) path for scalar loads, and paired bf16 atomics.
-- A small autotuning sweep over `tpr`/`unroll`/`xunroll` for the remaining short-row and
-  tile cases, in place of more rules.
+- Qwen3's fused q/k RMSNorm + RoPE (it also computes the rotary cos/sin) and the
+  RMSNorm weight gradient's column sum lose about 0.3 ms a step in the model.
+- Compile time: Qwen3-0.6B prefill compiles in 54 s against Triton's 25 s; a cached
+  host launch stub is the first lever (it is paid once per autotuning candidate).
+- Buffers of 2 GiB or more (large-vocabulary logits) fall back to Triton.
+- An NCHW -> NHWC copy stays 10% behind Triton at every tile size and block size tried.
 
 ## Reproducing
 
@@ -339,6 +387,8 @@ python benchmarks/inductor_backends/flydsl_simd/bench_kernels.py
 # whole models; --repeats N alternates backends and reports the median and spread,
 # --gpus 0,1,.. runs models in parallel, one per GPU; --only <models>, --quick
 python benchmarks/inductor_backends/flydsl_simd/bench_models.py --quick --repeats 3
+# full-size HuggingFace Qwen3 (needs transformers and the configs in the HF cache)
+python benchmarks/inductor_backends/flydsl_simd/bench_models.py --only qwen3_0p6b_train qwen3_0p6b_infer qwen3_8b_train qwen3_8b_infer --quick --repeats 3
 # stage ablation: one stage at a time
 TORCHINDUCTOR_FLYDSL_SIMD_STAGES=combo python benchmarks/inductor_backends/flydsl_simd/bench_models.py --quick --repeats 3
 # tests

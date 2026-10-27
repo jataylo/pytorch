@@ -350,6 +350,50 @@ def resnet_nchw_train():
     return _train(m, lambda: F.cross_entropy(m(x), t), opt="sgd")
 
 
+def _qwen3(repo):
+    """A HuggingFace Qwen3 at full size, randomly initialized from its config (only
+    the config has to be in the local HF cache), with SDPA attention."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    cfg = AutoConfig.from_pretrained(repo)
+    cfg.use_cache = False
+    cfg._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    with torch.device(DEV):
+        return AutoModelForCausalLM.from_config(
+            cfg, dtype=torch.bfloat16
+        ), cfg.vocab_size
+
+
+def _qwen3_train(repo, batch, seq):
+    m, vocab = _qwen3(repo)
+    x = torch.randint(0, vocab, (batch, seq), device=DEV)
+    return _train(m, lambda: m(input_ids=x, labels=x).loss)
+
+
+def _qwen3_infer(repo, batch, seq):
+    m, vocab = _qwen3(repo)
+    m.eval()
+    x = torch.randint(0, vocab, (batch, seq), device=DEV)
+    return torch.no_grad()(lambda: m(input_ids=x).logits)
+
+
+def qwen3_0p6b_train():
+    return _qwen3_train("Qwen/Qwen3-0.6B", 8, 1024)
+
+
+def qwen3_0p6b_infer():
+    return _qwen3_infer("Qwen/Qwen3-0.6B", 16, 1024)
+
+
+def qwen3_8b_train():
+    return _qwen3_train("Qwen/Qwen3-8B", 2, 2048)
+
+
+def qwen3_8b_infer():
+    return _qwen3_infer("Qwen/Qwen3-8B", 4, 2048)
+
+
 MODELS = {
     f.__name__: f
     for f in (
@@ -365,3 +409,9 @@ MODELS = {
         resnet_nchw_train,
     )
 }
+# Full-size HuggingFace models: run only when named (``--only qwen3_8b_train``).
+HF_MODELS = {
+    f.__name__: f
+    for f in (qwen3_0p6b_train, qwen3_0p6b_infer, qwen3_8b_train, qwen3_8b_infer)
+}
+ALL_MODELS = {**MODELS, **HF_MODELS}

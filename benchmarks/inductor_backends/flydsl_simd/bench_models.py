@@ -32,7 +32,7 @@ from torch._inductor import metrics
 
 name, backend, mode, here = sys.argv[1:5]
 sys.path.insert(0, here)
-from models import MODELS
+from models import ALL_MODELS as MODELS
 
 ic.flydsl.simd = backend == "flydsl"
 mode = None if mode == "default" else mode
@@ -70,7 +70,7 @@ print("RESULT " + json.dumps({"first_s": first, "step_ms": best * 1e3, "flydsl":
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from models import MODELS
+from models import ALL_MODELS, MODELS
 
 
 def child(name, backend, env, cwd, mode="default"):
@@ -134,7 +134,9 @@ def run_model(name, quick, gpu, repeats=1):
     for backend in ("triton", "flydsl"):
         if backend in failed:
             lines.append(f"{name:18s} {backend:7s} FAILED: {failed[backend][-300:]}")
-            rows.append({"model": name, "backend": backend, "error": failed[backend][-4000:]})
+            rows.append(
+                {"model": name, "backend": backend, "error": failed[backend][-4000:]}
+            )
             continue
         cold, warm = first[backend]
         g = graphs[backend]
@@ -190,7 +192,7 @@ def main():
         help="CUDA-graph timings per backend (fresh processes, alternating); median reported",
     )
     a = p.parse_args()
-    names = [n for n in MODELS if not a.only or n in a.only]
+    names = [n for n in (ALL_MODELS if a.only else MODELS) if not a.only or n in a.only]
     print(
         f"{'model':18s} {'backend':7s} {'cold s':>7s} {'warm s':>7s} {'step ms':>8s} {'graph ms':>9s}"
         f" {'ratio':>6s} {'kern':>5s}  coverage",
