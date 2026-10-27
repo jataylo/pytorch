@@ -630,6 +630,8 @@ _TEMPLATE_SOURCE = (
 {% if ADAPTIVE %}
     # Estimate the block's distinct destinations from a histogram of hashed
     # keys (linear counting), and skip the sort when it saves few atomics.
+    # Counting masked lanes as tokens only biases partial blocks toward the
+    # sort, and saves a block-wide reduction.
     live = tok_mask & valid
     hashed = ((dest.to(tl.int64) * 2654435761) >> (32 - LOG_HIST_BINS)) & (
         HIST_BINS - 1
@@ -637,8 +639,7 @@ _TEMPLATE_SOURCE = (
     counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
     empty = tl.maximum(tl.sum((counts == 0).to(tl.float32), 0), 1.0)
     distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
-    n_live = tl.sum(live.to(tl.float32), 0)
-    if n_live - distinct < n_live * MIN_SAVED:
+    if BLOCK_T - distinct < BLOCK_T * MIN_SAVED:
         # Plain atomics in token order, like regular Inductor. Rows of PLAIN_D
         # put fewer tokens in each atomic instruction than BLOCK_D-wide tiles,
         # which matters when hot keys collide within one.

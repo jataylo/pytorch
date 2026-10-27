@@ -8,8 +8,14 @@ Modes, all timed on identical inputs:
   base      preagg off, partitioned scatter off (plain Inductor atomics)
   ps        preagg off, partitioned scatter on
   preagg    gated preagg on top of partitioned scatter (the current stack)
+  ungated   preagg forced on every shape, always sorting
   adaptive  gate removed, each block picks sort or plain atomics; swept over
             scatter_preagg_adaptive_min_saved
+
+Contention is measured from the indices as the average number of tokens that
+share a token's destination row (sum of squared row counts over tokens): about
+1 for unique rows, 1 + n / rows for uniform ones, and far higher when a few
+rows are hot.
 """
 
 import argparse
@@ -38,13 +44,18 @@ DISTS = (
     "mixed",
     "runs32",
 )
-MIN_SAVED = (1 / 32, 1 / 16, 1 / 8, 1 / 4)
+MIN_SAVED = (1 / 16, 1 / 8)
 MODES = {
     "base": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=False),
     "ps": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=True),
     "preagg": dict(
         scatter_preagg_enabled=True,
         partitioned_scatter_enabled=True,
+        scatter_preagg_adaptive=False,
+    ),
+    "ungated": dict(
+        scatter_preagg_enabled=True,
+        scatter_preagg_force=True,
         scatter_preagg_adaptive=False,
     ),
     **{
@@ -149,8 +160,18 @@ def run_case(op, dtype, rows, d, n, dist):
     fn = OPS[op]
     ref = fn(x.double(), idx, v.double())
     scale = ref.abs().amax().clamp_min(1.0).item()
+    counts = torch.bincount(idx, minlength=rows).double()
     rec = dict(
-        op=op, dtype=dtype, rows=rows, d=d, n=n, dist=dist, times={}, err={}, applied={}
+        op=op,
+        dtype=dtype,
+        rows=rows,
+        d=d,
+        n=n,
+        dist=dist,
+        contention=(counts.square().sum() / n).item(),
+        times={},
+        err={},
+        applied={},
     )
     for mode, patch in MODES.items():
         torch._dynamo.reset()
@@ -203,8 +224,24 @@ def _geomean(xs):
 def _label(r):
     return (
         f"{r['op']} {r['dtype']} rows={r['rows']} d={r['d']} n={r['n']} "
-        f"{r['dist']} (tpd {r['n'] / r['rows']:.3g})"
+        f"{r['dist']} (contention {r['contention']:.3g})"
     )
+
+
+CONTENTION_BUCKETS = (
+    (1.5, "~1"),
+    (8, "1.5-8"),
+    (64, "8-64"),
+    (1024, "64-1K"),
+    (16384, "1K-16K"),
+)
+
+
+def _bucket(contention):
+    for hi, name in CONTENTION_BUCKETS:
+        if contention < hi:
+            return name
+    return ">=16K"
 
 
 def summary(args):
@@ -213,49 +250,50 @@ def summary(args):
     modes = [m for m in MODES if m not in ("base", "ps")]
     groups = defaultdict(list)
     for r in rows:
-        if "base" in r["times"] and "ps" in r["times"]:
+        if all(m in r["times"] for m in MODES):
             groups[(r["op"], r["dtype"])].append(r)
+
+    def best(r):
+        return min(r["times"]["base"], r["times"]["ps"])
+
     for (op, dtype), sel in sorted(groups.items()):
         print(f"\n== {op} {dtype}: {len(sel)} cases ==")
         for m in modes:
-            have = [r for r in sel if m in r["times"]]
-            speed = [
-                (min(r["times"]["base"], r["times"]["ps"]) / r["times"][m], r)
-                for r in have
-            ]
+            speed = [(best(r) / r["times"][m], r) for r in sel]
             slow = [(s, r) for s, r in speed if s < 1 / 1.03]
-            err = max((r["err"][m] for r in have), default=float("nan"))
+            err = max(r["err"][m] for r in sel)
             print(
                 f"{m:>16}: {_geomean([s for s, _ in speed]):.3f}x of best(base, ps), "
                 f"{len(slow)} >3% slower, max err {err:.1e}"
             )
-            for s, r in sorted(slow, key=lambda t: t[0])[: args.worst]:
-                print(f"{'':>18}{s:.2f}  {_label(r)}")
-        print("  adaptive vs gated preagg:")
-        for m in modes[1:]:
-            speed = [(r["times"]["preagg"] / r["times"][m], r) for r in sel]
-            print(f"{m:>16}: {_geomean([s for s, _ in speed]):.3f}x")
-            for s, r in sorted(speed, key=lambda t: t[0])[:3]:
-                print(f"{'':>18}worst {s:.2f}  {_label(r)}")
-            for s, r in sorted(speed, key=lambda t: -t[0])[:3]:
-                print(f"{'':>18}best  {s:.2f}  {_label(r)}")
-    by_dist = defaultdict(list)
-    for r in groups.get(("index_put", "float32"), []):
-        by_dist[r["dist"]].append(r)
-    print("\n== index_put float32 by distribution, geomean vs best(base, ps) ==")
-    print(f"{'dist':>8} " + " ".join(f"{m:>14}" for m in modes))
-    for dist, sel in sorted(by_dist.items()):
-        cells = []
-        for m in modes:
-            cells.append(
-                _geomean(
-                    [
-                        min(r["times"]["base"], r["times"]["ps"]) / r["times"][m]
-                        for r in sel
-                    ]
-                )
+            if m.startswith("adaptive"):
+                for s, r in sorted(slow, key=lambda t: t[0])[: args.worst]:
+                    print(f"{'':>18}{s:.2f}  {_label(r)}")
+
+    print("\nGeomean speedup over regular Inductor (base) by measured contention.")
+    print("'worst' is adaptive's worst ratio to best(base, ps) in the bucket.")
+    adaptive = f"adaptive_{MIN_SAVED[0]:g}"
+    cols = ["ps", "preagg", "ungated", *(m for m in modes if m.startswith("adaptive"))]
+    for (op, dtype), sel in sorted(groups.items()):
+        by_bucket = defaultdict(list)
+        for r in sel:
+            by_bucket[_bucket(r["contention"])].append(r)
+        print(f"\n{op} {dtype}\n")
+        print("| contention | cases | base | " + " | ".join(cols) + " | worst |")
+        print("|---" * (len(cols) + 4) + "|")
+        for _, name in (*CONTENTION_BUCKETS, (None, ">=16K")):
+            b = by_bucket.get(name)
+            if not b:
+                continue
+            cells = [
+                _geomean([r["times"]["base"] / r["times"][m] for r in b]) for m in cols
+            ]
+            worst = min(best(r) / r["times"][adaptive] for r in b)
+            print(
+                f"| {name} | {len(b)} | 1.00 | "
+                + " | ".join(f"{c:.2f}" for c in cells)
+                + f" | {worst:.2f} |"
             )
-        print(f"{dist:>8} " + " ".join(f"{c:>14.3f}" for c in cells))
 
 
 if __name__ == "__main__":
