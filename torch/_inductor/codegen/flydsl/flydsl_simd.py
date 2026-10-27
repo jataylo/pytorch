@@ -1067,6 +1067,19 @@ class FlyDSLKernel(SIMDKernel):
                 )
         return roots
 
+    def _has_gather(self) -> bool:
+        """Some load's index goes through another load (an embedding, a loss's target)."""
+        from ...loop_body import MemoryUsageType
+
+        for node in self.features.scheduler_nodes():
+            body = getattr(node, "_body", None)
+            if body is None:
+                continue
+            for e in body.memory_usage[MemoryUsageType.LOAD]:
+                if free_symbol_is_type(body.indexing_exprs[e.index_name], SymT.INDIRECT):
+                    return True
+        return False
+
     def _stream_itemsizes(self, loads: bool = True) -> list[int]:
         """Element sizes of the buffers a pointwise kernel streams: those whose index
         runs contiguously with x, which broadcast operands do not. Only the stored
@@ -1254,6 +1267,28 @@ class FlyDSLKernel(SIMDKernel):
                 runs //= 2
             tpr = min(self.threads, _pow2_ceil(runs))
             if (
+                tpr >= WAVE
+                and not self.in_combo
+                and not _tune("threads", 0)
+                and self.xnumel < _num_cus()
+            ):
+                # Fewer rows than CUs: each row's block as wide as its runs allow, for
+                # more of its loads in flight at once. BERT's loss tail (one row of
+                # 8192 gathered logits) 36.3us -> 25.3us at 1024 threads (Triton 26.4us);
+                # Llama's (4096) 15.0us at one wave, 14.1us at 512 threads and 12.2us
+                # at 1024 of 4 elements (Triton 12.1us). Narrower runs only pay for
+                # gathers: a contiguous 4096-wide sum went 1.8us -> 2.3us.
+                gathers = self._has_gather()
+                while (
+                    gathers
+                    and self.ept > 4
+                    and not _tune("ept", 0)
+                    and -(-self.rnumel // self.ept) < SMALL_COLUMN_THREADS
+                ):
+                    self.ept //= 2
+                full_runs = -(-self.rnumel // self.ept)
+                self.threads = tpr = min(SMALL_COLUMN_THREADS, _pow2_ceil(full_runs))
+            elif (
                 tpr > WAVE
                 and not atomic
                 and -(-self.rnumel // (WAVE * self.ept)) * self.ept
@@ -1276,17 +1311,6 @@ class FlyDSLKernel(SIMDKernel):
                 # (online) form: 254us vs 147us on a LayerNorm of the same shape.
                 tpr = WAVE
                 self.one_step = True
-            elif (
-                tpr == self.threads
-                and not self.in_combo
-                and not _tune("threads", 0)
-                and self.xnumel < _num_cus()
-            ):
-                # Fewer rows than CUs: each row's block as wide as its runs allow, for
-                # more of its loads in flight at once. BERT's loss tail (one row of
-                # 8192 gathered logits) 36.3us -> 25.3us at 1024 threads (Triton 26.4us).
-                full_runs = -(-self.rnumel // self.ept)
-                self.threads = tpr = min(SMALL_COLUMN_THREADS, _pow2_ceil(full_runs))
             self.tpr = _tune("row_tpr", tpr)
             short = (
                 -(-self.rnumel // (self.tpr * self.ept)) * self.ept
