@@ -5,12 +5,12 @@ partitioned scatter and gated preagg across index distributions.
   python bench_adaptive.py summary results/adaptive.jsonl
 
 Modes, all timed on identical inputs:
-  base      preagg off, partitioned scatter off (plain Inductor atomics)
-  ps        preagg off, partitioned scatter on
-  preagg    gated preagg on top of partitioned scatter (the current stack)
-  ungated   preagg forced on every shape, always sorting
-  adaptive  gate removed, each block picks sort or plain atomics; swept over
-            scatter_preagg_adaptive_min_saved
+  base          regular Inductor: preagg and partitioned scatter off
+  ps            partitioned scatter on, preagg off
+  adaptive      adaptive preagg with partitioned scatter on (ROCm default);
+                fp16 accumulates in an fp32 copy
+  adaptive_nops adaptive preagg with partitioned scatter off (CUDA default);
+                fp16 uses native atomics
 
 Contention is measured from the indices as the average number of tokens that
 share a token's destination row (sum of squared row counts over tokens): about
@@ -44,29 +44,12 @@ DISTS = (
     "mixed",
     "runs32",
 )
-MIN_SAVED = (1 / 16, 1 / 8)
+PREAGG = dict(scatter_preagg_enabled=True, scatter_preagg_adaptive=True)
 MODES = {
     "base": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=False),
     "ps": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=True),
-    "preagg": dict(
-        scatter_preagg_enabled=True,
-        partitioned_scatter_enabled=True,
-        scatter_preagg_adaptive=False,
-    ),
-    "ungated": dict(
-        scatter_preagg_enabled=True,
-        scatter_preagg_force=True,
-        scatter_preagg_adaptive=False,
-    ),
-    **{
-        f"adaptive_{s:g}": dict(
-            scatter_preagg_enabled=True,
-            partitioned_scatter_enabled=True,
-            scatter_preagg_adaptive=True,
-            scatter_preagg_adaptive_min_saved=s,
-        )
-        for s in MIN_SAVED
-    },
+    "adaptive": dict(PREAGG, partitioned_scatter_enabled=True),
+    "adaptive_nops": dict(PREAGG, partitioned_scatter_enabled=False),
 }
 
 
@@ -113,8 +96,16 @@ def _index_put(x, i, v):
     return torch.index_put(x, (i,), v, accumulate=True)
 
 
+def _index_add(x, i, v):
+    return x.index_add(0, i, v)
+
+
 def _scatter_add(x, i, v):
     return x.scatter_add(0, i[:, None].expand(-1, v.shape[1]), v)
+
+
+def _scatter_reduce(x, i, v):
+    return x.scatter_reduce(0, i[:, None].expand(-1, v.shape[1]), v, "sum")
 
 
 def _embedding_bwd(x, i, v):
@@ -123,7 +114,9 @@ def _embedding_bwd(x, i, v):
 
 OPS = {
     "index_put": _index_put,
+    "index_add": _index_add,
     "scatter_add": _scatter_add,
+    "scatter_reduce": _scatter_reduce,
     "embedding": _embedding_bwd,
 }
 
@@ -135,14 +128,20 @@ def cases():
             continue
         for dist in DISTS:
             out.append(("index_put", "float32", rows, d, n, dist))
-    for dtype, rows, dist in itertools.product(
-        ("bfloat16", "float16"), (64, 4096, 262144), DISTS
+    for op, rows, d, dist in itertools.product(
+        ("index_add", "scatter_add", "scatter_reduce", "embedding"),
+        ROWS,
+        (32, 128),
+        DISTS,
     ):
-        out.append(("index_put", dtype, rows, 128, 1048576, dist))
-    for op, rows, dist in itertools.product(
-        ("scatter_add", "embedding"), (4096, 262144), ("uniform", "zipf", "hot50")
+        out.append((op, "float32", rows, d, 1048576, dist))
+    for op, dtype, rows, dist in itertools.product(
+        ("index_put", "scatter_add", "embedding"),
+        ("bfloat16", "float16"),
+        (64, 4096, 262144),
+        DISTS,
     ):
-        out.append((op, "float32", rows, 128, 1048576, dist))
+        out.append((op, dtype, rows, 128, 1048576, dist))
     return out
 
 
@@ -247,53 +246,52 @@ def _bucket(contention):
 def summary(args):
     with open(args.results) as f:
         rows = [json.loads(line) for line in f]
-    modes = [m for m in MODES if m not in ("base", "ps")]
     groups = defaultdict(list)
     for r in rows:
         if all(m in r["times"] for m in MODES):
             groups[(r["op"], r["dtype"])].append(r)
+    cols = [m for m in MODES if m != "base"]
 
     def best(r):
         return min(r["times"]["base"], r["times"]["ps"])
 
-    for (op, dtype), sel in sorted(groups.items()):
-        print(f"\n== {op} {dtype}: {len(sel)} cases ==")
-        for m in modes:
-            speed = [(best(r) / r["times"][m], r) for r in sel]
-            slow = [(s, r) for s, r in speed if s < 1 / 1.03]
-            err = max(r["err"][m] for r in sel)
-            print(
-                f"{m:>16}: {_geomean([s for s, _ in speed]):.3f}x of best(base, ps), "
-                f"{len(slow)} >3% slower, max err {err:.1e}"
-            )
-            if m.startswith("adaptive"):
-                for s, r in sorted(slow, key=lambda t: t[0])[: args.worst]:
-                    print(f"{'':>18}{s:.2f}  {_label(r)}")
-
-    print("\nGeomean speedup over regular Inductor (base) by measured contention.")
-    print("'worst' is adaptive's worst ratio to best(base, ps) in the bucket.")
-    adaptive = f"adaptive_{MIN_SAVED[0]:g}"
-    cols = ["ps", "preagg", "ungated", *(m for m in modes if m.startswith("adaptive"))]
+    print("Geomean speedup over regular Inductor (base) by measured contention.")
+    print("'worst' and 'slower' compare adaptive with best(base, ps) per case;")
+    print("errors are the bucket's max, base / ps / adaptive / adaptive_nops.")
     for (op, dtype), sel in sorted(groups.items()):
         by_bucket = defaultdict(list)
         for r in sel:
             by_bucket[_bucket(r["contention"])].append(r)
+        buckets = [(name, by_bucket[name]) for _, name in CONTENTION_BUCKETS]
+        buckets += [(">=16K", by_bucket[">=16K"]), ("all", sel)]
         print(f"\n{op} {dtype}\n")
-        print("| contention | cases | base | " + " | ".join(cols) + " | worst |")
-        print("|---" * (len(cols) + 4) + "|")
-        for _, name in (*CONTENTION_BUCKETS, (None, ">=16K")):
-            b = by_bucket.get(name)
+        print(
+            "| contention | cases | base | "
+            + " | ".join(cols)
+            + " | worst | slower | max err |"
+        )
+        print("|---" * (len(cols) + 6) + "|")
+        for name, b in buckets:
             if not b:
                 continue
             cells = [
                 _geomean([r["times"]["base"] / r["times"][m] for r in b]) for m in cols
             ]
-            worst = min(best(r) / r["times"][adaptive] for r in b)
+            ratios = [best(r) / r["times"]["adaptive"] for r in b]
+            errs = " / ".join(f"{max(r['err'][m] for r in b):.0e}" for m in MODES)
             print(
                 f"| {name} | {len(b)} | 1.00 | "
                 + " | ".join(f"{c:.2f}" for c in cells)
-                + f" | {worst:.2f} |"
+                + f" | {min(ratios):.2f} | {sum(x < 1 / 1.03 for x in ratios)}"
+                + f" | {errs} |"
             )
+        slow = sorted(
+            (best(r) / r["times"]["adaptive"], r)
+            for r in sel
+            if best(r) / r["times"]["adaptive"] < 1 / 1.03
+        )
+        for ratio, r in slow[: args.worst]:
+            print(f"  {ratio:.2f}  {_label(r)}")
 
 
 if __name__ == "__main__":
@@ -308,6 +306,6 @@ if __name__ == "__main__":
     p.add_argument("--out", required=True)
     p = sub.add_parser("summary")
     p.add_argument("results")
-    p.add_argument("--worst", type=int, default=5)
+    p.add_argument("--worst", type=int, default=0)
     args = parser.parse_args()
     run(args) if args.cmd == "run" else summary(args)
