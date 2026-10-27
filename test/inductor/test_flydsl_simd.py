@@ -712,6 +712,35 @@ class TestFlyDSLSIMD(TestCase):
         self.assertIn("fdp_rt.compiled(async_compile, ", code)
         self.assertTrue(os.path.exists(binary), binary)
 
+    def test_compiles_at_codegen_once_pool_is_up(self):
+        # With the pool up, codegen hands each kernel to a worker; the module's load
+        # then waits for that job instead of submitting its own.
+        import os
+        from unittest import mock
+
+        from torch._inductor.async_compile import AsyncCompile
+        from torch._inductor.codegen.flydsl import flydsl_simd_runtime as rt
+
+        if not AsyncCompile.use_process_pool() and not (
+            AsyncCompile.wait_process_pool_ready() and AsyncCompile.use_process_pool()
+        ):
+            self.skipTest("no compile worker pool")
+        submitted = []
+
+        def record(name, source, binaries):
+            compile_early(name, source, binaries)
+            submitted.extend(b for b in binaries if b in rt._EARLY)
+
+        compile_early = rt.compile_early
+        x = torch.randn(1000, 1000, device="cuda")
+        with mock.patch.object(rt, "compile_early", record):
+            out = torch.compile(lambda t: (t * 3.25).sin() + 0.5)(x)
+        torch.testing.assert_close(out, (x * 3.25).sin() + 0.5)
+        self.assertTrue(submitted)
+        self.assertFalse(set(submitted) & set(rt._EARLY))
+        for binary in submitted:
+            self.assertTrue(os.path.exists(binary), binary)
+
     def test_autotuned_in_place(self):
         # A pointwise kernel this large times its candidates on its first call; one that
         # updates a buffer in place must be timed on a copy and applied exactly once.

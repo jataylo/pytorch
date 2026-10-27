@@ -2378,10 +2378,51 @@ def warm_worker(arch: str | None = None) -> None:
         compile_only(_warm_launch, 0)
 
 
+_EARLY: dict = {}
+
+
+def compile_early(kernel_name: str, source: str, binaries: list[str]) -> None:
+    """At codegen, hand each of a module's variants to an idle compile worker, rather
+    than when the finished graph module loads: a graph's first call otherwise waited
+    on its slowest compile after all of codegen (Llama training's AdamW kernel, 1.4 s).
+    Only once the pool is up, as ``async_compile`` decides; ``compiled`` then waits for
+    the job and loads its code object here."""
+    from torch._inductor import async_compile
+    from torch._inductor.codegen.flydsl.flydsl_kernel import MAIN_SUFFIX
+    from torch._inductor.runtime.compile_tasks import (
+        _worker_compile_pycodecache_kernel,
+    )
+
+    if not async_compile.AsyncCompile.use_process_pool():
+        return
+    env = async_compile._pycodecache_kernel_compile_env()
+    if "FLYDSL_RUNTIME_CACHE_DIR" in _os.environ:
+        env["FLYDSL_RUNTIME_CACHE_DIR"] = _os.environ["FLYDSL_RUNTIME_CACHE_DIR"]
+    pool = async_compile.AsyncCompile.process_pool()
+    for i, binary in enumerate(binaries):
+        if binary in _EARLY or _os.path.exists(binary):
+            continue
+        meta = {"only": i} if len(binaries) > 1 else {}
+        _EARLY[binary] = pool.submit(
+            _worker_compile_pycodecache_kernel,
+            kernel_name,
+            source,
+            MAIN_SUFFIX,
+            env,
+            meta,
+        )
+
+
 def compiled(async_compile, kernel_name: str, source: str, binary: str, **kw):
     """``async_compile.flydsl``, except that a kernel whose code object ``binary`` is
     already on disk (a warm start) loads in this process: through the pool it waited
-    on a worker to find nothing to do, 0.35 s of GPT training's warm start."""
+    on a worker to find nothing to do, 0.35 s of GPT training's warm start. So does
+    one that ``compile_early`` compiled, once its job is done; if it failed, the
+    regular compile reports the error."""
+    early = _EARLY.pop(binary, None)
+    if early is not None:
+        with contextlib.suppress(Exception):
+            early.result()
     if not _os.path.exists(binary):
         return async_compile.flydsl(kernel_name, source, **kw)
     from torch._inductor.codecache import PyCodeCache

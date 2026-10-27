@@ -3196,6 +3196,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             wrapper.add_import_once(
                 "from torch._inductor.codegen.flydsl import flydsl_simd_runtime as fdp_rt"
             )
+            from .flydsl_simd_runtime import compile_early
+
+            compile_early(kernel_name, literal, binaries)
 
         def compile_call(src: str, meta: str, i: int) -> str:
             if binaries is None:
