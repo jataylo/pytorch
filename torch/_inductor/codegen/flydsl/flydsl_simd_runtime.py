@@ -2152,6 +2152,14 @@ def pick_fastest(mains, args, mutated, stream=None):
     if torch.cuda.is_current_stream_capturing():
         mains[0](*args, stream=stream)
         return None
+    path = _pick_path(mains)
+    try:
+        with open(path) as f:
+            best = next(m for m in mains if m.__name__ == f.read().strip())
+        best(*args, stream=stream)
+        return best
+    except (OSError, TypeError, StopIteration):
+        pass
     scratch = list(args)
     for i in mutated:
         scratch[i] = args[i].clone()
@@ -2184,8 +2192,37 @@ def pick_fastest(mains, args, mutated, stream=None):
         for k, (s, e) in enumerate(events):
             times[k] = min(times[k], s.elapsed_time(e))
     best = mains[times.index(min(times))]
+    if path is not None:
+        tmp = f"{path}.{_os.getpid()}"
+        try:
+            _os.makedirs(_os.path.dirname(path), exist_ok=True)
+            with open(tmp, "w") as f:
+                f.write(best.__name__)
+            _os.replace(tmp, path)
+        except OSError:
+            pass
     best(*args, stream=stream)
     return best
+
+
+def _pick_path(mains):
+    """Where ``pick_fastest`` keeps its choice among ``mains`` for later processes, as
+    Triton keeps its autotuning results: a warm start otherwise re-timed every
+    autotuned kernel (0.17 s of a GPT-2 prefill's). None with caches disabled. The
+    names carry a hash of the kernel source, which fixes the shapes."""
+    import hashlib
+
+    import torch
+    from torch._inductor import config
+    from torch._inductor.runtime.cache_dir_utils import cache_dir
+
+    if config.force_disable_caches:
+        return None
+    key = "\n".join(
+        [torch.cuda.get_device_properties().gcnArchName, *(m.__name__ for m in mains)]
+    )
+    h = hashlib.sha256(key.encode()).hexdigest()[:32]
+    return _os.path.join(cache_dir(), "flydsl_picks", h)
 
 
 # The compiled artifact's GPU binary: `#gpu.object<..., bin = "...">`, an MLIR string
@@ -2236,13 +2273,32 @@ def compile_only(launch, *args, arch: str | None = None) -> None:
     _os.environ[var] = "1"
     try:
         # FlyDSL prints a line for every compile-only call.
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), _no_source_locations():
             launch(*args)
     finally:
         if old is None:
             del _os.environ[var]
         else:
             _os.environ[var] = old
+
+
+@contextlib.contextmanager
+def _no_source_locations():
+    """FlyDSL tags every op with its Python call stack (``inspect`` per op), a third
+    of tracing a generated kernel and ~15% of its compile; these kernels' line
+    numbers point into generated code nobody steps through."""
+    from flydsl.compiler import ast_rewriter
+    from flydsl.expr import meta
+
+    def unknown():
+        return ir.Location.unknown()
+
+    saved = meta.capture_user_location, ast_rewriter.capture_user_location
+    meta.capture_user_location = ast_rewriter.capture_user_location = unknown
+    try:
+        yield
+    finally:
+        meta.capture_user_location, ast_rewriter.capture_user_location = saved
 
 
 def warm_worker(arch: str | None = None) -> None:

@@ -2779,7 +2779,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
     @staticmethod
     def _candidates(kernel: FlyDSLKernel) -> list[dict[str, int]]:
         """Launch parameters to time against the heuristic's for a large pointwise,
-        transposing or short-row kernel. Which is fastest depends on what the kernel's
+        column or short-row kernel. Which is fastest depends on what the kernel's
         inputs were last touched by, so it is measured, as Triton autotunes these: in
         ResNet's training step an in-place conv bias add takes 106us at 2048 elements a
         block, 84us at 256 (Triton 95us), while its BatchNorm backward takes 96us at
@@ -2808,11 +2808,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             ]
             base = (kernel.ept, kernel.unroll, kernel.threads)
             return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
-        if stage == "tile":
-            # A heads permute of a [32, 512, 768] bf16 tensor: 25us at 128 threads, 21us
-            # at 64 (Triton 25us). The tile shape is not autotuned: the candidates time
-            # within 1% of one another on a warm cache (see _finalize_tile2d).
-            return [{"threads": 64}] if kernel.threads != 64 else []
+        # Not tuned, as no candidate won across ten models' autotuned kernels: a tile's
+        # block size or shape (see _finalize_tile2d), a row's rows per lane group.
         if stage == "column":
             # Twice the lanes on each column: Qwen3's per-head norm weight gradient
             # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32
@@ -2825,12 +2822,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             and "row_tpr" not in tuned
             and "xunroll" not in tuned
         ):
-            # Fewer lanes a row, or more rows a lane group: 71us vs 69us at 4 lanes a
-            # row on a 64-wide softmax, 19.4us vs 18.9us at two rows on a 768-wide
-            # add+layernorm.
-            cands = [{"xunroll": kernel.xunroll * 2}] if kernel.xunroll < 8 else []
-            if kernel.tpr > 1:
-                cands.append({"row_tpr": kernel.tpr // 2})
+            # Fewer lanes a row: ViT's LayerNorm through a transpose 180us -> 139us.
+            cands = [{"row_tpr": kernel.tpr // 2}] if kernel.tpr > 1 else []
             # Or more: an ALU-bound row (Qwen3's k-norm + RoPE, angles computed in the
             # kernel) 70us -> 61us at 4 elements a lane rather than 8 (Triton 101us).
             if kernel.ept > 2 and "ept" not in tuned:
