@@ -766,9 +766,6 @@ def _try_template(
         _hint(plan.num_inner),
         _hint(plan.num_keys),
     )
-    if num_keys >= 2**31:
-        _record_skip("key_space")
-        return False
     reason = _passes_size_gates(num_tokens, num_inner, num_keys)
     if reason is not None:
         _record_skip(reason)

@@ -379,6 +379,8 @@ class TestScatterPreagg(TestCase):
             50_000, 256, torch.float32, inner_contiguous=False
         )
         self.assertEqual((strided[0].block_t, strided[0].block_d), (512, 8))
+        half = V.choices.get_scatter_preagg_configs(50_000, 64, torch.bfloat16)
+        self.assertEqual((half[0].block_t, half[0].block_d), (64, 64))
         with config.patch(max_autotune=True):
             tuned = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertGreater(len(tuned), 1)

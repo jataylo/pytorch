@@ -1448,7 +1448,11 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         # cost more than the extra pre-aggregation saves. When inner elements
         # are strided in the output each one is its own memory transaction, so
         # thin slices of many tokens keep sorted neighbours together instead.
-        if inner_contiguous:
+        # 16-bit rows move half the bytes per sorted token, so the sort weighs
+        # more and smaller blocks of wider slices win (measured on gfx942).
+        if inner_contiguous and dtype.itemsize < 4:
+            max_block_d, tile_elems = 64, 4096
+        elif inner_contiguous:
             max_block_d = 32 if num_inner <= 128 else 64
             tile_elems = 8192
         else:
