@@ -2170,6 +2170,12 @@ def pick_fastest(mains, args, mutated, stream=None):
     # candidate with a high variance, a 16x64 transpose tile 10% slower on average.
     # Each round is queued behind a GPU sleep: a launch from Python takes longer than
     # a 20us kernel, and unqueued the GPU would idle between them, timing the launches.
+    # Every call starts from a flushed cache, as Triton's benchmarker does: repeated
+    # back to back, a kernel's 100 MB of inputs stay in the 256 MB last-level cache,
+    # where a 4-element-a-lane GPT-2 softmax backward timed fastest and ran 15%
+    # slower in the model than the 8-element one it beat.
+    device = next(a.device for a in args if isinstance(a, torch.Tensor))
+    flush = torch.empty(256 << 20, dtype=torch.int8, device=device)
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     ev[0].record()
     mains[0](*scratch, stream=stream)
@@ -2178,19 +2184,24 @@ def pick_fastest(mains, args, mutated, stream=None):
     reps = max(1, min(10, int(0.3 / max(ev[0].elapsed_time(ev[1]), 1e-3))))
     times = [float("inf")] * len(mains)
     for _ in range(3):
-        # ~60us a launch; a cycle is ~0.5ns (gfx942 at 2.1 GHz); over-sleeping is cheap.
-        torch.cuda._sleep(int(len(mains) * reps * 60e3 * 2.1))
+        # ~60us a launch (four with the flush and events); a cycle is ~0.5ns (gfx942
+        # at 2.1 GHz); over-sleeping is cheap.
+        torch.cuda._sleep(int(len(mains) * reps * 4 * 60e3 * 2.1))
         events = []
         for fn in mains:
-            pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-            pair[0].record()
+            pairs = []
             for _ in range(reps):
+                flush.zero_()
+                pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+                pair[0].record()
                 fn(*scratch, stream=stream)
-            pair[1].record()
-            events.append(pair)
-        events[-1][1].synchronize()
-        for k, (s, e) in enumerate(events):
-            times[k] = min(times[k], s.elapsed_time(e))
+                pair[1].record()
+                pairs.append(pair)
+            events.append(pairs)
+        events[-1][-1][1].synchronize()
+        for k, pairs in enumerate(events):
+            times[k] = min(times[k], sum(s.elapsed_time(e) for s, e in pairs))
+    del flush
     best = mains[times.index(min(times))]
     if path is not None:
         tmp = f"{path}.{_os.getpid()}"

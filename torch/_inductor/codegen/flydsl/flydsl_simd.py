@@ -1117,14 +1117,15 @@ class FlyDSLKernel(SIMDKernel):
             return
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
+        atomic = self._has_atomic()
+        if atomic:
+            # Atomics are issued an element at a time, and a wave's spread over more
+            # than two elements a lane goes slower: an embedding-gradient scatter
+            # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
+            # 23us at 2 in bf16 (Triton 21us).
+            widest_vec = min(widest_vec, 2)
         if not self.is_reduction_kernel:
-            if self._has_atomic():
-                # Atomics are issued an element at a time, and a wave's spread over more
-                # than two elements a lane goes slower: an embedding-gradient scatter
-                # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
-                # 23us at 2 in bf16 (Triton 21us).
-                widest_vec = min(widest_vec, 2)
-            elif not self.in_combo:
+            if not atomic and not self.in_combo:
                 # One-wave blocks: a [32, 512, 768] bf16 heads permute 18.6us -> 14.3us
                 # (Triton 18.1us), a 16M f32 add 45.8 -> 41.2us, an NCHW bias add
                 # 38.7 -> 36.0us; none slower.
@@ -1220,6 +1221,7 @@ class FlyDSLKernel(SIMDKernel):
             tpr = min(self.threads, _pow2_ceil(runs))
             if (
                 tpr > WAVE
+                and not atomic
                 and -(-self.rnumel // (WAVE * self.ept)) * self.ept
                 <= PERSISTENT_MAX_UNROLL
             ):
@@ -2858,8 +2860,15 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             ]
             base = (kernel.ept, kernel.unroll, kernel.threads)
             return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
-        # Not tuned, as no candidate won across ten models' autotuned kernels: a tile's
-        # block size or shape (see _finalize_tile2d), a row's rows per lane group.
+        if stage == "tile":
+            if tuned.keys() & {"tile_f", "tile_s"} or kernel.tile_f != TILE:
+                return []
+            # Twice the fast edge, at twice the threads: GPT-2's QKV gradient (three
+            # bf16 heads layouts to rows) 39.2us -> 33.4us in the model (Triton 34.3us),
+            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%.
+            return [{"tile_f": 2 * TILE, "threads": 2 * kernel.threads}]
+        # Not tuned, as no candidate won across ten models' autotuned kernels: a row's
+        # rows per lane group.
         if stage == "column":
             # Twice the lanes on each column: Qwen3's per-head norm weight gradient
             # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32
@@ -2872,8 +2881,13 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             and "row_tpr" not in tuned
             and "xunroll" not in tuned
         ):
-            # Fewer lanes a row: ViT's LayerNorm through a transpose 180us -> 139us.
-            cands = [{"row_tpr": kernel.tpr // 2}] if kernel.tpr > 1 else []
+            # A whole wave on a row the heuristic gave fewer lanes: GPT-2's masked
+            # softmax backward (512 bf16) 62.5us -> 58.4us in the model (Triton 61us).
+            # Otherwise fewer lanes: ViT's LayerNorm through a transpose 180us -> 139us.
+            if kernel.tpr < WAVE:
+                cands = [{"row_tpr": 2 * kernel.tpr}]
+            else:
+                cands = [{"row_tpr": kernel.tpr // 2}]
             # Or more: an ALU-bound row (Qwen3's k-norm + RoPE, angles computed in the
             # kernel) 70us -> 61us at 4 elements a lane rather than 8 (Triton 101us).
             if kernel.ept > 2 and "ept" not in tuned:

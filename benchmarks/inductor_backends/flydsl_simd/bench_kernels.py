@@ -73,6 +73,29 @@ def _ln_bwd(g, x, w):
     return dx.to(x.dtype)
 
 
+def _qkv_cat(q, kt, v):
+    # As the backward of qkv.split(768, -1) then per-head views: select_backward sums.
+    grads = [q.transpose(1, 2), kt.permute(0, 3, 1, 2), v.transpose(1, 2)]
+    out = 0
+    for i, g in enumerate(grads):
+        out = out + torch.ops.aten.select_backward(
+            g.reshape(4096, 12, 64), [3, 4096, 12, 64], 0, i
+        )
+    return out.permute(1, 0, 2, 3).reshape(4096, 2304)
+
+
+def _rms_bwd_embed(a, b, c, w, x, ix, e):
+    # Llama's first RMSNorm backward with the embedding gradient's accumulate fused in.
+    xf = x.float()
+    rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+    g = (a + b + c) * w
+    s = (g.float() * xf).sum(-1, keepdim=True)
+    dx = g.float() * rstd + (-0.5 * s * rstd**3 / x.shape[-1]) * (2 * xf)
+    h = (e + dx.to(e.dtype)).float()
+    out = torch.zeros(32000, x.shape[-1], device=x.device)
+    return out.index_put_((ix,), h, accumulate=True)
+
+
 # Outputs drawn from the RNG: Inductor's Philox stream differs from eager's.
 RANDOM = {"dropout_bf16", "randn_f32_16M"}
 
@@ -100,6 +123,8 @@ CASES = {
     ),
     "gelu_f16_64M": (lambda a: F.gelu(a, approximate="tanh"), [_r(1 << 26, dtype=f16)]),
     "transpose_f32": (lambda a: a.t().contiguous() * 2, [_r(4096, 4096)]),
+    # GPT-2's embedding gradient back to the weight's dtype
+    "cast_bf16_24M": (lambda a: a.to(bf16), [_r(32000, 768)]),
     "small_add_4K": (lambda a, b: a + b, [_r(4096), _r(4096)]),
     "embedding_bf16": (
         lambda w, ix: F.embedding(ix, w),
@@ -166,6 +191,21 @@ CASES = {
         .to(bf16),
         [_r(49152, 512, dtype=bf16), _r(49152, 512, dtype=bf16)],
     ),
+    # GPT-2's attention-probability gradient: causal mask and the 1/sqrt(d) scale fused
+    "masked_softmax_bwd_512": (
+        lambda g, y, m: (
+            (g.float() * y.float() - y.float() * (g.float() * y.float()).sum(-1, True))
+            .view(96, 512, 512)
+            .masked_fill(m, 0.0)
+            .mul(0.125)
+            .to(bf16)
+        ),
+        [
+            _r(49152, 512, dtype=bf16),
+            _r(49152, 512, dtype=bf16),
+            lambda: torch.ones(512, 512, device="cuda", dtype=torch.bool).triu(1),
+        ],
+    ),
     # LayerNorm weight/bias gradients at ViT-B shapes (197 tokens x 32): a split column
     # reduction of bf16 rows
     "ln_wgrad_vit": (
@@ -229,6 +269,20 @@ CASES = {
     ),
     # Qwen3-0.6B (16 heads of 128): q/k RMSNorm weight gradient, a sum over tokens and
     # heads of bf16 rows only 128 wide
+    # GPT-2's fused QKV projection gradient: q, k (transposed) and v gradients to rows
+    "qkv_grad_cat_bf16": (
+        lambda q, kt, v: _qkv_cat(q, kt, v),
+        [_r(8, 12, 512, 64, dtype=bf16), _r(8, 12, 64, 512, dtype=bf16)]
+        + [_r(8, 12, 512, 64, dtype=bf16)],
+    ),
+    # ViT-B/16 MLP bias gradient (32 x 197 tokens), a split reduction's first stage
+    "bias_grad_bf16": (lambda g: g.sum(0), [_r(6304, 3072, dtype=bf16)]),
+    "rms_bwd_embed_bf16": (
+        _rms_bwd_embed,
+        [_r(4096, 1024, dtype=bf16)] * 3
+        + [_r(1024, dtype=bf16), _r(4096, 1024, dtype=bf16), _i(32000, 4096)]
+        + [_r(4096, 1024, dtype=bf16)],
+    ),
     "head_wgrad_bf16": (
         lambda g: g.sum((0, 1, 2), keepdim=True),
         [_r(8, 1024, 16, 128, dtype=bf16)],
