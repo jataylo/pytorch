@@ -1107,15 +1107,29 @@ class FlyDSLKernel(SIMDKernel):
                 return True
         return False
 
-    def _has_atomic(self) -> bool:
+    def _has_atomic(self, per_element: bool = False) -> bool:
+        """Whether a node stores atomically; with ``per_element``, not counting a
+        reduction kernel's nodes that run once a row (no reduction range)."""
         from ...loop_body import MemoryUsageType
 
-        return any(
-            e.mode == "atomic_add"
-            for node in self.features.scheduler_nodes()
-            if getattr(node, "_body", None) is not None
-            for e in node._body.memory_usage[MemoryUsageType.STORE]
-        )
+        nodes = list(self.features.scheduler_nodes())
+        calls = self._node_index_vars
+        for i, node in enumerate(nodes):
+            body = getattr(node, "_body", None)
+            if body is None or not any(
+                e.mode == "atomic_add" for e in body.memory_usage[MemoryUsageType.STORE]
+            ):
+                continue
+            if (
+                per_element
+                and self.is_reduction_kernel
+                and len(calls) == len(nodes)
+                and len(calls[i]) > 1
+                and not calls[i][-1]
+            ):
+                continue
+            return True
+        return False
 
     def finalize_indexing(self, indices: Sequence[sympy.Expr]) -> None:
         """Choose the thread layout -- ``ept``, ``unroll``, ``tpr``, ``stride``,
@@ -1131,11 +1145,12 @@ class FlyDSLKernel(SIMDKernel):
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
         atomic = self._has_atomic()
-        if atomic:
+        if self._has_atomic(per_element=True):
             # Atomics are issued an element at a time, and a wave's spread over more
             # than two elements a lane goes slower: an embedding-gradient scatter
             # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
-            # 23us at 2 in bf16 (Triton 21us).
+            # 23us at 2 in bf16 (Triton 21us). Not one atomic a row, after its
+            # reduction, which leaves the row's loads and stores at full width.
             widest_vec = min(widest_vec, 2)
         if not self.is_reduction_kernel:
             if not atomic and not self.in_combo:
@@ -1607,6 +1622,9 @@ class FlyDSLKernel(SIMDKernel):
         in_loop = self._in_loop_region()
         if mode == "atomic_add":
             ms = self._masks(include_r=in_loop)
+            if self.is_reduction_kernel and not in_loop and self.tpr > 1:
+                # Every thread of the row group holds the row's value; one adds it.
+                ms.append("_lane0")
             fn, target = (
                 ("atomic_add_global", arg)
                 if st == "bf16"

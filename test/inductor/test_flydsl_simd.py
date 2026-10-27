@@ -473,6 +473,25 @@ class TestFlyDSLSIMD(TestCase):
             atol=1e-3,
         )
 
+    def test_atomic_add_of_row_reduction(self):
+        # A row's sum scattered with an atomic add: every thread of the row group holds
+        # the sum, and exactly one of them may add it.
+        for dtype, d in ((torch.float32, 1024), (torch.bfloat16, 1024), (torch.float32, 96)):
+            torch._dynamo.reset()
+            x = torch.randn(512, d, device="cuda", dtype=dtype)
+            ix = torch.randint(0, 64, (512,), device="cuda")
+
+            def fn(x, ix):
+                z = torch.zeros(64, device="cuda", dtype=dtype)
+                return z.index_put_((ix,), x.sum(-1), accumulate=True)
+
+            out = torch.compile(fn, dynamic=False)(x, ix)
+            ref = torch.zeros(64, device="cuda", dtype=torch.float64).index_put_(
+                (ix,), x.double().sum(-1), accumulate=True
+            )
+            tol = 0.5 if dtype == torch.bfloat16 else 1e-3
+            torch.testing.assert_close(out.double(), ref, atol=tol, rtol=2e-2)
+
     # -- training --------------------------------------------------------------------
 
     def test_transformer_block_train_step(self):
