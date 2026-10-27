@@ -715,9 +715,32 @@ def atomic_add_global(addr, off, value, st: str, mask=None):
     """bf16 ``*(addr + off) += value``: gfx942 has a packed bf16 atomic add only on
     global pointers (``buffer_atomic_pk_add_bf16`` is gfx950), so this one goes through
     an LLVM ``atomicrmw`` on the raw address instead of the buffer descriptor."""
+    v, byte_off = _packed_half(idx(off), value, st)
+    _packed_add_global(addr, byte_off, v, mask)
+
+
+def atomic_add_pair(cache, key, j: int, target, off, value, st: str, mask=None):
+    """A thread's elements ``j`` (even) and ``j + 1`` of a 16-bit atomic add, at offsets
+    ``off`` and ``off + 1`` with ``off`` even, as one packed add of both halves instead
+    of two each with a -0.0 half. ``j`` even holds its value; ``j + 1`` issues both,
+    under its own mask, which codegen guarantees is the even element's too."""
+    if j % 2 == 0:
+        cache[(key, "pair")] = (idx(off), value)
+        return
+    o, first = cache.pop((key, "pair"))
+    et = _STORAGE_IR[st]()
+    halves = [_cvt(_val(to(x, "f32")), "f32", st) for x in (first, value)]
+    v = _vector.FromElementsOp(ir.VectorType.get([2], et), halves).result
+    byte_off = _val(mul(o, 2))
+    if st == "bf16":
+        _packed_add_global(target, byte_off, v, mask)
+    else:
+        _buffer_add(target, byte_off, v, mask)
+
+
+def _packed_add_global(addr, byte_off, v, mask):
     from flydsl._mlir.dialects import llvm as _llvm
 
-    v, byte_off = _packed_half(idx(off), value, st)
     a = _arith.AddIOp(
         _val(to(addr, "i64")), _arith.ExtUIOp(T.i64(), byte_off).result
     ).result
@@ -751,6 +774,10 @@ def atomic_add(r, off, value, st: str, mask=None):
         v, byte_off = _packed_half(o, value, st)
     else:
         raise NotImplementedError(f"atomic_add of {st}")
+    _buffer_add(r, byte_off, v, mask)
+
+
+def _buffer_add(r, byte_off, v, mask):
     m = _mask(mask)
     if m is None:
         zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result

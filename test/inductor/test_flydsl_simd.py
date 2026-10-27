@@ -150,6 +150,28 @@ class TestFlyDSLSIMD(TestCase):
             kinds=["pointwise"],
         )
 
+    @parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_paired_half_atomics(self, dtype):
+        # An even row width packs a thread's two elements into one atomic add; an odd
+        # one adds an element at a time.
+        from torch._inductor.utils import run_and_get_code
+
+        for d, paired in ((64, True), (7, False)):
+            torch._dynamo.reset()
+            ix = torch.randint(0, 50, (300,), device="cuda")
+            g = torch.randn(300, d, device="cuda").to(dtype)
+
+            def fn(ix, g):
+                z = torch.zeros(50, d, device="cuda", dtype=dtype)
+                return z.index_put_((ix,), g, accumulate=True)
+
+            out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), ix, g)
+            ref = torch.zeros(50, d, device="cuda").index_put_(
+                (ix,), g.float(), accumulate=True
+            )
+            torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.02)
+            self.assertEqual("fdp.atomic_add_pair(" in code, paired)
+
     @parametrize("dtype", [torch.float32, torch.bfloat16, torch.int8])
     def test_wave_uniform_load(self, dtype):
         # A per-channel operand is the same across a wave's lanes and is read with one

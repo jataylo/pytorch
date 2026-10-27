@@ -1430,6 +1430,7 @@ class FlyDSLKernel(SIMDKernel):
     def store(
         self, name: str, index: sympy.Expr, value, mode: StoreMode = None
     ) -> None:
+        """Emit a store, or an atomic add, of ``value`` to ``name`` at ``index``."""
         if mode not in (None, "atomic_add"):
             raise FlyDSLUnsupported(f"store mode {mode}")
         arg = self.args.output(name)
@@ -1450,6 +1451,27 @@ class FlyDSLKernel(SIMDKernel):
             line = (
                 f"fdp.{fn}({target}, {index_str}, {value}, {st!r}{self._mask_arg(ms)})"
             )
+            var = self._vector_var()
+            if (
+                st in ("f16", "bf16")
+                and not self.is_reduction_kernel
+                and not self.tile2d
+                and self.ept % 2 == 0
+                # An even extent keeps both elements of an aligned pair under one mask.
+                and self.xnumel % 2 == 0
+                and var is not None
+                and classify_access(
+                    self._root_expr(index), var, 2, frozenset(self.uniform_vars)
+                )
+                == "contig"
+                and _tune("atomic_pair", 1)
+            ):
+                self.load_site += 1
+                key = repr(f"ap{self.load_site}_{name}")
+                line = (
+                    f"fdp.atomic_add_pair(_sc, {key}, _j, {target}, {index_str}, "
+                    f"{value}, {st!r}{self._mask_arg(ms)})"
+                )
             self.stores.writeline(DeferredLine(name, line))
             self.store_buffer_names.add(name)
             self.stored_args.add(arg)
