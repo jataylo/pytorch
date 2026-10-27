@@ -271,44 +271,50 @@ Compile time came down to within 3-11% of Triton (it was 37-150% more) -- see
 
 The same suite with `TORCHINDUCTOR_FLYDSL_SIMD_STAGES` set to one stage at a time
 (everything else Triton). Cells are ms a step saved against Triton, with the number of
-FlyDSL kernels; `*` marks a difference within the run-to-run spread. (This ablation
-predates the latest round: ViT inference's norm column has since gone from -0.15 to a
-win, with the interleaved rows above, and the totals moved from 9.5 to 12.2 ms.)
+FlyDSL kernels; `*` marks a difference within the run-to-run spread, and a cell with no
+kernel count is a model where that stage generates nothing, so its difference is noise.
+(`--quick --repeats 3`, on the code of this round.)
 
 | model | all | pointwise | tile | row | norm | column | scan | combo |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GPT train | +1.85 (129) | +0.12 (30) | -0.03 (8) | 0* | +0.61 (29) | +0.07 (58) | 0* | **+1.07** (4) |
-| GPT infer | +0.27 (33) | +0.10 (16) | -0.01 (4) | 0 | +0.17 (13) | 0* | 0 | 0* |
-| Llama train | +2.13 (83) | +0.11 (42) | 0* | 0* | +0.49 (21) | +0.01* (17) | 0* | **+1.47** (3) |
-| Llama infer | +0.09 (25) | +0.02* (16) | 0* | 0* | -0.09 (9) | 0* | 0* | 0* |
-| BERT train | +4.20 (112) | 0* (46) | -0.06 (8) | +0.03* | **+3.13** (20) | 0* (34) | 0* | +0.99 (4) |
-| ViT infer | -0.11 (13) | +0.03 (4) | 0* | 0* | -0.15 (9) | 0* | 0* | 0* |
-| ViT train | +0.49 (102) | +0.11 (14) | 0* (1) | 0* (1) | -0.03 (20) | +0.02 (62) | 0* | +0.40 (4) |
-| MoE train | +0.59 (42) | +0.16 (30) | 0* | -0.04 (1) | -0.03* (6) | 0* (2) | 0* (1) | +0.48 (2) |
-| ResNet train | -0.03 (119) | -0.31 (36) | 0* (19) | +0.22 (27) | 0* (4) | -0.03* (34) | +0.04* | +0.42 (1) |
-| ResNet NCHW | 0* (100) | -0.19 (34) | 0* | +0.20 (27) | 0* (4) | -0.02 (34) | -0.16 | 0* (1) |
-| **sum** | **+9.47** | +0.14 | -0.13 | +0.39 | **+4.14** | +0.01 | -0.11 | **+4.79** |
-| geomean ratio | 0.959 | 0.997 | 1.001 | 0.999 | 0.986 | 1.000 | 1.000 | 0.978 |
+| GPT train | **+2.05** (129) | +0.11 (30) | -0.01* (8) | 0* | +0.65 (29) | +0.12 (58) | -0.04 | **+1.07** (4) |
+| GPT infer | +0.39 (33) | +0.17 (16) | +0.01 (4) | -0.02 | +0.22 (13) | 0* | +0.02* | -0.01 |
+| Llama train | **+2.40** (83) | +0.23 (42) | +0.05 | -0.16* | +0.59* (21) | +0.09 (17) | -0.04* | **+1.51** (3) |
+| Llama infer | +0.07 (25) | +0.15 (16) | -0.01* | -0.01* | +0.04 (9) | -0.02* | -0.06* | +0.01* |
+| BERT train | **+4.77** (112) | -0.15 (46) | +0.01* (8) | +0.01* | **+3.37** (20) | +0.01* (34) | +0.01* | **+1.10** (4) |
+| ViT infer | +0.16 (13) | +0.01 (4) | -0.01* | 0* | +0.15 (9) | 0* | 0* | -0.01* |
+| ViT train | +0.73 (102) | +0.16 (14) | 0* (1) | -0.01* (1) | +0.11 (20) | +0.15 (62) | -0.02* | +0.39 (4) |
+| MoE train | +0.70 (42) | +0.30 (30) | +0.02* | -0.07 (1) | +0.04* (6) | +0.07 (2) | -0.01* (1) | +0.50 (2) |
+| ResNet train | +0.43 (119) | +0.23 (34) | +0.05 (19) | +0.17 (27) | +0.02 (4) | +0.03 (34) | 0* | -0.03* (1) |
+| ResNet NCHW | +0.48 (100) | +0.31 (36) | +0.02 | +0.16 (27) | -0.04 (4) | -0.05 (34) | -0.45 | -0.02* (1) |
+| **sum** | **+12.19** | **+1.53** | +0.14 | +0.08 | **+5.14** | +0.38 | -0.59 | **+4.52** |
+| geomean ratio | 0.945 | 0.991 | 0.999 | 1.000 | 0.979 | 0.998 | 1.002 | 0.979 |
 
-(The summed run-to-run spread is 0.2-0.35 ms per column; the scan column's -0.16 on
-ResNet NCHW, with no scan kernels in the model, is that noise.)
+(The summed run-to-run spread is 0.25-0.9 ms per column, 4.4 for combo, where one
+model's runs spread widely. The row column's -0.16 on Llama train and the scan column's
+-0.45 on ResNet NCHW are in models with no kernels of that stage. Counting only models
+that have them, row saves +0.25 ms and scan nothing.)
+
+Since the last ablation the stages that save most stayed the same. The total went from
+9.5 to 12.2 ms, mostly from pointwise (+0.14 -> +1.53: ResNet's BatchNorm-backward
+pointwise kernels went from -0.3 to +0.2-0.3 ms) and norm (+4.1 -> +5.1; ViT and Llama
+inference, which had lost, now win).
 
 Recommended order:
 
-1. **combo** -- 4.8 ms of the 9.5 from one to four kernels a model: the fused AdamW step
-   runs at about half Triton's time in every training model (1.65 ms against 3.1 on
-   Llama). The smallest surface to upstream for the largest gain.
-2. **norm** -- 4.1 ms, 3.1 of it BERT's f16 softmax/layernorm; the 0.27-0.74x kernel
-   wins above. Small losses on ViT and Llama inference (-0.15 and -0.09 ms) are the
-   thing to watch.
-3. **row** -- +0.4 ms, all on ResNet's BatchNorm-shaped reductions; neutral elsewhere.
-4. **pointwise** (with RNG) -- a net wash in models: +0.1-0.16 ms on each transformer,
-   -0.2/-0.3 ms on ResNet, from in-model BatchNorm-backward pointwise kernels that
-   measure at parity in isolation (see below). It is also the base the other stages
-   share (indexing, casts, loads/stores, masks), so it lands with the first of them.
-5. **column**, **scan** -- 0.85x and 0.69x on kernels, nothing measurable in these
-   models (their column reductions are small; none of them scans).
-6. **tile** -- at parity with Triton (-0.13 ms summed); upstream for coverage, not speed.
+1. **combo** -- 4.5 ms from one to four kernels a model: the fused AdamW step runs at
+   about half Triton's time in every training model (1.5 ms a step saved on Llama). The
+   smallest surface to upstream for a third of the gain.
+2. **norm** -- 5.1 ms, now the largest, 3.4 of it BERT's f16 softmax/layernorm; the
+   0.27-0.74x kernel wins above. It saves time on every model except ResNet NCHW (-0.04,
+   within noise).
+3. **pointwise** (with RNG) -- 1.5 ms, ahead on nine of the ten models (BERT -0.15). It
+   is also the base the other stages share (indexing, casts, loads/stores, masks), so
+   it lands with the first of them.
+4. **row** -- +0.25 ms, all of it ResNet's BatchNorm-shaped reductions.
+5. **column** -- +0.4 ms (GPT, ViT and Llama train each +0.1).
+6. **tile**, **scan** -- at parity in models (+0.14 ms, and no scans in these models);
+   upstream for coverage, not speed.
 
 ## Where it is complicated
 
