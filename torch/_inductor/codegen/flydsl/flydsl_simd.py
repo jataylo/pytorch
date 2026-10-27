@@ -1288,10 +1288,21 @@ class FlyDSLKernel(SIMDKernel):
                 full_runs = -(-self.rnumel // self.ept)
                 self.threads = tpr = min(SMALL_COLUMN_THREADS, _pow2_ceil(full_runs))
             self.tpr = _tune("row_tpr", tpr)
-            if self.tpr <= WAVE and not self.in_combo and not _tune("threads", 0):
+            short = (
+                -(-self.rnumel // (self.tpr * self.ept)) * self.ept
+                <= PERSISTENT_MAX_UNROLL
+            )
+            if (
+                self.tpr <= WAVE
+                and not self.in_combo
+                and not _tune("threads", 0)
+                and not (short and self._pure_reduction())
+            ):
                 # Rows that stay within a wave share nothing across it, and one-wave
                 # blocks schedule and retire independently: 40us vs 45us on a 512-wide
-                # bf16 softmax backward, as Triton's num_warps=1 there.
+                # bf16 softmax backward, as Triton's num_warps=1 there. Not a bare
+                # reduction of short rows, each thread group several of them: a sum of
+                # 32-wide rows 38.5us -> 35.7us in 256-thread blocks (Triton 35.5us).
                 self.threads = WAVE
             interleave = _tune(
                 "row_stride",
