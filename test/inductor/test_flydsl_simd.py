@@ -402,6 +402,28 @@ class TestFlyDSLSIMD(TestCase):
         torch._dynamo.reset()
         self.check(lambda x: F.layer_norm(x, (width,)), x, atol=1e-3, rtol=1e-3)
 
+    @parametrize("width", [256, 100])
+    def test_rows_through_transpose(self, width):
+        # A ViT patch embedding: LayerNorm over tokens of an NCHW conv output, whose
+        # rows (channels 49 apart) interleave across a wave's lanes. 100 channels leave
+        # a masked run, and 3 * 50 tokens a partly masked group of rows.
+        from torch._inductor.utils import run_and_get_code
+
+        def fn(conv, cls, pos):
+            x = conv.flatten(2).transpose(1, 2)
+            x = torch.cat([cls.expand(x.shape[0], -1, -1), x], 1) + pos
+            return F.layer_norm(x, (width,))
+
+        conv = torch.randn(3, width, 7, 7, device="cuda")
+        cls = torch.randn(1, 1, width, device="cuda")
+        pos = torch.randn(1, 50, width, device="cuda")
+        out, (code,) = run_and_get_code(
+            torch.compile(fn, dynamic=False), conv, cls, pos
+        )
+        torch.testing.assert_close(out, fn(conv, cls, pos), atol=1e-4, rtol=1e-4)
+        self.assertIn(f"stride={8}", code)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     def test_cross_entropy(self):
         x = torch.randn(512, 32000, device="cuda")
         t = torch.randint(0, 32000, (512,), device="cuda")

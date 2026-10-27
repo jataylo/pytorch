@@ -95,6 +95,12 @@ TILE_THREADS = 128
 # 256 threads, 33.8us at this many (Triton 32.5us); 34.8us at 512.
 SMALL_COLUMN_THREADS = 1024
 WAVE = 64
+# Rows a wave interleaves when they are read through a transpose (see
+# finalize_indexing): 101us at 8 (8 lanes a row), 107us at 16, 124us at 4.
+ROW_INTERLEAVE = 8
+# Only rows this short: 8 lanes on a ResNet BatchNorm backward's 200704-long rows took
+# 2.1 ms rather than 0.1 ms.
+ROW_INTERLEAVE_MAX = 4096
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
 PERSISTENT_MAX_UNROLL = 16
@@ -804,6 +810,7 @@ class FlyDSLKernel(SIMDKernel):
         self.unroll = 1
         self.tpr = 1
         self.stride = 1
+        self.interleaved = False  # rows `stride` lanes apart within a wave
         self.threads = THREADS  # block size
         self.in_combo = False
         self.rpb = self.threads
@@ -912,7 +919,7 @@ class FlyDSLKernel(SIMDKernel):
             )
         if not self.is_reduction_kernel:
             return f"pointwise xnumel={self.xnumel} ept={self.ept} unroll={self.unroll}"
-        mode = "column" if self.stride > 1 else "row"
+        mode = "column" if self.stage == "column" else "row"
         return (
             f"{mode} reduction xnumel={self.xnumel} rnumel={self.rnumel} ept={self.ept} "
             f"unroll={self.unroll} tpr={self.tpr} stride={self.stride} xunroll={self.xunroll} "
@@ -1074,6 +1081,19 @@ class FlyDSLKernel(SIMDKernel):
                         sizes.append(V.graph.get_dtype(e.buffer_name).itemsize)
         return sizes
 
+    def _transposed_rows(self, roots) -> bool:
+        """Whether some load strides along the row but is contiguous across rows, as a
+        row of an NCHW tensor read as NHWC."""
+        x, r = self._x_sym(), self._r_sym()
+        for e in roots:
+            if r not in e.free_symbols or classify_access(e, r, 2) == "contig":
+                continue
+            # Away from x == 0, where a shifted index such as (x0 - 1) % 196 wraps.
+            step = e.subs({r: 0, x: 2}) - e.subs({r: 0, x: 1})
+            if step == 1:
+                return True
+        return False
+
     def _has_atomic(self) -> bool:
         from ...loop_body import MemoryUsageType
 
@@ -1226,7 +1246,32 @@ class FlyDSLKernel(SIMDKernel):
                 # blocks schedule and retire independently: 40us vs 45us on a 512-wide
                 # bf16 softmax backward, as Triton's num_warps=1 there.
                 self.threads = WAVE
+            interleave = _tune(
+                "row_stride",
+                ROW_INTERLEAVE
+                if self.rnumel <= ROW_INTERLEAVE_MAX and self._transposed_rows(votes)
+                else 0,
+            )
+            if interleave and not self.in_combo and not _tune("threads", 0):
+                # Rows read through a transpose (an NCHW conv output as tokens): the
+                # rows of a wave interleave, `interleave` lanes apart, so its loads of
+                # one element of adjacent rows are adjacent. One row a wave reads 64
+                # lines for a strided load. ViT's patch embedding + LayerNorm (rows of
+                # 768 f16, 196 apart) 255us -> 101us (Triton 141us), the widest vectors
+                # along the row-contiguous inputs counting: 144us at 4 a lane.
+                self.threads, self.stride = WAVE, interleave
+                self.tpr = WAVE // interleave
+                self.interleaved = True
+                ept = _largest_pow2_dividing(self.rnumel, widest_vec)
+                contig = [e for e in r_roots if classify_access(e, r, 2) == "contig"]
+                while ept > 1 and not all(
+                    classify_access(e, r, ept) == "contig" for e in contig
+                ):
+                    ept //= 2
+                self.ept = _tune("ept", ept)
             self.rpb = self.threads // self.tpr
+        if not self.interleaved and getattr(self.features, "flydsl_transposed", False):
+            raise FlyDSLUnsupported("transposed access needs a 2D tile")
         iters = -(-self.rnumel // (self.tpr * self.ept))
         self.persistent = iters * self.ept <= PERSISTENT_MAX_UNROLL
         if self.persistent:
@@ -2046,7 +2091,7 @@ class FlyDSLKernel(SIMDKernel):
             return "pointwise"
         if self.has_scan:
             return "scan"
-        if self.stride > 1:
+        if self.stride > 1 and not self.interleaved:
             return "column"
         return "row" if self._pure_reduction() else "norm"
 
@@ -2708,8 +2753,13 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         )
         if not OrderedSet(preferred) & OrderedSet(["y", "z"]):
             return flat
-        if "z" in preferred or kernel_features.is_reduction():
+        if "z" in preferred:
             raise FlyDSLUnsupported("transposed access needs a 2D tile")
+        if kernel_features.is_reduction():
+            # Flat, if its rows interleave across lanes (finalize_indexing refuses it
+            # otherwise): a LayerNorm over an NCHW tensor's tokens.
+            kernel_features.flydsl_transposed = True
+            return flat
         return {"y": preferred["y"], "x": preferred["x"]}
 
     @staticmethod
