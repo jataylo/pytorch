@@ -944,8 +944,20 @@ class FlyDSLKernel(SIMDKernel):
         ):
             ept //= 2
         self.ept = _tune("ept", ept)
-        self.tile_f = _tune("tile_f", TILE)
-        self.tile_s = _tune("tile_s", TILE)
+        # A tile narrow along the stores and long along the loads when the stores' rows
+        # are close together, as when the fast dimension is a few channels, so the
+        # neighbouring tiles fill each other's cache lines: an NCHW -> NHWC f32 copy
+        # 52us -> 48us (Triton 46us), where a 4096^2 transpose (rows 16 KiB apart) goes
+        # 52.6us -> 57.5us.
+        s = self._tree_sym("x" if self.fast == "y" else "y")
+        pitch = [
+            e.subs({f: 0, s: 1}) - e.subs({f: 0, s: 0})
+            for e in stores
+            if classify_access(e, f, 2) == "contig"
+        ]
+        narrow = bool(pitch) and all(p.is_Integer and 0 < p <= 64 for p in pitch)
+        self.tile_f = _tune("tile_f", TILE // 2 if narrow else TILE)
+        self.tile_s = _tune("tile_s", TILE * 2 if narrow else TILE)
         while self.ept > 1 and self.threads * self.ept > self.tile_f * self.tile_s:
             self.ept //= 2
         # Runs of a pass: tile_f // ept threads across the fast dimension, the block's
@@ -1092,6 +1104,11 @@ class FlyDSLKernel(SIMDKernel):
                 # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
                 # 23us at 2 in bf16 (Triton 21us).
                 widest_vec = min(widest_vec, 2)
+            elif not self.in_combo:
+                # One-wave blocks: a [32, 512, 768] bf16 heads permute 18.6us -> 14.3us
+                # (Triton 18.1us), a 16M f32 add 45.8 -> 41.2us, an NCHW bias add
+                # 38.7 -> 36.0us; none slower.
+                self.threads = self.rpb = _tune("threads", WAVE)
             streams = self._stream_itemsizes()
             if streams:
                 # Runs as wide as the widest stream's 16-byte vector: wider ones split
@@ -2793,13 +2810,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
         if stage == "tile":
             # A heads permute of a [32, 512, 768] bf16 tensor: 25us at 128 threads, 21us
-            # at 64 (Triton 25us). A tile narrow along the stores and long along the
-            # loads: an NCHW -> NHWC f32 copy 51.4us -> 48.4us (Triton 46.4us), where a
-            # 4096^2 transpose goes 52.6us -> 57.5us. 256 threads won neither.
-            cands = [{"threads": 64}] if kernel.threads != 64 else []
-            if "tile_f" not in tuned and "tile_s" not in tuned:
-                cands.append({"threads": 64, "tile_f": TILE // 2, "tile_s": TILE * 2})
-            return cands
+            # at 64 (Triton 25us). The tile shape is not autotuned: the candidates time
+            # within 1% of one another on a warm cache (see _finalize_tile2d).
+            return [{"threads": 64}] if kernel.threads != 64 else []
         if stage == "column":
             # Twice the lanes on each column: Qwen3's per-head norm weight gradient
             # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32

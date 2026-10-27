@@ -2148,7 +2148,6 @@ def pick_fastest(mains, args, mutated, stream=None):
     None leaves the choice to a later call.
     """
     import torch
-    from torch._inductor.runtime.benchmarking import benchmarker
 
     if torch.cuda.is_current_stream_capturing():
         mains[0](*args, stream=stream)
@@ -2156,20 +2155,34 @@ def pick_fastest(mains, args, mutated, stream=None):
     scratch = list(args)
     for i in mutated:
         scratch[i] = args[i].clone()
-    times = []
     for fn in mains:
         fn(*scratch, stream=stream)  # compiles (and runs once)
-        # The scheduler's settings for timing fusion choices: the defaults (100 cache
-        # flushes and up to 25 ms a candidate) took 9 s of a Qwen3 prefill's compile.
-        times.append(
-            benchmarker.benchmark_gpu(
-                lambda fn=fn: fn(*scratch, stream=stream),
-                memory_warmup_iters=5,
-                benchmark_iters=10,
-                max_benchmark_duration=10,
-                is_vetted_benchmarking=True,
-            )
-        )
+    # Back-to-back calls averaged, the candidates interleaved round by round and the
+    # best round kept: the fastest single call (the benchmarker's "min") favours a
+    # candidate with a high variance, a 16x64 transpose tile 10% slower on average.
+    # Each round is queued behind a GPU sleep: a launch from Python takes longer than
+    # a 20us kernel, and unqueued the GPU would idle between them, timing the launches.
+    ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+    ev[0].record()
+    mains[0](*scratch, stream=stream)
+    ev[1].record()
+    ev[1].synchronize()
+    reps = max(1, min(10, int(0.3 / max(ev[0].elapsed_time(ev[1]), 1e-3))))
+    times = [float("inf")] * len(mains)
+    for _ in range(3):
+        # ~60us a launch; a cycle is ~0.5ns (gfx942 at 2.1 GHz); over-sleeping is cheap.
+        torch.cuda._sleep(int(len(mains) * reps * 60e3 * 2.1))
+        events = []
+        for fn in mains:
+            pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+            pair[0].record()
+            for _ in range(reps):
+                fn(*scratch, stream=stream)
+            pair[1].record()
+            events.append(pair)
+        events[-1][1].synchronize()
+        for k, (s, e) in enumerate(events):
+            times[k] = min(times[k], s.elapsed_time(e))
     best = mains[times.index(min(times))]
     best(*args, stream=stream)
     return best
