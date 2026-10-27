@@ -31,6 +31,7 @@ import contextlib
 import math as _math
 import os as _os
 import re as _re
+import time as _time
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -2199,10 +2200,13 @@ def pick_fastest(mains, args, mutated, stream=None):
     ev[1].synchronize()
     reps = max(1, min(10, int(0.3 / max(ev[0].elapsed_time(ev[1]), 1e-3))))
     times = [float("inf")] * len(mains)
-    for _ in range(3):
-        # ~60us a launch (four with the flush and events); a cycle is ~0.5ns (gfx942
-        # at 2.1 GHz); over-sleeping is cheap.
-        torch.cuda._sleep(int(len(mains) * reps * 4 * 60e3 * 2.1))
+    # ~60us a launch (four with the flush and events); over-sleeping is cheap.
+    sleep_us = len(mains) * reps * 4 * 60
+    rounds = tries = 0
+    while rounds < 3:
+        tries += 1
+        start = _time.perf_counter()
+        torch.cuda._sleep(int(sleep_us * 2.1e3))  # cycles: gfx942 at 2.1 GHz
         events = []
         for fn in mains:
             pairs = []
@@ -2214,7 +2218,15 @@ def pick_fastest(mains, args, mutated, stream=None):
                 pair[1].record()
                 pairs.append(pair)
             events.append(pairs)
+        queued_us = (_time.perf_counter() - start) * 1e6
         events[-1][-1][1].synchronize()
+        if queued_us > sleep_us and tries < 8:
+            # The GPU outran the launches (a host busy compiling other kernels), so
+            # this round timed them too: a [32, 512, 768] heads permute picked a
+            # variant 2.5x slower next to a pytest run.
+            sleep_us *= 2
+            continue
+        rounds += 1
         for k, pairs in enumerate(events):
             times[k] = min(times[k], sum(s.elapsed_time(e) for s, e in pairs))
     del flush

@@ -1248,6 +1248,17 @@ class FlyDSLKernel(SIMDKernel):
                 # (online) form: 254us vs 147us on a LayerNorm of the same shape.
                 tpr = WAVE
                 self.one_step = True
+            elif (
+                tpr == self.threads
+                and not self.in_combo
+                and not _tune("threads", 0)
+                and self.xnumel < _num_cus()
+            ):
+                # Fewer rows than CUs: each row's block as wide as its runs allow, for
+                # more of its loads in flight at once. BERT's loss tail (one row of
+                # 8192 gathered logits) 36.3us -> 25.3us at 1024 threads (Triton 26.4us).
+                full_runs = -(-self.rnumel // self.ept)
+                self.threads = tpr = min(SMALL_COLUMN_THREADS, _pow2_ceil(full_runs))
             self.tpr = _tune("row_tpr", tpr)
             if self.tpr <= WAVE and not self.in_combo and not _tune("threads", 0):
                 # Rows that stay within a wave share nothing across it, and one-wave

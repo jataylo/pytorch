@@ -149,6 +149,20 @@ CASES = {
         lambda x, t: F.cross_entropy(x, t),
         [_r(4096, 32000), _i(32000, 4096)],
     ),
+    # BERT's attention-probability gradient through dropout, 12 heads x 512 tokens
+    "softmax_dropout_bwd_f16": (
+        lambda g, y, m: torch.ops.aten._softmax_backward_data(g * m * 1.1111, y, -1, f16),
+        [
+            _r(98304, 512, dtype=f16),
+            _r(98304, 512, dtype=f16),
+            lambda: torch.rand(98304, 512, device="cuda") < 0.9,
+        ],
+    ),
+    # BERT's loss tail: one block gathers a logit for each of 8192 tokens
+    "nll_gather_f16": (
+        lambda x, m, l, t: F.nll_loss(x.float() - m - l, t),
+        [_r(8192, 30522, dtype=f16), _r(8192, 1), _r(8192, 1), _i(30522, 8192)],
+    ),
     # GPT-small shapes (d=768, 12 heads x 512 tokens), where whole-model time is lost
     "add_layernorm_768": (
         lambda x, h, w, b: F.layer_norm(x + h, (768,), w, b),
