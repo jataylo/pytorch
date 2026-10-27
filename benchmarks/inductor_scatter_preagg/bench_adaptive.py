@@ -45,11 +45,7 @@ DISTS = (
 MODES = {
     "base": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=False),
     "ps": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=True),
-    "adaptive": dict(
-        scatter_preagg_enabled=True,
-        scatter_preagg_adaptive=True,
-        partitioned_scatter_enabled=True,
-    ),
+    "adaptive": dict(scatter_preagg_enabled=True, partitioned_scatter_enabled=True),
 }
 
 

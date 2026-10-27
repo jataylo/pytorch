@@ -296,14 +296,12 @@ class TestScatterPreagg(TestCase):
             self.assertNotIn("tl.atomic_add(", code)
 
     def test_bf16_low_contention(self):
-        # About two writes per destination: on ROCm the fp32 copy still beats
-        # bf16 atomics, elsewhere the contention gate declines.
+        # About two writes per destination still goes through the fp32 copy.
         fn = _BF16_SCATTER_FNS["index_put"]
         x = torch.randn(10_000, 8, device=GPU_TYPE).bfloat16()
         idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
         v = torch.randn(20_000, 8, device=GPU_TYPE).bfloat16()
-        applied = torch.version.hip is not None
-        self._check(fn, x, idx, v, applied=applied, atol=2e-2, rtol=2e-2)
+        self._check(fn, x, idx, v, atol=2e-2, rtol=2e-2)
 
     @parametrize(
         "dtype",
@@ -338,12 +336,10 @@ class TestScatterPreagg(TestCase):
             return
 
         if dtype in (torch.float16, torch.bfloat16):
-            # Accumulated in an fp32 copy, so each destination is rounded once.
+            # Few destinations, so fp16 is also accumulated in an fp32 copy and
+            # each destination is rounded once.
             ref = fn(x.float(), idx, v.float())
-            with config.patch(
-                partitioned_scatter_enabled=True, scatter_preagg_adaptive=False
-            ):
-                out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
             self.assertEqual(
                 out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0
             )
@@ -434,41 +430,22 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, v, atol=2e-3, rtol=1e-4)
 
-    @config.patch(scatter_preagg_adaptive=False)
-    def test_skip_low_contention(self):
-        x = torch.zeros(10_000, 8, device=GPU_TYPE)
-        idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
-        v = torch.randn(20_000, 8, device=GPU_TYPE)
-
-        def fn(x, i, v):
-            return torch.index_put(x, (i,), v, accumulate=True)
-
-        self._check(fn, x, idx, v, applied=False)
-        self.assertEqual(
-            counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
-        )
-
-    @parametrize("adaptive", [False, True])
-    def test_fp16_native_atomics(self, adaptive):
-        # Gated preagg skips the fp32 copy with only the default lowering to
-        # replace; adaptive preagg always does.
-        x = torch.zeros(20, 16, device=GPU_TYPE, dtype=torch.float16)
-        idx = _hot_indices(20_000, 20, GPU_TYPE)
+    def test_fp16_native_atomics(self):
+        # Blocks may issue plain atomics into this many destinations, so fp16
+        # skips the fp32 copy.
+        x = torch.zeros(4096, 16, device=GPU_TYPE, dtype=torch.float16)
+        idx = _hot_indices(20_000, 4096, GPU_TYPE)
         v = torch.randn(20_000, 16, device=GPU_TYPE).half()
 
         def fn(x, i, v):
             return torch.index_put(x, (i,), v, accumulate=True)
 
         ref = fn(x.float(), idx, v.float())
-        with config.patch(
-            partitioned_scatter_enabled=adaptive, scatter_preagg_adaptive=adaptive
-        ):
-            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+        out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
         self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 3e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
         self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)
 
-    @config.patch(scatter_preagg_adaptive=True)
     def test_adaptive_low_contention(self):
         # Adaptive chunks take plain atomics instead of being gated out.
         x = torch.zeros(10_000, 8, device=GPU_TYPE)
@@ -480,7 +457,6 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, v)
 
-    @config.patch(scatter_preagg_adaptive=True)
     @parametrize("min_saved", [-1.0, 2.0])
     def test_adaptive_forced_path(self, min_saved):
         # -1 always sorts and 2 never does, covering both paths of each chunk.
@@ -490,8 +466,20 @@ class TestScatterPreagg(TestCase):
         x = torch.zeros(4096, 64, device=GPU_TYPE)
         idx = _hot_indices(50_000, 4096, GPU_TYPE)
         v = torch.randn(50_000, 64, device=GPU_TYPE)
-        with config.patch(scatter_preagg_adaptive_min_saved=min_saved):
+        with config.patch(scatter_preagg_min_saved=min_saved):
             self._check(fn, x, idx, v, atol=1e-2, rtol=1e-3)
+
+    @parametrize("min_saved", [-1.0, 2.0])
+    def test_constant_values(self, min_saved):
+        # Counting with scattered ones leaves a rank-1 constant as the value.
+        def fn(x, i):
+            ones = torch.ones(i.shape[0], x.shape[1], device=x.device)
+            return x.index_add(0, i, ones)
+
+        x = torch.zeros(4096, 16, device=GPU_TYPE)
+        idx = _hot_indices(20_000, 4096, GPU_TYPE)
+        with config.patch(scatter_preagg_min_saved=min_saved):
+            self._check(fn, x, idx)
 
     def test_values_read_output(self):
         # The values read the scatter target, so they must be computed before

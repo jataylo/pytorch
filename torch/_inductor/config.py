@@ -1403,41 +1403,35 @@ partitioned_scatter_force: bool = (
     os.environ.get("TORCHINDUCTOR_PARTITIONED_SCATTER_FORCE", "0") == "1"
 )
 
-# Lower contended atomic-add scatters (index_put(accumulate=True), index_add,
-# scatter_add, scatter_reduce(sum), ...) to a Triton template that sorts each chunk
-# of writes by destination and sums equal destinations before issuing atomics, so
-# each destination takes at most one atomic per chunk. Takes precedence over the
-# partitioned scatter pass for the scatters it claims. Block sizes come from
-# get_scatter_preagg_configs in heuristics/template/triton.py; max_autotune
-# benchmarks a wider set.
+# Lower atomic-add scatters (index_put(accumulate=True), index_add, scatter_add,
+# scatter_reduce(sum), ...) to a Triton template. Each chunk of writes estimates
+# its distinct destinations at runtime; chunks with enough duplicates sort by
+# destination and sum equal destinations before issuing atomics, so each takes at
+# most one atomic per chunk, and the rest issue plain atomics like the default
+# lowering. Takes precedence over the partitioned scatter pass for the scatters
+# it claims. Block sizes come from get_scatter_preagg_configs in
+# heuristics/template/triton.py; max_autotune benchmarks a wider set. Tuned on
+# gfx942, so on by default for ROCm only.
 scatter_preagg_enabled: bool = (
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG", "0") == "1"
+    os.environ.get(
+        "TORCHINDUCTOR_SCATTER_PREAGG", "1" if torch.version.hip else "0"
+    )
+    == "1"
 )
 
 # Skip scatters writing fewer elements than this.
 scatter_preagg_min_index_size: int = 4096
 
-# With scatter_preagg_adaptive off, skip scatters with fewer writes per destination
-# than this (tokens / destinations, assuming uniformly spread indices). Below it
-# the per-chunk sort costs more than the contention it removes. Skewed indices
-# raise real contention above this estimate, so the threshold is deliberately low
-# (the same as partitioned scatter).
-scatter_preagg_min_contention_ratio: float = 4.0
-
-# Bypass the size and contention gates. Enable via TORCHINDUCTOR_SCATTER_PREAGG_FORCE=1
+# Bypass the size gate. Enable via TORCHINDUCTOR_SCATTER_PREAGG_FORCE=1
 scatter_preagg_force: bool = (
     os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_FORCE", "0") == "1"
 )
 
-# Each chunk estimates its own duplicate destinations at runtime and sorts only
-# when that saves at least scatter_preagg_adaptive_min_saved of its atomics,
-# otherwise issuing plain atomics like the default lowering. Replaces the
-# contention gate, which has to guess the index distribution at compile time.
-scatter_preagg_adaptive: bool = (
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE", "1") == "1"
-)
-scatter_preagg_adaptive_min_saved: float = float(
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE_MIN_SAVED", "0.0625")
+# Chunks sort only when that saves at least this fraction of their atomics
+# (doubled for rows wider than 128, and again for at least as many destinations
+# as tokens). Negative always sorts; above 1 never does.
+scatter_preagg_min_saved: float = float(
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_MIN_SAVED", "0.125")
 )
 
 

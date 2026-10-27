@@ -136,23 +136,13 @@ def can_bypass_atomic_fallback(dtype: torch.dtype, device: torch.device | None) 
     )
 
 
-def _size_gate(
-    num_tokens: int, num_inner: int, num_keys: int, dtype: torch.dtype
-) -> str | None:
-    if config.scatter_preagg_force:
-        return None
-    if num_tokens * num_inner < config.scatter_preagg_min_index_size:
-        return "too_small"
-    # Adaptive blocks fall back to plain atomics where sorting does not pay.
-    if config.scatter_preagg_adaptive:
-        return None
-    # On gfx942, bf16 atomics are slower and less accurate than the fp32 copy
-    # at any contention, while plain atomics win for other dtypes below it.
-    if dtype == torch.bfloat16 and torch.version.hip:
-        return None
-    if num_tokens / num_keys < config.scatter_preagg_min_contention_ratio:
-        return "low_contention"
-    return None
+def _too_small(num_tokens: int, num_inner: int) -> bool:
+    # No contention gate: blocks fall back to plain atomics where sorting does
+    # not pay.
+    return (
+        not config.scatter_preagg_force
+        and num_tokens * num_inner < config.scatter_preagg_min_index_size
+    )
 
 
 def claims_index_put(
@@ -170,10 +160,9 @@ def claims_index_put(
     device, dtype = input_meta["device"], input_meta["dtype"]
     if _ineligible(device, dtype) is not None:
         return False
-    # The sorted lowering has no contention gate.
-    return _use_sorted(dtype) or (
-        _size_gate(index_size, output_size // scatter_dim_size, scatter_dim_size, dtype)
-        is None
+    # The sorted lowering has no size gate.
+    return _use_sorted(dtype) or not _too_small(
+        index_size, output_size // scatter_dim_size
     )
 
 
@@ -562,7 +551,11 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
                 value = plan.value_fn(coords)
             value = getattr(value, "value", value)
             acc = triton_type(plan.acc_dtype)
-            return [f"{out} = tl.broadcast_to(({value}).to({acc}), [{rows}, {cols}])"]
+            cast = f"({value}).to({acc})"
+            if len(getattr(value, "shape", None) or ()) == 2:
+                return [f"{out} = tl.broadcast_to({cast}, [{rows}, {cols}])"]
+            # Constants come out rank 1, which broadcast_to rejects.
+            return [f"{out} = tl.full([{rows}, {cols}], 0, {acc}) + {cast}"]
 
         return self._codegen_subgraph(
             body,
@@ -749,6 +742,10 @@ scatter_preagg_template = ScatterPreaggTemplate("scatter_preagg", _TEMPLATE_SOUR
 # Widest row of the adaptive plain path, about one wavefront's worth of a
 # regular Inductor scatter's elements.
 _PLAIN_MAX_D = 256
+
+# Up to this many destinations, every block of the default configs (at least
+# 128 tokens) sorts.
+_ALWAYS_SORTED_KEYS = 64
 
 # The sorted lowering. Tokens arrive sorted by destination (SKEYS, with PERM
 # their original positions), so each destination is one contiguous segment.
@@ -1119,7 +1116,7 @@ def _scatter_into_copy(
     return True
 
 
-def _stage_in_fp32(dtype: torch.dtype) -> bool:
+def _stage_in_fp32(dtype: torch.dtype, num_keys: sympy.Expr) -> bool:
     """
     Whether to accumulate a 16-bit output in an fp32 copy rather than with
     16-bit atomics, which round every block's partial sum into the output.
@@ -1127,15 +1124,13 @@ def _stage_in_fp32(dtype: torch.dtype) -> bool:
     if dtype == torch.bfloat16:
         # Slower and less accurate than the copy on gfx942 at any contention.
         return True
-    # Native fp16 atomics after pre-aggregation are at least as accurate as the
-    # default lowering, but not as partitioned scatter's, whose partitions each
-    # take a fraction of the roundings. Adaptive blocks would pay for the copy
-    # even where they issue plain atomics, so only gated preagg keeps it in
-    # place of partitioned scatter.
+    # Blocks that issue plain atomics would take twice as many in fp32 as
+    # packed fp16 ones, so fp16 is staged only when every block sorts, where
+    # the copy is small and its rounding saving comes free.
     return (
         dtype == torch.float16
-        and config.partitioned_scatter_enabled
-        and not config.scatter_preagg_adaptive
+        and isinstance(num_keys, (int, sympy.Integer))
+        and num_keys <= _ALWAYS_SORTED_KEYS
     )
 
 
@@ -1183,13 +1178,11 @@ def _try_template(
         _hint(plan.num_keys),
     )
     # The sorted lowering replaces the eager fallback rather than atomics, so
-    # the contention gates do not apply to it.
-    if not (use_sorted or gated) and (
-        reason := _size_gate(num_tokens, num_inner, num_keys, dtype)
-    ):
-        _record_skip(reason)
+    # the size gate does not apply to it.
+    if not (use_sorted or gated) and _too_small(num_tokens, num_inner):
+        _record_skip("too_small")
         return False
-    if _stage_in_fp32(dtype) and not use_sorted:
+    if _stage_in_fp32(dtype, plan.num_keys) and not use_sorted:
         return _scatter_into_copy(
             "fp32_copy",
             out,
@@ -1319,14 +1312,26 @@ def _lower_atomic(
     # Plain atomics run up to 2x faster with one 32-bit word per lane, so a
     # wavefront updates whole cache lines (fewer L2 atomic transactions, which
     # bound hot destinations). The sort path keeps two: one word per lane costs
-    # it registers for a layout conversion after the scan.
-    plain_vec = max(1, 4 // dtype.itemsize) if torch.version.hip else 0
+    # it registers for a layout conversion after the scan. So do outputs of
+    # 2GB or more, whose 64-bit addresses already halve occupancy.
+    plain_vec = atomic_vec
+    out_bytes = _hint(out.get_layout().storage_size()) * dtype.itemsize
+    if torch.version.hip and out_bytes < 2**31:
+        plain_vec = max(1, 4 // dtype.itemsize)
+
+    # Sorting pays less on wide rows, whose scans cost more than the atomics
+    # they save, and with at least as many destinations as tokens, whose
+    # duplicates are cold. Each doubles the saving required (gfx942).
+    min_saved = config.scatter_preagg_min_saved
+    if _hint(plan.num_inner) > 128:
+        min_saved *= 2
+    if _hint(plan.num_tokens) <= _hint(plan.num_keys):
+        min_saved *= 2
 
     def adaptive_kwargs(cfg, inner_mode) -> dict[str, Any]:
-        min_saved = config.scatter_preagg_adaptive_min_saved
-        if not config.scatter_preagg_adaptive or (
-            # With fewer keys than tokens per block, full blocks always save
-            # enough atomics to sort.
+        # With fewer keys than tokens per block, full blocks always save enough
+        # atomics to sort.
+        if (
             isinstance(plan.num_keys, (int, sympy.Integer))
             and plan.num_keys <= cfg.block_t * (1 - min_saved)
         ):

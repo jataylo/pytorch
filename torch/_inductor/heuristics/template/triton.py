@@ -1436,23 +1436,23 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         configs: list[ScatterPreaggConfig] = []
         if config.max_autotune:
             block_ds = (16, 32, 64, 128) if inner_contiguous else (8, 16)
-            for max_block_d, tile_elems in itertools.product(
-                block_ds, (2048, 4096, 8192)
+            for max_block_d, tile_elems, num_warps in itertools.product(
+                block_ds, (2048, 4096, 8192), (2, 4)
             ):
                 cfg = self._scatter_preagg_config(
-                    num_tokens, num_inner, max_block_d, tile_elems, 4
+                    num_tokens, num_inner, max_block_d, tile_elems, num_warps
                 )
                 if cfg not in configs:
                     configs.append(cfg)
 
-        # Fit on gfx942 for adaptive blocks over row widths, destination counts
-        # and index distributions: 4K-element tiles (larger ones make the
-        # per-block sort cost more than the extra pre-aggregation saves) of
-        # 16-wide slices up to 64-wide rows, so blocks take enough tokens to
-        # collapse hot destinations, and 32-wide beyond, on two warps, which
-        # keep more of the sort and scan within each thread than four. When inner elements are strided in
-        # the output each one is its own memory transaction, so thin slices of
-        # many tokens keep sorted neighbours together instead.
+        # Fit on gfx942 over row widths, destination counts and index
+        # distributions: 4K-element tiles (larger ones make the per-block sort
+        # cost more than the extra pre-aggregation saves) of 16-wide slices up
+        # to 64-wide rows, so blocks take enough tokens to collapse hot
+        # destinations, and 32-wide beyond, on two warps, which keep more of the
+        # sort and scan within each thread than four. When inner elements are
+        # strided in the output each one is its own memory transaction, so thin
+        # slices of many tokens keep sorted neighbours together instead.
         if not inner_contiguous:
             max_block_d = 8
         else:
