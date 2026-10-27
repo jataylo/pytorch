@@ -757,10 +757,11 @@ class FlyDSLKernel(SIMDKernel):
             if self.is_reduction_kernel
             else 1
         )
-        # A {y, x} pointwise kernel runs TILE x TILE tiles: see _finalize_tile2d.
+        # A {y, x} pointwise kernel runs tile_f x tile_s tiles: see _finalize_tile2d.
         self.tile2d = "y" in self.numels
         self.ynumel = self._static(self.numels["y"], "ynumel") if self.tile2d else 1
         self.fast = "x"  # the dimension a thread's vector runs follow
+        self.tile_f = self.tile_s = TILE  # tile edges along the fast and slow dimensions
         self.staged: list[dict[str, Any]] = []
         if self.xnumel * self.rnumel * self.ynumel > _I32_LIMIT:
             raise FlyDSLUnsupported("more than 2**31 elements")
@@ -907,7 +908,7 @@ class FlyDSLKernel(SIMDKernel):
         )
 
     def _finalize_tile2d(self, widest_vec: int) -> None:
-        """Layout of a {y, x} pointwise kernel: each block covers a TILE x TILE tile.
+        """Layout of a {y, x} pointwise kernel: each block covers a tile_f x tile_s tile.
 
         A thread's vector runs follow the ``fast`` dimension, chosen so the stores are
         contiguous along it. Loads contiguous along the other dimension are staged:
@@ -931,12 +932,14 @@ class FlyDSLKernel(SIMDKernel):
         ):
             ept //= 2
         self.ept = _tune("ept", ept)
-        while self.ept > 1 and self.threads * self.ept > TILE * TILE:
+        self.tile_f = _tune("tile_f", TILE)
+        self.tile_s = _tune("tile_s", TILE)
+        while self.ept > 1 and self.threads * self.ept > self.tile_f * self.tile_s:
             self.ept //= 2
-        # Runs of a pass: TILE // ept threads across the fast dimension, the block's
+        # Runs of a pass: tile_f // ept threads across the fast dimension, the block's
         # remaining threads down the slow one; `unroll` passes cover the tile.
-        self.unroll = TILE * TILE // (self.threads * self.ept)
-        self.rpb = self.threads * self.ept // TILE
+        self.unroll = self.tile_f * self.tile_s // (self.threads * self.ept)
+        self.rpb = self.threads * self.ept // self.tile_f
 
     def _finalize_scan(self, column: bool, widest_vec: int) -> None:
         """Layout of a scan: each run of the row gives a thread ``ept`` contiguous
@@ -971,7 +974,15 @@ class FlyDSLKernel(SIMDKernel):
         """Tiles along (fast, slow)."""
         nf = self.xnumel if self.fast == "x" else self.ynumel
         ns = self.ynumel if self.fast == "x" else self.xnumel
-        return -(-nf // TILE), -(-ns // TILE)
+        return -(-nf // self.tile_f), -(-ns // self.tile_s)
+
+    def _tile_edge(self, dim: str) -> int:
+        return self.tile_f if dim == self.fast else self.tile_s
+
+    @property
+    def _tile_pitch(self) -> int:
+        # LDS words a staged tile row (one fast index) takes: see TILE_PITCH.
+        return self.tile_s + 1
 
     def _pure_reduction(self) -> bool:
         """Every node is a reduction: the kernel stores only row results."""
@@ -1239,7 +1250,7 @@ class FlyDSLKernel(SIMDKernel):
 
     def _xmask(self) -> str | None:
         if self.tile2d:
-            return None if self.xnumel % TILE == 0 else "xmask"
+            return None if self.xnumel % self._tile_edge("x") == 0 else "xmask"
         if self.is_reduction_kernel:
             block = self.rpb * self.xunroll
         else:
@@ -1255,7 +1266,7 @@ class FlyDSLKernel(SIMDKernel):
         ms = []
         if (m := self._xmask()) is not None:
             ms.append(m)
-        if self.tile2d and self.ynumel % TILE:
+        if self.tile2d and self.ynumel % self._tile_edge("y"):
             ms.append("ymask")
         if include_r and (m := self._rmask()) is not None:
             ms.append(m)
@@ -1402,8 +1413,9 @@ class FlyDSLKernel(SIMDKernel):
             if (s["arg"], s["index"]) == (arg, index_str):
                 break
         else:
-            base = sum(s["words"] * TILE * TILE_PITCH for s in self.staged)
-            if base + words * TILE * TILE_PITCH > MAX_TILE_WORDS:
+            plane = self.tile_f * self._tile_pitch
+            base = sum(s["words"] * plane for s in self.staged)
+            if base + words * plane > MAX_TILE_WORDS:
                 return None
             s = {
                 "arg": arg,
@@ -1414,8 +1426,8 @@ class FlyDSLKernel(SIMDKernel):
                 "words": words,
             }
             self.staged.append(s)
-        plane = TILE * TILE_PITCH
-        return f"fdp.tile_get(_smem, {s['base']}, {plane}, _fl * {TILE_PITCH} + _sl, {ck!r})"
+        plane, pitch = self.tile_f * self._tile_pitch, self._tile_pitch
+        return f"fdp.tile_get(_smem, {s['base']}, {plane}, _fl * {pitch} + _sl, {ck!r})"
 
     def _in_loop_region(self) -> bool:
         return self.is_reduction_kernel and self.inside_reduction
@@ -2037,7 +2049,9 @@ class FlyDSLKernel(SIMDKernel):
     @property
     def smem_words(self) -> int:
         if self.staged:
-            return sum(s["words"] * TILE * TILE_PITCH for s in self.staged)
+            return sum(
+                s["words"] * self.tile_f * self._tile_pitch for s in self.staged
+            )
         # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
         return self.threads * 2 * self.max_components if self.uses_smem else 0
 
@@ -2165,10 +2179,11 @@ class FlyDSLKernel(SIMDKernel):
         nf, _ = self._tile_counts()
         code.writeline(f"_bf = _b % {nf}")
         code.writeline(f"_bs = _b // {nf}")
+        tf, ts, pitch = self.tile_f, self.tile_s, self._tile_pitch
         masks = []
-        if self.xnumel % TILE:
+        if self.xnumel % self._tile_edge("x"):
             masks.append(f"xmask = xindex < {self.xnumel}")
-        if self.ynumel % TILE:
+        if self.ynumel % self._tile_edge("y"):
             masks.append(f"ymask = yindex < {self.ynumel}")
         entries = [
             f"{e.name} = {self.kexpr(self.rename_indexing(e.expr))}"
@@ -2179,8 +2194,8 @@ class FlyDSLKernel(SIMDKernel):
         def coords(fl: str, sl: str) -> None:
             code.writeline(f"_fl = {fl}")
             code.writeline(f"_sl = {sl}")
-            code.writeline(f"{f}index = _bf * {TILE} + _fl")
-            code.writeline(f"{s}index = _bs * {TILE} + _sl")
+            code.writeline(f"{f}index = _bf * {tf} + _fl")
+            code.writeline(f"{s}index = _bs * {ts} + _sl")
             for m in masks:
                 code.writeline(m)
 
@@ -2188,10 +2203,10 @@ class FlyDSLKernel(SIMDKernel):
         # coalesced vector read; the tile keeps (fast, slow) coordinates.
         for i, st in enumerate(self.staged):
             w = st["w"]
-            tps = TILE // w
+            tps = ts // w
             rps = self.threads // tps
             code.writeline(f"_vs{i} = {{}}")
-            code.writeline(f"for _j in range_constexpr({w * (TILE // rps)}):")
+            code.writeline(f"for _j in range_constexpr({w * (tf // rps)}):")
             with code.indent():
                 coords(
                     f"_t // {tps} + (_j // {w}) * {rps}",
@@ -2204,15 +2219,15 @@ class FlyDSLKernel(SIMDKernel):
                     f"{st['st']!r}{mask_arg})"
                 )
                 code.writeline(
-                    f"fdp.tile_put(_smem, {st['base']}, {TILE * TILE_PITCH}, "
-                    f"_fl * {TILE_PITCH} + _sl, _v)"
+                    f"fdp.tile_put(_smem, {st['base']}, {tf * pitch}, "
+                    f"_fl * {pitch} + _sl, _v)"
                 )
         if self.staged:
             code.writeline("fdp.barrier()")
 
         code.writeline("_vc = {}")
         code.writeline("_sc = {}")
-        ept, tpf = self.ept, TILE // self.ept
+        ept, tpf = self.ept, tf // self.ept
         passes = [self.prefetch, self.body] if self.prefetch else [self.body]
         for part in passes:
             code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
@@ -2754,8 +2769,13 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
         if stage == "tile":
             # A heads permute of a [32, 512, 768] bf16 tensor: 25us at 128 threads, 21us
-            # at 64 (Triton 25us).
-            return [{"threads": t} for t in (64, 256) if t != kernel.threads]
+            # at 64 (Triton 25us). A tile narrow along the stores and long along the
+            # loads: an NCHW -> NHWC f32 copy 51.4us -> 48.4us (Triton 46.4us), where a
+            # 4096^2 transpose goes 52.6us -> 57.5us. 256 threads won neither.
+            cands = [{"threads": 64}] if kernel.threads != 64 else []
+            if "tile_f" not in tuned and "tile_s" not in tuned:
+                cands.append({"threads": 64, "tile_f": TILE // 2, "tile_s": TILE * 2})
+            return cands
         if stage == "column":
             # Twice the lanes on each column: Qwen3's per-head norm weight gradient
             # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32
@@ -2774,6 +2794,10 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             cands = [{"xunroll": kernel.xunroll * 2}] if kernel.xunroll < 8 else []
             if kernel.tpr > 1:
                 cands.append({"row_tpr": kernel.tpr // 2})
+            # Or more: an ALU-bound row (Qwen3's k-norm + RoPE, angles computed in the
+            # kernel) 70us -> 61us at 4 elements a lane rather than 8 (Triton 101us).
+            if kernel.ept > 2 and "ept" not in tuned:
+                cands.append({"ept": kernel.ept // 2})
             return cands
         return []
 

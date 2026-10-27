@@ -229,6 +229,15 @@ class TestFlyDSLSIMD(TestCase):
             lambda x: torch.where(x > 0, x.exp(), x.sin()) + x.tanh() * x.erf(), a
         )
 
+    def test_sin_cos(self):
+        # One angle reduction shared by a sin and a cos of the same value, OCML's for
+        # angles past 1e5; inf and NaN give NaN.
+        for scale in (1.0, 1e3, 3e5):
+            torch._dynamo.reset()
+            a = torch.randn(1 << 16, device="cuda") * scale
+            a[:4] = torch.tensor([float("inf"), -float("inf"), float("nan"), -0.0])
+            self.check(lambda x: x.sin() * 2 + x.cos(), a, atol=1e-6, rtol=1e-5)
+
     def test_strided(self):
         a = torch.randn(1000, 1000, device="cuda")
         self.check(lambda x: x * 2 + 1, a[:, :777])
@@ -247,6 +256,14 @@ class TestFlyDSLSIMD(TestCase):
         torch._dynamo.reset()
         i = torch.randint(0, 100, (300, 500), device="cuda")
         self.check(lambda x: x.t().contiguous() + 1, i)
+        torch._dynamo.reset()
+        # Rectangular tiles (an autotuning candidate), ragged on both edges.
+        from torch._inductor.codegen.flydsl.flydsl_simd import _tune_override
+
+        with _tune_override({"tile_f": 16, "tile_s": 64, "autotune": 0}):
+            self.check(lambda x: x.t() + 1, a)
+            torch._dynamo.reset()
+            self.check(lambda x: x.t().contiguous() * 2, i)
         torch._dynamo.reset()
         c, b = torch.randn(4, 64, 30, 30, device="cuda"), torch.randn(64, device="cuda")
         self.check(
@@ -273,6 +290,23 @@ class TestFlyDSLSIMD(TestCase):
 
         self.check(step, ps, gs)
         self.assertGreater(counters["flydsl_simd"]["combo"], 0)
+
+    def test_foreach_combo_merged(self):
+        # Same-shaped parameters share one traced body, each choosing its buffers
+        # under a switch on the member index; the odd one out keeps its own branch.
+        from torch._inductor.utils import run_and_get_code
+
+        ps = [torch.randn(s, device="cuda") for s in (4096,) * 5 + (777,)]
+        gs = [torch.randn_like(p) for p in ps]
+
+        def step(ps, gs):
+            torch._foreach_add_(ps, torch._foreach_mul(gs, 0.1))
+            return ps
+
+        ref = step([p.clone() for p in ps], gs)
+        out, (code,) = run_and_get_code(torch.compile(step, dynamic=False), ps, gs)
+        torch.testing.assert_close(out, ref)
+        self.assertIn("fdp.pick(_s, lambda: (", code)
 
     def test_indirect(self):
         w = torch.randn(5000, 128, device="cuda")

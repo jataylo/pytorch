@@ -21,6 +21,7 @@ import time
 import torch
 import torch._inductor.config as ic
 import torch.nn.functional as F
+import torch.utils._pytree as pytree
 from torch._dynamo.utils import counters
 
 
@@ -312,6 +313,21 @@ def _call_time_us(fn, args, reps=200) -> float:
     return best
 
 
+def _upcast_ref(fn, args, ref):
+    def up(a):
+        if isinstance(a, torch.Tensor) and a.dtype in (torch.float16, bf16):
+            return a.float()
+        if isinstance(a, (list, tuple)):
+            return type(a)(up(x) for x in a)
+        return a
+
+    return pytree.tree_map(
+        lambda o, r: o.to(r.dtype) if isinstance(r, torch.Tensor) else o,
+        fn(*up(args)),
+        ref,
+    )
+
+
 def run_case(name, fn, factories):
     torch.manual_seed(0)
     args = [f() for f in factories]
@@ -328,7 +344,14 @@ def run_case(name, fn, factories):
         torch.cuda.synchronize()
         row[f"{backend}_compile_s"] = time.perf_counter() - t0
         if name not in RANDOM:
-            torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
+            # Eager rounds bf16 intermediates the compiled kernels keep in f32, and
+            # lands an element past the tolerance now and then: then hold both to an
+            # f32 evaluation instead.
+            try:
+                torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
+            except AssertionError:
+                ref = _upcast_ref(fn, args, ref)
+                torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
         if backend == "flydsl":
             c = counters["flydsl_simd"]
             row["flydsl_kernels"] = c["flydsl_kernels"]

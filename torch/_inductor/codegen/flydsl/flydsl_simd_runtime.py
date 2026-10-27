@@ -1230,6 +1230,73 @@ def _sigmoid_rcp(x):
     return _rcp(e + fdu.const_f32(1.0))
 
 
+# pi/2 as three floats summing to it to ~2^-80, for the Cody-Waite reduction; minimax
+# sin(r)/r - 1 and cos(r) - 1 + r^2/2 on |r| <= pi/4 in r^2 (Cephes sinf/cosf, <=1 ulp).
+_PIO2 = (1.5707963705062866, -4.371138828673793e-08, -1.7151245100059315e-15)
+_SIN_POLY = (-1.6666654611e-1, 8.3321608736e-3, -1.9515295891e-4)
+_COS_POLY = (4.166664568298827e-2, -1.388731625493765e-3, 2.443315711809948e-5)
+# Past this the three-part reduction loses bits: OCML's Payne-Hanek path takes over.
+_TRIG_BIG = 1e5
+_TWO_OVER_PI = 2 / _math.pi
+_trig_memo: dict = {"ctx": None, "map": {}}
+
+
+def _trig_reduce(x):
+    """``(r, q)`` with ``x = q pi/2 + r``, ``|r| <= pi/4``: shared by a sin and a cos
+    of the same value in the same block, as RoPE takes both of every angle."""
+    ctx = ir.Context.current
+    if _trig_memo["ctx"] is not ctx:
+        _trig_memo.update(ctx=ctx, map={})
+    key = (x, ir.InsertionPoint.current.block)
+    hit = _trig_memo["map"].get(key)
+    if hit is not None:
+        return hit
+    q = ArithValue(fmath.roundeven(ArithValue(x * fdu.const_f32(_TWO_OVER_PI))))
+    r = x
+    for c in _PIO2:
+        r = ArithValue(fmath.fma(ArithValue(-q), fdu.const_f32(c), r))
+    qi = ArithValue(_arith.FPToSIOp(T.i32(), _val(q)).result)
+    _trig_memo["map"][key] = (r, qi)
+    return r, qi
+
+
+def _trig(x, cosine: bool):
+    # OCML's sin/cos each reduce the angle by Payne-Hanek, ~150 instructions apiece:
+    # a Qwen3 k-norm + RoPE with in-kernel angles spent most of its time there.
+    x = _f32(x)
+    r, q = _trig_reduce(x)
+    z = ArithValue(r * r)
+    s = ArithValue(fmath.fma(ArithValue(r * z), _horner(z, _SIN_POLY), r))
+    c = ArithValue(
+        fmath.fma(
+            ArithValue(z * z),
+            _horner(z, _COS_POLY),
+            fmath.fma(z, fdu.const_f32(-0.5), fdu.const_f32(1.0)),
+        )
+    )
+    if cosine:
+        q = ArithValue(q + fx.Int32(1))
+    odd = ArithValue((q & fx.Int32(1)) != fx.Int32(0))
+    neg_ = ArithValue((q & fx.Int32(2)) != fx.Int32(0))
+    v = ArithValue(odd.select(c, s))
+    v = ArithValue(neg_.select(ArithValue(-v), v))
+    big = ArithValue(ArithValue(fmath.absf(x)) > fdu.const_f32(_TRIG_BIG))
+    if_op = _scf.IfOp(_val(big), [T.f32()], has_else=True)
+    with ir.InsertionPoint(if_op.then_block):
+        _scf.YieldOp([_val((fdu.cos if cosine else fdu.sin)(x))])
+    with ir.InsertionPoint(if_op.else_block):
+        _scf.YieldOp([_val(v)])
+    return ArithValue(if_op.results[0])
+
+
+def sin(x):
+    return _trig(_require_f32("sin", x), False)
+
+
+def cos(x):
+    return _trig(_require_f32("cos", x), True)
+
+
 exp = _unary_f32("exp", fdu.exp)
 exp2 = _unary_f32("exp2", fdu.exp2)
 expm1 = _unary_f32("expm1", fdu.expm1)
@@ -1237,8 +1304,6 @@ log = _unary_f32("log", fdu.log)
 log2 = _unary_f32("log2", fdu.log2)
 log10 = _unary_f32("log10", fdu.log10)
 log1p = _unary_f32("log1p", fdu.log1p)
-sin = _unary_f32("sin", fdu.sin)
-cos = _unary_f32("cos", fdu.cos)
 tanh = _unary_f32("tanh", _tanh_rcp)
 sigmoid = _unary_f32("sigmoid", _sigmoid_rcp)
 sinh = _unary_f32("sinh", fdu.sinh)
