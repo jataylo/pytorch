@@ -630,7 +630,14 @@ class TestFlyDSLSIMD(TestCase):
             torch.compile(lambda x: x + 1), torch.randn(1024, device="cuda")
         )
         self.assertIn(f"# runtime {_runtime_fingerprint()}", code)
-        self.assertIn("async_compile.flydsl(", code)
+        # The wrapper names the code object the worker saves, so a warm start can load
+        # it without the pool.
+        import os
+        import re
+
+        (binary,) = re.findall(r"''', '([^']+\.hsaco)', precompile_metadata", code)
+        self.assertIn("fdp_rt.compiled(async_compile, ", code)
+        self.assertTrue(os.path.exists(binary), binary)
 
     def test_autotuned_in_place(self):
         # A pointwise kernel this large times its candidates on its first call; one that

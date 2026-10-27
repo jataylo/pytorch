@@ -2166,6 +2166,24 @@ def warm_worker(arch: str | None = None) -> None:
         compile_only(_warm_launch, 0)
 
 
+def compiled(async_compile, kernel_name: str, source: str, binary: str, **kw):
+    """``async_compile.flydsl``, except that a kernel whose code object ``binary`` is
+    already on disk (a warm start) loads in this process: through the pool it waited
+    on a worker to find nothing to do, 0.35 s of GPT training's warm start."""
+    if not _os.path.exists(binary):
+        return async_compile.flydsl(kernel_name, source, **kw)
+    from torch._inductor.codecache import PyCodeCache
+    from torch._inductor.codegen.flydsl.flydsl_kernel import (
+        FlyDSLKernelWrapper,
+        MAIN_SUFFIX,
+    )
+
+    key, path = PyCodeCache.write(source)
+    return async_compile._load_kernel_wrapper(
+        kernel_name, MAIN_SUFFIX, FlyDSLKernelWrapper, key, path
+    )
+
+
 def have_binary(path: str) -> bool:
     """Whether ``save_binary`` already wrote ``path`` (its name holds the module's source
     hash, so it is this source's code object): a warm start's compile is then nothing."""

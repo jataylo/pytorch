@@ -2881,17 +2881,41 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         while f"{kernel_name}_c{variants}_kernel" in src_code:
             variants += 1
         source = f"{kernel_name}_source"
-        compile_wrapper = IndentedBuffer()
-        if variants > 1:
-            compile_wrapper.writeline(
-                f"async_compile.flydsl({kernel_name!r}, ({source} := r'''"
-            )
-            compile_wrapper.splice(src_code, strip=True)
-            compile_wrapper.writeline("'''), precompile_metadata={'only': 0})")
+        literal_buf = IndentedBuffer()
+        literal_buf.splice(src_code, strip=True)
+        literal = literal_buf.getvalue()
+        if V.graph.cpp_wrapper:
+            binaries = None
         else:
-            compile_wrapper.writeline(f"async_compile.flydsl({kernel_name!r}, r'''")
-            compile_wrapper.splice(src_code, strip=True)
-            compile_wrapper.writeline("''', precompile_metadata={})")
+            # The module's path, as async_compile writes it, names its code objects.
+            stem = get_path(code_hash(literal.strip()), "py")[2].rsplit(".", 1)[0]
+            binaries = [
+                f"{stem}.{kernel_name}{f'_c{i}' if variants > 1 else ''}.hsaco"
+                for i in range(variants)
+            ]
+            wrapper.add_import_once(
+                "from torch._inductor.codegen.flydsl import flydsl_simd_runtime as fdp_rt"
+            )
+
+        def compile_call(src: str, meta: str, i: int) -> str:
+            if binaries is None:
+                return f"async_compile.flydsl({kernel_name!r}, {src}, precompile_metadata={meta})"
+            return (
+                f"fdp_rt.compiled(async_compile, {kernel_name!r}, {src}, "
+                f"{binaries[i]!r}, precompile_metadata={meta})"
+            )
+
+        if variants > 1:
+            head, tail = f"({source} := r'''", "''')"
+            meta = "{'only': 0}"
+        else:
+            head, tail, meta = "r'''", "'''", "{}"
+        call = compile_call("\0", meta, 0)
+        cut = call.index("\0")
+        compile_wrapper = IndentedBuffer()
+        compile_wrapper.writeline(call[:cut] + head)
+        compile_wrapper.splice(literal)
+        compile_wrapper.writeline(tail + call[cut + 1 :])
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         metadata = f"# kernel path: {kernel_path}\n{origins}\n{detailed}"
         body = compile_wrapper.getvalue()
@@ -2903,22 +2927,16 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             # this line on load, after all of codegen. Not when the first kernel's code
             # object is already on disk (a warm start compiles nothing): 7.6 s vs 4 s.
             wrapper.flydsl_waits_for_pool = True
-            if not V.graph.cpp_wrapper:
-                literal = body[body.index("r'''") + 4 : body.rindex("'''")]
-                stem = get_path(code_hash(literal.strip()), "py")[2].rsplit(".", 1)[0]
-                variant = "_c0" if f"{kernel_name}_c0_kernel" in literal else ""
-                binary = f"{stem}.{kernel_name}{variant}.hsaco"
+            if binaries is not None:
                 metadata = (
-                    f"if not os.path.exists({binary!r}):\n"
+                    f"if not os.path.exists({binaries[0]!r}):\n"
                     "    async_compile.wait_process_pool_ready()\n"
                     f"{metadata}"
                 )
         wrapper.define_kernel(kernel_name, body, metadata)
         for i in range(1, variants):
             wrapper.define_kernel(
-                f"{kernel_name}_v{i}",
-                f"async_compile.flydsl({kernel_name!r}, {source}, "
-                f"precompile_metadata={{'only': {i}}})",
+                f"{kernel_name}_v{i}", compile_call(source, f"{{'only': {i}}}", i)
             )
         return kernel_name
 
