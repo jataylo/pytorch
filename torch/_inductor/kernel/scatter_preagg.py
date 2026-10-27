@@ -665,9 +665,9 @@ _TEMPLATE_SOURCE = (
                 inner_mask = inner_raw < NUM_INNER
                 if INNER_MODE == 0:
                     inner = inner_raw[None, :]
-                    if ATOMIC_VEC:
+                    if PLAIN_VEC:
                         atomic_inner = tl.max_contiguous(
-                            tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
+                            tl.multiple_of(inner_raw, PLAIN_VEC), PLAIN_VEC
                         )[None, :]
                     else:
                         atomic_inner = inner
@@ -1129,8 +1129,14 @@ def _stage_in_fp32(dtype: torch.dtype) -> bool:
         return True
     # Native fp16 atomics after pre-aggregation are at least as accurate as the
     # default lowering, but not as partitioned scatter's, whose partitions each
-    # take a fraction of the roundings. Keep the copy wherever preagg replaces it.
-    return dtype == torch.float16 and config.partitioned_scatter_enabled
+    # take a fraction of the roundings. Adaptive blocks would pay for the copy
+    # even where they issue plain atomics, so only gated preagg keeps it in
+    # place of partitioned scatter.
+    return (
+        dtype == torch.float16
+        and config.partitioned_scatter_enabled
+        and not config.scatter_preagg_adaptive
+    )
 
 
 def _try_template(
@@ -1304,13 +1310,17 @@ def _lower_atomic(
     inputs: list[ir.IRNode],
     configs: list[Any],
 ) -> bool:
-    # 16-bit floats are staged in fp32, so atomics here are 32 or 64 bits.
     dtype = out.get_dtype()
     few_keys = _hint(plan.num_keys) <= 64
     # On CDNA, 32-bit atomics run ~1.7x faster at two elements per thread than
     # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
     atomic_vec = 2 if torch.version.hip else 0
+    # Plain atomics run up to 2x faster with one 32-bit word per lane, so a
+    # wavefront updates whole cache lines (fewer L2 atomic transactions, which
+    # bound hot destinations). The sort path keeps two: one word per lane costs
+    # it registers for a layout conversion after the scan.
+    plain_vec = max(1, 4 // dtype.itemsize) if torch.version.hip else 0
 
     def adaptive_kwargs(cfg, inner_mode) -> dict[str, Any]:
         min_saved = config.scatter_preagg_adaptive_min_saved
@@ -1336,6 +1346,7 @@ def _lower_atomic(
             "HIST_BINS": hist_bins,
             "LOG_HIST_BINS": hist_bins.bit_length() - 1,
             "MIN_SAVED": min_saved,
+            "PLAIN_VEC": plain_vec,
             "PLAIN_T": cfg.block_t // widen,
             "PLAIN_D": cfg.block_d * widen,
             "PLAIN_ITERS": cfg.d_iters // widen,

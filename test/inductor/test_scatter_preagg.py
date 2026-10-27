@@ -340,7 +340,9 @@ class TestScatterPreagg(TestCase):
         if dtype in (torch.float16, torch.bfloat16):
             # Accumulated in an fp32 copy, so each destination is rounded once.
             ref = fn(x.float(), idx, v.float())
-            with config.patch(partitioned_scatter_enabled=True):
+            with config.patch(
+                partitioned_scatter_enabled=True, scatter_preagg_adaptive=False
+            ):
                 out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
             self.assertEqual(
                 out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0
@@ -405,10 +407,10 @@ class TestScatterPreagg(TestCase):
 
         default = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertEqual(len(default), 1)
+        self.assertEqual(default[0].num_warps, 2)
         self.assertEqual(block(50_000, 32, torch.float32), (256, 16))
         self.assertEqual(block(50_000, 128, torch.bfloat16), (128, 32))
-        self.assertEqual(block(50_000, 512, torch.float32), (64, 64))
-        self.assertEqual(block(50_000, 512, torch.float32, num_keys=16), (64, 32))
+        self.assertEqual(block(50_000, 512, torch.float32), (128, 32))
         strided = (50_000, 256, torch.float32)
         self.assertEqual(block(*strided, inner_contiguous=False), (512, 8))
         with config.patch(max_autotune=True):
@@ -446,9 +448,10 @@ class TestScatterPreagg(TestCase):
             counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
         )
 
-    @config.patch(partitioned_scatter_enabled=False)
-    def test_fp16_native_atomics_without_ps(self):
-        # With only the default lowering to replace, fp16 skips the fp32 copy.
+    @parametrize("adaptive", [False, True])
+    def test_fp16_native_atomics(self, adaptive):
+        # Gated preagg skips the fp32 copy with only the default lowering to
+        # replace; adaptive preagg always does.
         x = torch.zeros(20, 16, device=GPU_TYPE, dtype=torch.float16)
         idx = _hot_indices(20_000, 20, GPU_TYPE)
         v = torch.randn(20_000, 16, device=GPU_TYPE).half()
@@ -457,7 +460,10 @@ class TestScatterPreagg(TestCase):
             return torch.index_put(x, (i,), v, accumulate=True)
 
         ref = fn(x.float(), idx, v.float())
-        out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+        with config.patch(
+            partitioned_scatter_enabled=adaptive, scatter_preagg_adaptive=adaptive
+        ):
+            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
         self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 3e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
         self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)

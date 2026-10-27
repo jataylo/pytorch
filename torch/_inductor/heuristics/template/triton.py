@@ -1445,23 +1445,20 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
                 if cfg not in configs:
                     configs.append(cfg)
 
-        # Fit on gfx942 with benchmarks/inductor_scatter_preagg/tune.py, over
-        # row widths, destination counts and index distributions: 4K-element
-        # tiles (larger ones make the per-block sort cost more than the extra
-        # pre-aggregation saves) of slices growing with the row. Wide rows into
-        # a handful of destinations prefer narrower slices of fewer tokens.
-        # When inner elements are strided in the output each one is its own
-        # memory transaction, so thin slices of many tokens keep sorted
-        # neighbours together instead.
+        # Fit on gfx942 for adaptive blocks over row widths, destination counts
+        # and index distributions: 4K-element tiles (larger ones make the
+        # per-block sort cost more than the extra pre-aggregation saves) of
+        # 16-wide slices up to 64-wide rows, so blocks take enough tokens to
+        # collapse hot destinations, and 32-wide beyond, on two warps, which
+        # keep more of the sort and scan within each thread than four. When inner elements are strided in
+        # the output each one is its own memory transaction, so thin slices of
+        # many tokens keep sorted neighbours together instead.
         if not inner_contiguous:
-            max_block_d, tile_elems = 8, 4096
-        elif num_inner >= 256 and num_keys is not None and num_keys <= 64:
-            max_block_d, tile_elems = 32, 2048
+            max_block_d = 8
         else:
-            max_block_d = 16 if num_inner <= 32 else 32 if num_inner <= 128 else 64
-            tile_elems = 4096
+            max_block_d = 16 if num_inner <= 64 else 32
         default_config = self._scatter_preagg_config(
-            num_tokens, num_inner, max_block_d, tile_elems, 4
+            num_tokens, num_inner, max_block_d, 4096, 2
         )
         if default_config not in configs:
             configs.append(default_config)

@@ -1,16 +1,14 @@
-"""Compare the per-block adaptive preagg prototype against regular Inductor,
-partitioned scatter and gated preagg across index distributions.
+"""Compare adaptive preagg against regular Inductor and partitioned scatter
+across ops, index distributions and dtypes.
 
   python bench_adaptive.py run --gpus 8 --out results/adaptive.jsonl
   python bench_adaptive.py summary results/adaptive.jsonl
 
 Modes, all timed on identical inputs:
-  base          regular Inductor: preagg and partitioned scatter off
-  ps            partitioned scatter on, preagg off
-  adaptive      adaptive preagg with partitioned scatter on (ROCm default);
-                fp16 accumulates in an fp32 copy
-  adaptive_nops adaptive preagg with partitioned scatter off (CUDA default);
-                fp16 uses native atomics
+  base      regular Inductor: preagg and partitioned scatter off
+  ps        partitioned scatter on, preagg off
+  adaptive  adaptive preagg; partitioned scatter stays on but leaves the
+            scatters preagg takes alone
 
 Contention is measured from the indices as the average number of tokens that
 share a token's destination row (sum of squared row counts over tokens): about
@@ -44,12 +42,14 @@ DISTS = (
     "mixed",
     "runs32",
 )
-PREAGG = dict(scatter_preagg_enabled=True, scatter_preagg_adaptive=True)
 MODES = {
     "base": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=False),
     "ps": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=True),
-    "adaptive": dict(PREAGG, partitioned_scatter_enabled=True),
-    "adaptive_nops": dict(PREAGG, partitioned_scatter_enabled=False),
+    "adaptive": dict(
+        scatter_preagg_enabled=True,
+        scatter_preagg_adaptive=True,
+        partitioned_scatter_enabled=True,
+    ),
 }
 
 
@@ -131,7 +131,7 @@ def cases():
     for op, rows, d, dist in itertools.product(
         ("index_add", "scatter_add", "scatter_reduce", "embedding"),
         ROWS,
-        (32, 128),
+        (32, 64, 128),
         DISTS,
     ):
         out.append((op, "float32", rows, d, 1048576, dist))
@@ -257,7 +257,7 @@ def summary(args):
 
     print("Geomean speedup over regular Inductor (base) by measured contention.")
     print("'worst' and 'slower' compare adaptive with best(base, ps) per case;")
-    print("errors are the bucket's max, base / ps / adaptive / adaptive_nops.")
+    print("errors are the bucket's max, base / ps / adaptive.")
     for (op, dtype), sel in sorted(groups.items()):
         by_bucket = defaultdict(list)
         for r in sel:
