@@ -1417,10 +1417,11 @@ scatter_preagg_enabled: bool = (
 # Skip scatters writing fewer elements than this.
 scatter_preagg_min_index_size: int = 4096
 
-# Skip scatters with fewer writes per destination than this (tokens / destinations,
-# assuming uniformly spread indices). Below it the per-chunk sort costs more than
-# the contention it removes. Skewed indices raise real contention above this
-# estimate, so the threshold is deliberately low (the same as partitioned scatter).
+# With scatter_preagg_adaptive off, skip scatters with fewer writes per destination
+# than this (tokens / destinations, assuming uniformly spread indices). Below it
+# the per-chunk sort costs more than the contention it removes. Skewed indices
+# raise real contention above this estimate, so the threshold is deliberately low
+# (the same as partitioned scatter).
 scatter_preagg_min_contention_ratio: float = 4.0
 
 # Bypass the size and contention gates. Enable via TORCHINDUCTOR_SCATTER_PREAGG_FORCE=1
@@ -1428,14 +1429,15 @@ scatter_preagg_force: bool = (
     os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_FORCE", "0") == "1"
 )
 
-# Prototype: each block estimates its own duplicate destinations and only sorts
+# Each chunk estimates its own duplicate destinations at runtime and sorts only
 # when that saves at least scatter_preagg_adaptive_min_saved of its atomics,
-# otherwise issuing plain atomics. Replaces the contention gate.
+# otherwise issuing plain atomics like the default lowering. Replaces the
+# contention gate, which has to guess the index distribution at compile time.
 scatter_preagg_adaptive: bool = (
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE", "0") == "1"
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE", "1") == "1"
 )
 scatter_preagg_adaptive_min_saved: float = float(
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE_MIN_SAVED", "0.125")
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG_ADAPTIVE_MIN_SAVED", "0.0625")
 )
 
 

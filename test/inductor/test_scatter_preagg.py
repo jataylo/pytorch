@@ -431,6 +431,7 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, v, atol=2e-3, rtol=1e-4)
 
+    @config.patch(scatter_preagg_adaptive=False)
     def test_skip_low_contention(self):
         x = torch.zeros(10_000, 8, device=GPU_TYPE)
         idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
@@ -443,6 +444,31 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(
             counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
         )
+
+    @config.patch(scatter_preagg_adaptive=True)
+    def test_adaptive_low_contention(self):
+        # Adaptive chunks take plain atomics instead of being gated out.
+        x = torch.zeros(10_000, 8, device=GPU_TYPE)
+        idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
+        v = torch.randn(20_000, 8, device=GPU_TYPE)
+
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        self._check(fn, x, idx, v)
+
+    @config.patch(scatter_preagg_adaptive=True)
+    @parametrize("min_saved", [-1.0, 2.0])
+    def test_adaptive_forced_path(self, min_saved):
+        # -1 always sorts and 2 never does, covering both paths of each chunk.
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        x = torch.zeros(4096, 64, device=GPU_TYPE)
+        idx = _hot_indices(50_000, 4096, GPU_TYPE)
+        v = torch.randn(50_000, 64, device=GPU_TYPE)
+        with config.patch(scatter_preagg_adaptive_min_saved=min_saved):
+            self._check(fn, x, idx, v, atol=1e-2, rtol=1e-3)
 
     def test_values_read_output(self):
         # The values read the scatter target, so they must be computed before
