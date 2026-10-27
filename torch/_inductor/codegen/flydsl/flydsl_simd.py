@@ -89,6 +89,10 @@ THREADS = 256
 AUTOTUNE_MIN_NUMEL = 1 << 22
 # A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
 TILE_THREADS = 128
+# A column reduction launching fewer blocks than CUs: Qwen3's per-head weight
+# gradient's second stage (128 columns x 319 partial sums) took 37.6us end to end at
+# 256 threads, 33.8us at this many (Triton 32.5us); 34.8us at 512.
+SMALL_COLUMN_THREADS = 1024
 WAVE = 64
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
@@ -1105,6 +1109,14 @@ class FlyDSLKernel(SIMDKernel):
             # handles the few-columns, very-long-rows case at the graph level.
             self.ept = 1
             self.stride = _tune("col_stride", WAVE)
+            if (
+                not self.in_combo
+                and not _tune("threads", 0)
+                and -(-self.xnumel // self.stride) < _num_cus()
+            ):
+                # A few blocks over the whole GPU (a split reduction's second stage):
+                # more of each block's waves on the rows.
+                self.threads = SMALL_COLUMN_THREADS
             self.tpr = self.threads // self.stride
             self.rpb = self.stride
         else:
@@ -2674,6 +2686,11 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             # A heads permute of a [32, 512, 768] bf16 tensor: 25us at 128 threads, 21us
             # at 64 (Triton 25us).
             return [{"threads": t} for t in (64, 256) if t != kernel.threads]
+        if stage == "column":
+            # Twice the lanes on each column: Qwen3's per-head norm weight gradient
+            # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32
+            # column sum 82us -> 103us.
+            return [{"threads": 2 * kernel.threads}] if kernel.threads < 512 else []
         if (
             stage in ("row", "norm")
             and kernel.persistent

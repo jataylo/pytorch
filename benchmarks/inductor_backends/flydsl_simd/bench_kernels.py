@@ -42,6 +42,24 @@ def _rms(x, w):
     return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)).to(x.dtype) * w
 
 
+def _qk_norm_rope(x, w, cos, sin):
+    b, t, d = cos.shape
+    q = _rms(x.view(b, t, -1, d), w).transpose(1, 2)
+    c, s = cos.unsqueeze(1), sin.unsqueeze(1)
+    return q * c + torch.cat((-q[..., d // 2 :], q[..., : d // 2]), -1) * s
+
+
+def _k_norm_rope_pos(x, w, inv_freq):
+    # As Qwen3 prefill compiles it: cos/sin from the positions inside the kernel, the
+    # 8 KV heads normalized and rotated.
+    b, t, d = 16, 1024, inv_freq.numel() * 2
+    pos = torch.arange(t, device=x.device, dtype=torch.float32)
+    emb = torch.cat([pos[:, None] * inv_freq[None, :]] * 2, -1)
+    cos, sin = emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+    k = _rms(x.view(b, t, -1, d), w).transpose(1, 2)
+    return k * cos + torch.cat((-k[..., d // 2 :], k[..., : d // 2]), -1) * sin
+
+
 def _ln_bwd(g, x, w):
     # Input gradient of layer_norm(x, w) with mean/rstd recomputed, as Inductor fuses it.
     xf, gf = x.float(), g.float() * w.float()
@@ -206,6 +224,30 @@ CASES = {
             _r(8, 16, 1024, 64, dtype=bf16),
             _r(1024, 64, dtype=bf16),
             _r(1024, 64, dtype=bf16),
+        ],
+    ),
+    # Qwen3-0.6B (16 heads of 128): q/k RMSNorm weight gradient, a sum over tokens and
+    # heads of bf16 rows only 128 wide
+    "head_wgrad_bf16": (
+        lambda g: g.sum((0, 1, 2), keepdim=True),
+        [_r(8, 1024, 16, 128, dtype=bf16)],
+    ),
+    # and the attention prologue: q RMSNorm over each head, to heads-major, RoPE
+    "qk_norm_rope_bf16": (
+        lambda x, w, c, s: _qk_norm_rope(x, w, c, s),
+        [
+            _r(16, 1024, 16 * 128, dtype=bf16),
+            _r(128, dtype=bf16),
+            _r(16, 1024, 128, dtype=bf16),
+            _r(16, 1024, 128, dtype=bf16),
+        ],
+    ),
+    "k_norm_rope_pos_bf16": (
+        _k_norm_rope_pos,
+        [
+            _r(16, 1024, 8 * 128, dtype=bf16),
+            _r(128, dtype=bf16),
+            lambda: 1e-4 ** (torch.arange(64, device="cuda") / 64),
         ],
     ),
     # Scans
