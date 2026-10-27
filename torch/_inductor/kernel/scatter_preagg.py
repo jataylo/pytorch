@@ -1119,6 +1119,20 @@ def _scatter_into_copy(
     return True
 
 
+def _stage_in_fp32(dtype: torch.dtype) -> bool:
+    """
+    Whether to accumulate a 16-bit output in an fp32 copy rather than with
+    16-bit atomics, which round every block's partial sum into the output.
+    """
+    if dtype == torch.bfloat16:
+        # Slower and less accurate than the copy on gfx942 at any contention.
+        return True
+    # Native fp16 atomics after pre-aggregation are at least as accurate as the
+    # default lowering, but not as partitioned scatter's, whose partitions each
+    # take a fraction of the roundings. Keep the copy wherever preagg replaces it.
+    return dtype == torch.float16 and config.partitioned_scatter_enabled
+
+
 def _try_template(
     out: ir.TensorBox,
     value_fn: ValueFn,
@@ -1169,8 +1183,7 @@ def _try_template(
     ):
         _record_skip(reason)
         return False
-    if dtype in (torch.float16, torch.bfloat16) and not use_sorted:
-        # 16-bit atomics would round every block's partial sum.
+    if _stage_in_fp32(dtype) and not use_sorted:
         return _scatter_into_copy(
             "fp32_copy",
             out,

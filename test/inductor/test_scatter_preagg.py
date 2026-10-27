@@ -340,7 +340,8 @@ class TestScatterPreagg(TestCase):
         if dtype in (torch.float16, torch.bfloat16):
             # Accumulated in an fp32 copy, so each destination is rounded once.
             ref = fn(x.float(), idx, v.float())
-            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+            with config.patch(partitioned_scatter_enabled=True):
+                out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
             self.assertEqual(
                 out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0
             )
@@ -444,6 +445,22 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(
             counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
         )
+
+    @config.patch(partitioned_scatter_enabled=False)
+    def test_fp16_native_atomics_without_ps(self):
+        # With only the default lowering to replace, fp16 skips the fp32 copy.
+        x = torch.zeros(20, 16, device=GPU_TYPE, dtype=torch.float16)
+        idx = _hot_indices(20_000, 20, GPU_TYPE)
+        v = torch.randn(20_000, 16, device=GPU_TYPE).half()
+
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        ref = fn(x.float(), idx, v.float())
+        out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 3e-2, rtol=0)
+        self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
+        self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)
 
     @config.patch(scatter_preagg_adaptive=True)
     def test_adaptive_low_contention(self):
