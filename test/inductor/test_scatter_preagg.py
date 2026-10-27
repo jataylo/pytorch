@@ -1,5 +1,7 @@
 # Owner(s): ["module: inductor"]
 
+import unittest.mock
+
 import torch
 import torch._dynamo
 from torch._dynamo.utils import counters
@@ -7,6 +9,7 @@ from torch._inductor import config
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import run_and_get_code
 from torch.testing._internal.common_utils import (
+    DeterministicGuard,
     instantiate_parametrized_tests,
     parametrize,
 )
@@ -44,6 +47,11 @@ class TestScatterPreagg(TestCase):
         patch = config.patch(scatter_preagg_enabled=True)
         patch.__enter__()
         self.addCleanup(patch.__exit__, None, None, None)
+        # Deterministic mode selects a different lowering; other suites can
+        # leave it on.
+        guard = DeterministicGuard(False)
+        guard.__enter__()
+        self.addCleanup(guard.__exit__, None, None, None)
         torch._dynamo.reset()
         counters.clear()
         torch.manual_seed(0)
@@ -217,10 +225,7 @@ class TestScatterPreagg(TestCase):
         ref = fn(x.float().clone(), idx, v.float())
         out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
         self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0)
-        self.assertEqual(
-            counters["inductor"]["scatter_preagg_applied"],
-            1 if _has_native_bf16_atomics() else 0,
-        )
+        self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
 
     def test_scatter_add_full_index(self):
         x = torch.zeros(16, 8, device=GPU_TYPE)
@@ -276,10 +281,7 @@ class TestScatterPreagg(TestCase):
         out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0)
-        self.assertEqual(
-            counters["inductor"]["scatter_preagg_applied"],
-            1 if _has_native_bf16_atomics() else 0,
-        )
+        self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
 
     @parametrize("op", ["index_put", "scatter_reduce"])
     def test_bf16_declined_falls_back(self, op):
@@ -293,7 +295,9 @@ class TestScatterPreagg(TestCase):
         _, (code,) = run_and_get_code(
             torch.compile(fn, fullgraph=True), x.clone(), idx, v
         )
-        self._check(fn, x, idx, v, applied=False, atol=2e-2, rtol=2e-2)
+        # Without native bf16 atomics the sorted lowering takes it instead.
+        applied = not _has_native_bf16_atomics()
+        self._check(fn, x, idx, v, applied=applied, atol=2e-2, rtol=2e-2)
         self.assertNotIn("tl.atomic_add(", code)
 
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64, torch.int32])
@@ -317,8 +321,7 @@ class TestScatterPreagg(TestCase):
             self.assertEqual(
                 out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0
             )
-            expected = 1 if dtype == torch.float16 or _has_native_bf16_atomics() else 0
-            self.assertEqual(counters["inductor"]["scatter_preagg_applied"], expected)
+            self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
             return
         self._check(fn, x, idx, v, atol=tol, rtol=tol)
 
@@ -494,6 +497,76 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(
             counters["inductor"]["partitioned_scatter_skipped_scatter_preagg"], 1
         )
+
+    def _check_deterministic(self, fn, *args, tol):
+        ref = fn(*[a.double() if a.is_floating_point() else a.clone() for a in args])
+        ref = ref.double()
+        compiled = torch.compile(fn, fullgraph=True)
+        with DeterministicGuard(True):
+            out1, (code,) = run_and_get_code(compiled, *[a.clone() for a in args])
+            out2 = compiled(*[a.clone() for a in args])
+        self.assertEqual(out1.double(), ref, atol=ref.abs().max().item() * tol, rtol=0)
+        self.assertTrue(torch.equal(out1, out2))
+        self.assertEqual(counters["inductor"]["scatter_preagg_sorted"], 1)
+        self.assertNotIn("tl.atomic_add(", code)
+
+    @parametrize(
+        "case",
+        ["index_put", "index_add", "scatter_add", "one_key", "unique", "int32", "view"],
+    )
+    def test_deterministic(self, case):
+        n, rows, d = 30_000, 50, 24
+        dtype = torch.int32 if case == "int32" else torch.float32
+        x = torch.zeros(rows, d, device=GPU_TYPE, dtype=dtype)
+        v = torch.randn(n, d, device=GPU_TYPE).to(dtype)
+        idx = _hot_indices(n, rows, GPU_TYPE)
+        fn = _BF16_SCATTER_FNS.get(case, _BF16_SCATTER_FNS["index_put"])
+        if case == "one_key":
+            # One segment spanning every chunk.
+            idx = torch.zeros_like(idx)
+        elif case == "unique":
+            x = torch.zeros(n, d, device=GPU_TYPE)
+            idx = torch.randperm(n, device=GPU_TYPE)
+        elif case == "int32":
+            v = torch.randint(-5, 5, (n, d), device=GPU_TYPE, dtype=dtype)
+        elif case == "view":
+            x = torch.zeros(rows, 3, device=GPU_TYPE)
+            v = torch.randn(n, 1, device=GPU_TYPE)
+
+            def fn(x, i, v):
+                return x[:, 1:2].index_add_(0, i, v)
+
+        self._check_deterministic(fn, x, idx, v, tol=1e-5)
+
+    def test_deterministic_embedding_dense_backward(self):
+        idx = _hot_indices(30_000, 500, GPU_TYPE)
+        grad = torch.randn(30_000, 64, device=GPU_TYPE).bfloat16()
+
+        def fn(i, g):
+            return torch.ops.aten.embedding_dense_backward(g, i, 500, -1, False)
+
+        self._check_deterministic(fn, idx, grad, tol=1e-2)
+
+    @parametrize("op", ["index_put", "scatter_reduce"])
+    def test_bf16_without_native_atomics(self, op):
+        from torch._inductor.kernel import scatter_preagg
+
+        fn = _BF16_SCATTER_FNS[op]
+        x = torch.randn(24, 64, device=GPU_TYPE).bfloat16()
+        idx = _hot_indices(50_000, 24, GPU_TYPE)
+        v = torch.randn(50_000, 64, device=GPU_TYPE).bfloat16()
+        ref = fn(x.float(), idx, v.float())
+        with unittest.mock.patch.object(
+            scatter_preagg, "_has_native_bf16_atomics", lambda device: False
+        ):
+            _, (code,) = run_and_get_code(
+                torch.compile(fn, fullgraph=True), x.clone(), idx, v
+            )
+            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+        # One fp32 sum per destination, rounded once.
+        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0)
+        self.assertNotIn("tl.atomic_add(", code)
+        self.assertGreater(counters["inductor"]["scatter_preagg_sorted"], 0)
 
     @config.patch(scatter_preagg_enabled=False)
     def test_disabled(self):

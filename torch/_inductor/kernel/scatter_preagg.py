@@ -99,31 +99,39 @@ def _has_native_bf16_atomics(device: torch.device) -> bool:
 
 
 def _ineligible(device: torch.device | None, dtype: torch.dtype) -> str | None:
-    """Skip reason from the device, dtype and determinism alone, or None."""
+    """Skip reason from the device and dtype alone, or None."""
     if device is None or device.type != "cuda":
         return "device"
     if dtype not in _ACC_DTYPE:
         return "dtype"
-    if dtype == torch.bfloat16 and not _has_native_bf16_atomics(device):
-        return "bf16_atomics"
-    if config.deterministic or torch.are_deterministic_algorithms_enabled():
-        return "deterministic"
     return None
+
+
+def _deterministic() -> bool:
+    return config.deterministic or torch.are_deterministic_algorithms_enabled()
+
+
+def _needs_sorted(device: torch.device, dtype: torch.dtype) -> bool:
+    """
+    True when the scatter must use the atomic-free sorted lowering: under
+    deterministic algorithms, and for bf16 without native atomics (plain Triton
+    bf16 atomics are a CAS loop and serialize badly under contention).
+    """
+    return _deterministic() or (
+        dtype == torch.bfloat16 and not _has_native_bf16_atomics(device)
+    )
 
 
 def can_bypass_atomic_fallback(dtype: torch.dtype, device: torch.device | None) -> bool:
     """
     True when an accumulating scatter that Inductor would otherwise send to the
-    eager fallback because of atomic_add dtype limitations may be offered to this
-    template instead. The template sums each chunk in fp32 and issues one
-    output-dtype atomic per destination per chunk, so it only needs the
-    hardware to have native atomics for the output dtype (plain Triton bf16
-    atomics are a CAS loop and serialize badly under contention).
+    eager fallback, because of atomic_add dtype limitations or deterministic
+    algorithms, may be offered to this template instead.
     """
     return (
         config.scatter_preagg_enabled
-        and dtype == torch.bfloat16
         and _ineligible(device, dtype) is None
+        and (dtype == torch.bfloat16 or _deterministic())
     )
 
 
@@ -157,8 +165,15 @@ def claims_index_put(
         if j != scatter_dim
     ):
         return False
-    if _ineligible(input_meta["device"], input_meta["dtype"]) is not None:
+    device, dtype = input_meta["device"], input_meta["dtype"]
+    if _ineligible(device, dtype) is not None:
         return False
+    if _needs_sorted(device, dtype):
+        # The sorted lowering has no contention gate but needs static sizes.
+        return not any(
+            isinstance(s, torch.SymInt)
+            for s in (*input_meta["shape"], *index_meta["shape"])
+        )
     return (
         _passes_size_gates(
             index_size, output_size // scatter_dim_size, scatter_dim_size
@@ -569,6 +584,143 @@ scatter_preagg_template = ScatterPreaggTemplate(
     source=_TEMPLATE_SOURCE,
 )
 
+# The sorted (atomic-free, deterministic) lowering. Tokens arrive sorted by
+# destination key (SKEYS, with PERM their original positions), so every
+# destination is one contiguous segment. Each program sums the segments in its
+# chunk of BLOCK_T sorted tokens in a fixed order. A segment that starts and
+# ends in the chunk has no other writer and is added to OUT directly; the parts
+# of segments that cross a chunk boundary go to PART (slot 0: the chunk's first
+# segment, continued from the previous chunk; slot 1: its last segment,
+# continued into the next) for the fixup kernel to add in chunk order.
+_SORTED_PRELUDE = r"""
+{{preagg_def_kernel()}}
+    PART = IN0
+    SKEYS = IN1
+    PERM = IN2
+    pid_tok = tl.program_id(0).to(INDEX_DTYPE)
+    pid_inner = tl.program_id(1).to(INDEX_DTYPE)
+    pos = tl.arange(0, BLOCK_T).to(INDEX_DTYPE)
+    first = pid_tok * BLOCK_T
+    last = tl.minimum(first + BLOCK_T, NUM_TOKENS) - 1
+    first_key = tl.load(SKEYS + first)
+    last_key = tl.load(SKEYS + last)
+    prev_key = tl.where(pid_tok > 0, tl.load(SKEYS + tl.maximum(first - 1, 0)), -1)
+    next_key = tl.where(
+        last + 1 < NUM_TOKENS, tl.load(SKEYS + tl.minimum(last + 1, NUM_TOKENS - 1)), -1
+    )
+"""
+
+_SORTED_INNER_LOOP = r"""
+    for it in tl.range(0, D_ITERS):
+        inner_raw = (pid_inner * D_ITERS + it) * BLOCK_D + tl.arange(0, BLOCK_D)
+        inner_mask = inner_raw < NUM_INNER
+        if NUM_INNER % (BLOCK_D * D_ITERS) == 0:
+            inner = inner_raw[None, :]
+        else:
+            inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
+"""
+
+_SORTED_CHUNK_SOURCE = (
+    _SORTED_PRELUDE
+    + r"""
+    spos = first + pos
+    in_range = spos < NUM_TOKENS
+    sp = tl.minimum(spos, NUM_TOKENS - 1)
+    skey = tl.where(in_range, tl.load(SKEYS + sp), NUM_KEYS)
+    ptok = tl.load(PERM + sp).to(INDEX_DTYPE)[:, None]
+    next_skey = tl.gather(skey, tl.minimum(pos + 1, BLOCK_T - 1), 0)
+    seg_end = (skey < NUM_KEYS) & ((skey != next_skey) | (pos == BLOCK_T - 1))
+    head = (skey == first_key) & (first_key == prev_key)
+    tail = (skey == last_key) & (last_key == next_key) & ~head
+    direct = (seg_end & ~head & ~tail)[:, None]
+    out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
+    seg_key = tl.broadcast_to(skey.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
+"""
+    + _SORTED_INNER_LOOP
+    + r"""
+        {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
+
+        _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
+        mask = direct & inner_mask[None, :]
+        addr = tl.broadcast_to(
+            OUT + ({{preagg_addr("out_key", "inner")}}), [BLOCK_T, BLOCK_D]
+        )
+        old = tl.load(addr, mask=mask, other=0).to(acc.dtype)
+        tl.store(addr, (old + acc).to(OUT_DTYPE), mask=mask)
+        part = PART + pid_tok * NUM_INNER + inner_raw[None, :]
+        tl.store(
+            part + tl.where(head, 0, NUM_CHUNKS * NUM_INNER)[:, None],
+            acc,
+            mask=(seg_end & (head | tail))[:, None] & inner_mask[None, :],
+        )
+
+
+@triton.jit
+def _preagg_segmented_sum(key_a, val_a, key_b, val_b):
+    return key_b, tl.where(key_a == key_b, val_a + val_b, val_b)
+"""
+)
+
+# The chunk where a crossing segment starts owns it: it adds the head parts of
+# the following chunks, in order, to its tail part and writes the destination.
+_SORTED_FIXUP_SOURCE = (
+    _SORTED_PRELUDE
+    + r"""
+    owns = (
+        (last_key == next_key)
+        & ((first_key != last_key) | (first_key != prev_key))
+        & (last_key < NUM_KEYS)
+    )
+    if owns:
+        out_key = last_key.to(INDEX_DTYPE)
+"""
+    + _SORTED_INNER_LOOP.replace("\n    ", "\n        ")
+    + r"""
+            acc = tl.load(
+                PART + NUM_CHUNKS * NUM_INNER + pid_tok * NUM_INNER + inner_raw,
+                mask=inner_mask,
+            )[None, :]
+            # Keys are sorted, so a later chunk continues the segment iff its
+            # first key is still last_key.
+            chunk = pid_tok + 1 + tl.arange(0, 32).to(INDEX_DTYPE)
+            more = True
+            while more:
+                in_seg = (chunk < NUM_CHUNKS) & (
+                    tl.load(SKEYS + tl.minimum(chunk, NUM_CHUNKS - 1) * BLOCK_T)
+                    == last_key
+                )
+                heads = tl.load(
+                    PART + chunk[:, None] * NUM_INNER + inner_raw[None, :],
+                    mask=in_seg[:, None] & inner_mask[None, :],
+                    other=0,
+                )
+                acc += tl.sum(heads, 0)[None, :]
+                more = (tl.max(chunk) + 1 < NUM_CHUNKS) & (
+                    tl.min(in_seg.to(tl.int32)) == 1
+                )
+                chunk += 32
+            addr = tl.broadcast_to(
+                OUT + ({{preagg_addr("out_key", "inner")}}), [1, BLOCK_D]
+            )
+            mask = inner_mask[None, :]
+            old = tl.load(addr, mask=mask, other=0).to(acc.dtype)
+            tl.store(addr, (old + acc).to(OUT_DTYPE), mask=mask)
+"""
+)
+
+scatter_sorted_chunk_template = ScatterPreaggTemplate(
+    name="scatter_sorted_chunk",
+    grid=scatter_preagg_grid,
+    always_freeze_layout=True,
+    source=_SORTED_CHUNK_SOURCE,
+)
+scatter_sorted_fixup_template = ScatterPreaggTemplate(
+    name="scatter_sorted_fixup",
+    grid=scatter_preagg_grid,
+    always_freeze_layout=True,
+    source=_SORTED_FIXUP_SOURCE,
+)
+
 
 def _analyze(
     out_layout: ir.Layout,
@@ -658,6 +810,88 @@ def _materialize_values(
     return values.make_loader()
 
 
+def _lower_sorted(
+    out: ir.TensorBox,
+    plan: _ScatterPlan,
+    value_subgraph: ir.ComputedBuffer,
+    inputs: list[ir.IRNode],
+    cfg: Any,
+) -> bool:
+    """
+    Atomic-free lowering: sort the tokens by destination, then sum each
+    destination's contiguous run in a fixed order (see _SORTED_CHUNK_SOURCE).
+    """
+    from ..lowering import empty_strided, lowerings
+    from ..virtualized import ops
+
+    if not (plan.num_tokens.is_number and plan.num_inner.is_number):
+        _record_skip("sorted_dynamic")
+        return False
+    device, dtype = out.get_device(), out.get_dtype()
+    num_tokens, num_inner = int(plan.num_tokens), int(plan.num_inner)
+
+    def key_fn(idx: list[sympy.Expr]) -> Any:
+        coords = plan.iteration_coords(idx[0], sympy.S.Zero)
+        return ops.index_expr(plan.key_expr(plan.output_indexer(coords)), torch.int64)
+
+    keys = ir.Pointwise.create(
+        device=device, dtype=torch.int64, inner_fn=key_fn, ranges=[num_tokens]
+    )
+    sorted_keys, perm = lowerings[torch.ops.aten.sort.stable](keys, stable=True)
+    sorted_keys.realize()
+    perm.realize()
+    num_chunks = -(-num_tokens // cfg.block_t)
+    part = empty_strided(
+        [2 * num_chunks * num_inner], [1], dtype=plan.acc_dtype, device=device
+    )
+    part.realize()
+    nodes: list[ir.IRNode] = []
+    for x in (part, sorted_keys, perm):
+        ir.as_storage_and_layout(x, freeze=True)
+        nodes.append(x)
+
+    layout = ir.FixedLayout(device=device, dtype=dtype, size=[1], stride=[1])
+    kwargs = {
+        "BLOCK_T": cfg.block_t,
+        "BLOCK_D": cfg.block_d,
+        "D_ITERS": cfg.d_iters,
+        "NUM_TOKENS": num_tokens,
+        "NUM_INNER": num_inner,
+        "NUM_KEYS": int(plan.num_keys),
+        "NUM_CHUNKS": num_chunks,
+        "OUT_DTYPE": triton_type(dtype),
+    }
+    stages = [
+        ("scatter_sorted_chunk", scatter_sorted_chunk_template, [out, part], inputs),
+        ("scatter_sorted_fixup", scatter_sorted_fixup_template, [out], []),
+    ]
+    selections = []
+    for name, template, mutated, extra in stages:
+        choices: list[Any] = []
+        input_nodes = [out, *nodes, *extra]
+        template.maybe_append_choice(
+            choices,
+            input_nodes=input_nodes,
+            layout=layout,
+            num_stages=cfg.num_stages,
+            num_warps=cfg.num_warps,
+            subgraphs=[value_subgraph],
+            mutated_inputs=mutated,
+            call_sizes=[plan.num_tokens, plan.num_inner],
+            **kwargs,
+        )
+        if not choices:
+            _record_skip("codegen_failed")
+            return False
+        selections.append((name, choices, input_nodes))
+    for name, choices, input_nodes in selections:
+        autotune_select_algorithm(
+            name, choices, input_nodes, layout, return_multi_template=False
+        )
+    counters["inductor"]["scatter_preagg_sorted"] += 1
+    return True
+
+
 def maybe_preaggregated_scatter(
     out: ir.TensorBox,
     value_fn: Callable[[list[sympy.Expr]], Any],
@@ -685,7 +919,7 @@ def maybe_preaggregated_scatter(
                 read_names.add(name)
     if _try_template(out, value_fn, iter_sizes, output_indexer, read_names):
         return True
-    if needs_fallback_due_to_atomic_add_limitations(out.get_dtype()):
+    if needs_fallback_due_to_atomic_add_limitations(out.get_dtype()) or _deterministic():
         atomic_fallback()
         return True
     return False
@@ -766,7 +1000,10 @@ def _try_template(
         _hint(plan.num_inner),
         _hint(plan.num_keys),
     )
-    reason = _passes_size_gates(num_tokens, num_inner, num_keys)
+    # The sorted lowering replaces eager's fallback, not atomics, so the
+    # contention gates do not apply to it.
+    sorted_path = _needs_sorted(device, dtype)
+    reason = None if sorted_path else _passes_size_gates(num_tokens, num_inner, num_keys)
     if reason is not None:
         _record_skip(reason)
         return False
@@ -788,13 +1025,15 @@ def _try_template(
             out_layout.stride[plan.inner_out_dims[-1]], 1
         )
     )
-    configs = V.choices.get_scatter_preagg_configs(
-        num_tokens,
-        num_inner,
-        dtype,
-        device_type=device.type,
-        inner_contiguous=inner_contiguous,
-    )
+    # Deterministic results need the same config on every compile.
+    with config.patch(max_autotune=config.max_autotune and not sorted_path):
+        configs = V.choices.get_scatter_preagg_configs(
+            num_tokens,
+            num_inner,
+            dtype,
+            device_type=device.type,
+            inner_contiguous=inner_contiguous,
+        )
     # The sort packs (key, position) into one integer.
     key_bits = (num_keys + 1).bit_length()
     configs = [c for c in configs if key_bits + c.block_t.bit_length() - 1 <= 62]
@@ -826,6 +1065,11 @@ def _try_template(
         ),
     )
     value_subgraph.preagg_plan = plan  # type: ignore[attr-defined]
+    if sorted_path:
+        if not _lower_sorted(out, plan, value_subgraph, inputs, configs[-1]):
+            return False
+        counters["inductor"]["scatter_preagg_applied"] += 1
+        return True
 
     layout = ir.FixedLayout(device=device, dtype=dtype, size=[1], stride=[1])
     # On CDNA, fp32 atomics run ~1.7x faster at two elements per thread than at

@@ -5063,7 +5063,9 @@ def index_put_impl_(self, indices, values, accumulate, check, may_realize=False)
         return index_put_as_masked_fill(self, [mask], values, accumulate)
 
     # Fallback in torch deterministic mode
-    if torch.are_deterministic_algorithms_enabled():
+    if torch.are_deterministic_algorithms_enabled() and not (
+        accumulate and _preagg_lifts_atomic_fallback(self.get_dtype(), self.get_device())
+    ):
         return index_put_fallback(self, indices, values, accumulate)
 
     # Fallback if there is a boolean index
