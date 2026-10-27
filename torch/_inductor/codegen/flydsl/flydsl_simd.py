@@ -2769,11 +2769,27 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         compile_wrapper.splice(src_code, strip=True)
         compile_wrapper.writeline("''', precompile_metadata={})")
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
-        wrapper.define_kernel(
-            kernel_name,
-            compile_wrapper.getvalue(),
-            f"# kernel path: {kernel_path}\n{origins}\n{detailed}",
-        )
+        metadata = f"# kernel path: {kernel_path}\n{origins}\n{detailed}"
+        body = compile_wrapper.getvalue()
+        if not getattr(wrapper, "flydsl_waits_for_pool", False):
+            # async_compile hands kernels to the compile workers only once the pool is
+            # up, and those defined before are compiled lazily on their first call, one
+            # at a time: 39 flyc.compile calls, 11 s of Llama inference's 17 s first
+            # step. The pool has been starting since compilation began; the module runs
+            # this line on load, after all of codegen. Not when the first kernel's code
+            # object is already on disk (a warm start compiles nothing): 7.6 s vs 4 s.
+            wrapper.flydsl_waits_for_pool = True
+            if not V.graph.cpp_wrapper:
+                literal = body[body.index("r'''") + 4 : body.rindex("'''")]
+                stem = get_path(code_hash(literal.strip()), "py")[2].rsplit(".", 1)[0]
+                variant = "_c0" if f"{kernel_name}_c0_kernel" in literal else ""
+                binary = f"{stem}.{kernel_name}{variant}.hsaco"
+                metadata = (
+                    f"if not os.path.exists({binary!r}):\n"
+                    "    async_compile.wait_process_pool_ready()\n"
+                    f"{metadata}"
+                )
+        wrapper.define_kernel(kernel_name, body, metadata)
         return kernel_name
 
 
