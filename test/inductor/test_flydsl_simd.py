@@ -265,6 +265,14 @@ class TestFlyDSLSIMD(TestCase):
             torch._dynamo.reset()
             self.check(lambda x: x.t().contiguous() * 2, i)
         torch._dynamo.reset()
+        # Blocks wider than a staging pass of full vectors covers.
+        h = torch.randn(512, 768, device="cuda", dtype=torch.bfloat16)
+        for threads in (256, 512):
+            with _tune_override({"threads": threads, "autotune": 0}):
+                self.check(lambda x: x.t().contiguous() * 2, h, atol=1e-2, rtol=1e-2)
+                torch._dynamo.reset()
+                self.check(lambda x: x.t().contiguous() * 2, a)
+            torch._dynamo.reset()
         c, b = torch.randn(4, 64, 30, 30, device="cuda"), torch.randn(64, device="cuda")
         self.check(
             lambda c, b: (c + b.view(1, -1, 1, 1)).to(
@@ -476,6 +484,7 @@ class TestFlyDSLSIMD(TestCase):
     def test_atomic_add_of_row_reduction(self):
         # A row's sum scattered with an atomic add: every thread of the row group holds
         # the sum, and exactly one of them may add it.
+        torch.manual_seed(0)
         for dtype, d in ((torch.float32, 1024), (torch.bfloat16, 1024), (torch.float32, 96)):
             torch._dynamo.reset()
             x = torch.randn(512, d, device="cuda", dtype=dtype)
@@ -489,7 +498,8 @@ class TestFlyDSLSIMD(TestCase):
             ref = torch.zeros(64, device="cuda", dtype=torch.float64).index_put_(
                 (ix,), x.double().sum(-1), accumulate=True
             )
-            tol = 0.5 if dtype == torch.bfloat16 else 1e-3
+            # bf16 partial sums near 90 round to 0.5, in an atomic order that varies.
+            tol = 2.0 if dtype == torch.bfloat16 else 1e-3
             torch.testing.assert_close(out.double(), ref, atol=tol, rtol=2e-2)
 
     # -- training --------------------------------------------------------------------

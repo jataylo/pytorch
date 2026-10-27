@@ -60,6 +60,7 @@ from ...utils import (
     get_fused_kernel_name,
     get_kernel_metadata,
     Placeholder,
+    sympy_product,
     upcast_compute_type,
 )
 from ...virtualized import ops, OpsWrapper, V
@@ -89,7 +90,8 @@ THREADS = 256
 # At 2M elements the candidates tied on every Llama and GPT kernel, doubling their
 # compile time for nothing.
 AUTOTUNE_MIN_NUMEL = 1 << 22
-# Transposing tiles, rarer, from here: GPT-2's 3M-element V-head select won 29%.
+# Transposing tiles, rarer, from here: GPT-2's 3M-element V-head select 11.1us ->
+# 9.9us at its candidate (Triton 9.8us).
 AUTOTUNE_MIN_TILE_NUMEL = 1 << 20
 # A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
 TILE_THREADS = 128
@@ -1127,22 +1129,20 @@ class FlyDSLKernel(SIMDKernel):
         reduction kernel's nodes that run once a row (no reduction range)."""
         from ...loop_body import MemoryUsageType
 
-        nodes = list(self.features.scheduler_nodes())
-        calls = self._node_index_vars
-        for i, node in enumerate(nodes):
+        for node in self.features.scheduler_nodes():
             body = getattr(node, "_body", None)
             if body is None or not any(
                 e.mode == "atomic_add" for e in body.memory_usage[MemoryUsageType.STORE]
             ):
                 continue
-            if (
-                per_element
-                and self.is_reduction_kernel
-                and len(calls) == len(nodes)
-                and len(calls[i]) > 1
-                and not calls[i][-1]
-            ):
-                continue
+            if per_element and self.is_reduction_kernel and not node.is_reduction():
+                # A pointwise node's reduction range is always empty; one per row
+                # spans just the kernel's rows.
+                sizes, _ = node.get_ranges()
+                if V.graph.sizevars.statically_known_equals(
+                    sympy_product(sizes), self.numels["x"]
+                ):
+                    continue
             return True
         return False
 
@@ -1596,6 +1596,9 @@ class FlyDSLKernel(SIMDKernel):
         slow = self._tree_sym("y" if self.fast == "x" else "x")
         w = min(8, max(1, 16 // dtype.itemsize))
         while w > 1 and classify_access(root, slow, w) != "contig":
+            w //= 2
+        # A staging pass's threads must fit the tile, or it loads nothing.
+        while w > 1 and (self.tile_s // w) * self.tile_f < self.threads:
             w //= 2
         if w == 1:
             return None
@@ -3101,14 +3104,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                 return []
             # Twice the fast edge, at twice the threads: GPT-2's QKV gradient (three
             # bf16 heads layouts to rows) 39.2us -> 33.4us in the model (Triton 34.3us),
-            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%. Or
-            # the same tile at twice the threads, half the elements each: GPT-2's
-            # V-head select (bf16 heads layout to rows) 11.1us -> 7.9us (Triton
-            # 9.8us), where those standalone cases lose 5-40%.
-            return [
-                {"tile_f": 2 * TILE, "threads": 2 * kernel.threads},
-                {"threads": 2 * kernel.threads},
-            ]
+            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%.
+            return [{"tile_f": 2 * TILE, "threads": 2 * kernel.threads}]
         # Not tuned, as no candidate won across ten models' autotuned kernels: a row's
         # rows per lane group.
         if stage == "column":
