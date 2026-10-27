@@ -203,7 +203,12 @@ def _evaluate_candidate(
         from torch._inductor.kernel.scatter_preagg import claims_index_put
 
         if claims_index_put(
-            input_meta, index_meta, index_size, output_size, scatter_dim_size
+            input_meta,
+            index_meta,
+            index_size,
+            output_size,
+            scatter_dim,
+            scatter_dim_size,
         ):
             _record_skip(ctx, "scatter_preagg", node_name)
             return None

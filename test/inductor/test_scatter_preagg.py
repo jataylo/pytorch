@@ -413,19 +413,36 @@ class TestScatterPreagg(TestCase):
             counters["inductor"]["scatter_preagg_skipped_low_contention"], 1
         )
 
-    def test_skip_values_read_output(self):
-        # values is realized (it reads the scatter target) with a flexible
-        # layout; the template must decline without tracing it.
+    def test_values_read_output(self):
+        # The values read the scatter target, so they must be computed before
+        # the template mutates it.
         def fn(x, i):
             x.index_put_((i,), x[i] * 2, accumulate=True)
             return x
 
         x = torch.randn(16, 64, device=GPU_TYPE)
         idx = _hot_indices(20_000, 16, GPU_TYPE)
-        self._check(fn, x, idx, applied=False)
-        self.assertEqual(counters["inductor"]["scatter_preagg_skipped_reads_output"], 1)
+        self._check(fn, x, idx, rtol=1e-3)
 
-    def test_skip_dynamic_shapes(self):
+    def test_dynamic_shapes(self):
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        # Symbolic token and key counts; covers fewer tokens than a block and
+        # an inner size no tile divides.
+        for n, rows in [(100, 3), (20_000, 16), (30_001, 24)]:
+            x = torch.zeros(rows, 72, device=GPU_TYPE)
+            idx = torch.randint(0, rows, (n,), device=GPU_TYPE)
+            v = torch.randn(n, 72, device=GPU_TYPE)
+            expect = fn(x.clone(), idx, v)
+            for t in (x, idx, v):
+                torch._dynamo.mark_dynamic(t, 0)
+            self.assertEqual(compiled(x, idx, v), expect, atol=1e-3, rtol=1e-3)
+        self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+    def test_skip_dynamic_inner(self):
         x = torch.zeros(16, 8, device=GPU_TYPE)
         idx = torch.randint(0, 16, (20_000,), device=GPU_TYPE)
         v = torch.randn(20_000, 8, device=GPU_TYPE)
@@ -434,8 +451,21 @@ class TestScatterPreagg(TestCase):
             return torch.index_put(x, (i,), v, accumulate=True)
 
         self._check(fn, x, idx, v, applied=False, dynamic=True)
+        self.assertEqual(
+            counters["inductor"]["scatter_preagg_skipped_dynamic_inner"], 1
+        )
 
-    def test_skip_masked_value_producer(self):
+    def test_output_view(self):
+        def fn(i, v):
+            base = v.new_zeros(64, 16)
+            base[32:].t().index_add_(0, i, v)
+            return base
+
+        idx = _hot_indices(20_000, 16, GPU_TYPE)
+        v = torch.randn(20_000, 32, device=GPU_TYPE)
+        self._check(fn, idx, v, rtol=1e-3)
+
+    def test_masked_value_producer_materialized(self):
         x = torch.zeros(16, 40, device=GPU_TYPE)
         idx = torch.randint(0, 16, (20_000,), device=GPU_TYPE)
         v = torch.randn(20_000, 32, device=GPU_TYPE)
@@ -445,10 +475,8 @@ class TestScatterPreagg(TestCase):
                 x, (i,), torch.nn.functional.pad(v, (4, 4)), accumulate=True
             )
 
-        self._check(fn, x, idx, v, applied=False)
-        self.assertEqual(
-            counters["inductor"]["scatter_preagg_skipped_unsupported_op"], 1
-        )
+        self._check(fn, x, idx, v)
+        self.assertEqual(counters["inductor"]["scatter_preagg_materialized_values"], 1)
 
     @config.patch(partitioned_scatter_enabled=True)
     def test_partitioned_scatter_defers(self):

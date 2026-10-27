@@ -142,6 +142,7 @@ def claims_index_put(
     index_meta: dict[str, Any],
     index_size: int,
     output_size: int,
+    scatter_dim: int,
     scatter_dim_size: int,
 ) -> bool:
     """
@@ -152,7 +153,8 @@ def claims_index_put(
         return False
     if any(
         isinstance(s, torch.SymInt)
-        for s in (*input_meta["shape"], *index_meta["shape"])
+        for j, s in enumerate(input_meta["shape"])
+        if j != scatter_dim
     ):
         return False
     if _ineligible(input_meta["device"], input_meta["dtype"]) is not None:
@@ -226,7 +228,11 @@ class _IndirectIndexHandler(WrapperHandler):
         self.valid: list[Any] = []
 
     def indirect_indexing(self, x, size, check=True, wrap_neg=True):
-        size_v = self.constant(int(size), torch.int64)
+        size = sympy.sympify(size)
+        if size.is_number:
+            size_v = self.constant(int(size), torch.int64)
+        else:
+            size_v = self.index_expr(size, torch.int64)
         zero = self.constant(0, torch.int64)
         if wrap_neg:
             x = self.where(self.lt(x, zero), self.add(x, size_v), x)
@@ -234,7 +240,7 @@ class _IndirectIndexHandler(WrapperHandler):
             in_bounds = self.and_(self.ge(x, zero), self.lt(x, size_v))
             if check:
                 self.device_assert_async(
-                    in_bounds, f"index out of bounds: 0 <= index < {int(size)}"
+                    in_bounds, f"index out of bounds: 0 <= index < {size}"
                 )
             if self.record_validity:
                 self.valid.append(in_bounds)
@@ -258,7 +264,7 @@ class _IndirectIndexHandler(WrapperHandler):
         )
 
 
-def _unravel(linear: sympy.Expr, sizes: list[int]) -> list[sympy.Expr]:
+def _unravel(linear: sympy.Expr, sizes: list[sympy.Expr]) -> list[sympy.Expr]:
     """Row-major coordinates of ``linear`` over ``sizes``."""
     coords: list[sympy.Expr] = []
     stride = 1
@@ -276,30 +282,30 @@ def _unravel(linear: sympy.Expr, sizes: list[int]) -> list[sympy.Expr]:
 
 @dataclass
 class _ScatterPlan:
-    iter_sizes: list[int]
+    iter_sizes: list[sympy.Expr]
     tok_dims: list[int]
     inner_dims: list[int]
     # output dim fed by each inner iteration dim
     inner_out_dims: list[int]
     key_out_dims: list[int]
-    key_sizes: list[int]
-    out_sizes: list[int]
+    key_sizes: list[sympy.Expr]
+    out_sizes: list[sympy.Expr]
     out_indexer: Callable[[list[sympy.Expr]], sympy.Expr]
     output_indexer: Callable[[list[sympy.Expr]], list[sympy.Expr]]
     value_fn: Callable[[list[sympy.Expr]], Any]
     acc_dtype: torch.dtype
 
     @property
-    def num_tokens(self) -> int:
-        return int(sympy_product([self.iter_sizes[d] for d in self.tok_dims]))
+    def num_tokens(self) -> sympy.Expr:
+        return sympy_product([self.iter_sizes[d] for d in self.tok_dims])
 
     @property
-    def num_inner(self) -> int:
-        return int(sympy_product([self.iter_sizes[d] for d in self.inner_dims]))
+    def num_inner(self) -> sympy.Expr:
+        return sympy_product([self.iter_sizes[d] for d in self.inner_dims])
 
     @property
-    def num_keys(self) -> int:
-        return int(sympy_product(self.key_sizes))
+    def num_keys(self) -> sympy.Expr:
+        return sympy_product(self.key_sizes)
 
     def iteration_coords(
         self, token: sympy.Expr, inner: sympy.Expr
@@ -331,16 +337,8 @@ class _ScatterPlan:
         return self.out_indexer(coords)
 
 
-def _static_ints(sizes: Any) -> list[int] | None:
-    out = []
-    for s in sizes:
-        if isinstance(s, int):
-            out.append(s)
-        elif isinstance(s, sympy.Integer):
-            out.append(int(s))
-        else:
-            return None
-    return out
+def _hint(expr: sympy.Expr) -> int:
+    return V.graph.sizevars.optimization_hint(expr)
 
 
 class ScatterPreaggTemplateKernel(TritonTemplateKernel):
@@ -348,6 +346,7 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
         super().__init__(*args, **kwargs)
         self._register_extra_template_env_fns(
             self.preagg_def_kernel,
+            self.preagg_sizes,
             self.preagg_key,
             self.preagg_value,
             self.preagg_addr,
@@ -369,6 +368,20 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
         if out_name not in V.graph.removed_buffers:
             self.args.output(out_name)
         return code
+
+    def preagg_sizes(self) -> str:
+        """Kernel-argument definitions of the sizes that are not constexprs."""
+        plan = self._plan
+        sizes = {
+            "NUM_TOKENS": plan.num_tokens,
+            "NUM_INNER": plan.num_inner,
+            "NUM_KEYS": plan.num_keys,
+        }
+        return "\n".join(
+            f"{name} = {self.kexpr(self.rename_indexing(size))}"
+            for name, size in sizes.items()
+            if not size.is_number
+        )
 
     def _codegen_subgraph(
         self,
@@ -469,21 +482,23 @@ class ScatterPreaggTemplate(TritonTemplate):
 
 _TEMPLATE_SOURCE = r"""
 {{preagg_def_kernel()}}
+    {{preagg_sizes() | indent_except_first(1)}}
     pid_tok = tl.program_id(0).to(INDEX_DTYPE)
     pid_inner = tl.program_id(1).to(INDEX_DTYPE)
     pos = tl.arange(0, BLOCK_T).to(INDEX_DTYPE)
-    # Subgraph loads are unmasked, so every lane must address a real token. The
-    # last chunk is shifted back to end at NUM_TOKENS (lanes it shares with the
-    # previous chunk are masked off) rather than clamped, which keeps the token
-    # range contiguous for the compiler.
-    if NUM_TOKENS >= BLOCK_T:
-        tok_start = tl.minimum(pid_tok * BLOCK_T, NUM_TOKENS - BLOCK_T)
+    # Subgraph loads are unmasked, so every lane must address a real token.
+    # Given one full block, the last block is shifted back to end at NUM_TOKENS
+    # (lanes it shares with the previous block are masked off) rather than
+    # clamped, which keeps the token range contiguous for the compiler.
+    tok_block = pid_tok * BLOCK_T
+    if TOK_SHIFT:
+        tok_start = tl.minimum(tok_block, NUM_TOKENS - BLOCK_T)
         tok = tok_start + pos
-        tok_mask = tok >= pid_tok * BLOCK_T
+        tok_mask = tok >= tok_block
     else:
-        tok_start = 0
-        tok = tl.minimum(pos, NUM_TOKENS - 1)
-        tok_mask = pos < NUM_TOKENS
+        tok_start = tok_block
+        tok = tl.minimum(tok_block + pos, NUM_TOKENS - 1)
+        tok_mask = tok_block + pos < NUM_TOKENS
 
     {{preagg_key("tok", "key", "valid") | indent_except_first(1)}}
 
@@ -491,15 +506,16 @@ _TEMPLATE_SOURCE = r"""
     packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
     skey = packed >> LOG_BLOCK_T
     sorted_pos = (packed & (BLOCK_T - 1)).to(INDEX_DTYPE)
-    if NUM_TOKENS >= BLOCK_T:
+    if TOK_SHIFT:
         ptok = (tok_start + sorted_pos)[:, None]
     else:
-        ptok = tl.minimum(sorted_pos, NUM_TOKENS - 1)[:, None]
+        ptok = tl.minimum(tok_start + sorted_pos, NUM_TOKENS - 1)[:, None]
 
     next_key = tl.gather(skey, tl.minimum(pos + 1, BLOCK_T - 1), 0)
     seg_end = (skey < NUM_KEYS) & ((skey != next_key) | (pos == BLOCK_T - 1))
     out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
-    seg_key = tl.broadcast_to(skey[:, None], (BLOCK_T, BLOCK_D))
+    # Keys are below the output's storage size, so INDEX_DTYPE holds them.
+    seg_key = tl.broadcast_to(skey.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
     if SKIP_UNIQUE_SCAN:
         # Every valid token that does not end a segment has a duplicate.
         has_dup = tl.max(((skey < NUM_KEYS) & ~seg_end).to(tl.int32), 0) > 0
@@ -555,14 +571,17 @@ scatter_preagg_template = ScatterPreaggTemplate(
 
 
 def _analyze(
-    out_buf: ir.Buffer,
-    out_sizes: list[int],
-    iter_sizes: list[int],
+    out_layout: ir.Layout,
+    out_sizes: list[sympy.Expr],
+    iter_sizes: list[sympy.Expr],
     value_fn: Callable[[list[sympy.Expr]], Any],
     output_indexer: Callable[[list[sympy.Expr]], list[sympy.Expr]],
     acc_dtype: torch.dtype,
-) -> tuple[_ScatterPlan, OrderedSet[str]] | str:
-    """Classify iteration dims into token/inner dims. Returns a skip reason on failure."""
+) -> tuple[_ScatterPlan, OrderedSet[str], OrderedSet[str]] | str:
+    """
+    Classify iteration dims into token/inner dims. Returns the plan and the
+    buffers the key and value functions read, or a skip reason on failure.
+    """
     iter_syms = [
         sympy.Symbol(f"preagg_i{d}", integer=True, nonnegative=True)
         for d in range(len(iter_sizes))
@@ -581,7 +600,7 @@ def _analyze(
             list(key_rec.unsupported),
             list(value_rec.unsupported),
         )
-        return "unsupported_op"
+        return "unsupported_key_op" if key_rec.unsupported else "unsupported_value_op"
     if len(out_coords) != len(out_sizes):
         return "rank_mismatch"
 
@@ -607,12 +626,36 @@ def _analyze(
         key_out_dims=key_out_dims,
         key_sizes=[out_sizes[j] for j in key_out_dims],
         out_sizes=out_sizes,
-        out_indexer=out_buf.get_layout().make_indexer(),
+        out_indexer=out_layout.make_indexer(),
         output_indexer=output_indexer,
         value_fn=value_fn,
         acc_dtype=acc_dtype,
     )
-    return plan, key_rec.read_names | value_rec.read_names
+    return plan, key_rec.read_names, value_rec.read_names
+
+
+def _materialize_values(
+    value_fn: Callable[[list[sympy.Expr]], Any],
+    sizes: list[Any],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Callable[[list[sympy.Expr]], Any]:
+    """
+    Compute the values into their own buffer (before the scatter mutates the
+    output) and return a plain loader of it, for value functions the template
+    cannot inline: ones that read the output or use unsupported ops.
+    """
+    from ..virtualized import ops
+
+    values = ir.Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda idx: ops.to_dtype(value_fn(idx), dtype),
+        ranges=list(sizes),
+    )
+    values.realize()
+    values.data.data.freeze_layout()  # type: ignore[union-attr]
+    return values.make_loader()
 
 
 def maybe_preaggregated_scatter(
@@ -637,6 +680,9 @@ def maybe_preaggregated_scatter(
     for x in inputs:
         if isinstance(x, ir.IRNode):
             read_names |= x.get_read_names()
+            # A realized input reports the reads of its producer, not itself.
+            if (name := ir.try_get_name(x)) is not None:
+                read_names.add(name)
     if _try_template(out, value_fn, iter_sizes, output_indexer, read_names):
         return True
     if needs_fallback_due_to_atomic_add_limitations(out.get_dtype()):
@@ -659,27 +705,26 @@ def _try_template(
         _record_skip(reason)
         return False
 
-    if not (
-        isinstance(out, ir.TensorBox)
-        and isinstance(out.data, ir.StorageBox)
-        and isinstance(out.data.data, ir.Buffer)
-    ):
+    # A view output is scattered through its layout into the base buffer.
+    try:
+        view = out.data
+        if isinstance(view, ir.BaseView):
+            view = ir.ExternKernel.convert_to_reinterpret_view(view)
+        out_storage, out_layout = ir.as_storage_and_layout(view, freeze=True)
+    except NotImplementedError:
+        out_storage = None
+    if out_storage is None or not isinstance(out_storage.data, ir.Buffer):
         _record_skip("output_view")
         return False
-    out_buf = out.data.data
+    out_buf = out_storage.data
+    out = ir.TensorBox(out_storage)
 
-    out_sizes = _static_ints(out.get_size())
-    sizes = _static_ints(iter_sizes)
-    if out_sizes is None or sizes is None:
-        _record_skip("dynamic_shape")
-        return False
-    if 0 in out_sizes or 0 in sizes or len(out_sizes) == 0:
+    out_sizes = [sympy.sympify(s) for s in out_layout.size]
+    sizes = [sympy.sympify(s) for s in iter_sizes]
+    if len(out_sizes) == 0 or 0 in [_hint(s) for s in (*out_sizes, *sizes)]:
         _record_skip("empty")
         return False
 
-    if out_buf.get_name() in read_names:
-        _record_skip("reads_output")
-        return False
     # Tracing the loaders below indexes any realized input directly, which
     # needs a fixed layout.
     for name in read_names:
@@ -689,19 +734,38 @@ def _try_template(
     if isinstance(out_buf.layout, ir.FlexibleLayout):
         out_buf.freeze_layout()
 
-    analyzed = _analyze(
-        out_buf, out_sizes, sizes, value_fn, output_indexer, _ACC_DTYPE[dtype]
-    )
+    def analyze():
+        return _analyze(
+            out_layout, out_sizes, sizes, value_fn, output_indexer, _ACC_DTYPE[dtype]
+        )
+
+    analyzed = analyze()
+    if analyzed == "unsupported_value_op" or (
+        not isinstance(analyzed, str) and out_buf.get_name() in analyzed[2]
+    ):
+        value_fn = _materialize_values(value_fn, sizes, device, dtype)
+        counters["inductor"]["scatter_preagg_materialized_values"] += 1
+        analyzed = analyze()
     if isinstance(analyzed, str):
         _record_skip(analyzed)
         return False
-    plan, traced_reads = analyzed
+    plan, key_reads, value_reads = analyzed
+    traced_reads = key_reads | value_reads
 
     if out_buf.get_name() in traced_reads:
         _record_skip("reads_output")
         return False
+    # A symbolic row size hides the alignment that vectorized loads and atomics
+    # need; measured on gfx942 this loses to partitioned scatter and atomics.
+    if not plan.num_inner.is_number:
+        _record_skip("dynamic_inner")
+        return False
 
-    num_tokens, num_inner, num_keys = plan.num_tokens, plan.num_inner, plan.num_keys
+    num_tokens, num_inner, num_keys = (
+        _hint(plan.num_tokens),
+        _hint(plan.num_inner),
+        _hint(plan.num_keys),
+    )
     if num_keys >= 2**31:
         _record_skip("key_space")
         return False
@@ -724,7 +788,7 @@ def _try_template(
     inner_contiguous = (
         not plan.inner_out_dims
         or V.graph.sizevars.statically_known_equals(
-            out_buf.get_layout().stride[plan.inner_out_dims[-1]], 1
+            out_layout.stride[plan.inner_out_dims[-1]], 1
         )
     )
     configs = V.choices.get_scatter_preagg_configs(
@@ -737,6 +801,16 @@ def _try_template(
     # The sort packs (key, position) into one integer.
     key_bits = (num_keys + 1).bit_length()
     configs = [c for c in configs if key_bits + c.block_t.bit_length() - 1 <= 62]
+    # Symbolic sizes are runtime arguments; the key width cannot follow the hint.
+    static_sizes = {
+        name: int(size)
+        for name, size in (
+            ("NUM_TOKENS", plan.num_tokens),
+            ("NUM_INNER", plan.num_inner),
+            ("NUM_KEYS", plan.num_keys),
+        )
+        if size.is_number
+    }
     if not configs:
         _record_skip("key_space")
         return False
@@ -763,6 +837,7 @@ def _try_template(
     atomic_vec = 2 if torch.version.hip else 0
     # Skipping the scan for blocks with no repeated destination pays for its
     # check only on wide slices or 16-bit outputs (measured on gfx942).
+    sizevars = V.graph.sizevars
     choices: list[Any] = []
     for cfg in configs:
         log_block_t = cfg.block_t.bit_length() - 1
@@ -774,15 +849,16 @@ def _try_template(
             num_warps=cfg.num_warps,
             subgraphs=[value_subgraph],
             mutated_inputs=[out],
-            call_sizes=[num_tokens, num_inner],
+            call_sizes=[plan.num_tokens, plan.num_inner],
             BLOCK_T=cfg.block_t,
             BLOCK_D=cfg.block_d,
             D_ITERS=cfg.d_iters,
             LOG_BLOCK_T=log_block_t,
-            NUM_TOKENS=num_tokens,
-            NUM_INNER=num_inner,
-            NUM_KEYS=num_keys,
-            KEY_DTYPE="tl.int32" if key_bits + log_block_t <= 31 else "tl.int64",
+            KEY_DTYPE=(
+                "tl.int32"
+                if "NUM_KEYS" in static_sizes and key_bits + log_block_t <= 31
+                else "tl.int64"
+            ),
             OUT_DTYPE=triton_type(dtype),
             ATOMIC_VEC=(
                 0
@@ -791,6 +867,11 @@ def _try_template(
                 else atomic_vec
             ),
             SKIP_UNIQUE_SCAN=dtype.itemsize < 4 or cfg.block_d >= 64,
+            **static_sizes,
+            # A symbolic token count takes the shifted path under a guard when
+            # its hint does; the clamped path handles any size.
+            TOK_SHIFT=num_tokens >= cfg.block_t
+            and sizevars.guard_or_false(sympy.Ge(plan.num_tokens, cfg.block_t)),
         )
     if not choices:
         _record_skip("codegen_failed")
