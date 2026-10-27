@@ -27,6 +27,7 @@ access), and cross-lane reductions are written so every lane computes the same a
 
 from __future__ import annotations
 
+import contextlib
 import math as _math
 import os as _os
 import re as _re
@@ -413,6 +414,34 @@ def rsrc(addr, nbytes: int):
     return buffer_ops.create_buffer_resource_from_addr(
         _val(addr), num_records_bytes=int(nbytes)
     )
+
+
+def pick(s, *members):
+    """``members[s]`` for a block-uniform ``s``: a merged combo branch choosing its
+    sub-kernel's buffers (descriptors or raw addresses), one callable per sub-kernel
+    returning them.
+
+    A uniform switch building each member's descriptors in its own case, rather than
+    select chains: selects keep every candidate descriptor live at once, which spills
+    SGPRs once a group has a few dozen."""
+    s = _arith.IndexCastOp(T.index(), _val(idx(s))).result
+    wrap: list[bool] = []
+
+    def emit(member):
+        vals = member()
+        wrap[:] = [not isinstance(v, ir.Value) for v in vals]
+        _scf.YieldOp([_val(v) for v in vals])
+
+    # The switch needs its result types up front; this trace of member 0 is left dead.
+    types = [_val(v).type for v in members[0]()]
+    op = _scf.IndexSwitchOp(
+        types,
+        s,
+        list(range(1, len(members))),
+        lambda op, i, _c: emit(members[i + 1]),
+        lambda op: emit(members[0]),
+    )
+    return tuple(ArithValue(r) if w else r for w, r in zip(wrap, op.results))
 
 
 def idx(x):
@@ -2011,6 +2040,51 @@ def save_binary(launch, path: str, kernel: str) -> None:
     with open(tmp, "wb") as f:
         f.write(image)
     _os.replace(tmp, path)
+
+
+def compile_only(launch, *args) -> None:
+    """Compile ``launch`` for ``args`` into its caches without building the host
+    launcher (~18 ms) or launching."""
+    import io
+
+    from flydsl.utils import env
+
+    var = type(env.compile).__dict__["compile_only"].env_var  # "COMPILE_ONLY"
+    old = _os.environ.get(var)
+    _os.environ[var] = "1"
+    try:
+        # FlyDSL prints a line for every compile-only call.
+        with contextlib.redirect_stdout(io.StringIO()):
+            launch(*args)
+    finally:
+        if old is None:
+            del _os.environ[var]
+        else:
+            _os.environ[var] = old
+
+
+def warm_worker() -> None:
+    """A compile worker's first FlyDSL kernel paid ~1.4 s of imports and ~0.5 s of
+    one-time compiler setup; run ahead of the kernels, while Inductor is still
+    generating them."""
+    import flydsl.compiler as flyc
+
+    @flyc.kernel
+    def _warm_kernel(p: fx.Int64):
+        store(rsrc(p, 4), tid(), const(0, "i32"), "i32", mask=tid() < 1)
+
+    @flyc.jit
+    def _warm_launch(p: fx.Int64, stream: fx.Stream = fx.Stream(None)):
+        _warm_kernel(p).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    with contextlib.suppress(Exception):  # only a head start; the kernels report errors
+        compile_only(_warm_launch, 0)
+
+
+def have_binary(path: str) -> bool:
+    """Whether ``save_binary`` already wrote ``path`` (its name holds the module's source
+    hash, so it is this source's code object): a warm start's compile is then nothing."""
+    return _os.path.exists(path)
 
 
 def load_binary(path: str, kernel: str, threads: int, nargs: int):

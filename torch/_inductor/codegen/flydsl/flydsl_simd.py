@@ -2338,12 +2338,52 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
 
 
         def {kname}_precompile(**_):
-            # All-zero addresses with a zero grid: compiles into FlyDSL's disk cache and
-            # launches nothing; the code object is kept beside this module for _main.
+            # Compiles into FlyDSL's disk cache, launching nothing; the code object is
+            # kept beside this module for _main.
+            if fdp.have_binary({kname}_binary):
+                return
             launch = {kname}_flydsl()
-            launch({"0, " * len(arg_names)}0, 0)
+            fdp.compile_only(launch, {"0, " * len(arg_names)}0, 0)
             fdp.save_binary(launch, {kname}_binary, "{kname}_kernel_0")
         """
+
+
+_PTR_RE = re.compile(r"(?<![A-Za-z0-9])(_r_)?((?:in_out_ptr|in_ptr|out_ptr)\d+)\b")
+
+
+def _merge_identical(kernels, inners) -> list[tuple[int, str, list[tuple[str, ...]]]]:
+    """Group a combo's sub-kernels whose bodies differ only in their buffers, as a
+    foreach's per-parameter kernels do (6 distinct of GPT's 22 AdamW sub-kernels).
+    Each group is ``(blocks per member, body, members)``: the body names its j-th
+    buffer ``_g{j}`` (descriptor ``_r__g{j}``), a member lists its buffers in that
+    order. One traced body a group: GPT's largest AdamW kernel compiles in 2.4 s
+    rather than 4.7 s, and runs faster for its smaller code."""
+    groups: dict[tuple[int, str], tuple[int, str, list[tuple[str, ...]]]] = {}
+    for k, inner in zip(kernels, inners):
+        names: list[str] = []
+
+        def rename(m):
+            if m.group(2) not in names:
+                names.append(m.group(2))
+            return f"{m.group(1) or ''}_g{names.index(m.group(2))}"
+
+        body = _PTR_RE.sub(rename, inner)
+        key = (k.num_blocks, body if _tune("combo_merge", 1) else inner)
+        if key not in groups:
+            groups[key] = (k.num_blocks, body, [])
+        groups[key][2].append(tuple(names))
+    out = []
+    for blocks, body, members in groups.values():
+        if len(members) == 1:
+            # Unchanged, under its own buffer names.
+            names = members[0]
+            body = re.sub(
+                r"(?<![A-Za-z0-9])(_r_)?_g(\d+)\b",
+                lambda m: f"{m.group(1) or ''}{names[int(m.group(2))]}",
+                body,
+            )
+        out.append((blocks, body, members))
+    return out
 
 
 def _combo_source(kernels: list[FlyDSLKernel]) -> str:
@@ -2369,23 +2409,50 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
         helpers,
         kernels[0].threads,
     )
+    groups = _merge_identical(kernels, inners)
     start = 0
     with code.indent():
         code.writeline("_bid = fdp.bid()")
-        if len(kernels) == 1:
+        if len(groups) == 1 and len(groups[0][2]) == 1:
             code.writeline("_b = _bid")
             code.splice(inners[0])
             start = kernels[0].num_blocks
-        for i, (k, inner) in enumerate(
-            zip(kernels, inners) if len(kernels) > 1 else []
+        for i, (blocks, inner, members) in enumerate(
+            groups if len(groups) > 1 or len(groups[0][2]) > 1 else []
         ):
-            end = start + k.num_blocks
-            if i == len(kernels) - 1:
+            end = start + blocks * len(members)
+            if len(groups) == 1:
+                pass
+            elif i == len(groups) - 1:
                 code.writeline("else:")
             else:
                 code.writeline(f"{'if' if i == 0 else 'elif'} _bid < {end}:")
-            with code.indent():
-                code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
+            with code.indent() if len(groups) > 1 else contextlib.nullcontext():
+                if len(members) == 1:
+                    code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
+                else:
+                    code.writeline(f"_s = fdp.idiv(_bid - {start}, {blocks})")
+                    code.writeline(f"_b = _bid - {start} - _s * {blocks}")
+                    picks = []
+                    for j in range(len(members[0])):
+                        if f"_r__g{j}" in inner:
+                            picks.append(
+                                (
+                                    f"_r__g{j}",
+                                    lambda n: f"fdp.rsrc({n}, {extents[n]})",
+                                    j,
+                                )
+                            )
+                        if re.search(rf"(?<!['_])\b_g{j}\b(?!')", inner):
+                            picks.append((f"_g{j}", lambda n: n, j))
+                    tuples = ", ".join(
+                        "lambda: ("
+                        + "".join(f"{ref(m[j])}, " for _, ref, j in picks)
+                        + ")"
+                        for m in members
+                    )
+                    targets = "".join(f"{t}, " for t, _, _ in picks)
+                    code.writeline(f"{targets}= fdp.pick(_s, {tuples})")
                 code.splice(inner)
             start = end
     code.splice(
@@ -2404,7 +2471,10 @@ def _autotune_source(srcs: list[str], arg_names: list[str]) -> str:
     parts = [s.replace(kname, n) for s, n in zip(srcs, names)]
     args = ", ".join(arg_names)
     mutated = tuple(i for i, a in enumerate(arg_names) if a.startswith("in_out_ptr"))
-    precompiles = "".join(f"\n            {n}_precompile(**kw)" for n in names)
+    precompiles = "".join(
+        f"\n            if only in (None, {i}):\n                {n}_precompile(**kw)"
+        for i, n in enumerate(names)
+    )
     parts.append(
         f"""
         {kname}_best = None
@@ -2420,7 +2490,7 @@ def _autotune_source(srcs: list[str], arg_names: list[str]) -> str:
             {kname}_best({args}, stream=stream)
 
 
-        def {kname}_precompile(**kw):{precompiles}
+        def {kname}_precompile(only=None, **kw):{precompiles}
         """
     )
     code = IndentedBuffer()
@@ -2744,6 +2814,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         return _autotune_source(srcs, arg_names)
 
     def _define_flydsl_kernel(self, src_code: str, node_schedule) -> str:
+        _warm_compile_workers()
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
             return wrapper.src_to_kernel[src_code]
@@ -2764,10 +2835,23 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         wrapper.src_to_kernel[src_code] = kernel_name
         src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_name)
         _, _, kernel_path = get_path(code_hash(src_code), "py")
+        # An autotuned module's variants compile as separate jobs, one per worker: in
+        # one job they compiled one after another, 2-3 s a kernel.
+        variants = 1
+        while f"{kernel_name}_c{variants}_kernel" in src_code:
+            variants += 1
+        source = f"{kernel_name}_source"
         compile_wrapper = IndentedBuffer()
-        compile_wrapper.writeline(f"async_compile.flydsl({kernel_name!r}, r'''")
-        compile_wrapper.splice(src_code, strip=True)
-        compile_wrapper.writeline("''', precompile_metadata={})")
+        if variants > 1:
+            compile_wrapper.writeline(
+                f"async_compile.flydsl({kernel_name!r}, ({source} := r'''"
+            )
+            compile_wrapper.splice(src_code, strip=True)
+            compile_wrapper.writeline("'''), precompile_metadata={'only': 0})")
+        else:
+            compile_wrapper.writeline(f"async_compile.flydsl({kernel_name!r}, r'''")
+            compile_wrapper.splice(src_code, strip=True)
+            compile_wrapper.writeline("''', precompile_metadata={})")
         origins, detailed = get_kernel_metadata(node_schedule, wrapper)
         metadata = f"# kernel path: {kernel_path}\n{origins}\n{detailed}"
         body = compile_wrapper.getvalue()
@@ -2790,7 +2874,33 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                     f"{metadata}"
                 )
         wrapper.define_kernel(kernel_name, body, metadata)
+        for i in range(1, variants):
+            wrapper.define_kernel(
+                f"{kernel_name}_v{i}",
+                f"async_compile.flydsl({kernel_name!r}, {source}, "
+                f"precompile_metadata={{'only': {i}}})",
+            )
         return kernel_name
+
+
+@functools.cache
+def _warm_compile_workers() -> None:
+    """Once a process: start every compile worker importing and setting up FlyDSL
+    (~2 s each) while the kernels are still being generated."""
+    from torch._inductor import async_compile
+
+    threads = async_compile.get_compile_threads()
+    if (
+        threads <= 1
+        or not async_compile._process_pool_allowed()
+        or config.triton.proton_profiling
+    ):
+        return
+    from .flydsl_simd_runtime import warm_worker
+
+    pool = async_compile.AsyncCompile.process_pool()
+    for _ in range(threads):
+        pool.submit(warm_worker)
 
 
 @functools.cache
