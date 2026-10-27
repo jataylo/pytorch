@@ -1467,7 +1467,7 @@ class FlyDSLKernel(SIMDKernel):
                 and _tune("atomic_pair", 1)
             ):
                 self.load_site += 1
-                key = repr(f"ap{self.load_site}_{name}")
+                key = repr(f"ap{self.load_site}_{arg}")
                 line = (
                     f"fdp.atomic_add_pair(_sc, {key}, _j, {target}, {index_str}, "
                     f"{value}, {st!r}{self._mask_arg(ms)})"
@@ -1494,7 +1494,7 @@ class FlyDSLKernel(SIMDKernel):
         buf = self.stores
         if merged:
             line = (
-                f"fdp.xstore(_xs, {name!r}, _xr, {self.xunroll}, {self.tpr}, _rl, "
+                f"fdp.xstore(_xs, {arg!r}, _xr, {self.xunroll}, {self.tpr}, _rl, "
                 f"_r_{arg}, {index_str}, {value}, {st!r})"
             )
         elif contig:
@@ -1503,7 +1503,7 @@ class FlyDSLKernel(SIMDKernel):
                 # A masked lane's register holds a value its reload would read as 0.
                 seed = f", seed=(_lc, {self._site_key(arg, index_str)})"
             line = (
-                f"fdp.vstore(_sc, {repr(f'st{self.load_site}_{name}')}, _j, {w}, _r_{arg}, "
+                f"fdp.vstore(_sc, {repr(f'st{self.load_site}_{arg}')}, _j, {w}, _r_{arg}, "
                 f"{index_str}, {value}, {st!r}{mask}{seed})"
             )
             self.load_site += 1
@@ -2254,10 +2254,7 @@ def _module_prologue(
         code.splice(src)
     sig = ", ".join(f"{a}: fx.Int64" for a in arg_names)
     code.writeline("")
-    if threads > THREADS:
-        code.writeline(f"@flyc.kernel(known_block_size=[{threads}, 1, 1])")
-    else:
-        code.writeline("@flyc.kernel")
+    # Undecorated: _module_epilogue's {name}_flydsl() applies flyc.kernel on first use.
     code.writeline(f"def {Placeholder.KERNEL_NAME}_kernel({sig}):")
     with code.indent():
         # FlyDSL's binary cache keys on this function's source and on helpers in the
@@ -2281,34 +2278,59 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
         ""
         if slp
         else (
-            f"\n        {kname}_launch.compile_hints = "
-            '{"llvm_options": {"vectorize-slp": False}}\n'
+            f"\n                {kname}_launch.compile_hints = "
+            '{"llvm_options": {"vectorize-slp": False}}'
         )
+    )
+    decorator = (
+        f"flyc.kernel(known_block_size=[{threads}, 1, 1])"
+        if threads > THREADS
+        else "flyc.kernel"
     )
     launch_sig = ", ".join([f"{a}: fx.Int64" for a in arg_names] + ["_grid: fx.Int32"])
     return f"""
 
-        @flyc.jit
-        def {kname}_launch({launch_sig}, stream: fx.Stream = fx.Stream(None)):
+        def {kname}_launch_fn({launch_sig}, stream: fx.Stream = fx.Stream(None)):
             {kname}_kernel({", ".join(arg_names)}).launch(grid=(_grid, 1, 1), block=({threads}, 1, 1), stream=stream)
-{hints}
+
+
+        {kname}_launch = None
+
+
+        def {kname}_flydsl():
+            # Decorating rewrites the kernel's AST, ~15 ms a kernel: only the compile
+            # worker, or a process without the saved code object, needs it.
+            global {kname}_kernel, {kname}_launch
+            if {kname}_launch is None:
+                {kname}_kernel = {decorator}({kname}_kernel)
+                {kname}_launch = flyc.jit({kname}_launch_fn){hints}
+            return {kname}_launch
+
+
         {kname}_compiled = None
+        {kname}_binary = __file__.rsplit(".", 1)[0] + ".{kname}.hsaco"
 
 
         def {kname}_main({", ".join(arg_names)}, stream=None):
             global {kname}_compiled
             args = ({"".join(f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
             if {kname}_compiled is None:
-                # flyc.compile launches once while compiling, so this call is done.
-                {kname}_compiled = flyc.compile({kname}_launch, *args)
-                return
+                {kname}_compiled = fdp.load_binary(
+                    {kname}_binary, "{kname}_kernel_0", {threads}, {len(arg_names)}
+                )
+                if {kname}_compiled is None:
+                    # flyc.compile launches once while compiling, so this call is done.
+                    {kname}_compiled = flyc.compile({kname}_flydsl(), *args)
+                    return
             {kname}_compiled(*args)
 
 
         def {kname}_precompile(**_):
             # All-zero addresses with a zero grid: compiles into FlyDSL's disk cache and
-            # launches nothing.
-            {kname}_launch({"0, " * len(arg_names)}0, 0)
+            # launches nothing; the code object is kept beside this module for _main.
+            launch = {kname}_flydsl()
+            launch({"0, " * len(arg_names)}0, 0)
+            fdp.save_binary(launch, {kname}_binary, "{kname}_kernel_0")
         """
 
 
@@ -2674,6 +2696,19 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         cands = self._candidates(kernel)
         if not cands:
             return src_code
+        # A model's repeated layers lower to the same source: lowering each candidate
+        # again took a third of a Qwen3 prefill's codegen.
+        memo = self.__dict__.setdefault("_candidate_sources", {})
+        if src_code in memo:
+            return memo[src_code]
+        memo[src_code] = self._lower_candidates(
+            cands, kernel, src_code, kernel_features, node_schedule, tiling
+        )
+        return memo[src_code]
+
+    def _lower_candidates(
+        self, cands, kernel, src_code, kernel_features, node_schedule, tiling
+    ) -> str:
         arg_names = kernel.arg_names()
         srcs = [src_code]
         count = metrics.generated_kernel_count

@@ -28,6 +28,8 @@ access), and cross-lane reductions are written so every lane computes the same a
 from __future__ import annotations
 
 import math as _math
+import os as _os
+import re as _re
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -1981,6 +1983,63 @@ def pick_fastest(mains, args, mutated, stream=None):
     best = mains[times.index(min(times))]
     best(*args, stream=stream)
     return best
+
+
+# The compiled artifact's GPU binary: `#gpu.object<..., bin = "...">`, an MLIR string
+# with non-printable bytes, `"` and `\` escaped as `\XX` / `\\`.
+_BIN_RE = _re.compile(r'bin\s*=\s*"((?:[^"\\]|\\.)*)"')
+_ESC_RE = _re.compile(rb"\\(\\|[0-9A-Fa-f]{2})")
+
+
+def save_binary(launch, path: str, kernel: str) -> None:
+    """After ``launch`` has compiled (in the compile worker), write its kernel's code
+    object to ``path``, for ``load_binary``. Skipped, leaving the FlyDSL path, unless
+    the artifact holds exactly one ELF binary whose kernel is ``kernel``."""
+    last = launch._last_compiled
+    art = last[1] if last else next(iter(launch._mem_cache.values()), None)
+    ir_text = getattr(art, "_ir_text", "")
+    found = _BIN_RE.findall(ir_text)
+    if len(found) != 1 or f'"{kernel}"' not in ir_text:
+        return
+    image = _ESC_RE.sub(
+        lambda m: b"\\" if m.group(1) == b"\\" else bytes([int(m.group(1), 16)]),
+        found[0].encode("latin-1"),
+    )
+    if not image.startswith(b"\x7fELF"):
+        return
+    tmp = f"{path}.{_os.getpid()}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(image)
+    _os.replace(tmp, path)
+
+
+def load_binary(path: str, kernel: str, threads: int, nargs: int):
+    """A launcher for the code object ``save_binary`` wrote, taking the arguments of a
+    FlyDSL launch (``nargs`` addresses, the grid, the stream), or None if there is
+    none. FlyDSL's own first call in a process re-JITs the host launch code from the
+    cached module, about 18 ms a kernel: 10 s of a Qwen3 prefill's first step."""
+    if not _os.path.exists(path):
+        return None
+    import torch
+
+    device = torch.cuda.current_device()
+    # On ROCm the launcher's block is num_warps times the device's warp size.
+    warp = torch.cuda.get_device_properties(device).warp_size
+    if threads % warp:
+        return None
+    launcher = torch._C._StaticCudaLauncher
+    module, function, _, _ = launcher._load_kernel(path, kernel, 0, device)
+    launch_kernel = launcher._launch_kernel
+    tys = "l" * nargs
+    warps = threads // warp
+
+    def run(*args):
+        launch_kernel(
+            function, args[nargs], 1, 1, warps, 0, tys, args[:nargs], args[nargs + 1]
+        )
+
+    run.module = module  # keep the code object loaded
+    return run
 
 
 del _math
