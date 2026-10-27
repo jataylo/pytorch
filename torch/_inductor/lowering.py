@@ -5314,17 +5314,16 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
     if isinstance(src, Number):
         src = full_like(self, src)
 
-    # For a same-dtype GPU sum, atomic_add dtype support is the only reason
-    # scatter_fallback would fire, and the template may lift it.
+    # For a same-dtype GPU sum, scatter_fallback fires only for atomic_add dtype
+    # support or deterministic mode, both of which the template may lift.
     preagg_lifts = (
         reduce == "sum"
         and isinstance(src, TensorBox)
         and src.get_dtype() == self.get_dtype()
         and _preagg_lifts_atomic_fallback(self.get_dtype(), self.get_device())
     )
-    fallback_result = None
-    if not preagg_lifts:
-        fallback_result = scatter_fallback(
+    if not preagg_lifts and (
+        fallback_result := scatter_fallback(
             aten.scatter_reduce_.two,
             self,
             dim,
@@ -5333,8 +5332,7 @@ def scatter_reduce_(self, dim: int, index, src, reduce, *, include_self: bool = 
             reduce=reduce,
             include_self=include_self,
         )
-
-    if fallback_result:
+    ):
         return fallback_result
     orig_self, orig_index, orig_src = self, index, src
 

@@ -7,7 +7,10 @@ import torch._dynamo
 from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.test_case import TestCase
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import (
+    needs_fallback_due_to_atomic_add_limitations,
+    run_and_get_code,
+)
 from torch.testing._internal.common_utils import (
     DeterministicGuard,
     instantiate_parametrized_tests,
@@ -20,12 +23,6 @@ def _hot_indices(n, num_rows, device, hot_fraction=0.5, dtype=torch.int64):
     tail = torch.randint(0, num_rows, (n,), device=device, dtype=dtype)
     hot = torch.rand(n, device=device) < hot_fraction
     return torch.where(hot, torch.zeros_like(tail), tail)
-
-
-def _has_native_bf16_atomics():
-    from torch._inductor.kernel.scatter_preagg import _has_native_bf16_atomics
-
-    return _has_native_bf16_atomics(torch.device(GPU_TYPE, 0))
 
 
 _BF16_SCATTER_FNS = {
@@ -224,7 +221,7 @@ class TestScatterPreagg(TestCase):
             return
         ref = fn(x.float().clone(), idx, v.float())
         out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
-        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0)
+        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
 
     def test_scatter_add_full_index(self):
@@ -274,19 +271,18 @@ class TestScatterPreagg(TestCase):
         idx = _hot_indices(50_000, 24, GPU_TYPE)
         v = torch.randn(50_000, 64, device=GPU_TYPE).bfloat16()
 
-        # One bf16 atomic per chunk per destination (~200 for the hot row
-        # here), so expect a few percent of the row magnitude, not the single
-        # rounding of an fp32 sum.
+        # Accumulated in an fp32 copy, so each destination is rounded once.
         ref = fn(x.float(), idx, v.float())
         out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
         self.assertEqual(out.dtype, torch.bfloat16)
-        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0)
+        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
+        self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 1)
 
     @parametrize("op", ["index_put", "scatter_reduce"])
     def test_bf16_declined_falls_back(self, op):
-        # Too little contention for the template: the scatter must still go to
-        # the eager fallback rather than a per-element bf16 atomic kernel.
+        # Too little contention for the template: where bf16 atomics need the
+        # eager fallback, the scatter must still go to it.
         fn = _BF16_SCATTER_FNS[op]
         x = torch.randn(10_000, 8, device=GPU_TYPE).bfloat16()
         idx = torch.randint(0, 10_000, (20_000,), device=GPU_TYPE)
@@ -295,10 +291,9 @@ class TestScatterPreagg(TestCase):
         _, (code,) = run_and_get_code(
             torch.compile(fn, fullgraph=True), x.clone(), idx, v
         )
-        # Without native bf16 atomics the sorted lowering takes it instead.
-        applied = not _has_native_bf16_atomics()
-        self._check(fn, x, idx, v, applied=applied, atol=2e-2, rtol=2e-2)
-        self.assertNotIn("tl.atomic_add(", code)
+        self._check(fn, x, idx, v, applied=False, atol=2e-2, rtol=2e-2)
+        if needs_fallback_due_to_atomic_add_limitations(torch.bfloat16):
+            self.assertNotIn("tl.atomic_add(", code)
 
     @parametrize(
         "dtype",
@@ -332,18 +327,18 @@ class TestScatterPreagg(TestCase):
             self.assertEqual(counters["inductor"]["scatter_preagg_sorted"], 1)
             return
 
-        tol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-6
         if dtype in (torch.float16, torch.bfloat16):
-            # Chunks are summed in fp32 but combined with output-dtype atomics,
-            # so compare against an fp32 reference relative to its magnitude.
+            # fp16 blocks are summed in fp32 but combined with fp16 atomics;
+            # bf16 accumulates in fp32 throughout.
             ref = fn(x.float(), idx, v.float())
             out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
+            rel = 8e-2 if dtype == torch.float16 else 1e-2
             self.assertEqual(
-                out.float(), ref, atol=ref.abs().max().item() * 8e-2, rtol=0
+                out.float(), ref, atol=ref.abs().max().item() * rel, rtol=0
             )
             self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
             return
-        self._check(fn, x, idx, v, atol=tol, rtol=tol)
+        self._check(fn, x, idx, v, atol=1e-6, rtol=1e-6)
 
     @parametrize("n", [1000, 4096, 4097, 50_001])
     @config.patch(scatter_preagg_force=True)
@@ -636,27 +631,6 @@ class TestScatterPreagg(TestCase):
             return torch.ops.aten.embedding_dense_backward(g, i, 500, -1, False)
 
         self._check_deterministic(fn, idx, grad, tol=1e-2)
-
-    @parametrize("op", ["index_put", "scatter_reduce"])
-    def test_bf16_without_native_atomics(self, op):
-        from torch._inductor.kernel import scatter_preagg
-
-        fn = _BF16_SCATTER_FNS[op]
-        x = torch.randn(24, 64, device=GPU_TYPE).bfloat16()
-        idx = _hot_indices(50_000, 24, GPU_TYPE)
-        v = torch.randn(50_000, 64, device=GPU_TYPE).bfloat16()
-        ref = fn(x.float(), idx, v.float())
-        with unittest.mock.patch.object(
-            scatter_preagg, "_has_native_bf16_atomics", lambda device: False
-        ):
-            _, (code,) = run_and_get_code(
-                torch.compile(fn, fullgraph=True), x.clone(), idx, v
-            )
-            out = torch.compile(fn, fullgraph=True)(x.clone(), idx, v)
-        # One fp32 sum per destination, rounded once.
-        self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 1e-2, rtol=0)
-        self.assertNotIn("tl.atomic_add(", code)
-        self.assertGreater(counters["inductor"]["scatter_preagg_sorted"], 0)
 
     @config.patch(scatter_preagg_enabled=False)
     def test_disabled(self):

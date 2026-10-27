@@ -80,12 +80,7 @@ def _template_patch(name: str):
                 f"template variant {name}: pattern not found: {old[:60]!r}"
             )
         src = src.replace(old, new)
-    tpl = sp.ScatterPreaggTemplate(
-        name=f"scatter_preagg_{name}",
-        grid=sp.scatter_preagg_grid,
-        always_freeze_layout=True,
-        source=src,
-    )
+    tpl = sp.ScatterPreaggTemplate(f"scatter_preagg_{name}", src)
     return mock.patch.object(sp, "scatter_preagg_template", tpl)
 
 
