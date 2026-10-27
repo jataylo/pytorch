@@ -89,6 +89,8 @@ THREADS = 256
 # At 2M elements the candidates tied on every Llama and GPT kernel, doubling their
 # compile time for nothing.
 AUTOTUNE_MIN_NUMEL = 1 << 22
+# Transposing tiles, rarer, from here: GPT-2's 3M-element V-head select won 29%.
+AUTOTUNE_MIN_TILE_NUMEL = 1 << 20
 # A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
 TILE_THREADS = 128
 # A column reduction launching fewer blocks than CUs: Qwen3's per-head weight
@@ -3075,7 +3077,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         tuned = _tune_table()
         if (
             kernel.in_combo
-            or numel < AUTOTUNE_MIN_NUMEL
+            or numel
+            < (AUTOTUNE_MIN_TILE_NUMEL if stage == "tile" else AUTOTUNE_MIN_NUMEL)
             or kernel._has_atomic()
             or not _tune("autotune", 1)
             or "threads" in tuned
@@ -3098,8 +3101,14 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                 return []
             # Twice the fast edge, at twice the threads: GPT-2's QKV gradient (three
             # bf16 heads layouts to rows) 39.2us -> 33.4us in the model (Triton 34.3us),
-            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%.
-            return [{"tile_f": 2 * TILE, "threads": 2 * kernel.threads}]
+            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%. Or
+            # the same tile at twice the threads, half the elements each: GPT-2's
+            # V-head select (bf16 heads layout to rows) 11.1us -> 7.9us (Triton
+            # 9.8us), where those standalone cases lose 5-40%.
+            return [
+                {"tile_f": 2 * TILE, "threads": 2 * kernel.threads},
+                {"threads": 2 * kernel.threads},
+            ]
         # Not tuned, as no candidate won across ten models' autotuned kernels: a row's
         # rows per lane group.
         if stage == "column":
