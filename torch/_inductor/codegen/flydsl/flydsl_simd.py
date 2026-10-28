@@ -40,6 +40,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import hashlib
+import itertools
 import logging
 import math
 import re
@@ -2686,14 +2687,16 @@ _PTR_RE = re.compile(r"(?<![A-Za-z0-9])(_r_)?((?:in_out_ptr|in_ptr|out_ptr)\d+)\
 
 def _merge_identical(
     kernels, inners, flat: OrderedSet[str] = OrderedSet()
-) -> list[tuple[int, str, list[tuple[str, ...]]]]:
+) -> list[tuple[list[int], str, list[tuple[str, ...]]]]:
     """Group a combo's sub-kernels whose bodies differ only in their buffers, as a
     foreach's per-parameter kernels do (6 distinct of GPT's 22 AdamW sub-kernels).
-    Each group is ``(blocks per member, body, members)``: the body names its j-th
+    Each group is ``(each member's blocks, body, members)``: the body names its j-th
     buffer ``_g{j}`` (descriptor ``_r__g{j}``), a member lists its buffers in that
     order. One traced body a group: GPT's largest AdamW kernel compiles in 2.4 s
-    rather than 4.7 s, and runs faster for its smaller code."""
-    groups: dict[tuple, tuple[int, str, list[tuple[str, ...]]]] = {}
+    rather than 4.7 s, and runs faster for its smaller code. Members of different
+    sizes share a body too when it does not depend on the size (Llama's 1024^2 and
+    256 x 1024 weights)."""
+    groups: dict[tuple, tuple[list[int], str, list[tuple[str, ...]]]] = {}
     for k, inner in zip(kernels, inners):
         names: list[str] = []
 
@@ -2706,9 +2709,10 @@ def _merge_identical(
         # A buffer of 2 GiB or more is a raw address rather than a descriptor (see
         # fdp._Flat): members switch between buffers of one kind.
         kinds = tuple(n in flat for n in names)
-        key = (k.num_blocks, kinds, body if _tune("combo_merge", 1) else inner)
+        key = (kinds, body) if _tune("combo_merge", 1) else (k.num_blocks, inner)
         if key not in groups:
-            groups[key] = (k.num_blocks, body, [])
+            groups[key] = ([], body, [])
+        groups[key][0].append(k.num_blocks)
         groups[key][2].append(tuple(names))
     out = []
     for blocks, body, members in groups.values():
@@ -2760,7 +2764,8 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
         for i, (blocks, inner, members) in enumerate(
             groups if len(groups) > 1 or len(groups[0][2]) > 1 else []
         ):
-            end = start + blocks * len(members)
+            ends = list(itertools.accumulate(blocks))
+            end = start + ends[-1]
             if len(groups) == 1:
                 pass
             elif i == len(groups) - 1:
@@ -2771,8 +2776,14 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
                 if len(members) == 1:
                     code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
                 else:
-                    code.writeline(f"_s = fdp.idiv(_bid - {start}, {blocks})")
-                    code.writeline(f"_b = _bid - {start} - _s * {blocks}")
+                    even = len(set(blocks)) == 1
+                    if even:
+                        code.writeline(f"_s = fdp.idiv(_bid - {start}, {blocks[0]})")
+                        code.writeline(f"_b = _bid - {start} - _s * {blocks[0]}")
+                    else:
+                        code.writeline(
+                            f"_s = fdp.bucket(_bid - {start}, {tuple(ends[:-1])})"
+                        )
                     picks = []
                     for j in range(len(members[0])):
                         if f"_r__g{j}" in inner:
@@ -2788,11 +2799,16 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
                     tuples = ", ".join(
                         "lambda: ("
                         + "".join(f"{ref(m[j])}, " for _, ref, j in picks)
+                        + ("" if even else f"fdp.idx({first}), ")
                         + ")"
-                        for m in members
+                        for m, first in zip(members, [0, *ends[:-1]])
                     )
                     targets = "".join(f"{t}, " for t, _, _ in picks)
+                    if not even:
+                        targets += "_first, "
                     code.writeline(f"{targets}= fdp.pick(_s, {tuples})")
+                    if not even:
+                        code.writeline(f"_b = _bid - {start} - _first")
                 code.splice(inner)
             start = end
     code.splice(

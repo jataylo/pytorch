@@ -560,6 +560,18 @@ def idx(x):
     return ArithValue(_cvt(v, k, "i32"))
 
 
+def bucket(o, ends):
+    """The member of a merged combo branch that owns block ``o`` (rebased to the
+    branch) when members take different numbers of blocks: how many of the members'
+    cumulative block ``ends`` are at or below it."""
+    o = _val(idx(o))
+    one, s = _val(idx(1)), _val(idx(0))
+    for e in ends:
+        ge = _arith.CmpIOp(_arith.CmpIPredicate.uge, o, _val(idx(e))).result
+        s = _arith.AddIOp(s, _arith.SelectOp(ge, one, _val(idx(0))).result).result
+    return ArithValue(s)
+
+
 def idiv(a, b):
     """Index floor division. Index terms are non-negative, so unsigned is exact and cheaper."""
     a, b = idx(a), idx(b)

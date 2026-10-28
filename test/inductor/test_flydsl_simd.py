@@ -316,6 +316,23 @@ class TestFlyDSLSIMD(TestCase):
         torch.testing.assert_close(out, ref)
         self.assertIn("fdp.pick(_s, lambda: (", code)
 
+    def test_foreach_combo_merged_sizes(self):
+        # Parameters of different sizes whose bodies match share one branch too, each
+        # member owning its own number of blocks.
+        from torch._inductor.utils import run_and_get_code
+
+        ps = [torch.randn(s, device="cuda") for s in (16384, 4096, 12288, 4096, 777)]
+        gs = [torch.randn_like(p) for p in ps]
+
+        def step(ps, gs):
+            torch._foreach_add_(ps, torch._foreach_mul(gs, 0.1))
+            return ps
+
+        ref = step([p.clone() for p in ps], gs)
+        out, (code,) = run_and_get_code(torch.compile(step, dynamic=False), ps, gs)
+        torch.testing.assert_close(out, ref)
+        self.assertIn("fdp.bucket(", code)
+
     def test_indirect(self):
         w = torch.randn(5000, 128, device="cuda")
         ix = torch.randint(0, 5000, (64, 33), device="cuda")
