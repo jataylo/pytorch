@@ -625,6 +625,40 @@ else:
     inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
     atomic_inner = inner
 {%- endmacro %}
+{%- macro scan_atomics(value_body) -%}
+# Sums runs of equal skey (next_key is its successor) segmented by seg, with
+# values at tokens ptok, and adds each run's sum at its end.
+seg_end = (skey < NUM_KEYS) & ((skey != next_key) | (pos == BLOCK_T - 1))
+out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
+# Keys are below the output's storage size, so INDEX_DTYPE holds them.
+seg_key = tl.broadcast_to(seg.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
+if SKIP_UNIQUE_SCAN:
+    # Every valid token that does not end a segment has a duplicate.
+    has_dup = tl.max(((skey < NUM_KEYS) & ~seg_end).to(tl.int32), 0) > 0
+else:
+    has_dup = True
+
+# The sort is amortized over D_ITERS inner blocks so BLOCK_T can stay
+# large (more pre-aggregation) while the register tile stays small.
+for it in tl.range(0, D_ITERS):
+    {{inner_block("D_ITERS", "BLOCK_D", "ATOMIC_VEC") | indent_except_first(1)}}
+
+    {{preagg_value("ptok", "inner", "val", value_body) | indent_except_first(1)}}
+
+    if has_dup:
+        _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
+    else:
+        acc = val
+    # The address drops out_key when there is a single destination.
+    tl.atomic_add(
+        tl.broadcast_to(
+            OUT + ({{preagg_addr("out_key", "atomic_inner")}}), [BLOCK_T, BLOCK_D]
+        ),
+        acc.to(OUT_DTYPE),
+        mask=seg_end[:, None] & inner_mask[None, :],
+        sem="relaxed",
+    )
+{%- endmacro %}
 {{preagg_def_kernel()}}
     {{preagg_sizes() | indent_except_first(1)}}
     pid_tok = tl.program_id(0).to(INDEX_DTYPE)
@@ -773,6 +807,15 @@ else:
         # A key can recur after others, so the scan segments by run number.
         run_end = (dest != next_dest).to(KEY_DTYPE)
         seg = tl.cumsum(run_end, 0) - run_end
+{% if BLOCK_D == 1 %}
+        # Single columns scan in a copy of their own, as one shared with the
+        # sort hides that the tokens are contiguous (~1.3x on gfx942). Wider
+        # tiles lose more to its registers.
+        ptok = tok[:, None]
+        next_key = next_dest
+        {{scan_atomics("preagg_run_value") | indent_except_first(2)}}
+        return
+{% endif %}
     else:
         packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
         skey = packed >> LOG_BLOCK_T
@@ -788,38 +831,8 @@ else:
         ptok = (tok_start + sorted_pos)[:, None]
     else:
         ptok = tl.minimum(tok_start + sorted_pos, NUM_TOKENS - 1)[:, None]
-
     next_key = tl.gather(skey, tl.minimum(pos + 1, BLOCK_T - 1), 0)
-    seg_end = (skey < NUM_KEYS) & ((skey != next_key) | (pos == BLOCK_T - 1))
-    out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
-    # Keys are below the output's storage size, so INDEX_DTYPE holds them.
-    seg_key = tl.broadcast_to(seg.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
-    if SKIP_UNIQUE_SCAN:
-        # Every valid token that does not end a segment has a duplicate.
-        has_dup = tl.max(((skey < NUM_KEYS) & ~seg_end).to(tl.int32), 0) > 0
-    else:
-        has_dup = True
-
-    # The sort is amortized over D_ITERS inner blocks so BLOCK_T can stay
-    # large (more pre-aggregation) while the register tile stays small.
-    for it in tl.range(0, D_ITERS):
-        {{inner_block("D_ITERS", "BLOCK_D", "ATOMIC_VEC") | indent_except_first(2)}}
-
-        {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
-
-        if has_dup:
-            _, acc = tl.associative_scan((seg_key, val), 0, _preagg_segmented_sum)
-        else:
-            acc = val
-        # The address drops out_key when there is a single destination.
-        tl.atomic_add(
-            tl.broadcast_to(
-                OUT + ({{preagg_addr("out_key", "atomic_inner")}}), [BLOCK_T, BLOCK_D]
-            ),
-            acc.to(OUT_DTYPE),
-            mask=seg_end[:, None] & inner_mask[None, :],
-            sem="relaxed",
-        )
+    {{scan_atomics("preagg_value") | indent_except_first(1)}}
 {% endif %}
 """
     + _SEGMENTED_SUM

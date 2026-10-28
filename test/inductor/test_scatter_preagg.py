@@ -415,6 +415,12 @@ class TestScatterPreagg(TestCase):
             self.assertEqual(block(50_000, 16, torch.float16), (256, 16))
         strided = (50_000, 256, torch.float32)
         self.assertEqual(block(*strided, inner_contiguous=False), (512, 8))
+        # Single columns take one wave64 unless destinations are hot.
+        for keys, threads in ((1 << 16, 64), (64, 128)):
+            (cfg,) = V.choices.get_scatter_preagg_configs(
+                1 << 20, 1, torch.float32, num_keys=keys
+            )
+            self.assertEqual(cfg.num_warps, ScatterPreaggTarget.of().warps(threads))
         with config.patch(max_autotune=True):
             tuned = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertGreater(len(tuned), 1)
@@ -604,8 +610,10 @@ class TestScatterPreagg(TestCase):
     @parametrize("d", [1, 32])
     def test_adaptive_runs(self, d):
         # Runs of a few recurring keys take the in-order scan, which must not
-        # merge a key's runs across the runs between them.
+        # merge a key's runs across the runs between them, nor count the
+        # ragged last block's shared tokens twice.
         idx = torch.randint(0, 4, (8192,), device=GPU_TYPE).repeat_interleave(8)
+        idx = idx[:-37]
         shape = (4096, d) if d > 1 else (4096,)
         x = torch.zeros(shape, device=GPU_TYPE)
         v = torch.randn(idx.numel(), *shape[1:], device=GPU_TYPE)

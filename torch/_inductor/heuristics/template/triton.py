@@ -1542,6 +1542,12 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             threads = 64
         else:
             max_block_d = 16 if num_inner <= 64 else 32
+        if num_inner == 1 and num_keys is not None and num_tokens < 256 * num_keys:
+            # Single columns of under a block's tokens per destination mostly
+            # scan in token order or skip pre-aggregation, ~1.4x faster on one
+            # wave64, which keeps the scan within a wavefront. Hotter
+            # destinations sort faster on two (gfx942).
+            threads = 64
         default_config = self._scatter_preagg_config(
             num_tokens, num_inner, max_block_d, tile_elems, threads, target
         )

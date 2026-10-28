@@ -118,21 +118,20 @@ hist int32
 
 | contention | cases | geomean | worst | slower | max err |
 |---|---|---|---|---|---|
-| 1.5-8 | 2 | 1.00 | 0.71 | 1 | 0e+00 / 0e+00 |
-| 64-1K | 2 | 0.95 | 0.83 | 1 | 0e+00 / 0e+00 |
-| >=16K | 8 | 2.46 | 1.70 | 0 | 0e+00 / 0e+00 |
-| all | 12 | 1.81 | 0.71 | 2 | 0e+00 / 0e+00 |
-  0.71  hist int32 rows=262144 d=1 n=1048576 sorted (contention 5.01)
-  0.83  hist int32 rows=4096 d=1 n=1048576 sorted (contention 257)
+| 1.5-8 | 2 | 1.22 | 0.96 | 1 | 0e+00 / 0e+00 |
+| 64-1K | 2 | 1.07 | 1.01 | 0 | 0e+00 / 0e+00 |
+| >=16K | 8 | 2.52 | 2.23 | 0 | 0e+00 / 0e+00 |
+| all | 12 | 1.93 | 0.96 | 1 | 0e+00 / 0e+00 |
+  0.96  hist int32 rows=262144 d=1 n=1048576 sorted (contention 5.01)
 
 hist int64
 
 | contention | cases | geomean | worst | slower | max err |
 |---|---|---|---|---|---|
-| 1.5-8 | 2 | 11.54 | 11.33 | 0 | 0e+00 / 0e+00 |
-| 64-1K | 2 | 14.15 | 12.81 | 0 | 0e+00 / 0e+00 |
-| >=16K | 8 | 53.05 | 8.38 | 0 | 0e+00 / 0e+00 |
-| all | 12 | 33.01 | 8.38 | 0 | 0e+00 / 0e+00 |
+| 1.5-8 | 2 | 13.87 | 11.74 | 0 | 0e+00 / 0e+00 |
+| 64-1K | 2 | 16.12 | 12.94 | 0 | 0e+00 / 0e+00 |
+| >=16K | 8 | 52.30 | 8.21 | 0 | 0e+00 / 0e+00 |
+| all | 12 | 34.46 | 8.21 | 0 | 0e+00 / 0e+00 |
 
 index_add bfloat16
 
@@ -219,23 +218,23 @@ index_put float32
 
 | contention | cases | geomean | worst | slower | max err |
 |---|---|---|---|---|---|
-| ~1 | 77 | 1.08 | 0.86 | 7 | 8e-08 / 9e-08 |
-| 1.5-8 | 81 | 1.22 | 0.70 | 10 | 2e-07 / 2e-07 |
-| 8-64 | 112 | 1.37 | 0.75 | 16 | 7e-07 / 3e-07 |
-| 64-1K | 86 | 1.35 | 0.73 | 21 | 2e-06 / 2e-06 |
-| 1K-16K | 249 | 2.15 | 0.64 | 12 | 9e-06 / 6e-06 |
-| >=16K | 278 | 6.96 | 1.05 | 0 | 5e-05 / 4e-04 |
-| all | 883 | 2.51 | 0.64 | 66 | 5e-05 / 4e-04 |
+| ~1 | 77 | 1.10 | 0.86 | 7 | 8e-08 / 9e-08 |
+| 1.5-8 | 81 | 1.25 | 0.78 | 8 | 2e-07 / 2e-07 |
+| 8-64 | 112 | 1.42 | 0.84 | 5 | 7e-07 / 3e-07 |
+| 64-1K | 86 | 1.40 | 0.75 | 14 | 2e-06 / 1e-06 |
+| 1K-16K | 249 | 2.16 | 0.64 | 11 | 9e-06 / 6e-06 |
+| >=16K | 278 | 6.95 | 1.05 | 0 | 5e-04 / 5e-04 |
+| all | 883 | 2.54 | 0.64 | 45 | 5e-04 / 5e-04 |
   0.64  index_put float32 rows=1048576 d=1 n=1048576 fewhot (contention 4.2e+03)
-  0.70  index_put float32 rows=1048576 d=1 n=4194304 sorted (contention 5)
   0.71  index_put float32 rows=1048576 d=1 n=262144 fewhot (contention 1.05e+03)
-  0.72  index_put float32 rows=262144 d=1 n=1048576 sorted (contention 5)
-  0.73  index_put float32 rows=4096 d=1 n=4194304 runs32 (contention 1.05e+03)
-  0.73  index_put float32 rows=262144 d=1 n=262144 fewhot (contention 1.05e+03)
-  0.73  index_put float32 rows=65536 d=1 n=4194304 runs32 (contention 95.7)
   0.75  index_put float32 rows=4096 d=8 n=65536 fewhot (contention 277)
-  0.75  index_put float32 rows=262144 d=1 n=4194304 runs32 (contention 48.1)
-  0.75  index_put float32 rows=1048576 d=1 n=4194304 runs32 (contention 35.9)
+  0.76  index_put float32 rows=262144 d=1 n=262144 fewhot (contention 1.05e+03)
+  0.78  index_put float32 rows=65536 d=8 n=262144 sorted (contention 5.01)
+  0.79  index_put float32 rows=262144 d=8 n=65536 fewhot (contention 263)
+  0.80  index_put float32 rows=65536 d=32 n=65536 fewhot (contention 262)
+  0.81  index_put float32 rows=4096 d=32 n=65536 fewhot (contention 275)
+  0.83  index_put float32 rows=65536 d=1 n=65536 fewhot (contention 266)
+  0.84  index_put float32 rows=4096 d=128 n=65536 fewhot (contention 279)
 
 index_put int32
 
@@ -370,9 +369,9 @@ Overall:
 
 | dtype | cases | geomean | worst | < 0.95 |
 |---|---|---|---|---|
-| all | 2281 | 3.68 | 0.64 | 101 |
+| all | 2281 | 3.70 | 0.64 | 77 |
 | bfloat16 | 360 | 14.07 | 0.75 | 11 |
 | float16 | 366 | 3.15 | 0.68 | 20 |
-| float32 | 1507 | 2.66 | 0.64 | 68 |
-| int32 | 24 | 3.55 | 0.71 | 2 |
-| int64 | 24 | 52.69 | 5.04 | 0 |
+| float32 | 1507 | 2.68 | 0.64 | 46 |
+| int32 | 24 | 3.68 | 0.96 | 0 |
+| int64 | 24 | 53.83 | 5.04 | 0 |
