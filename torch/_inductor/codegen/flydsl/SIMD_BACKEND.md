@@ -38,11 +38,19 @@ codegen with `FlyDSLKernel`, whose ops overrides print every op as a call into `
 (`fdp.add(tmp0, tmp1)`, `fdp.vload(...)`). Any `FlyDSLUnsupported` raised on the way rolls
 the attempt back and the schedule is handed to Triton. A combo kernel is split into
 groups of at most `combo_kernel_max_num_args` buffers, each generated as one FlyDSL
-kernel whose blocks dispatch on the sub-kernel. Inductor's mix-order reductions (a row
-and a column reduction of one input fused, as in a norm's backward) and nested
-reductions have only Triton kernels, so with FlyDSL the scheduler does not form them
-and FlyDSL generates their reductions apart: BERT training 29.83 -> 29.47 ms a step,
-all 130 of its kernels on FlyDSL.
+kernel whose blocks dispatch on the sub-kernel. Nested reductions have only Triton
+kernels, so with FlyDSL the scheduler does not form them and FlyDSL generates their
+reductions apart: BERT training 29.83 -> 29.47 ms a step.
+
+Mix-order reductions (a row and a column reduction of one input fused, as in a norm's
+backward) FlyDSL generates itself. A block runs `rsplit_size` rows (16) over 4 one-wave
+row groups, each unrolling its rows with every row's loads issued first, the lanes
+summing the column values they see into a register per element. The groups combine
+through LDS into one workspace row a block, and a second kernel sums the workspace
+down its rows (one-wave blocks, 16 lanes a partial row, combined by shuffles) where
+Triton's leaves it to ATen's `sum(dim=0)` and a cast. Qwen3-0.6B's RMSNorm backward
+(8192 x 1024 bf16): 24.2 + 4.9 µs, against 42.6 µs generated apart and Triton's 36.2
+µs kernel + 19.4 µs of ATen (49.8 µs for Triton generating them apart).
 
 The emitted module holds the kernel and launcher as plain functions, decorated with
 `@flyc.kernel` / `@flyc.jit` only when something compiles them, plus `_precompile` and
@@ -587,10 +595,12 @@ kernel, or raise under `flydsl.simd_strict`.
   its default launch is 12% faster back to back, the suite's hot loop, but 3-8% slower
   with the cache flushed, so the pick turns on whether the cold margin falls under the
   3% that sends it to the warm tie-break.
-- Mix-order reductions: Qwen3-0.6B's training step has 591 kernels against Triton's
-  457, as Triton folds each RMSNorm backward's weight-gradient column sum into it and
-  this backend runs those sums alone (about 2.5 ms of a 633 ms step). The generated
-  kernels are still 40.2 ms against 61.1; attention and matmuls are the other 593 ms.
+- Mix-order reductions: with them, Qwen3-0.6B's generated kernels take 39.0 ms of a
+  632 ms training step (40.2 generated apart; Triton's 61.1). The mix-order kernel
+  still runs 20 µs on its 8192 x 1024 RMSNorm backward with neither the column partials
+  nor the workspace, against 16 µs for one row a one-wave block: several rows a row
+  group cost it, but fewer rows a block mean more partials for the second kernel. Most
+  of the suite's norms are under the scheduler's size limits for these.
 - Under `max-autotune-no-cudagraphs` (GPT, Llama, BERT training) FlyDSL's kernels sit
   next to the Triton matmul templates that take their epilogues, and stay ahead of the
   coordinate-descent-tuned Triton kernels kernel by kernel: matched, 1.94 against 2.59

@@ -354,21 +354,27 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 777, device="cuda")
         self.check(lambda x: x.sum(0), a, atol=1e-3, kinds=["reduction"])
 
-    def test_no_mix_order_reduction(self):
+    @parametrize("cols,two", [(1024, False), (768, True)])
+    def test_mix_order_reduction(self, cols, two):
         # A row and a column reduction of the same input (a norm's backward) fuse into
-        # one Triton-only mix-order kernel; with FlyDSL they are generated apart.
+        # one mix-order kernel, its column partials summed by a second.
         from torch._inductor.utils import run_and_get_code
 
-        x = torch.randn(8192, 1024, device="cuda")
-        w = torch.randn(1024, device="cuda")
-        fn = lambda x, w: ((x * w).sum(1), (x * x).sum(0))  # noqa: E731
-        with config.patch({"flydsl.simd": False}):
-            _, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
-        self.assertEqual(code.count("@triton.jit"), 1)
-        torch._dynamo.reset()
+        x = torch.randn(8192, cols, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(cols, device="cuda", dtype=torch.bfloat16)
+
+        def fn(x, w):
+            xf = x.float()
+            out = ((xf * w).sum(1), (xf * xf).sum(0).to(x.dtype))
+            return out + ((xf * w).sum(0),) if two else out
+
         out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
-        torch.testing.assert_close(out, fn(x, w), atol=1e-2, rtol=1e-4)
+        ref = fn(x.double(), w.double())
+        for o, r in zip(out, ref):
+            torch.testing.assert_close(o.double(), r, atol=0.5, rtol=1e-2)
         self.assertNotIn("@triton.jit", code)
+        self.assertEqual(counters["flydsl_simd"]["mix_order"], 1)
+        self.assertIn("mix-order finalize", code)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
     @parametrize("rows", [1, 3, 17])

@@ -2562,9 +2562,21 @@ class SIMDScheduling(BaseScheduling):
                 f"len(kernel.saved_partial_accumulate), got "
                 f"{len(converted_nodes)} and {len(kernel.saved_partial_accumulate)}"
             )
-        nsplit = V.graph.wrapper_code.codegen_python_sizevar(
-            (numel + split_size - 1) // split_size
+        self._codegen_mix_order_finalize(
+            kernel, ws_name, (numel + split_size - 1) // split_size, rnumel
         )
+
+        kernel.deallocate_workspaces()
+
+        if node2_epilogue:
+            self._codegen_nodes(node2_epilogue)
+
+        self.free_buffers_in_scheduler()
+
+    def _codegen_mix_order_finalize(self, kernel, ws_name, nsplit, rnumel):
+        """Reduce the mix-order kernel's workspace, ``nsplit`` partial rows of
+        ``rnumel`` per partial accumulate, into the accumulates' buffers."""
+        nsplit = V.graph.wrapper_code.codegen_python_sizevar(nsplit)
         for idx, partial_accum in enumerate(kernel.saved_partial_accumulate):
             buffer_name = partial_accum.buffer_name
 
@@ -2599,13 +2611,6 @@ class SIMDScheduling(BaseScheduling):
             # mark the buffer as allocated, so we don't try to allocate
             # it again when it's later used
             V.graph.wrapper_code.allocated.add(buffer_name)
-
-        kernel.deallocate_workspaces()
-
-        if node2_epilogue:
-            self._codegen_nodes(node2_epilogue)
-
-        self.free_buffers_in_scheduler()
 
     def codegen_nested_reduction(self, node):
         """

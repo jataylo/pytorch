@@ -196,15 +196,16 @@ class ComboKernelMemoryContext:
 def _is_gpu_triton_backend(
     node1: BaseSchedulerNode,
     node2: BaseSchedulerNode,
+    flydsl_mix_order: bool = False,
 ) -> bool:
     if not node1.is_gpu() or not node2.is_gpu():
         return False
     device_type = node1.get_device().type  # type: ignore[union-attr]
     if device_type == "cuda" and config.flydsl.simd and torch.version.hip:
-        # Mix-order and nested reductions have only Triton kernels, which would
-        # bypass FlyDSL; generated apart, its two reductions ran BERT training
-        # 29.83 -> 29.47 ms a step.
-        return False
+        # Nested reductions have only Triton kernels, which would bypass FlyDSL;
+        # generated apart, its two reductions ran BERT training 29.83 -> 29.47 ms a
+        # step. Mix-order reductions FlyDSL generates (FlyDSLSIMDScheduling).
+        return flydsl_mix_order
     return (
         device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
     )
@@ -360,7 +361,7 @@ class MixOrderReduction:
         if V.graph.cpp_wrapper:
             return False
 
-        if not _is_gpu_triton_backend(node1, node2):
+        if not _is_gpu_triton_backend(node1, node2, flydsl_mix_order=True):
             return False
         if not node1.is_reduction() or not node2.is_reduction():
             return False

@@ -73,7 +73,7 @@ from ..common import (
     OpOverrides,
     PythonPrinter,
 )
-from ..simd import IterationRangesEntry, SIMDKernel
+from ..simd import IterationRangesEntry, PartialAccumulate, SIMDKernel
 from ..triton import TritonScheduling
 
 
@@ -114,6 +114,15 @@ ROW_INTERLEAVE_MAX = 4096
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
 PERSISTENT_MAX_UNROLL = 16
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
+# A mix-order reduction's block (see FlyDSLKernel._finalize_mix_order): its threads,
+# rows a row group unrolls, and the LDS its groups' column partials may take.
+MIX_ORDER_THREADS = 256
+MIX_ORDER_XUNROLL = 4
+MIX_ORDER_LDS_WORDS = 4096
+# Its second stage (_mix_order_finalize_source): lanes splitting a column's partials,
+# and the partials a lane loads at once.
+MIX_FINALIZE_SLICES = 16
+MIX_FINALIZE_UNROLL = 16
 SCAN_PHASE = "__scan_phase__"  # replaced per traced pass of a multi-element scan
 # Edge of the square tile a block covers in a {y, x} (transposing) pointwise kernel. A
 # 64-wide f32 tile's 16.6 KiB of LDS leaves room for three blocks a CU: 54us vs 47us
@@ -1386,6 +1395,10 @@ class FlyDSLKernel(SIMDKernel):
             ):
                 self.xunroll //= 2
             self.xunroll = _tune("xunroll", self.xunroll)
+            if self.mix_order_reduction:
+                # Each row group loops over its rows, so their column partials
+                # accumulate in its registers: see _emit_mix_order.
+                self.xunroll = 1
         else:
             # Long rows: several runs per loop iteration, for loads in flight.
             self.unroll = max(
@@ -1414,6 +1427,8 @@ class FlyDSLKernel(SIMDKernel):
                 # which falls back to one column if the body has other control flow.
                 self.cpair = 2
         self.rstep = self.tpr * self.ept * self.unroll
+        if self.mix_order_reduction:
+            self._finalize_mix_order()
 
     # -- range trees --------------------------------------------------------------------
 
@@ -1851,8 +1866,57 @@ class FlyDSLKernel(SIMDKernel):
     def bucketize(self, *args, **kwargs):
         raise FlyDSLUnsupported("bucketize")
 
-    def partial_accumulate(self, *args, **kwargs):
-        raise FlyDSLUnsupported("partial_accumulate")
+    def _finalize_mix_order(self) -> None:
+        """A block runs ``rsplit_size`` rows over ``rpb`` row groups, each of its rows
+        unrolled ``xunroll`` at a time with every row's loads issued first, then
+        combines the groups' column partials through LDS into one workspace row."""
+        split = self.rsplit_size
+        if not (
+            self.persistent
+            and self.stride == 1
+            and not self.interleaved
+            and self.xnumel % split == 0
+            and self.tpr * split >= WAVE
+        ):
+            raise FlyDSLUnsupported("mix-order reduction over a looped row")
+        groups = max(1, _tune("mix_threads", MIX_ORDER_THREADS) // self.tpr)
+        while groups > 1 and (
+            split % groups
+            or groups * self._mix_cols(groups * self.tpr) > MIX_ORDER_LDS_WORDS
+            or groups * self.tpr < WAVE
+        ):
+            groups //= 2
+        if groups * self.tpr < WAVE:
+            raise FlyDSLUnsupported("mix-order reduction row groups under a wave")
+        self.rpb = groups
+        self.threads = groups * self.tpr
+        rows = split // groups
+        self.xunroll = min(rows, _tune("mix_xunroll", MIX_ORDER_XUNROLL))
+        while rows % self.xunroll:
+            self.xunroll -= 1
+
+    def _mix_cols(self, threads: int) -> int:
+        """A partial's LDS row: the columns, padded to the block's 4-wide stores and to
+        the row's loop steps."""
+        span = 4 * threads
+        return max(
+            -(-self.rnumel // span) * span,
+            -(-self.rnumel // self.rstep) * self.rstep,
+        )
+
+    def partial_accumulate(self, name, reduction_type, value, extra_meta) -> None:
+        """A mix-order reduction's column partial: the row's elements, collected in
+        order for _emit_mix_order to fold into the row group's accumulators."""
+        if not self.mix_order_reduction or reduction_type not in ("sum", "prod"):
+            raise FlyDSLUnsupported(f"partial_accumulate {reduction_type}")
+        i = len(self.saved_partial_accumulate)
+        self.saved_partial_accumulate.append(
+            PartialAccumulate(name, reduction_type, value)
+        )
+        ms = self._masks()
+        mask = ms[0] if len(ms) == 1 else f"fdp.land({', '.join(ms)})" if ms else None
+        self.body.writeline(f"_pv{i} = []")
+        self.compute.writeline(f"_pv{i}.append(({value}, {mask}))")
 
     # -- reductions ---------------------------------------------------------------------
 
@@ -2197,7 +2261,15 @@ class FlyDSLKernel(SIMDKernel):
             if hasattr(inner, "inner_name"):
                 name_of[inner.inner_name] = outer
         extents = {}
+        workspaces = {ws.inner_name: ws for ws in self.args.workspace_args}
         for a in arg_defs:
+            if a in workspaces:
+                ws = workspaces[a]
+                n = _int_or_none(V.graph.sizevars.simplify(ws.count))
+                if n is None:
+                    raise FlyDSLUnsupported("dynamic workspace")
+                extents[a] = max(1, n) * ws.dtype.itemsize
+                continue
             buf = name_of.get(a)
             if buf is None:
                 raise FlyDSLUnsupported(f"argument {a} without a buffer")
@@ -2259,7 +2331,10 @@ class FlyDSLKernel(SIMDKernel):
         if self.staged:
             return sum(s["words"] * self.tile_f * self._tile_pitch for s in self.staged)
         # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
-        return self.threads * 2 * self.max_components if self.uses_smem else 0
+        words = self.threads * 2 * self.max_components if self.uses_smem else 0
+        if self.mix_order_reduction and self.rpb > 1:
+            words += self.rpb * self._mix_cols(self.threads)
+        return words
 
     @property
     def num_blocks(self) -> int:
@@ -2268,6 +2343,8 @@ class FlyDSLKernel(SIMDKernel):
             return nf * ns
         if not self.is_reduction_kernel:
             return -(-self.xnumel // (self.threads * self.ept * self.unroll))
+        if self.mix_order_reduction:
+            return self.xnumel // self.rsplit_size
         pairs = 2 if self._pair_lines is not None else 1
         return -(-self.xnumel // (self.rpb * self.xunroll * pairs))
 
@@ -2443,6 +2520,9 @@ class FlyDSLKernel(SIMDKernel):
                 code.writeline(f"_rl = _t // {self.stride}")
                 lane_x = f"_t % {self.stride}"
             code.writeline("_lane0 = _rl == 0")
+            if self.mix_order_reduction:
+                self._emit_mix_order(code, lane_x)
+                return
             if self._pair_lines is not None:
                 code.splice(self._pair_lines)
                 return
@@ -2491,6 +2571,131 @@ class FlyDSLKernel(SIMDKernel):
                 row_start()
                 self._splice_preload()
                 code.splice(self.body)
+
+    def _emit_mix_order(self, code: IndentedBuffer, lane_x: str) -> None:
+        """A mix-order reduction (Inductor's MixOrderReduction): each row group runs
+        ``rsplit_size`` rows one after another, the row reduction as usual, while
+        each lane sums the column values it saw into one register per element it
+        owns. The group then writes those partials as row ``_b * rpb + group`` of the
+        workspace, which the wrapper sums over its rows."""
+        split, ept = self.rsplit_size, self.ept
+        steps = -(-self.rnumel // self.rstep)
+        per_step = ept * self.unroll
+        slots = steps * per_step
+        accs = self.saved_partial_accumulate
+        for i, pa in enumerate(accs):
+            for s in range(slots):
+                code.writeline(
+                    f"_pa{i}_{s} = fdp.default({pa.reduction_type!r}, 'f32')"
+                )
+        groups, xr = self.rpb, self.xunroll
+        iters = split // groups // xr
+        xc = "_xc" if iters > 1 else "0"
+
+        def row_start() -> None:
+            code.writeline(
+                f"xindex = _b * {split} + ({xc} * {xr} + _xr) * {groups} + {lane_x}"
+            )
+
+        def row_end() -> None:
+            for i, pa in enumerate(accs):
+                for s in range(slots):
+                    code.writeline(
+                        f"_pa{i}_{s} = fdp.combine({pa.reduction_type!r}, _pa{i}_{s}, *_pv{i}[{s}])"
+                    )
+
+        loop = contextlib.ExitStack()
+        if iters > 1:
+            code.writeline(
+                f"for _xc in range(fx.Int32(0), fx.Int32({iters}), fx.Int32(1)):"
+            )
+            loop.enter_context(code.indent())
+        if xr > 1 and self.preload_lines:
+            code.writeline("_caches = []")
+            code.writeline(f"for _xr in range_constexpr({xr}):")
+            with code.indent():
+                code.writeline("_vc, _sc, _lc = {}, {}, {}")
+                row_start()
+                pre = IndentedBuffer()
+                pre.get_lines_ref().extend(
+                    li
+                    for li in self.body.get_lines_ref()[: self._preload_at]
+                    if isinstance(li, str)
+                )
+                pre.get_lines_ref().extend(self.preload_lines)
+                code.splice(pre)
+                code.writeline("_caches.append((_vc, _sc, _lc))")
+            self.preload_lines = []
+            code.writeline(f"for _xr in range_constexpr({xr}):")
+            with code.indent():
+                code.writeline("_vc, _sc, _lc = _caches[_xr]")
+                row_start()
+                code.splice(self.body)
+                row_end()
+        else:
+            code.writeline(f"for _xr in range_constexpr({xr}):")
+            with code.indent():
+                code.writeline("_vc, _sc, _lc = {}, {}, {}")
+                row_start()
+                self._splice_preload()
+                code.splice(self.body)
+                row_end()
+        loop.close()
+
+        (ws,) = self.args.workspace_args
+        partials = self.num_blocks
+        rnumel = self.rnumel
+        code.writeline("_ws = {}")
+
+        def col_of(step: int, j: int) -> str:
+            return f"{step * self.rstep + (j // ept) * self.tpr * ept + j % ept} + _rl * {ept}"
+
+        if groups == 1:
+            w = min(ept, 4)
+            for i in range(len(accs)):
+                for step in range(steps):
+                    for j in range(per_step):
+                        col = col_of(step, j)
+                        mask = (
+                            f", mask=({col}) < {rnumel}" if rnumel % self.rstep else ""
+                        )
+                        code.writeline(
+                            f"fdp.vstore(_ws, 'pa{i}_{step}_{j // w}', {j % w}, {w}, "
+                            f"_r_{ws.inner_name}, {i * partials * rnumel} + _b * {rnumel} + {col}, "
+                            f"_pa{i}_{step * per_step + j}, 'f32'{mask})"
+                        )
+            return
+        # The groups' partials through LDS, a row each, then summed down the groups
+        # by every thread, four columns a thread.
+        base = self.threads * 2 * self.max_components if self.uses_smem else 0
+        cols = self._mix_cols(self.threads)
+        span = 4 * self.threads
+        w = 4 if rnumel % 4 == 0 else 1
+        for i, pa in enumerate(accs):
+            if i:
+                code.writeline("fdp.barrier()")
+            for step in range(steps):
+                for j in range(per_step):
+                    code.writeline(
+                        f"fdp.tile_put(_smem, {base}, 0, {lane_x} * {cols} + {col_of(step, j)}, "
+                        f"_pa{i}_{step * per_step + j})"
+                    )
+            code.writeline("fdp.barrier()")
+            for c in range(-(-rnumel // span)):
+                for e in range(4):
+                    col = f"{c * span + e} + _t * 4"
+                    code.writeline(f"_v = fdp.tile_get(_smem, {base}, 0, {col}, 'f32')")
+                    for g in range(1, groups):
+                        code.writeline(
+                            f"_v = fdp.combine({pa.reduction_type!r}, _v, "
+                            f"fdp.tile_get(_smem, {base}, 0, {g * cols} + {col}, 'f32'))"
+                        )
+                    mask = f", mask=({col}) < {rnumel}" if rnumel % span else ""
+                    code.writeline(
+                        f"fdp.vstore(_ws, 'f{i}_{c}_{e // w}', {e % w}, {w}, "
+                        f"_r_{ws.inner_name}, {i * partials * rnumel} + _b * {rnumel} + {col}, "
+                        f"_v, 'f32'{mask})"
+                    )
 
     def _emit_tile2d(self, code: IndentedBuffer) -> None:
         f = self.fast
@@ -2560,7 +2765,11 @@ class FlyDSLKernel(SIMDKernel):
     def call_kernel(self, name: str, node=None, deallocate_ws: bool = True):
         wrapper = V.graph.wrapper_code
         _, call_args, _, arg_types = self.args.python_argdefs()
+        for ws in self.args.workspace_args:
+            wrapper.generate_workspace_allocation(ws)
         wrapper.generate_kernel_call(name, call_args, triton=True, arg_types=arg_types)
+        if deallocate_ws:
+            self.deallocate_workspaces()
 
 
 # ---------------------------------------------------------------------------------------
@@ -2680,6 +2889,91 @@ def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -
             fdp.compile_only(launch, {"0, " * len(arg_names)}0, 0, arch={_gpu_arch()!r})
             fdp.save_binary(launch, {kname}_binary, "{kname}_kernel_0")
         """
+
+
+def _mix_order_finalize_source(
+    nsplit: int, rnumel: int, outs: list[tuple[str, torch.dtype]]
+) -> str:
+    """A mix-order reduction's second stage: each of ``outs`` (reduction type,
+    storage) reduces its ``nsplit`` x ``rnumel`` f32 slice of the workspace over its
+    rows. A one-wave block takes four columns a lane over its column lanes, the
+    ``slices`` lanes of each splitting the rows, then combined by shuffles. ATen's
+    ``sum(dim=0)`` and cast took 19.7us on 512 x 1024 partials."""
+    slices = _tune("mix_fin_slices", MIX_FINALIZE_SLICES)
+    lanes = WAVE // slices
+    cols = 4 * lanes
+    steps = -(-nsplit // slices)
+    unroll = min(steps, _tune("mix_fin_unroll", MIX_FINALIZE_UNROLL))
+    iters = -(-steps // unroll)
+    w = 4 if rnumel % 4 == 0 else 1
+    args = ["ws_ptr", *(f"out_ptr{i}" for i in range(len(outs)))]
+    extents = {"ws_ptr": len(outs) * nsplit * rnumel * 4}
+    for i, (_, dtype) in enumerate(outs):
+        extents[f"out_ptr{i}"] = rnumel * dtype.itemsize
+    code = _module_prologue(
+        args,
+        extents,
+        0,
+        [f"mix-order finalize nsplit={nsplit} rnumel={rnumel}"],
+        {},
+        WAVE,
+    )
+    with code.indent():
+        code.writeline("_b = fdp.bid()")
+        code.writeline(f"_c = _b * {cols} + (_t // {slices}) * 4")
+        code.writeline(f"_s = _t % {slices}")
+        for i, (rt, dtype) in enumerate(outs):
+            for e in range(4):
+                code.writeline(f"_a{e} = fdp.default({rt!r}, 'f32')")
+            loop = contextlib.ExitStack()
+            k = "0"
+            if iters > 1:
+                code.writeline(
+                    f"for _k in range(fx.Int32(0), fx.Int32({iters}), fx.Int32(1)):"
+                )
+                loop.enter_context(code.indent())
+                k = "_k"
+            code.writeline("_lc = {}")
+            for u in range(unroll):
+                row = f"({k} * {unroll} + {u}) * {slices} + _s"
+                ms = []
+                if iters * unroll * slices != nsplit:
+                    ms.append(f"({row}) < {nsplit}")
+                if rnumel % cols:
+                    ms.append(f"_c < {rnumel}")
+                for e in range(4):
+                    m = ms + ([f"_c + {e} < {rnumel}"] if rnumel % 4 else [])
+                    mask = (
+                        "None"
+                        if not m
+                        else m[0]
+                        if len(m) == 1
+                        else f"fdp.land({', '.join(m)})"
+                    )
+                    off = f"{i * nsplit * rnumel} + ({row}) * {rnumel} + _c + {e}"
+                    load = (
+                        f"fdp.vload(_lc, ('ws', {u}), {e}, 4, _r_ws_ptr, {off}, 'f32', {mask})"
+                        if w == 4
+                        else f"fdp.load(_r_ws_ptr, {off}, 'f32', {mask})"
+                    )
+                    code.writeline(
+                        f"_a{e} = fdp.combine({rt!r}, _a{e}, {load}, {mask})"
+                    )
+            loop.close()
+            code.writeline("_os = {}")
+            for e in range(4):
+                code.writeline(
+                    f"_v = fdp.group_reduce({rt!r}, _a{e}, {slices}, None, {WAVE})"
+                )
+                m = ["_s == 0"]
+                if rnumel % cols or rnumel % 4:
+                    m.append(f"_c + {e} < {rnumel}")
+                mask = m[0] if len(m) == 1 else f"fdp.land({', '.join(m)})"
+                code.writeline(
+                    f"fdp.vstore(_os, 'o', {e % w}, {w}, _r_out_ptr{i}, _c + {e}, _v, {_STORAGE[dtype]!r}, {mask})"
+                )
+    code.splice(_module_epilogue(args, -(-rnumel // cols), WAVE, False))
+    return code.getvalue()
 
 
 _PTR_RE = re.compile(r"(?<![A-Za-z0-9])(_r_)?((?:in_out_ptr|in_ptr|out_ptr)\d+)\b")
@@ -2928,6 +3222,124 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         if config.flydsl.simd_strict:
             raise FlyDSLUnsupported(f"FlyDSL SIMD kernel refused ({reason})")
         return super().codegen_combo_kernel(combo_kernel_node)
+
+    def codegen_mix_order_reduction(self, node):
+        # A fixed split: autotuning it would benchmark the kernel as Triton's.
+        with config.patch(
+            {
+                "triton.mix_order_reduction_split_size": config.triton.mix_order_reduction_split_size
+                or self._mix_order_split(node.node1)
+            }
+        ):
+            return super().codegen_mix_order_reduction(node)
+
+    @staticmethod
+    def _mix_order_split(node1) -> int:
+        """Rows a row group runs: Triton's choice, about eight splits a CU of 16 to
+        128 rows."""
+        from ...scheduler import MixOrderReduction
+
+        numel, _ = MixOrderReduction.get_numel_rnumel(node1)
+        n = V.graph.sizevars.optimization_hint(numel, fallback=0)
+        if _tune("mix_split", 0):
+            return _tune("mix_split", 0)
+        split = 16
+        while split < 128 and n // (split * 2) >= 8 * _num_cus():
+            split *= 2
+        return split
+
+    def _generate_kernel_code_for_mix_order_reduction(
+        self, kernel_features, split_size, for_benchmark
+    ):
+        reason = self._precheck(kernel_features)
+        if reason is None and not for_benchmark:
+            count_before = metrics.generated_kernel_count
+            try:
+                with _quiet_scheduler_codegen_errors():
+                    kernel = FlyDSLKernel(
+                        {
+                            "x": kernel_features.numel,
+                            "r0_": kernel_features.reduction_numel,
+                        },
+                        features=kernel_features,
+                        mix_order_reduction=True,
+                    )
+                    kernel.rsplit_size = split_size
+                    kernel.mix_node_schedule = kernel_features.node_schedule
+                    self.codegen_node_schedule_with_kernel(
+                        kernel_features.node_schedule, kernel
+                    )
+                    partials = -(-kernel.xnumel // split_size)
+                    _, ws_name, _ = kernel.args.workspace(
+                        len(kernel.saved_partial_accumulate) * partials * kernel.rnumel,
+                        False,
+                        dtype=torch.float,
+                    )
+                    with V.set_kernel_handler(kernel):
+                        src_code = kernel.codegen_kernel()
+                    if not _stage_enabled(kernel.stage):
+                        raise FlyDSLUnsupported(f"stage {kernel.stage} disabled")
+                flydsl_simd_counters()["flydsl_kernels"] += 1
+                flydsl_simd_counters()["mix_order"] += 1
+                return kernel, ws_name, src_code
+            except FlyDSLUnsupported as e:
+                reason = str(e)
+            except (NotImplementedError, TypeError, KeyError, AssertionError) as e:
+                reason = f"{type(e).__name__}: {e}"
+            metrics.generated_kernel_count = count_before
+        if not for_benchmark:
+            flydsl_simd_counters()[f"fallback: mix-order: {reason}"] += 1
+            flydsl_simd_counters()["triton_kernels"] += 1
+            if config.flydsl.simd_strict:
+                raise FlyDSLUnsupported(f"FlyDSL SIMD kernel refused ({reason})")
+        return super()._generate_kernel_code_for_mix_order_reduction(
+            kernel_features, split_size, for_benchmark
+        )
+
+    def _codegen_mix_order_finalize(self, kernel, ws_name, nsplit, rnumel):
+        n, r = _int_or_none(nsplit), _int_or_none(rnumel)
+        bufs = [
+            V.graph.get_buffer(pa.buffer_name) for pa in kernel.saved_partial_accumulate
+        ]
+        if not (
+            isinstance(kernel, FlyDSLKernel)
+            and n
+            and r
+            and all(
+                b is not None
+                and b.get_layout().is_contiguous()
+                and _int_or_none(b.get_numel()) == r
+                and b.get_dtype() in (torch.float32, torch.bfloat16, torch.float16)
+                for b in bufs
+            )
+        ):
+            return super()._codegen_mix_order_finalize(kernel, ws_name, nsplit, rnumel)
+        src = _mix_order_finalize_source(
+            n,
+            r,
+            [
+                (pa.reduction_type, b.get_dtype())
+                for pa, b in zip(kernel.saved_partial_accumulate, bufs)
+            ],
+        )
+        name = self._define_flydsl_kernel(src, kernel.mix_node_schedule)
+        wrapper = V.graph.wrapper_code
+        names = [pa.buffer_name for pa in kernel.saved_partial_accumulate]
+        for b in bufs:
+            wrapper.writeline(wrapper.make_buffer_allocation(b))
+        wrapper.generate_kernel_call(
+            name,
+            [ws_name, *names],
+            triton=True,
+            arg_types=[torch.float32, *(b.get_dtype() for b in bufs)],
+        )
+        wrapper.allocated.update(names)
+        flydsl_simd_counters()["flydsl_kernels"] += 1
+
+    def define_kernel(self, src_code, node_schedule, kernel):
+        if isinstance(kernel, FlyDSLKernel):
+            return self._define_flydsl_kernel(src_code, node_schedule)
+        return super().define_kernel(src_code, node_schedule, kernel)
 
     def _combo_groups(self, subkernel_nodes) -> list[list[Any]]:
         """Split the sub-kernels so no launch takes more buffers than Triton's combo
