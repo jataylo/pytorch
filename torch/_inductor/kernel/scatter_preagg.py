@@ -14,7 +14,8 @@ destination depends on) and
   3. otherwise sorts (key, position) pairs so equal destinations become
      contiguous, evaluates the fused value expression at the sorted token
      positions and sums runs of equal keys with a segmented associative scan
-     (fp16 on ROCm: a 0/1 matrix product over the block's tokens instead), and
+     (fp16 on ROCm: a 0/1 matrix product over the block's tokens instead;
+     blocks whose keys already come in runs scan in token order unsorted), and
   4. issues one atomic per (distinct key, inner element).
 
 Iteration dims that the destination does not depend on and that map unchanged
@@ -227,6 +228,42 @@ class _TemplateIndexHandler(_ValidityHandler):
             line,
             dtype=dtype,
             shape=TritonSymbols.get_block_shape(expr),
+        )
+
+
+class _TileValueHandler(_TemplateIndexHandler):
+    """
+    _TemplateIndexHandler for the value tile. A float load indexed by the token
+    alone (a per-token weight) comes out [rows, 1], and Triton then gives the
+    whole [rows, cols] tile and its scan that load's layout, converting the
+    tile both ways on every inner block (~2x on gfx942), so it loads through a
+    pointer broadcast to the tile. Integer ones (indices, masks) stay narrow,
+    where the arithmetic on them is cheap.
+    """
+
+    def __init__(self, inner: Any, inner_sym: sympy.Symbol, shape: tuple[str, str]):
+        super().__init__(inner, record_validity=False)
+        self.inner_sym = inner_sym
+        self.shape = shape
+
+    def load(self, name: str, index: sympy.Expr) -> Any:
+        wrapper = self._inner
+        if (
+            name in wrapper.fixed_inputs
+            or self.inner_sym in index.free_symbols
+            or not (dtype := V.graph.get_buffer(name).dtype).is_floating_point
+        ):
+            return wrapper.load(name, index)
+        ptr = f"{wrapper._add_kernel_input(name)} + {wrapper._process_indexing(index)}"
+        line = f"tl.load(tl.broadcast_to({ptr}, [{', '.join(self.shape)}]))"
+        if (
+            dtype in (torch.float16, torch.bfloat16)
+            and config.triton.codegen_upcast_to_fp32
+        ):
+            line += ".to(tl.float32)"
+            dtype = torch.float32
+        return wrapper.kernel.cse.generate(
+            wrapper.kernel.compute, line, dtype=dtype, shape=self.shape
         )
 
 
@@ -520,7 +557,7 @@ class ScatterPreaggTemplateKernel(TritonTemplateKernel):
             tok_sym = self._symbol_of(handler.load("ptok", sympy.S.Zero))
             inner_sym = self._symbol_of(handler.load("inner", sympy.S.Zero))
             coords = plan.iteration_coords(tok_sym, inner_sym)
-            with V.set_ops_handler(_TemplateIndexHandler(handler, False)):
+            with V.set_ops_handler(_TileValueHandler(handler, inner_sym, (rows, cols))):
                 value = plan.value_fn(coords)
             value = getattr(value, "value", value)
             acc = triton_type(plan.acc_dtype)
@@ -620,23 +657,33 @@ else:
     heads = (sorted_key != next_key) | (pos == BLOCK_T - 1)
     distinct = tl.sum(heads.to(tl.int32), 0)
 {% else %}
-    # Estimate the block's distinct destinations from a histogram of hashed
-    # keys (linear counting), and skip the sort when it saves few atomics.
-    # Counting masked lanes as tokens only biases partial blocks toward the
-    # sort, and saves a block-wide reduction.
-    live = tok_mask & valid
-    hashed = ((dest.to(tl.int64) * 2654435761) >> (32 - LOG_HIST_BINS)) & (
-        HIST_BINS - 1
-    )
-    counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
-    # A destination taking an eighth of the block serializes its plain
-    # atomics, so such blocks sort whatever they save: a hot bin counts as
-    # HIST_BINS more empty ones, which takes the estimate below zero.
-    empty = (counts == 0).to(tl.float32) + (counts > BLOCK_T // 8).to(
-        tl.float32
-    ) * HIST_BINS
-    empty = tl.maximum(tl.sum(empty, 0), 1.0)
-    distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
+    # Runs of equal keys in token order: a segmented scan sums them without
+    # the sort, which pays when sorting would save few more atomics.
+    next_dest = tl.gather(dest, tl.minimum(pos + 1, BLOCK_T - 1), 0)
+    runs = tl.sum(((dest != next_dest) | (pos == BLOCK_T - 1)).to(tl.int32), 0)
+    distinct = runs.to(tl.float32)
+    # Blocks of so few runs take the scan whatever the estimate below, so
+    # narrow rows, where the histogram is a good part of the block, skip it.
+    # Wider rows lose more to the branch's registers than they save.
+    if BLOCK_D > 8 or runs - 1 > BLOCK_T * MIN_SAVED:
+        # Estimate the block's distinct destinations from a histogram of
+        # hashed keys (linear counting), and skip the sort when it saves few
+        # atomics. Counting masked lanes as tokens only biases partial blocks
+        # toward the sort, and saves a block-wide reduction.
+        live = tok_mask & valid
+        hashed = ((dest.to(tl.int64) * 2654435761) >> (32 - LOG_HIST_BINS)) & (
+            HIST_BINS - 1
+        )
+        counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
+        # A destination taking an eighth of the block serializes its plain
+        # atomics, so such blocks sort whatever they save: a hot bin counts
+        # as HIST_BINS more empty ones, which takes the estimate below zero.
+        empty = (counts == 0).to(tl.float32) + (counts > BLOCK_T // 8).to(
+            tl.float32
+        ) * HIST_BINS
+        empty = tl.maximum(tl.sum(empty, 0), 1.0)
+        distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
+    in_order = runs - tl.maximum(distinct, 1.0) <= BLOCK_T * MIN_SAVED
 {% endif %}
     if BLOCK_T - distinct < BLOCK_T * MIN_SAVED:
         # Plain atomics in token order, like regular Inductor. Rows of PLAIN_D
@@ -718,9 +765,24 @@ else:
                 sem="relaxed",
             )
 {% else %}
+{% if ADAPTIVE %}
+    if in_order:
+        skey = dest
+        sorted_pos = pos
+        # A key can recur after others, so the scan segments by run number.
+        run_end = (dest != next_dest).to(KEY_DTYPE)
+        seg = tl.cumsum(run_end, 0) - run_end
+    else:
+        packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
+        skey = packed >> LOG_BLOCK_T
+        sorted_pos = (packed & (BLOCK_T - 1)).to(INDEX_DTYPE)
+        seg = skey
+{% else %}
     packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
     skey = packed >> LOG_BLOCK_T
     sorted_pos = (packed & (BLOCK_T - 1)).to(INDEX_DTYPE)
+    seg = skey
+{% endif %}
     if TOK_SHIFT:
         ptok = (tok_start + sorted_pos)[:, None]
     else:
@@ -730,7 +792,7 @@ else:
     seg_end = (skey < NUM_KEYS) & ((skey != next_key) | (pos == BLOCK_T - 1))
     out_key = tl.where(seg_end, skey, 0).to(INDEX_DTYPE)[:, None]
     # Keys are below the output's storage size, so INDEX_DTYPE holds them.
-    seg_key = tl.broadcast_to(skey.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
+    seg_key = tl.broadcast_to(seg.to(INDEX_DTYPE)[:, None], (BLOCK_T, BLOCK_D))
     if SKIP_UNIQUE_SCAN:
         # Every valid token that does not end a segment has a duplicate.
         has_dup = tl.max(((skey < NUM_KEYS) & ~seg_end).to(tl.int32), 0) > 0
@@ -1399,6 +1461,24 @@ def _lower_atomic(
         if distinct <= cfg.block_t * (1 - block_min_saved):
             return {"ADAPTIVE": False}
         hist_bins = min(2 * cfg.block_t, 2048)
+        adaptive = {
+            "ADAPTIVE": True,
+            "HIST_BINS": hist_bins,
+            "LOG_HIST_BINS": hist_bins.bit_length() - 1,
+            "MIN_SAVED": block_min_saved,
+        }
+        if not plan.inner_contiguous:
+            # Strided inner elements take a transaction each, so the plain
+            # path runs one column at a time with lanes over tokens, like a
+            # regular Inductor scatter. Lanes over a power-of-two row stride
+            # would also put a whole atomic on one memory channel (up to 7x
+            # on gfx942).
+            return adaptive | {
+                "PLAIN_VEC": 0,
+                "PLAIN_T": cfg.block_t,
+                "PLAIN_D": 1,
+                "PLAIN_ITERS": cfg.d_iters * cfg.block_d,
+            }
         # Widen the plain path's rows by a power of two that divides D_ITERS,
         # so each program still covers exactly its own inner range, up to
         # _PLAIN_MAX_D. Chunks of fewer than 128 tokens pay only in rows at
@@ -1414,18 +1494,12 @@ def _lower_atomic(
                 return (
                     rows > _PLAIN_MAX_D
                     or chunk < min_chunk
-                    or (
-                        plan.inner_contiguous and not dot and rows < 128 and chunk < 128
-                    )
+                    or (not dot and rows < 128 and chunk < 128)
                 )
 
             while widen > 1 and too_wide(widen):
                 widen //= 2
-        return {
-            "ADAPTIVE": True,
-            "HIST_BINS": hist_bins,
-            "LOG_HIST_BINS": hist_bins.bit_length() - 1,
-            "MIN_SAVED": block_min_saved,
+        return adaptive | {
             "PLAIN_VEC": plain_vec,
             "PLAIN_T": cfg.block_t // widen,
             "PLAIN_D": cfg.block_d * widen,

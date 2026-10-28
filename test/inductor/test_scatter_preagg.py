@@ -541,6 +541,30 @@ class TestScatterPreagg(TestCase):
             self._check(fn, x, idx, v, atol=1e-2, rtol=1e-3)
 
     @parametrize("min_saved", [-1.0, 2.0])
+    def test_adaptive_forced_path_strided(self, min_saved):
+        x = torch.zeros(64, 4096, device=GPU_TYPE)
+        idx = _hot_indices(50_000, 4096, GPU_TYPE)
+        v = torch.randn(64, 50_000, device=GPU_TYPE)
+        with config.patch(scatter_preagg_min_saved=min_saved):
+            self._check(
+                lambda x, i, v: x.index_add(1, i, v), x, idx, v, atol=1e-2, rtol=1e-3
+            )
+
+    @parametrize("d", [1, 32])
+    def test_adaptive_runs(self, d):
+        # Runs of a few recurring keys take the in-order scan, which must not
+        # merge a key's runs across the runs between them.
+        idx = torch.randint(0, 4, (8192,), device=GPU_TYPE).repeat_interleave(8)
+        shape = (4096, d) if d > 1 else (4096,)
+        x = torch.zeros(shape, device=GPU_TYPE)
+        v = torch.randn(idx.numel(), *shape[1:], device=GPU_TYPE)
+
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        self._check(fn, x, idx, v, atol=1e-2, rtol=1e-3)
+
+    @parametrize("min_saved", [-1.0, 2.0])
     def test_constant_values(self, min_saved):
         # Counting with scattered ones leaves a rank-1 constant as the value.
         def fn(x, i):

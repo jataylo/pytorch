@@ -1412,7 +1412,9 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             # exceed the 64KB LDS of gfx9 above 4K elements.
             tile_elems = min(tile_elems, 4096)
         block_t = next_power_of_2(max(1, tile_elems // block_d))
-        block_t = max(32, min(1024, block_t))
+        # Narrow rows give each block's sort few elements to amortize over:
+        # past 256 tokens per element it costs more than it saves (gfx942).
+        block_t = max(32, min(1024, 256 * block_d, block_t))
 
         # Fewest programs along the inner dim (one sort per token block) that
         # still keeps enough programs in flight to fill the GPU.

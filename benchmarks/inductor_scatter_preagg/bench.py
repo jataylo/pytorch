@@ -3,7 +3,7 @@ regular Inductor across ops, index distributions, shapes and dtypes, timed on
 identical inputs.
 
   python bench.py run --gpus 8 --out results/gfx942.jsonl
-  python bench.py summary results/gfx942.jsonl [--worst 10]
+  python bench.py summary results/gfx942.jsonl --worst 10 > results/gfx942_summary.md
 
 Cases are sharded over GPUs and appended as JSON lines; a rerun skips the
 cases already in --out, and a shard that crashes restarts past the case it
