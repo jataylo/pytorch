@@ -407,6 +407,11 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(block(50_000, 32, torch.float32), (256, 16))
         self.assertEqual(block(50_000, 128, torch.bfloat16), (128, 32))
         self.assertEqual(block(50_000, 512, torch.float32), (128, 32))
+        if torch.version.hip:
+            # fp16 blocks take the matrix product.
+            self.assertEqual(block(50_000, 128, torch.float16), (64, 32))
+            self.assertEqual(block(50_000, 512, torch.float16), (64, 64))
+            self.assertEqual(block(50_000, 16, torch.float16), (256, 16))
         strided = (50_000, 256, torch.float32)
         self.assertEqual(block(*strided, inner_contiguous=False), (512, 8))
         with config.patch(max_autotune=True):
@@ -445,6 +450,72 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(out.float(), ref, atol=ref.abs().max().item() * 3e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
         self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)
+
+    def _check_fp16(self, fn, x, idx, v, matrix=True):
+        ref = fn(x.float(), idx, v.float())
+        out, (code,) = run_and_get_code(
+            torch.compile(fn, fullgraph=True), x.clone(), idx, v
+        )
+        out = out.float()
+        self.assertEqual(out.isnan(), ref.isnan())
+        self.assertEqual(out.isinf(), ref.isinf())
+        finite = ref.isfinite()
+        scale = ref[finite].abs().max().item()
+        self.assertEqual(out[finite], ref[finite], atol=scale * 3e-2, rtol=0)
+        self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
+        self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)
+        if torch.version.hip:
+            self.assertEqual("tl.dot(" in code, matrix)
+
+    @parametrize(
+        "rows,d,n",
+        [(20, 64, 50_000), (4096, 128, 50_000), (300, 100, 30_000), (64, 320, 20_000)],
+    )
+    def test_fp16_matrix_preagg(self, rows, d, n):
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        x = torch.randn(rows, d, device=GPU_TYPE).half()
+        idx = _hot_indices(n, rows, GPU_TYPE)
+        v = torch.randn(n, d, device=GPU_TYPE).half()
+        self._check_fp16(fn, x, idx, v)
+
+    @config.patch(scatter_preagg_force=True)
+    def test_fp16_matrix_preagg_tail(self):
+        def fn(x, i, v):
+            return x.index_add(0, i, v)
+
+        x = torch.zeros(8, 64, device=GPU_TYPE).half()
+        idx = torch.randint(0, 8, (1000,), device=GPU_TYPE)
+        v = torch.randn(1000, 64, device=GPU_TYPE).half()
+        self._check_fp16(fn, x, idx, v)
+
+    @parametrize("rows", [20, 4096])
+    def test_fp16_matrix_preagg_non_finite(self, rows):
+        # A block with inf or nan values must not spread nan (0 * inf) into
+        # the other destinations of its product.
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        x = torch.zeros(rows, 64, device=GPU_TYPE).half()
+        idx = _hot_indices(50_000, rows, GPU_TYPE)
+        v = torch.randn(50_000, 64, device=GPU_TYPE).half()
+        v[torch.nonzero(idx == 3)[0], 5] = float("inf")
+        v[torch.nonzero(idx == 7)[0], 9] = float("nan")
+        self._check_fp16(fn, x, idx, v)
+
+    @parametrize("min_saved", [-1.0, 2.0])
+    def test_fp16_matrix_preagg_forced_path(self, min_saved):
+        # -1 always takes the product and 2 never does. A milder hot row keeps
+        # the plain fp16 atomics' rounding within tolerance.
+        def fn(x, i, v):
+            return torch.index_put(x, (i,), v, accumulate=True)
+
+        x = torch.zeros(4096, 64, device=GPU_TYPE).half()
+        idx = _hot_indices(50_000, 4096, GPU_TYPE, hot_fraction=0.05)
+        v = torch.randn(50_000, 64, device=GPU_TYPE).half()
+        with config.patch(scatter_preagg_min_saved=min_saved):
+            self._check_fp16(fn, x, idx, v)
 
     def test_adaptive_low_contention(self):
         # Adaptive chunks take plain atomics instead of being gated out.

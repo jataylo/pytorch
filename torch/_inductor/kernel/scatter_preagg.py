@@ -621,6 +621,16 @@ _TEMPLATE_SOURCE = (
 
     dest = tl.where(tok_mask & valid, key, NUM_KEYS).to(KEY_DTYPE)
 {% if ADAPTIVE %}
+{% if DOT %}
+    # Count the block's destinations exactly from its sorted keys (reducing
+    # the product's matrix instead costs a second copy of it), and skip the
+    # product when it saves few atomics. Masked lanes count as one
+    # destination, which only biases partial blocks toward the product.
+    sorted_key = tl.sort(dest)
+    next_key = tl.gather(sorted_key, tl.minimum(pos + 1, BLOCK_T - 1), 0)
+    heads = (sorted_key != next_key) | (pos == BLOCK_T - 1)
+    distinct = tl.sum(heads.to(tl.int32), 0)
+{% else %}
     # Estimate the block's distinct destinations from a histogram of hashed
     # keys (linear counting), and skip the sort when it saves few atomics.
     # Counting masked lanes as tokens only biases partial blocks toward the
@@ -630,8 +640,15 @@ _TEMPLATE_SOURCE = (
         HIST_BINS - 1
     )
     counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
-    empty = tl.maximum(tl.sum((counts == 0).to(tl.float32), 0), 1.0)
+    # A destination taking an eighth of the block serializes its plain
+    # atomics, so such blocks sort whatever they save: a hot bin counts as
+    # HIST_BINS more empty ones, which takes the estimate below zero.
+    empty = (counts == 0).to(tl.float32) + (counts > BLOCK_T // 8).to(
+        tl.float32
+    ) * HIST_BINS
+    empty = tl.maximum(tl.sum(empty, 0), 1.0)
     distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
+{% endif %}
     if BLOCK_T - distinct < BLOCK_T * MIN_SAVED:
         # Plain atomics in token order, like regular Inductor. Rows of PLAIN_D
         # put fewer tokens in each atomic instruction than BLOCK_D-wide tiles,
@@ -681,6 +698,60 @@ _TEMPLATE_SOURCE = (
                 )
         return
 {% endif %}
+{% if DOT %}
+    # Pre-aggregate on the matrix cores: row i of SAME @ values sums the
+    # values of the tokens sharing token i's destination, which the first of
+    # them adds. Products with a 0/1 matrix are exact in 16 bits. The matrix
+    # compares raw keys, since masking them first costs a layout conversion;
+    # dead tokens instead contribute zero and start no segment.
+    tok_live = tok_mask & valid
+    raw_key = key.to(KEY_DTYPE)
+    same = raw_key[:, None] == raw_key[None, :]
+    earlier = same & tok_live[None, :] & (pos[None, :] < pos[:, None])
+    seg_end = (tl.sum(earlier.to(tl.int32), 1) == 0) & tok_live
+    out_key = tl.where(seg_end, raw_key, 0).to(INDEX_DTYPE)[:, None]
+    tok_key = tl.where(tok_live, raw_key, 0).to(INDEX_DTYPE)[:, None]
+    onehot = same.to(OUT_DTYPE)
+    ptok = tok[:, None]
+    for it in tl.range(0, D_ITERS):
+        inner_raw = (pid_inner * D_ITERS + it) * BLOCK_D + tl.arange(0, BLOCK_D)
+        inner_mask = inner_raw < NUM_INNER
+        if INNER_MODE == 0:
+            inner = inner_raw[None, :]
+            atomic_inner = tl.max_contiguous(
+                tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
+            )[None, :]
+        else:
+            inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
+            atomic_inner = inner
+
+        {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
+
+        val = tl.where(tok_live[:, None], val.to(OUT_DTYPE), 0.0)
+        # 0 * inf is nan, so the product would carry a non-finite value to
+        # every destination in the block.
+        if tl.max(tl.where(tl.abs(val) < float("inf"), 0, 1)) > 0:
+            tl.atomic_add(
+                tl.broadcast_to(
+                    OUT + ({{preagg_addr("tok_key", "atomic_inner")}}),
+                    [BLOCK_T, BLOCK_D],
+                ),
+                val,
+                mask=tok_live[:, None] & inner_mask[None, :],
+                sem="relaxed",
+            )
+        else:
+            acc = tl.dot(onehot, val, out_dtype=tl.float32)
+            tl.atomic_add(
+                tl.broadcast_to(
+                    OUT + ({{preagg_addr("out_key", "atomic_inner")}}),
+                    [BLOCK_T, BLOCK_D],
+                ),
+                acc.to(OUT_DTYPE),
+                mask=seg_end[:, None] & inner_mask[None, :],
+                sem="relaxed",
+            )
+{% else %}
     packed = tl.sort((dest << LOG_BLOCK_T) | pos.to(KEY_DTYPE))
     skey = packed >> LOG_BLOCK_T
     sorted_pos = (packed & (BLOCK_T - 1)).to(INDEX_DTYPE)
@@ -733,6 +804,7 @@ _TEMPLATE_SOURCE = (
             mask=seg_end[:, None] & inner_mask[None, :],
             sem="relaxed",
         )
+{% endif %}
 """
     + _SEGMENTED_SUM
 )
@@ -1116,7 +1188,24 @@ def _scatter_into_copy(
     return True
 
 
-def _stage_in_fp32(dtype: torch.dtype, num_keys: sympy.Expr) -> bool:
+def _matrix_preagg(dtype: torch.dtype, num_inner: int, inner_contiguous: bool) -> bool:
+    """
+    Whether blocks pre-aggregate with a 0/1 matrix product rather than a sort
+    and segmented scan. On gfx942 that runs 1.5-2.5x faster for fp16 outputs,
+    whose packed atomics it keeps, from 32-wide rows up; narrower rows leave
+    the matrix cores too little work per block.
+    """
+    return (
+        bool(torch.version.hip)
+        and dtype == torch.float16
+        and inner_contiguous
+        and num_inner >= 32
+    )
+
+
+def _stage_in_fp32(
+    dtype: torch.dtype, num_keys: sympy.Expr, matrix_preagg: bool
+) -> bool:
     """
     Whether to accumulate a 16-bit output in an fp32 copy rather than with
     16-bit atomics, which round every block's partial sum into the output.
@@ -1126,9 +1215,11 @@ def _stage_in_fp32(dtype: torch.dtype, num_keys: sympy.Expr) -> bool:
         return True
     # Blocks that issue plain atomics would take twice as many in fp32 as
     # packed fp16 ones, so fp16 is staged only when every block sorts, where
-    # the copy is small and its rounding saving comes free.
+    # the copy is small and its rounding saving comes free. The matrix
+    # product's blocks lose their speed with fp32 atomics.
     return (
         dtype == torch.float16
+        and not matrix_preagg
         and isinstance(num_keys, (int, sympy.Integer))
         and num_keys <= _ALWAYS_SORTED_KEYS
     )
@@ -1182,7 +1273,13 @@ def _try_template(
     if not (use_sorted or gated) and _too_small(num_tokens, num_inner):
         _record_skip("too_small")
         return False
-    if _stage_in_fp32(dtype, plan.num_keys) and not use_sorted:
+    inner_contiguous = not plan.inner_out_dims or (
+        V.graph.sizevars.statically_known_equals(
+            out_layout.stride[plan.inner_out_dims[-1]], 1
+        )
+    )
+    matrix_preagg = _matrix_preagg(dtype, num_inner, inner_contiguous)
+    if _stage_in_fp32(dtype, plan.num_keys, matrix_preagg) and not use_sorted:
         return _scatter_into_copy(
             "fp32_copy",
             out,
@@ -1204,11 +1301,6 @@ def _try_template(
             buf.freeze_layout()
         inputs.append(buf)
 
-    inner_contiguous = not plan.inner_out_dims or (
-        V.graph.sizevars.statically_known_equals(
-            out_layout.stride[plan.inner_out_dims[-1]], 1
-        )
-    )
     # Deterministic results need the same config on every compile.
     with config.patch(max_autotune=config.max_autotune and not use_sorted):
         configs = V.choices.get_scatter_preagg_configs(
@@ -1305,6 +1397,11 @@ def _lower_atomic(
 ) -> bool:
     dtype = out.get_dtype()
     few_keys = _hint(plan.num_keys) <= 64
+    inner_contiguous = not plan.inner_out_dims or (
+        V.graph.sizevars.statically_known_equals(
+            out.get_layout().stride[plan.inner_out_dims[-1]], 1
+        )
+    )
     # On CDNA, 32-bit atomics run ~1.7x faster at two elements per thread than
     # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
@@ -1313,11 +1410,24 @@ def _lower_atomic(
     # wavefront updates whole cache lines (fewer L2 atomic transactions, which
     # bound hot destinations). The sort path keeps two: one word per lane costs
     # it registers for a layout conversion after the scan. So do outputs of
-    # 2GB or more, whose 64-bit addresses already halve occupancy.
+    # 2GB or more, whose 64-bit addresses already halve occupancy. The word
+    # also sets the width of value loads, which 16-bit inputs keep at 32 bits
+    # once the output outgrows L2, and atomics wait on memory rather than
+    # issue.
     plain_vec = atomic_vec
     out_bytes = _hint(out.get_layout().storage_size()) * dtype.itemsize
     if torch.version.hip and out_bytes < 2**31:
-        plain_vec = max(1, 4 // dtype.itemsize)
+        elem_bytes = dtype.itemsize
+        if out_bytes > torch.cuda.get_device_properties(out.get_device()).L2_cache_size:
+            elem_bytes = min(
+                [elem_bytes]
+                + [
+                    i.get_dtype().itemsize
+                    for i in inputs
+                    if i.get_dtype().is_floating_point
+                ]
+            )
+        plain_vec = max(1, 4 // elem_bytes)
 
     # Sorting pays less on wide rows, whose scans cost more than the atomics
     # they save, and with at least as many destinations as tokens, whose
@@ -1328,29 +1438,50 @@ def _lower_atomic(
     if _hint(plan.num_tokens) <= _hint(plan.num_keys):
         min_saved *= 2
 
-    def adaptive_kwargs(cfg, inner_mode) -> dict[str, Any]:
-        # With fewer keys than tokens per block, full blocks always save enough
-        # atomics to sort.
-        if (
-            isinstance(plan.num_keys, (int, sympy.Integer))
-            and plan.num_keys <= cfg.block_t * (1 - min_saved)
-        ):
+    def adaptive_kwargs(cfg, inner_mode, dot) -> dict[str, Any]:
+        block_min_saved = min_saved
+        if dot:
+            # The product costs little more than plain atomics without
+            # duplicates: it pays at half the sort's saving, and is taken
+            # without counting whenever uniformly spread keys would save
+            # enough (skew only adds duplicates) (gfx942).
+            block_min_saved /= 2
+            keys = _hint(plan.num_keys)
+            distinct = keys * (1 - (1 - 1 / keys) ** cfg.block_t)
+        elif isinstance(plan.num_keys, (int, sympy.Integer)):
+            # With fewer keys than tokens per block, full blocks always save
+            # enough atomics to sort.
+            distinct = int(plan.num_keys)
+        else:
+            distinct = cfg.block_t
+        if distinct <= cfg.block_t * (1 - block_min_saved):
             return {"ADAPTIVE": False}
         hist_bins = min(2 * cfg.block_t, 2048)
         # Widen the plain path's rows by a power of two that divides D_ITERS,
-        # so each program still covers exactly its own inner range.
+        # so each program still covers exactly its own inner range, up to
+        # _PLAIN_MAX_D. Chunks of fewer than 128 tokens pay only in rows at
+        # least 128 wide (gfx942); the matrix product's short blocks keep
+        # 32-token chunks, which cost less per atomic.
         widen = 1
         if inner_mode == 0:
             widen = cfg.d_iters & -cfg.d_iters
-            while widen > 1 and (
-                cfg.block_d * widen > _PLAIN_MAX_D or widen > cfg.block_t
-            ):
+            min_chunk = 32 if dot else 1
+
+            def too_wide(widen: int) -> bool:
+                rows, chunk = cfg.block_d * widen, cfg.block_t // widen
+                return (
+                    rows > _PLAIN_MAX_D
+                    or chunk < min_chunk
+                    or (inner_contiguous and not dot and rows < 128 and chunk < 128)
+                )
+
+            while widen > 1 and too_wide(widen):
                 widen //= 2
         return {
             "ADAPTIVE": True,
             "HIST_BINS": hist_bins,
             "LOG_HIST_BINS": hist_bins.bit_length() - 1,
-            "MIN_SAVED": min_saved,
+            "MIN_SAVED": block_min_saved,
             "PLAIN_VEC": plain_vec,
             "PLAIN_T": cfg.block_t // widen,
             "PLAIN_D": cfg.block_d * widen,
@@ -1362,14 +1493,26 @@ def _lower_atomic(
     for cfg in configs:
         log_block_t = cfg.block_t.bit_length() - 1
         int32_keys = _guarded(sympy.Lt(plan.num_keys + 1, 2 ** (31 - log_block_t)))
-        wide_few_keys = cfg.block_d >= 64 and few_keys
+        # The [BLOCK_T, BLOCK_T] matrix outgrows registers past 128 tokens.
+        dot = (
+            _matrix_preagg(dtype, _hint(plan.num_inner), inner_contiguous)
+            and cfg.block_d >= 32
+            and 16 <= cfg.block_t <= 128
+        )
+        wide_few_keys = cfg.block_d >= 64 and few_keys and not dot
         inner_mode = _inner_mode(plan.num_inner, cfg.block_d, cfg.d_iters)
+        adaptive = adaptive_kwargs(cfg, inner_mode, dot)
+        num_warps = cfg.num_warps
+        if dot and not adaptive["ADAPTIVE"]:
+            # Without plain atomics to serve, the product runs faster on two
+            # warps.
+            num_warps = max(num_warps, 2)
         scatter_preagg_template.maybe_append_choice(
             choices,
             input_nodes=(out, *inputs),
             layout=layout,
             num_stages=cfg.num_stages,
-            num_warps=cfg.num_warps,
+            num_warps=num_warps,
             subgraphs=[value_subgraph],
             mutated_inputs=[out],
             call_sizes=[plan.num_tokens, plan.num_inner],
@@ -1380,6 +1523,7 @@ def _lower_atomic(
             KEY_DTYPE="tl.int32" if int32_keys else "tl.int64",
             INNER_MODE=inner_mode,
             OUT_DTYPE=triton_type(dtype),
+            DOT=dot,
             ATOMIC_VEC=(0 if cfg.block_d < atomic_vec or wide_few_keys else atomic_vec),
             # Skipping the scan for blocks without a repeated destination pays
             # for its check only on wide slices (gfx942).
@@ -1387,7 +1531,7 @@ def _lower_atomic(
             # The shifted token block needs one full block; the clamped one
             # handles any size.
             TOK_SHIFT=_guarded(sympy.Ge(plan.num_tokens, cfg.block_t)),
-            **adaptive_kwargs(cfg, inner_mode),
+            **adaptive,
             **plan.static_sizes(),
         )
     if not choices:

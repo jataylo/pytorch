@@ -1453,12 +1453,23 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         # sort and scan within each thread than four. When inner elements are
         # strided in the output each one is its own memory transaction, so thin
         # slices of many tokens keep sorted neighbours together instead.
+        tile_elems, num_warps = 4096, 2
         if not inner_contiguous:
             max_block_d = 8
+        elif torch.version.hip and dtype == torch.float16 and num_inner >= 32:
+            # fp16 blocks pre-aggregate with a matrix product over their
+            # tokens (_matrix_preagg in kernel/scatter_preagg.py), fastest at
+            # 64 tokens of 32-wide slices, 64-wide past 128.
+            max_block_d = 32 if num_inner <= 128 else 64
+            tile_elems = 64 * max_block_d
+            # One warp keeps the block's reductions within a wavefront, which
+            # suits the plain atomics of blocks without duplicates (the
+            # lowering gives the product two when every block takes it).
+            num_warps = 1
         else:
             max_block_d = 16 if num_inner <= 64 else 32
         default_config = self._scatter_preagg_config(
-            num_tokens, num_inner, max_block_d, 4096, 2
+            num_tokens, num_inner, max_block_d, tile_elems, num_warps
         )
         if default_config not in configs:
             configs.append(default_config)
