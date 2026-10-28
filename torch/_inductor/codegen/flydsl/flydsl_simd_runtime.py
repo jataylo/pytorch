@@ -2378,6 +2378,16 @@ def warm_worker(arch: str | None = None) -> None:
         compile_only(_warm_launch, 0)
 
 
+def preload_worker(arch: str | None = None) -> None:
+    """Run in the compile pool's sidecar before it forks its workers, so each inherits
+    FlyDSL's imports and the gfx target rather than paying for them itself."""
+    from flydsl.runtime.device import get_rocm_arch
+
+    _set_arch(arch)
+    _os.environ.setdefault("FLYDSL_GPU_ARCH", get_rocm_arch())
+    warm_worker()
+
+
 _EARLY: dict = {}
 
 

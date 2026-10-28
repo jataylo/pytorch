@@ -48,6 +48,18 @@ def _lookup_and_create_type(base: type[_T], qname: str) -> _T:
     return ty()
 
 
+def _run_preload(spec: str) -> None:
+    """Run ``module:function[=arg]`` before the workers fork, so each inherits its
+    result. Only a head start: a failure is logged and the workers set up alone."""
+    target, _, arg = spec.partition("=")
+    pkg, _, name = target.partition(":")
+    try:
+        fn = getattr(importlib.import_module(pkg), name)
+        fn(arg) if arg else fn()
+    except Exception:
+        log.exception("compile_worker preload %s failed", spec)
+
+
 def main():
     try:
         parser = argparse.ArgumentParser()
@@ -60,6 +72,7 @@ def main():
         parser.add_argument("--read-fd", type=int)
         parser.add_argument("--write-fd", type=int)
         parser.add_argument("--torch-key", type=str)
+        parser.add_argument("--preload", action="append", default=[])
         args = parser.parse_args()
         if os.getppid() != args.parent:
             sys.exit(0)
@@ -71,6 +84,9 @@ def main():
         torch_key.set(base64.b64decode(args.torch_key.encode("utf-8")))  # type: ignore[attr-defined]
 
         _async_compile_initializer(args.parent)
+
+        for spec in args.preload:
+            _run_preload(spec)
 
         SubprocMain(args.pickler, args.kind, args.workers, read_fd, write_fd).main()
     except Exception:

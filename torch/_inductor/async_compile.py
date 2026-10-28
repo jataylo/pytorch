@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import functools
+import importlib.util
 import json
 import logging
 import multiprocessing
@@ -93,6 +94,25 @@ def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
         "TORCHINDUCTOR_CUTLASS_DIR",
     ]
     return {v: os.environ.get(v) for v in env_vars}
+
+
+def _worker_preloads() -> list[str]:
+    """Setup the SubprocPool's sidecar runs before forking its workers (see
+    ``SubprocPool(preload=...)``), for kernel kinds whose first compile in a worker
+    would otherwise pay for it."""
+    preloads = []
+    if (
+        config.flydsl.simd
+        and torch.version.hip
+        and importlib.util.find_spec("flydsl") is not None
+    ):
+        arch = None
+        if torch.cuda.is_initialized():
+            name = torch.cuda.get_device_properties(torch.cuda.current_device())
+            arch = name.gcnArchName.split(":", 1)[0]
+        spec = "torch._inductor.codegen.flydsl.flydsl_simd_runtime:preload_worker"
+        preloads.append(f"{spec}={arch}" if arch else spec)
+    return preloads
 
 
 def pre_fork_setup():
@@ -329,7 +349,9 @@ class AsyncCompile:
         if config.worker_start_method == "subprocess":
             # Wrapper around ProcessPoolExecutor forks in a new process we control
             pool = SubprocPool(
-                get_compile_threads(), quiesce=config.quiesce_async_compile_pool
+                get_compile_threads(),
+                quiesce=config.quiesce_async_compile_pool,
+                preload=_worker_preloads(),
             )
         else:
             if config.worker_start_method == "spawn":

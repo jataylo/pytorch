@@ -13,7 +13,7 @@ import threading
 import time
 import traceback
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from enum import Enum, IntEnum
@@ -164,8 +164,12 @@ class SubprocPool:
         pickler: SubprocPickler | None = None,
         kind: SubprocKind = SubprocKind.FORK,
         quiesce: bool = False,
+        preload: Sequence[str] = (),
     ) -> None:
+        """``preload``: ``"module:function"`` or ``"module:function=arg"`` setup the
+        sidecar runs before forking its workers, so each worker inherits it."""
         entry = os.path.join(os.path.dirname(__file__), "__main__.py")
+        self.preload = tuple(preload)
         self.pickler = pickler or SubprocPickler()
         self.kind = kind
 
@@ -191,6 +195,7 @@ class SubprocPool:
             f"--write-fd={str(subproc_write_fd)}",
             f"--torch-key={torch_key_str}",
         ]
+        args.extend(f"--preload={p}" for p in preload)
         cmd.extend(args)
         log_path = None
         self.log_file = None

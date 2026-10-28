@@ -42,6 +42,19 @@ class TestCompileWorker(TestCase):
             pool.shutdown()
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
+    def test_preload(self):
+        # The sidecar runs each preload before forking, so the workers inherit it;
+        # one that fails is logged and skipped.
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            pool = SubprocPool(2, preload=["no_such_module:f", f"os:chdir={d}"])
+            try:
+                self.assertEqual(pool.submit(os.getcwd).result(), d)
+                self.assertEqual(pool.submit(operator.add, 100, 1).result(), 101)
+            finally:
+                pool.shutdown()
+
+    @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_exception(self):
         pool = self.make_pool(2)
         try:

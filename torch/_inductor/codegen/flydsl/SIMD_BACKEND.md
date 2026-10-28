@@ -183,31 +183,33 @@ elements, so its stores are 16 bytes too.
 compilation included, with empty Inductor, Triton and FlyDSL caches; *warm* the same
 with the caches filled by the cold run; *graph* the `mode="reduce-overhead"` step. Graph
 times are from a `--quick` run (ResNet and ViT train the median of `--repeats 3`; a
-model moves by up to 0.15 ms between runs, as autotune picks shift); compile times are
-from the last `--repeats 3` run.
+model moves by up to 0.15 ms between runs, as autotune picks shift); cold times are
+from one `--quick` run with the compile pool's FlyDSL preload (single runs move by up to
+1 s), warm times from the last `--repeats 3` run.
 
 | model | Triton graph ms | FlyDSL graph ms | FlyDSL/Triton | FlyDSL kernels | cold s Triton / FlyDSL | warm s Triton / FlyDSL |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
-| GPT train (bf16, AdamW) | 16.71 | 14.67 | **0.878** | 129 | 23.1 / 24.2 | 7.0 / 7.1 |
-| BERT train (f16) | 34.60 | 29.82 | **0.862** | 112 | 25.2 / 25.4 | 6.1 / 6.7 |
-| Llama train (bf16) | 30.88 | 28.57 | **0.925** | 83 | 20.7 / 23.3 | 6.9 / 7.1 |
-| MoE train (bf16) | 11.46 | 10.73 | **0.937** | 42 | 15.6 / 16.9 | 5.8 / 6.8 |
-| ViT train (bf16) | 16.39 | 15.64 | **0.954** | 102 | 24.0 / 24.8 | 7.0 / 7.3 |
-| GPT inference (bf16) | 10.08 | 9.69 | **0.961** | 33 | 9.5 / 9.5 | 4.5 / 4.9 |
-| Llama inference (bf16) | 15.35 | 15.23 | **0.992** | 25 | 7.0 / 8.8 | 3.0 / 3.3 |
-| ViT inference (f16) | 8.24 | 8.09 | **0.981** | 13 | 6.3 / 7.2 | 2.6 / 2.9 |
-| ResNet train (f32, channels_last) | 26.70 | 26.27 | **0.984** | 119 | 14.1 / 12.2 | 4.5 / 4.7 |
-| ResNet train (f32, NCHW) | 26.57 | 26.08 | **0.982** | 100 | 13.2 / 12.5 | 4.6 / 4.7 |
+| GPT train (bf16, AdamW) | 16.71 | 14.67 | **0.878** | 129 | 23.5 / 23.6 | 7.0 / 7.1 |
+| BERT train (f16) | 34.60 | 29.82 | **0.862** | 112 | 25.1 / 24.3 | 6.1 / 6.7 |
+| Llama train (bf16) | 30.88 | 28.57 | **0.925** | 83 | 20.9 / 23.2 | 6.9 / 7.1 |
+| MoE train (bf16) | 11.46 | 10.73 | **0.937** | 42 | 16.2 / 17.9 | 5.8 / 6.8 |
+| ViT train (bf16) | 16.39 | 15.64 | **0.954** | 102 | 22.4 / 24.5 | 7.0 / 7.3 |
+| GPT inference (bf16) | 10.08 | 9.69 | **0.961** | 33 | 9.4 / 9.3 | 4.5 / 4.9 |
+| Llama inference (bf16) | 15.35 | 15.23 | **0.992** | 25 | 7.2 / 9.0 | 3.0 / 3.3 |
+| ViT inference (f16) | 8.24 | 8.09 | **0.981** | 13 | 6.0 / 7.3 | 2.6 / 2.9 |
+| ResNet train (f32, channels_last) | 26.70 | 26.27 | **0.984** | 119 | 13.8 / 12.9 | 4.5 / 4.7 |
+| ResNet train (f32, NCHW) | 26.57 | 26.08 | **0.982** | 100 | 14.3 / 12.4 | 4.6 / 4.7 |
 
 Geomean **0.945**; 12.2 ms a step saved summed over the ten models, and every model is
 faster than Triton. `check_models.py` runs one forward and backward of each model on
 eager, Triton and FlyDSL and compares the loss and every parameter gradient: FlyDSL's
-worst relative error tracks Triton's on all ten. Cold compile sums to 165 s against
-Triton's 161 s. The remaining cold gap is on
-the small inference graphs (0.4-1.2 s): FlyDSL's per-kernel compile (about 0.2 s a
-variant, 0.4 s for large kernels) is faster than Triton's, but each of the pool's
-workers pays about 0.6 s to import FlyDSL and set up its first compile, which a graph of
-13-33 kernels does not hide. Graph time tracks
+worst relative error tracks Triton's on all ten. Cold compile sums to 164 s against
+Triton's 159 s. The compile pool's sidecar now imports FlyDSL and runs one warm-up
+compile before it forks its workers (`SubprocPool(preload=...)`), so no worker pays that
+setup: over five models, three runs each back to back, FlyDSL's cold first steps sum to
+70.1 s with it against 72.5 s without (GPT train 23.7 -> 22.3 s, GPT inference 9.9 ->
+9.3 s; Triton 65.6 s). The rest of the gap is on graphs whose compile ends on a slow
+kernel: Llama, ViT and MoE training, and Llama and ViT inference (1.3-2.3 s). Graph time tracks
 eager step time, so the differences are kernel time, not launch overhead. The models
 spend most of their time in matmuls and attention, which neither backend generates; of
 the time in generated kernels (`rocprofv3 --kernel-trace`, per training step), FlyDSL
@@ -527,9 +529,15 @@ the second autotune
 candidate of large pointwise kernels (8 runs a thread), slow to compile but the pick on
 16 of the 69 kernels it was offered.
 
-On a cold ViT inference first step, FlyDSL's Inductor codegen takes 0.74 s against
-Triton's 1.04 s, and the gap is waiting on the workers: 0.56 s against 0.18 s, most of
-it each worker's one-time FlyDSL setup. A call costs about 1-3 µs more host time than
+On a cold ViT inference first step the pool is created at the first `torch.compile`
+call, and its sidecar takes about 4 s (3.2 s importing torch, 0.9 s for Triton's cache
+key and the device properties, 0.3 s for the FlyDSL preload) before it forks, which is
+about when codegen ends. So every kernel compiles after codegen, and the module then
+waits 0.94 s on 18 worker jobs against Triton's 0.24 s on 8. Most jobs take 0.15-0.6
+s; the last is GELU's 8-runs-a-thread candidate, at 0.93 s, which wins 31 of the 95
+large pointwise kernels it is offered across the ten models, by up to 55%. The AdamW
+combo kernel (Llama train: 1.5 s, the end of the optimizer graph) is 0.28 s of FlyDSL's
+AST rewrite, 0.34 s of tracing and 0.70 s of the MLIR/LLVM pipeline at `O2`. A call costs about 1-3 µs more host time than
 Triton's launcher, invisible under CUDA graphs.
 
 ### Not supported
@@ -540,10 +548,10 @@ kernel, or raise under `flydsl.simd_strict`.
 
 ### Next
 
-- Cold compile on small graphs: a worker's one-time FlyDSL import and first-compile
-  setup (about 0.6 s) is 0.4-1.2 s of first step on 13-33-kernel inference graphs.
-  Forking workers after FlyDSL is imported, as the pool already does for Triton, would
-  remove it; that is in `async_compile`/the compile worker, outside this backend.
+- Cold compile on small graphs: the pool's sidecar becomes ready only as codegen ends
+  (about 4 s of startup, mostly importing torch), so a small graph's kernels all compile
+  after it. Starting the pool earlier than the first `torch.compile`, or compiling the
+  first kernels in-process while it starts, would hide that for both backends.
 - Transposing tiles stay 2-6% behind Triton (`nchw_to_nhwc_f32`, `transpose_f32`): 4-byte
   stores from a tile row are narrower than Triton's. A 32 x 64 tile at 256 threads ran
   the NCHW -> NHWC copy at 40.8 µs in a kernel trace against 49.2 for the default, but
