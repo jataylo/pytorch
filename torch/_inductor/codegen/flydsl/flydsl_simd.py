@@ -1228,6 +1228,15 @@ class FlyDSLKernel(SIMDKernel):
                 # more of each block's waves on the rows.
                 self.threads = SMALL_COLUMN_THREADS
             self.tpr = self.threads // self.stride
+            if not _tune("threads", 0):
+                # No more lanes a column than it has rows: ResNet's BatchNorm stats
+                # finalize (64 channels x 3 partial sums) ran 1024 threads, 192 of them
+                # loading, and combined through LDS across all of them.
+                while self.tpr > 1 and V.graph.sizevars.statically_known_geq(
+                    self.tpr // 2, self.rnumel
+                ):
+                    self.tpr //= 2
+                self.threads = self.tpr * self.stride
             self.rpb = self.stride
         else:
             self.ept = _largest_pow2_dividing(self.rnumel, widest_vec)

@@ -337,6 +337,20 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 777, device="cuda")
         self.check(lambda x: x.sum(0), a, atol=1e-3, kinds=["reduction"])
 
+    @parametrize("rows", [1, 3, 17])
+    def test_short_column_reduction(self, rows):
+        # No more lanes a column than rows: 3 rows of 64 columns take 4 lanes each.
+        from torch._inductor.utils import run_and_get_code
+
+        a = torch.randn(rows, 64, device="cuda")
+        b = torch.randn(rows, 64, device="cuda")
+        fn = lambda a, b: (a * b).sum(0) + a.mean(0)  # noqa: E731
+        with config.patch({"unroll_reductions_threshold": 1}):
+            out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), a, b)
+        torch.testing.assert_close(out, fn(a, b), atol=1e-4, rtol=1e-4)
+        if rows == 3:
+            self.assertIn("tpr=4 stride=64", code)
+
     @parametrize(
         "op",
         ["amax", "amin", "prod", "any", "argmax", "argmin", "var_mean", "logsumexp"],
