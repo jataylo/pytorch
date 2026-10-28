@@ -114,6 +114,8 @@ ROW_INTERLEAVE_MAX = 4096
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
 PERSISTENT_MAX_UNROLL = 16
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
+# Preloaded f16/bf16 elements a thread converts to f32 ahead of the reduction (fdp.widen).
+WIDEN_MAX_ELEMENTS = 32
 # A mix-order reduction's block (see FlyDSLKernel._finalize_mix_order): its threads,
 # rows a row group unrolls, and the LDS its groups' column partials may take.
 MIX_ORDER_THREADS = 256
@@ -819,6 +821,8 @@ class FlyDSLKernel(SIMDKernel):
         self._preload_at: int | None = None
         self._preload_indent = 0
         self.preload_lines: list[Any] = []
+        # Where the first pass's loop ends: see _insert_widen.
+        self._widen_at: int | None = None
         self.stored_args: OrderedSet[str] = OrderedSet()
         self.index_expr_roots: dict[str, sympy.Expr] = {}
         # Decided in finalize_indexing. A thread owns `unroll` runs of `ept` contiguous
@@ -1090,7 +1094,9 @@ class FlyDSLKernel(SIMDKernel):
             if body is None:
                 continue
             for e in body.memory_usage[MemoryUsageType.LOAD]:
-                if free_symbol_is_type(body.indexing_exprs[e.index_name], SymT.INDIRECT):
+                if free_symbol_is_type(
+                    body.indexing_exprs[e.index_name], SymT.INDIRECT
+                ):
                     return True
         return False
 
@@ -2155,6 +2161,31 @@ class FlyDSLKernel(SIMDKernel):
             return
         self.preload_lines.extend(pre.get_lines_ref())
 
+    def _insert_widen(self) -> None:
+        """After the first pass, convert the preloaded f16/bf16 loads the same for every
+        row (a norm's weight and bias) to f32 (see fdp.widen), as long as the f32
+        copies stay few: they are live across the reduction. Not a row's own inputs:
+        the converted copies of those only add pressure (Qwen's q/k RMSNorm + RoPE
+        67us -> 79us)."""
+        if not self.preload_lines or self._widen_at is None:
+            return
+        text = "\n".join(str(li) for li in self.preload_lines)
+        keys = [
+            (a, i)
+            for a, i in OrderedSet(
+                re.findall(r"fdp\.vload\(_lc, \('(\w+)', '([^']*)'", text)
+            )
+            if not re.search(r"\bx|\btmp", i)
+        ]
+        per_thread = -(-self.rnumel // (self.tpr * self.ept)) * self.ept
+        if not keys or len(keys) * per_thread > _tune("widen_max", WIDEN_MAX_ELEMENTS):
+            return
+        line = IndentedBuffer(initial_indent=self._preload_indent)
+        line.writeline(f"fdp.widen(_lc, {tuple(keys)!r})")
+        lines = self.body.get_lines_ref()
+        lines[self._widen_at : self._widen_at] = line.get_lines_ref()
+        self._widen_at = None
+
     def _splice_preload(self) -> None:
         if self.preload_lines and self._preload_at is not None:
             lines = self.body.get_lines_ref()
@@ -2220,6 +2251,8 @@ class FlyDSLKernel(SIMDKernel):
                 self.body.splice(self.chunk_post)
             for arg, name in self.loop_stored_args.items():
                 self.body.writeline(DeferredLine(name, f"fdp.forget(_lc, {arg!r})"))
+            if self.persistent and self._widen_at is None:
+                self._widen_at = len(self.body.get_lines_ref())
             self.loop_stored_args.clear()
             self.cse.invalidate(self.outside_loop_vars)
             self.range_trees[-1].cache_clear()
@@ -2401,7 +2434,9 @@ class FlyDSLKernel(SIMDKernel):
                     continue
                 text = re.sub(r", cache=_pc, key=\d+\)", ")", text)
                 text = text.replace("fdp.pair_load(_K_, ", "fdp.load(")
-                lines[i] = li._new_line(text) if isinstance(li, DeferredLineBase) else text
+                lines[i] = (
+                    li._new_line(text) if isinstance(li, DeferredLineBase) else text
+                )
 
         if self.cpair < 2:
             return None
@@ -2410,13 +2445,16 @@ class FlyDSLKernel(SIMDKernel):
             return None
         lane_x = f"(_t % {self.stride}) * 2 + _K_"
         template: list[tuple[int, Any]] = [
-            (0, line)
-            for line in ("_vc = {}", "_sc = {}", "_lc = {}")
+            (0, line) for line in ("_vc = {}", "_sc = {}", "_lc = {}")
         ]
         template.append((0, f"xindex = _b * {self.rpb * 2} + {lane_x}"))
         if self._xmask():
             template.append((0, f"xmask = xindex < {self.xnumel}"))
-        body = [li for li in lines if not isinstance(text_of(li), str) or text_of(li).strip()]
+        body = [
+            li
+            for li in lines
+            if not isinstance(text_of(li), str) or text_of(li).strip()
+        ]
         if any(not isinstance(text_of(li), str) for li in body):
             unpaired()
             return None
@@ -2539,6 +2577,7 @@ class FlyDSLKernel(SIMDKernel):
                 if self._xmask():
                     code.writeline(f"xmask = xindex < {self.xnumel}")
 
+            self._insert_widen()
             if self.xunroll > 1 and self.preload_lines:
                 # Every row's preloads first, into per-row trace-time caches: a row's
                 # stores would otherwise hold back the next row's loads, which the
@@ -2613,6 +2652,7 @@ class FlyDSLKernel(SIMDKernel):
                 f"for _xc in range(fx.Int32(0), fx.Int32({iters}), fx.Int32(1)):"
             )
             loop.enter_context(code.indent())
+        self._insert_widen()
         if xr > 1 and self.preload_lines:
             code.writeline("_caches = []")
             code.writeline(f"for _xr in range_constexpr({xr}):")
@@ -2832,14 +2872,14 @@ def _module_prologue(
 
 def _module_epilogue(arg_names: list[str], grid: int, threads: int, slp: bool) -> str:
     kname = str(Placeholder.KERNEL_NAME)
-    hints = (
-        ""
-        if slp
-        else (
-            f"\n                {kname}_launch.compile_hints = "
-            '{"llvm_options": {"vectorize-slp": False}}'
-        )
-    )
+    # Contracting a multiply and add into an FMA, as Triton's default enable_fp_fusion:
+    # LayerNorm over 16384 x 4096 bf16 118us -> 112us.
+    hint: dict[str, Any] = {}
+    if _tune("fma", 1):
+        hint["fastmath"] = "contract"
+    if not slp:
+        hint["llvm_options"] = {"vectorize-slp": False}
+    hints = f"\n                {kname}_launch.compile_hints = {hint!r}" if hint else ""
     decorator = (
         f"flyc.kernel(known_block_size=[{threads}, 1, 1])"
         if threads > THREADS
@@ -3073,7 +3113,7 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
                 if len(members) == 1:
                     code.writeline(f"_b = _bid - {start}" if start else "_b = _bid")
                 else:
-                    even = len(set(blocks)) == 1
+                    even = len(OrderedSet(blocks)) == 1
                     if even:
                         code.writeline(f"_s = fdp.idiv(_bid - {start}, {blocks[0]})")
                         code.writeline(f"_b = _bid - {start} - _s * {blocks[0]}")
@@ -3539,7 +3579,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             base = (kernel.ept, kernel.unroll, kernel.threads)
             return [c for c in cands if (c["ept"], c["unroll"], c["threads"]) != base]
         if stage == "tile":
-            if tuned.keys() & {"tile_f", "tile_s"} or kernel.tile_f != TILE:
+            if tuned.keys() & OrderedSet(["tile_f", "tile_s"]) or kernel.tile_f != TILE:
                 return []
             # Twice the fast edge, at twice the threads: GPT-2's QKV gradient (three
             # bf16 heads layouts to rows) 39.2us -> 33.4us in the model (Triton 34.3us),
