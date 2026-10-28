@@ -1363,11 +1363,11 @@ _micro_pipeline_tp: bool = False
 # scatter_add, scatter_reduce(sum), embedding_dense_backward, ...) to a Triton
 # template that sums each block's writes to a shared destination before its
 # atomics. Blocks count their distinct destinations at runtime and issue plain
-# atomics, like the default lowering, when that saves too few. Tuned on gfx942,
-# so on by default for ROCm only.
-scatter_preagg_enabled: bool = (
-    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG", "1" if torch.version.hip else "0")
-    == "1"
+# atomics, like the default lowering, when that saves too few. None enables it
+# on the GPUs its heuristics are tuned for: CDNA3 (gfx942), CDNA4 (gfx950) and
+# CDNA5 (gfx1250).
+scatter_preagg_enabled: bool | None = {"1": True, "0": False}.get(
+    os.environ.get("TORCHINDUCTOR_SCATTER_PREAGG", "")
 )
 
 # Skip scatters writing fewer elements than this.

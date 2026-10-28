@@ -6,6 +6,7 @@ import torch
 import torch._dynamo
 from torch._dynamo.utils import counters
 from torch._inductor import config
+from torch._inductor.heuristics.template.triton import ScatterPreaggTarget
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import (
     needs_fallback_due_to_atomic_add_limitations,
@@ -403,11 +404,11 @@ class TestScatterPreagg(TestCase):
 
         default = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
         self.assertEqual(len(default), 1)
-        self.assertEqual(default[0].num_warps, 2)
+        self.assertEqual(default[0].num_warps, ScatterPreaggTarget.of().warps(128))
         self.assertEqual(block(50_000, 32, torch.float32), (256, 16))
         self.assertEqual(block(50_000, 128, torch.bfloat16), (128, 32))
         self.assertEqual(block(50_000, 512, torch.float32), (128, 32))
-        if torch.version.hip:
+        if ScatterPreaggTarget.of().cdna3_or_later:
             # fp16 blocks take the matrix product.
             self.assertEqual(block(50_000, 128, torch.float16), (64, 32))
             self.assertEqual(block(50_000, 512, torch.float16), (64, 64))
@@ -421,6 +422,56 @@ class TestScatterPreagg(TestCase):
         # Ragged inner sizes must stay within the LDS-safe tile.
         for cfg in V.choices.get_scatter_preagg_configs(50_000, 37, torch.float32):
             self.assertLessEqual(cfg.block_t * cfg.block_d, 4096)
+
+    @unittest.skipIf(GPU_TYPE != "cuda", "device properties of CUDA/ROCm")
+    def test_target_configs(self):
+        # Configs keep the lanes per program across wave sizes and scale the
+        # ragged tile with LDS; only CDNA3 and later take the ROCm-specific
+        # paths and enable preagg by default.
+        from torch._inductor.choices import InductorChoices
+        from torch._inductor.heuristics.template import triton as heuristics
+        from torch._inductor.virtualized import V
+
+        targets = {
+            "gfx942": (ScatterPreaggTarget("gfx942"), True, 4096),
+            "gfx950": (ScatterPreaggTarget("gfx950", lds_bytes=160 << 10), True, 8192),
+            "gfx1250": (
+                ScatterPreaggTarget("gfx1250", warp_size=32, lds_bytes=320 << 10),
+                True,
+                8192,
+            ),
+            "gfx90a": (ScatterPreaggTarget("gfx90a"), False, 4096),
+            "gfx1100": (ScatterPreaggTarget("gfx1100", warp_size=32), False, 4096),
+        }
+        device = torch.device(GPU_TYPE, 0)
+        for arch, (target, cdna3, ragged_tile) in targets.items():
+            with (
+                self.subTest(arch),
+                unittest.mock.patch.object(
+                    heuristics, "_scatter_preagg_target", return_value=target
+                ),
+            ):
+                wave = target.warp_size
+                (cfg,) = V.choices.get_scatter_preagg_configs(50_000, 32, torch.float32)
+                self.assertEqual(cfg.num_warps * wave, 128)
+                (cfg,) = V.choices.get_scatter_preagg_configs(
+                    50_000, 128, torch.float16
+                )
+                if cdna3:
+                    self.assertEqual((cfg.block_t, cfg.block_d), (64, 32))
+                    self.assertEqual(cfg.num_warps * wave, 64)
+                else:
+                    self.assertEqual((cfg.block_t, cfg.block_d), (128, 32))
+                with config.patch(max_autotune=True):
+                    tuned = V.choices.get_scatter_preagg_configs(
+                        50_000, 37, torch.float32
+                    )
+                self.assertEqual(max(c.block_t * c.block_d for c in tuned), ragged_tile)
+                with config.patch(scatter_preagg_enabled=None):
+                    self.assertEqual(
+                        InductorChoices._scatter_preagg_enabled(device), cdna3
+                    )
+                self.assertTrue(InductorChoices._scatter_preagg_enabled(device))
 
     @config.patch(max_autotune=True)
     def test_max_autotune(self):
@@ -464,7 +515,7 @@ class TestScatterPreagg(TestCase):
         self.assertEqual(out[finite], ref[finite], atol=scale * 3e-2, rtol=0)
         self.assertEqual(counters["inductor"]["scatter_preagg_applied"], 1)
         self.assertEqual(counters["inductor"]["scatter_preagg_fp32_copy"], 0)
-        if torch.version.hip:
+        if ScatterPreaggTarget.of().cdna3_or_later:
             self.assertEqual("tl.dot(" in code, matrix)
 
     @parametrize(

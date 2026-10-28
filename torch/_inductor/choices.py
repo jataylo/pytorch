@@ -194,11 +194,22 @@ class InductorChoices:
         device_type: str | None = "cuda",
         inner_contiguous: bool = True,
         num_keys: int | None = None,
+        device: torch.device | None = None,
     ) -> list[Any]:
         heuristics = self.get_config_heuristics(device_type)
         return heuristics.get_scatter_preagg_configs(
-            num_tokens, num_inner, dtype, inner_contiguous, num_keys
+            num_tokens, num_inner, dtype, inner_contiguous, num_keys, device
         )
+
+    @staticmethod
+    def _scatter_preagg_enabled(device: torch.device | None) -> bool:
+        if config.scatter_preagg_enabled is not None:
+            return config.scatter_preagg_enabled
+        if device is None or device.type != "cuda":
+            return False
+        from .heuristics.template.triton import ScatterPreaggTarget
+
+        return ScatterPreaggTarget.of(device).cdna3_or_later
 
     def lowers_scatter_fallbacks(
         self, dtype: torch.dtype, device: torch.device | None
@@ -208,7 +219,7 @@ class InductorChoices:
         fallback (atomic_add dtype support, deterministic algorithms) should be
         offered to lower_accumulating_scatter first.
         """
-        if not config.scatter_preagg_enabled:
+        if not self._scatter_preagg_enabled(device):
             return False
         from .kernel.scatter_preagg import can_bypass_atomic_fallback
 
@@ -228,7 +239,7 @@ class InductorChoices:
         Returns False, emitting nothing, to lower a regular atomic Scatter;
         ``fallback()`` emits the eager kernel.
         """
-        if not config.scatter_preagg_enabled:
+        if not self._scatter_preagg_enabled(out.get_device()):
             return False
         from .kernel.scatter_preagg import maybe_preaggregated_scatter
 

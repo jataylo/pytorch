@@ -5,7 +5,7 @@ import itertools
 import logging
 import math
 import os
-from functools import partial
+from functools import cache, partial
 from threading import Lock
 from typing import Any, cast, TYPE_CHECKING
 
@@ -410,6 +410,68 @@ class ScatterPreaggConfig:
     d_iters: int
     num_stages: int
     num_warps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ScatterPreaggTarget:
+    """
+    The device as scatter pre-aggregation's heuristics see it. They were
+    measured on gfx942 (MI308X, wave64 with 64KB of LDS) and scale with these
+    quantities to CDNA4 (gfx950: 160KB of LDS) and CDNA5 (gfx1250: wave32,
+    320KB of LDS). The ROCm-specific choices (atomic widths, the fp16 matrix
+    product, on by default) apply to those generations only.
+    """
+
+    arch: str = ""
+    warp_size: int = 64
+    lds_bytes: int = 64 * 1024
+    l2_bytes: int = 4 * 1024 * 1024
+
+    @property
+    def cdna3_or_later(self) -> bool:
+        return self.arch in ("gfx942", "gfx950", "gfx1250")
+
+    def warps(self, threads: int) -> int:
+        """Warps of ``threads`` lanes in all: configs keep per-lane work fixed."""
+        return max(1, threads // self.warp_size)
+
+    def matrix_preagg(
+        self, dtype: torch.dtype, num_inner: int, inner_contiguous: bool
+    ) -> bool:
+        """
+        Whether blocks pre-aggregate with a 0/1 matrix product rather than a
+        sort and segmented scan. On gfx942 that runs 1.5-2.5x faster for fp16
+        outputs, whose packed atomics it keeps, from 32-wide rows up; narrower
+        rows leave the matrix cores too little work per block.
+        """
+        return (
+            self.cdna3_or_later
+            and dtype == torch.float16
+            and inner_contiguous
+            and num_inner >= 32
+        )
+
+    @staticmethod
+    def of(device: torch.device | None = None) -> ScatterPreaggTarget:
+        if device is not None and device.type != "cuda":
+            return ScatterPreaggTarget()
+        if not torch.cuda.is_available():
+            return ScatterPreaggTarget()
+        index = device.index if device is not None else None
+        return _scatter_preagg_target(
+            torch.cuda.current_device() if index is None else index
+        )
+
+
+@cache
+def _scatter_preagg_target(index: int) -> ScatterPreaggTarget:
+    props = torch.cuda.get_device_properties(index)
+    arch = props.gcnArchName.split(":", 1)[0] if torch.version.hip else ""
+    # HIP reports the 64KB default rather than the opt-in limit (see
+    # torch.cuda._utils.set_shared_memory_config); other targets keep the 64KB
+    # the LDS-bound choices were measured with.
+    lds_bytes = {"gfx950": 160 * 1024, "gfx1250": 320 * 1024}.get(arch, 64 * 1024)
+    return ScatterPreaggTarget(arch, props.warp_size, lds_bytes, props.L2_cache_size)
 
 
 class BaseHeuristicSingleton(type):
@@ -1395,7 +1457,8 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         num_inner: int,
         max_block_d: int,
         tile_elems: int,
-        num_warps: int,
+        threads: int,
+        target: ScatterPreaggTarget,
     ) -> ScatterPreaggConfig:
         from ...runtime.runtime_utils import next_power_of_2
         from ...utils import ceildiv
@@ -1408,16 +1471,20 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             if divisor >= 8:
                 block_d = min(divisor, max_block_d)
         if num_inner % block_d != 0:
-            # Ragged blocks change the layout chosen for the sort/scan and
-            # exceed the 64KB LDS of gfx9 above 4K elements.
-            tile_elems = min(tile_elems, 4096)
+            # Ragged blocks change the layout chosen for the sort/scan, which
+            # then takes about 16 bytes of LDS per element.
+            tile_elems = min(
+                tile_elems, 1 << ((target.lds_bytes // 16).bit_length() - 1)
+            )
         block_t = next_power_of_2(max(1, tile_elems // block_d))
         # Narrow rows give each block's sort few elements to amortize over:
         # past 256 tokens per element it costs more than it saves (gfx942).
         block_t = max(32, min(1024, 256 * block_d, block_t))
 
         # Fewest programs along the inner dim (one sort per token block) that
-        # still keeps enough programs in flight to fill the GPU.
+        # still keeps 1024 programs in flight. That count does not scale with
+        # the GPU: on gfx942 masked to 10-80 CUs each scatter's best split
+        # stays the same.
         num_blocks = ceildiv(num_inner, block_d)
         token_programs = ceildiv(num_tokens, block_t)
         d_iters = 1
@@ -1425,7 +1492,7 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
             if num_blocks % cand == 0 and token_programs * (num_blocks // cand) >= 1024:
                 d_iters = cand
                 break
-        return ScatterPreaggConfig(block_t, block_d, d_iters, 1, num_warps)
+        return ScatterPreaggConfig(block_t, block_d, d_iters, 1, target.warps(threads))
 
     def get_scatter_preagg_configs(
         self,
@@ -1434,15 +1501,17 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         dtype: Any,
         inner_contiguous: bool = True,
         num_keys: int | None = None,
+        device: torch.device | None = None,
     ) -> list[ScatterPreaggConfig]:
+        target = ScatterPreaggTarget.of(device)
         configs: list[ScatterPreaggConfig] = []
         if config.max_autotune:
             block_ds = (16, 32, 64, 128) if inner_contiguous else (8, 16)
-            for max_block_d, tile_elems, num_warps in itertools.product(
-                block_ds, (2048, 4096, 8192), (2, 4)
+            for max_block_d, tile_elems, threads in itertools.product(
+                block_ds, (2048, 4096, 8192), (128, 256)
             ):
                 cfg = self._scatter_preagg_config(
-                    num_tokens, num_inner, max_block_d, tile_elems, num_warps
+                    num_tokens, num_inner, max_block_d, tile_elems, threads, target
                 )
                 if cfg not in configs:
                     configs.append(cfg)
@@ -1451,27 +1520,30 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         # distributions: 4K-element tiles (larger ones make the per-block sort
         # cost more than the extra pre-aggregation saves) of 16-wide slices up
         # to 64-wide rows, so blocks take enough tokens to collapse hot
-        # destinations, and 32-wide beyond, on two warps, which keep more of the
-        # sort and scan within each thread than four. When inner elements are
-        # strided in the output each one is its own memory transaction, so thin
-        # slices of many tokens keep sorted neighbours together instead.
-        tile_elems, num_warps = 4096, 2
+        # destinations, and 32-wide beyond, on 128 threads, which keep more of
+        # the sort and scan within each thread than 256. When inner elements
+        # are strided in the output each one is its own memory transaction, so
+        # thin slices of many tokens keep sorted neighbours together instead.
+        tile_elems, threads = 4096, 128
         if not inner_contiguous:
             max_block_d = 8
-        elif torch.version.hip and dtype == torch.float16 and num_inner >= 32:
+        elif target.matrix_preagg(dtype, num_inner, inner_contiguous):
             # fp16 blocks pre-aggregate with a matrix product over their
-            # tokens (_matrix_preagg in kernel/scatter_preagg.py), fastest at
-            # 64 tokens of 32-wide slices, 64-wide past 128.
-            max_block_d = 32 if num_inner <= 128 else 64
+            # tokens, fastest at 64 tokens of 32-wide slices. Past 128-wide
+            # rows 64-wide ones pay (~10%) only for cold duplicates, with at
+            # least as many destinations as tokens, and otherwise lose up to
+            # 1.9x; they also take more than 256 registers on gfx950.
+            wide = num_inner > 128 and (num_keys is None or num_keys >= num_tokens)
+            max_block_d = 64 if wide else 32
             tile_elems = 64 * max_block_d
-            # One warp keeps the block's reductions within a wavefront, which
+            # One wave64 keeps the block's reductions within a wavefront, which
             # suits the plain atomics of blocks without duplicates (the
-            # lowering gives the product two when every block takes it).
-            num_warps = 1
+            # lowering doubles it when every block takes the product).
+            threads = 64
         else:
             max_block_d = 16 if num_inner <= 64 else 32
         default_config = self._scatter_preagg_config(
-            num_tokens, num_inner, max_block_d, tile_elems, num_warps
+            num_tokens, num_inner, max_block_d, tile_elems, threads, target
         )
         if default_config not in configs:
             configs.append(default_config)

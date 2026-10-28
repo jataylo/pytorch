@@ -48,6 +48,7 @@ from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from .. import config, ir
 from ..codegen.triton import TritonSymbols
+from ..heuristics.template.triton import ScatterPreaggTarget
 from ..ops_handler import DefaultHandler, WrapperHandler
 from ..select_algorithm import (
     AlgorithmSelectorCache,
@@ -1199,21 +1200,6 @@ def _scatter_into_copy(
     return True
 
 
-def _matrix_preagg(dtype: torch.dtype, num_inner: int, inner_contiguous: bool) -> bool:
-    """
-    Whether blocks pre-aggregate with a 0/1 matrix product rather than a sort
-    and segmented scan. On gfx942 that runs 1.5-2.5x faster for fp16 outputs,
-    whose packed atomics it keeps, from 32-wide rows up; narrower rows leave
-    the matrix cores too little work per block.
-    """
-    return (
-        bool(torch.version.hip)
-        and dtype == torch.float16
-        and inner_contiguous
-        and num_inner >= 32
-    )
-
-
 def _stage_in_fp32(
     dtype: torch.dtype, num_keys: sympy.Expr, matrix_preagg: bool
 ) -> bool:
@@ -1288,7 +1274,9 @@ def _try_template(
             out_layout.stride[plan.inner_out_dims[-1]], 1
         )
     )
-    matrix_preagg = _matrix_preagg(dtype, num_inner, plan.inner_contiguous)
+    matrix_preagg = ScatterPreaggTarget.of(device).matrix_preagg(
+        dtype, num_inner, plan.inner_contiguous
+    )
     if _stage_in_fp32(dtype, plan.num_keys, matrix_preagg) and not use_sorted:
         return _scatter_into_copy(
             "fp32_copy",
@@ -1319,6 +1307,7 @@ def _try_template(
             device_type=device.type,
             inner_contiguous=plan.inner_contiguous,
             num_keys=num_keys,
+            device=device,
         )
     if not use_sorted:
         # The atomic template packs (key, position) into one integer; the
@@ -1405,11 +1394,12 @@ def _lower_atomic(
     configs: list[Any],
 ) -> bool:
     dtype = out.get_dtype()
+    target = ScatterPreaggTarget.of(out.get_device())
     few_keys = _hint(plan.num_keys) <= 64
     # On CDNA, 32-bit atomics run ~1.7x faster at two elements per thread than
     # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
-    atomic_vec = 2 if torch.version.hip else 0
+    atomic_vec = 2 if target.cdna3_or_later else 0
     # Plain atomics run up to 2x faster with one 32-bit word per lane, so a
     # wavefront updates whole cache lines (fewer L2 atomic transactions, which
     # bound hot destinations). The sort path keeps two: one word per lane costs
@@ -1420,9 +1410,9 @@ def _lower_atomic(
     # issue.
     plain_vec = atomic_vec
     out_bytes = _hint(out.get_layout().storage_size()) * dtype.itemsize
-    if torch.version.hip and out_bytes < 2**31:
+    if target.cdna3_or_later and out_bytes < 2**31:
         elem_bytes = dtype.itemsize
-        if out_bytes > torch.cuda.get_device_properties(out.get_device()).L2_cache_size:
+        if out_bytes > target.l2_bytes:
             elem_bytes = min(
                 [elem_bytes]
                 + [
@@ -1513,7 +1503,7 @@ def _lower_atomic(
         int32_keys = _guarded(sympy.Lt(plan.num_keys + 1, 2 ** (31 - log_block_t)))
         # The [BLOCK_T, BLOCK_T] matrix outgrows registers past 128 tokens.
         dot = (
-            _matrix_preagg(dtype, _hint(plan.num_inner), plan.inner_contiguous)
+            target.matrix_preagg(dtype, _hint(plan.num_inner), plan.inner_contiguous)
             and cfg.block_d >= 32
             and 16 <= cfg.block_t <= 128
         )
@@ -1522,9 +1512,9 @@ def _lower_atomic(
         adaptive = adaptive_kwargs(cfg, inner_mode, dot)
         num_warps = cfg.num_warps
         if dot and not adaptive["ADAPTIVE"]:
-            # Without plain atomics to serve, the product runs faster on two
-            # warps.
-            num_warps = max(num_warps, 2)
+            # Without plain atomics to serve, the product runs faster on 128
+            # threads.
+            num_warps = max(num_warps, target.warps(128))
         scatter_preagg_template.maybe_append_choice(
             choices,
             input_nodes=(out, *inputs),
