@@ -337,6 +337,23 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 777, device="cuda")
         self.check(lambda x: x.sum(0), a, atol=1e-3, kinds=["reduction"])
 
+    def test_no_mix_order_reduction(self):
+        # A row and a column reduction of the same input (a norm's backward) fuse into
+        # one Triton-only mix-order kernel; with FlyDSL they are generated apart.
+        from torch._inductor.utils import run_and_get_code
+
+        x = torch.randn(8192, 1024, device="cuda")
+        w = torch.randn(1024, device="cuda")
+        fn = lambda x, w: ((x * w).sum(1), (x * x).sum(0))  # noqa: E731
+        with config.patch({"flydsl.simd": False}):
+            _, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+        self.assertEqual(code.count("@triton.jit"), 1)
+        torch._dynamo.reset()
+        out, (code,) = run_and_get_code(torch.compile(fn, dynamic=False), x, w)
+        torch.testing.assert_close(out, fn(x, w), atol=1e-2, rtol=1e-4)
+        self.assertNotIn("@triton.jit", code)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     @parametrize("rows", [1, 3, 17])
     def test_short_column_reduction(self, rows):
         # No more lanes a column than rows: 3 rows of 64 columns take 4 lanes each.

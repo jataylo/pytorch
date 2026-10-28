@@ -200,6 +200,11 @@ def _is_gpu_triton_backend(
     if not node1.is_gpu() or not node2.is_gpu():
         return False
     device_type = node1.get_device().type  # type: ignore[union-attr]
+    if device_type == "cuda" and config.flydsl.simd and torch.version.hip:
+        # Mix-order and nested reductions have only Triton kernels, which would
+        # bypass FlyDSL; generated apart, its two reductions ran BERT training
+        # 29.83 -> 29.47 ms a step.
+        return False
     return (
         device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
     )
