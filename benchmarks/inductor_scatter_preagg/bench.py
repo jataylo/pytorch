@@ -1,13 +1,9 @@
-"""Compare adaptive scatter preagg against regular Inductor and partitioned
-scatter across ops, index distributions, shapes and dtypes.
+"""Compare scatter pre-aggregation (config.scatter_preagg_enabled) against
+regular Inductor across ops, index distributions, shapes and dtypes, timed on
+identical inputs.
 
-  python bench_adaptive.py run --gpus 8 --out results/adaptive.jsonl
-  python bench_adaptive.py summary results/adaptive.jsonl [--worst 10]
-
-Modes, all timed on identical inputs:
-  base      regular Inductor: preagg and partitioned scatter off
-  ps        partitioned scatter on, preagg off
-  adaptive  adaptive preagg on, partitioned scatter off
+  python bench.py run --gpus 8 --out results/gfx942.jsonl
+  python bench.py summary results/gfx942.jsonl [--worst 10]
 
 Cases are sharded over GPUs and appended as JSON lines; a rerun skips the
 cases already in --out, and a shard that crashes restarts past the case it
@@ -47,11 +43,7 @@ DISTS = (
     "runs32",
 )
 SKEWED = ("uniform", "sorted", "hot50", "zipf", "fewhot", "runs32")
-MODES = {
-    "base": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=False),
-    "ps": dict(scatter_preagg_enabled=False, partitioned_scatter_enabled=True),
-    "adaptive": dict(scatter_preagg_enabled=True, partitioned_scatter_enabled=False),
-}
+MODES = {"base": False, "preagg": True}
 FIELDS = ("op", "dtype", "rows", "d", "n", "dist", "dynamic")
 
 
@@ -284,11 +276,11 @@ def run_case(case):
         err={},
         applied={},
     )
-    for mode, patch in MODES.items():
+    for mode, enabled in MODES.items():
         torch._dynamo.reset()
         counters.clear()
         try:
-            with config.patch(**patch):
+            with config.patch(scatter_preagg_enabled=enabled):
                 compiled = torch.compile(fn, dynamic=case["dynamic"] or None)
                 out = compiled(*args)
                 rec["times"][mode] = do_bench(
@@ -392,17 +384,14 @@ def summary(args):
         rows = [json.loads(line) for line in f]
     crashed = [r for r in rows if r.get("crashed")]
     rows = [r for r in rows if all(m in r["times"] for m in MODES)]
+    for r in rows:
+        r["speedup"] = r["times"]["base"] / r["times"]["preagg"]
     groups = defaultdict(list)
     for r in rows:
         groups[(r["op"], r["dtype"])].append(r)
-    cols = [m for m in MODES if m != "base"]
 
-    def best(r):
-        return min(r["times"]["base"], r["times"]["ps"])
-
-    print("Geomean speedup over regular Inductor (base) by measured contention.")
-    print("'vs best' and 'slower' compare adaptive with best(base, ps) per case;")
-    print("errors are the bucket's max, base / ps / adaptive.")
+    print("Speedup of preagg over regular Inductor (base) by measured contention;")
+    print("'slower' counts cases below 0.97, errors are the max, base / preagg.")
     for (op, dtype), sel in sorted(groups.items()):
         by_bucket = defaultdict(list)
         for r in sel:
@@ -410,51 +399,32 @@ def summary(args):
         buckets = [(name, by_bucket[name]) for _, name in CONTENTION_BUCKETS]
         buckets += [(">=16K", by_bucket[">=16K"]), ("all", sel)]
         print(f"\n{op} {dtype}\n")
-        print(
-            "| contention | cases | base | "
-            + " | ".join(cols)
-            + " | worst vs base | worst vs best | slower | max err |"
-        )
-        print("|---" * (len(cols) + 7) + "|")
+        print("| contention | cases | geomean | worst | slower | max err |")
+        print("|---|---|---|---|---|---|")
         for name, b in buckets:
             if not b:
                 continue
-            cells = [
-                _geomean([r["times"]["base"] / r["times"][m] for r in b]) for m in cols
-            ]
-            vs_base = [r["times"]["base"] / r["times"]["adaptive"] for r in b]
-            vs_best = [best(r) / r["times"]["adaptive"] for r in b]
+            speedups = [r["speedup"] for r in b]
             errs = " / ".join(f"{max(r['err'][m] for r in b):.0e}" for m in MODES)
             print(
-                f"| {name} | {len(b)} | 1.00 | "
-                + " | ".join(f"{c:.2f}" for c in cells)
-                + f" | {min(vs_base):.2f} | {min(vs_best):.2f}"
-                + f" | {sum(x < 1 / 1.03 for x in vs_best)} | {errs} |"
+                f"| {name} | {len(b)} | {_geomean(speedups):.2f} | {min(speedups):.2f}"
+                f" | {sum(x < 0.97 for x in speedups)} | {errs} |"
             )
-        slow = sorted(
-            (best(r) / r["times"]["adaptive"], r)
-            for r in sel
-            if best(r) / r["times"]["adaptive"] < 1 / 1.03
-        )
+        slow = sorted((r["speedup"], r) for r in sel if r["speedup"] < 0.97)
         for ratio, r in slow[: args.worst]:
             print(f"  {ratio:.2f}  {_label(r)}")
 
-    print("\nOverall, adaptive vs base and vs best(base, ps):\n")
-    print(
-        "| dtype | cases | geomean vs base | worst vs base | geomean vs best | worst vs best | < 0.95 vs best |"
-    )
-    print("|---|---|---|---|---|---|---|")
+    print("\nOverall:\n")
+    print("| dtype | cases | geomean | worst | < 0.95 |")
+    print("|---|---|---|---|---|")
     by_dtype = defaultdict(list)
     for r in rows:
-        by_dtype[r["dtype"]].append(r)
-        by_dtype["all"].append(r)
-    for dtype, sel in sorted(by_dtype.items()):
-        vs_base = [r["times"]["base"] / r["times"]["adaptive"] for r in sel]
-        vs_best = [best(r) / r["times"]["adaptive"] for r in sel]
+        by_dtype[r["dtype"]].append(r["speedup"])
+        by_dtype["all"].append(r["speedup"])
+    for dtype, speedups in sorted(by_dtype.items()):
         print(
-            f"| {dtype} | {len(sel)} | {_geomean(vs_base):.2f} | {min(vs_base):.2f}"
-            f" | {_geomean(vs_best):.2f} | {min(vs_best):.2f}"
-            f" | {sum(x < 0.95 for x in vs_best)} |"
+            f"| {dtype} | {len(speedups)} | {_geomean(speedups):.2f}"
+            f" | {min(speedups):.2f} | {sum(x < 0.95 for x in speedups)} |"
         )
     if crashed:
         print(f"\n{len(crashed)} crashed cases:")

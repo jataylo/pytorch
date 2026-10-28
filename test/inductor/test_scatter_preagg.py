@@ -348,7 +348,7 @@ class TestScatterPreagg(TestCase):
         self._check(fn, x, idx, v, atol=1e-6, rtol=1e-6)
 
     @parametrize("n", [1000, 4096, 4097, 50_001])
-    @config.patch(scatter_preagg_force=True)
+    @config.patch(scatter_preagg_min_index_size=0)
     def test_token_tails(self, n):
         x = torch.zeros(10, 32, device=GPU_TYPE)
         idx = torch.randint(0, 10, (n,), device=GPU_TYPE)
@@ -480,7 +480,7 @@ class TestScatterPreagg(TestCase):
         v = torch.randn(n, d, device=GPU_TYPE).half()
         self._check_fp16(fn, x, idx, v)
 
-    @config.patch(scatter_preagg_force=True)
+    @config.patch(scatter_preagg_min_index_size=0)
     def test_fp16_matrix_preagg_tail(self):
         def fn(x, i, v):
             return x.index_add(0, i, v)
@@ -686,21 +686,6 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, v)
         self.assertEqual(counters["inductor"]["scatter_preagg_materialized_values"], 1)
-
-    @config.patch(partitioned_scatter_enabled=True)
-    def test_partitioned_scatter_defers(self):
-        x = torch.zeros(24, 32, device=GPU_TYPE)
-        idx = _hot_indices(20_000, 24, GPU_TYPE)
-        v = torch.randn(20_000, 32, device=GPU_TYPE)
-
-        def fn(x, i, v):
-            return torch.index_put(x, (i,), v, accumulate=True)
-
-        self._check(fn, x, idx, v)
-        self.assertEqual(counters["inductor"]["partitioned_scatter_applied"], 0)
-        self.assertEqual(
-            counters["inductor"]["partitioned_scatter_skipped_scatter_preagg"], 1
-        )
 
     def _check_deterministic(self, fn, *args, tol):
         ref = fn(*[a.double() if a.is_floating_point() else a.clone() for a in args])

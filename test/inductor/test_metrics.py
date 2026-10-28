@@ -77,7 +77,6 @@ class TestMetrics(TestCase):
         )
 
     @config.patch("fx_graph_remote_cache", False)
-    @config.patch("partitioned_scatter_enabled", False)
     def test_atomic_add(self):
         @torch.compile
         def f(lhs, index, rhs):

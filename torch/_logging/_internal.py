@@ -265,7 +265,6 @@ def set_logs(
     hierarchical_compile: bool = False,
     compute_dependencies: bool = False,
     caching: bool = False,
-    partitioned_scatter: bool = False,
 ) -> None:
     """
     Sets the log level for individual components and toggles individual log
@@ -615,7 +614,6 @@ def set_logs(
         hierarchical_compile=hierarchical_compile,
         compute_dependencies=compute_dependencies,
         caching=caching,
-        partitioned_scatter=partitioned_scatter,
     )
 
 

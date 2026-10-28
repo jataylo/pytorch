@@ -1,6 +1,6 @@
 # mypy: allow-untyped-defs
 """
-Sort-based pre-aggregation for accumulating scatters.
+Pre-aggregation for accumulating scatters.
 
 An accumulating scatter (index_put with accumulate=True, index_add, scatter_add,
 scatter_reduce(sum), embedding_dense_backward, ...) normally lowers to one
@@ -9,10 +9,13 @@ Here each program takes a block of BLOCK_T "tokens" (the iteration positions the
 destination depends on) and
 
   1. computes each token's destination key from the fused index expression,
-  2. sorts (key, position) pairs so equal destinations become contiguous,
-  3. evaluates the fused value expression at the sorted token positions,
-  4. sums runs of equal keys with a segmented associative scan, and
-  5. issues one atomic per (distinct key, inner element).
+  2. estimates its distinct destinations, and issues plain atomics in token
+     order, like regular Inductor, when pre-aggregating would save few,
+  3. otherwise sorts (key, position) pairs so equal destinations become
+     contiguous, evaluates the fused value expression at the sorted token
+     positions and sums runs of equal keys with a segmented associative scan
+     (fp16 on ROCm: a 0/1 matrix product over the block's tokens instead), and
+  4. issues one atomic per (distinct key, inner element).
 
 Iteration dims that the destination does not depend on and that map unchanged
 onto an output dim ("inner" dims, e.g. the embedding dim) form a second,
@@ -22,9 +25,9 @@ Values are loaded after the sort, at the permuted tokens: permuting a computed
 
 Where atomics are not wanted (deterministic algorithms) or not available (8- and
 16-bit integers), a sorted lowering sorts all tokens by destination first and
-sums every destination's run in a fixed order without atomics. fp16 and bf16
-outputs accumulate into an fp32 copy, so each destination is rounded once, as
-in eager.
+sums every destination's run in a fixed order without atomics. 16-bit outputs
+may accumulate into an fp32 copy, so each destination is rounded once, as in
+eager (see _stage_in_fp32).
 """
 
 import dataclasses
@@ -129,40 +132,8 @@ def can_bypass_atomic_fallback(dtype: torch.dtype, device: torch.device | None) 
     fallback, for atomic_add dtype support or deterministic algorithms, may be
     offered to this template instead.
     """
-    return (
-        config.scatter_preagg_enabled
-        and _ineligible(device, dtype) is None
-        and (needs_fallback_due_to_atomic_add_limitations(dtype) or _deterministic())
-    )
-
-
-def _too_small(num_tokens: int, num_inner: int) -> bool:
-    # No contention gate: blocks fall back to plain atomics where sorting does
-    # not pay.
-    return (
-        not config.scatter_preagg_force
-        and num_tokens * num_inner < config.scatter_preagg_min_index_size
-    )
-
-
-def claims_index_put(
-    input_meta: dict[str, Any],
-    index_size: int,
-    output_size: int,
-    scatter_dim_size: int,
-) -> bool:
-    """
-    Whether this template will take an FX index_put, so the partitioned scatter
-    pass leaves it alone.
-    """
-    if not config.scatter_preagg_enabled or scatter_dim_size <= 0:
-        return False
-    device, dtype = input_meta["device"], input_meta["dtype"]
-    if _ineligible(device, dtype) is not None:
-        return False
-    # The sorted lowering has no size gate.
-    return _use_sorted(dtype) or not _too_small(
-        index_size, output_size // scatter_dim_size
+    return _ineligible(device, dtype) is None and (
+        needs_fallback_due_to_atomic_add_limitations(dtype) or _deterministic()
     )
 
 
@@ -289,6 +260,8 @@ class _ScatterPlan:
     acc_dtype: torch.dtype
     # Buffers only the destination keys read.
     index_reads: OrderedSet[str] = dataclasses.field(default_factory=OrderedSet)
+    # Whether the last inner dim is contiguous in the output.
+    inner_contiguous: bool = True
     # Size symbols guarded to be multiples of 16 (see _align_strides).
     aligned_symbols: OrderedSet[sympy.Symbol] = dataclasses.field(
         default_factory=OrderedSet
@@ -598,6 +571,22 @@ def _preagg_segmented_sum(key_a, val_a, key_b, val_b):
 
 _TEMPLATE_SOURCE = (
     r"""
+{%- macro inner_block(iters, width, vec) -%}
+inner_raw = (pid_inner * {{iters}} + it) * {{width}} + tl.arange(0, {{width}})
+inner_mask = inner_raw < NUM_INNER
+# Clamping hides contiguity, which disables vectorized loads.
+if INNER_MODE == 0:
+    inner = inner_raw[None, :]
+    if {{vec}}:
+        atomic_inner = tl.max_contiguous(
+            tl.multiple_of(inner_raw, {{vec}}), {{vec}}
+        )[None, :]
+    else:
+        atomic_inner = inner
+else:
+    inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
+    atomic_inner = inner
+{%- endmacro %}
 {{preagg_def_kernel()}}
     {{preagg_sizes() | indent_except_first(1)}}
     pid_tok = tl.program_id(0).to(INDEX_DTYPE)
@@ -669,21 +658,7 @@ _TEMPLATE_SOURCE = (
             ckey = tl.where(clive, ckey, 0).to(INDEX_DTYPE)[:, None]
             ctok = ctok[:, None]
             for it in tl.range(0, PLAIN_ITERS):
-                inner_raw = (pid_inner * PLAIN_ITERS + it) * PLAIN_D + tl.arange(
-                    0, PLAIN_D
-                )
-                inner_mask = inner_raw < NUM_INNER
-                if INNER_MODE == 0:
-                    inner = inner_raw[None, :]
-                    if PLAIN_VEC:
-                        atomic_inner = tl.max_contiguous(
-                            tl.multiple_of(inner_raw, PLAIN_VEC), PLAIN_VEC
-                        )[None, :]
-                    else:
-                        atomic_inner = inner
-                else:
-                    inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
-                    atomic_inner = inner
+                {{inner_block("PLAIN_ITERS", "PLAIN_D", "PLAIN_VEC") | indent_except_first(4)}}
 
                 {{preagg_value("ctok", "inner", "val", "preagg_plain_value", "PLAIN_T", "PLAIN_D") | indent_except_first(4)}}
 
@@ -714,16 +689,7 @@ _TEMPLATE_SOURCE = (
     onehot = same.to(OUT_DTYPE)
     ptok = tok[:, None]
     for it in tl.range(0, D_ITERS):
-        inner_raw = (pid_inner * D_ITERS + it) * BLOCK_D + tl.arange(0, BLOCK_D)
-        inner_mask = inner_raw < NUM_INNER
-        if INNER_MODE == 0:
-            inner = inner_raw[None, :]
-            atomic_inner = tl.max_contiguous(
-                tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
-            )[None, :]
-        else:
-            inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
-            atomic_inner = inner
+        {{inner_block("D_ITERS", "BLOCK_D", "ATOMIC_VEC") | indent_except_first(2)}}
 
         {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
 
@@ -774,20 +740,7 @@ _TEMPLATE_SOURCE = (
     # The sort is amortized over D_ITERS inner blocks so BLOCK_T can stay
     # large (more pre-aggregation) while the register tile stays small.
     for it in tl.range(0, D_ITERS):
-        inner_raw = (pid_inner * D_ITERS + it) * BLOCK_D + tl.arange(0, BLOCK_D)
-        inner_mask = inner_raw < NUM_INNER
-        # Clamping hides contiguity, which disables vectorized loads.
-        if INNER_MODE == 0:
-            inner = inner_raw[None, :]
-            if ATOMIC_VEC:
-                atomic_inner = tl.max_contiguous(
-                    tl.multiple_of(inner_raw, ATOMIC_VEC), ATOMIC_VEC
-                )[None, :]
-            else:
-                atomic_inner = inner
-        else:
-            inner = tl.minimum(inner_raw, NUM_INNER - 1)[None, :]
-            atomic_inner = inner
+        {{inner_block("D_ITERS", "BLOCK_D", "ATOMIC_VEC") | indent_except_first(2)}}
 
         {{preagg_value("ptok", "inner", "val") | indent_except_first(2)}}
 
@@ -1170,17 +1123,13 @@ def _scatter_into_copy(
     sizes: list[sympy.Expr],
     output_indexer: IndexFn,
     read_names: OrderedSet[str],
-    gated: bool = False,
 ) -> bool:
-    """
-    Scatter into a contiguous ``dtype`` copy of ``out``, then copy it back.
-    ``gated`` when the size gates already passed for ``out``.
-    """
+    """Scatter into a contiguous ``dtype`` copy of ``out``, then copy it back."""
     from ..lowering import lowerings, to_dtype
 
     tmp = _realize(to_dtype(out, dtype, copy=True))
     if _output_storage(tmp) is None or not _try_template(
-        tmp, value_fn, sizes, output_indexer, read_names, gated
+        tmp, value_fn, sizes, output_indexer, read_names
     ):
         return False
     lowerings[torch.ops.aten.copy_.default](out, tmp)
@@ -1231,7 +1180,6 @@ def _try_template(
     sizes: list[sympy.Expr],
     output_indexer: IndexFn,
     read_names: OrderedSet[str],
-    gated: bool = False,
 ) -> bool:
     device, dtype = out.get_device(), out.get_dtype()
     if (reason := _ineligible(device, dtype)) is not None:
@@ -1270,15 +1218,15 @@ def _try_template(
     )
     # The sorted lowering replaces the eager fallback rather than atomics, so
     # the size gate does not apply to it.
-    if not (use_sorted or gated) and _too_small(num_tokens, num_inner):
+    if not use_sorted and num_tokens * num_inner < config.scatter_preagg_min_index_size:
         _record_skip("too_small")
         return False
-    inner_contiguous = not plan.inner_out_dims or (
+    plan.inner_contiguous = not plan.inner_out_dims or (
         V.graph.sizevars.statically_known_equals(
             out_layout.stride[plan.inner_out_dims[-1]], 1
         )
     )
-    matrix_preagg = _matrix_preagg(dtype, num_inner, inner_contiguous)
+    matrix_preagg = _matrix_preagg(dtype, num_inner, plan.inner_contiguous)
     if _stage_in_fp32(dtype, plan.num_keys, matrix_preagg) and not use_sorted:
         return _scatter_into_copy(
             "fp32_copy",
@@ -1288,7 +1236,6 @@ def _try_template(
             sizes,
             plan.output_indexer,
             read_names,
-            gated=True,
         )
 
     inputs: list[ir.IRNode] = []
@@ -1308,7 +1255,7 @@ def _try_template(
             num_inner,
             dtype,
             device_type=device.type,
-            inner_contiguous=inner_contiguous,
+            inner_contiguous=plan.inner_contiguous,
             num_keys=num_keys,
         )
     if not use_sorted:
@@ -1397,11 +1344,6 @@ def _lower_atomic(
 ) -> bool:
     dtype = out.get_dtype()
     few_keys = _hint(plan.num_keys) <= 64
-    inner_contiguous = not plan.inner_out_dims or (
-        V.graph.sizevars.statically_known_equals(
-            out.get_layout().stride[plan.inner_out_dims[-1]], 1
-        )
-    )
     # On CDNA, 32-bit atomics run ~1.7x faster at two elements per thread than
     # at the four the compiler derives from load contiguity, except for wide
     # rows into a handful of destinations.
@@ -1472,7 +1414,9 @@ def _lower_atomic(
                 return (
                     rows > _PLAIN_MAX_D
                     or chunk < min_chunk
-                    or (inner_contiguous and not dot and rows < 128 and chunk < 128)
+                    or (
+                        plan.inner_contiguous and not dot and rows < 128 and chunk < 128
+                    )
                 )
 
             while widen > 1 and too_wide(widen):
@@ -1495,7 +1439,7 @@ def _lower_atomic(
         int32_keys = _guarded(sympy.Lt(plan.num_keys + 1, 2 ** (31 - log_block_t)))
         # The [BLOCK_T, BLOCK_T] matrix outgrows registers past 128 tokens.
         dot = (
-            _matrix_preagg(dtype, _hint(plan.num_inner), inner_contiguous)
+            _matrix_preagg(dtype, _hint(plan.num_inner), plan.inner_contiguous)
             and cfg.block_d >= 32
             and 16 <= cfg.block_t <= 128
         )
