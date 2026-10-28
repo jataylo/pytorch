@@ -1730,8 +1730,7 @@ class FlyDSLKernel(SIMDKernel):
             )
         elif contig:
             seed = ""
-            if self._persistent_region() and not ms:
-                # A masked lane's register holds a value its reload would read as 0.
+            if self._persistent_region():
                 seed = f", seed=(_lc, {self._site_key(arg, index_str)})"
             line = (
                 f"fdp.vstore(_sc, {repr(f'st{self.load_site}_{arg}')}, _j, {w}, _r_{arg}, "

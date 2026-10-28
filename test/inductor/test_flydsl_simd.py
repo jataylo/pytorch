@@ -368,6 +368,26 @@ class TestFlyDSLSIMD(TestCase):
         if rows == 3:
             self.assertIn("tpr=4 stride=64", code)
 
+    @parametrize("ept", [0, 8])
+    def test_stored_row_reloaded(self, ept):
+        # A persistent row stores the gathered embedding, then normalizes it from the
+        # registers; at 8 elements a lane the last run of 768 is masked.
+        from torch._inductor.codegen.flydsl.flydsl_simd import _tune_override
+
+        idx = torch.randint(0, 1000, (64, 32), device="cuda")
+        e = torch.randn(1000, 768, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(768, device="cuda", dtype=torch.bfloat16)
+
+        def fn(idx, e, w):
+            x = torch.nn.functional.embedding(idx, e) + 1
+            y, m, r = torch.ops.aten.native_layer_norm(x, [768], w, None, 1e-5)
+            return x, y, m, r
+
+        with _tune_override({"ept": ept} if ept else {}):
+            out = torch.compile(fn, dynamic=False)(idx, e, w)
+        for o, ref in zip(out, fn(idx, e, w)):
+            torch.testing.assert_close(o, ref, atol=2e-2, rtol=2e-2)
+
     @parametrize(
         "op",
         ["amax", "amin", "prod", "any", "argmax", "argmin", "var_mean", "logsumexp"],

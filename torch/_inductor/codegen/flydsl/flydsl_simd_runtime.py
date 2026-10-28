@@ -746,11 +746,13 @@ def memo(cache: dict, key, thunk):
 
 
 _FRESH = "__fresh__"
+_PENDING = "__pending__"
 
 
 def forget(cache: dict, arg: str) -> None:
-    """Drop every cached load of ``arg`` after a store to it, but the stored values
-    themselves (vstore's ``seed``) entered since the last forget."""
+    """Issue the stores to ``arg`` vstore held back, then drop every cached load of
+    ``arg``, but the stored values themselves (vstore's ``seed``) entered since the
+    last forget."""
 
     def owner(k):
         while isinstance(k, tuple) and k:
@@ -759,6 +761,10 @@ def forget(cache: dict, arg: str) -> None:
             k = k[0]
         return False
 
+    pending = cache.get(_PENDING, [])
+    for p in [p for p in pending if p[0] == arg]:
+        _bstore(*p[1:])
+        pending.remove(p)
     fresh = cache.get(_FRESH, OrderedSet())
     for k in [k for k in cache if owner(k)]:
         if k in fresh:
@@ -811,20 +817,32 @@ def vstore(
         vec = _vector.FromElementsOp(vt, slot["elems"]).result
         word_t, n, ratio = _packing(st, w)
         if word_t is None:
-            _bstore(vec, r, slot["off"], slot["mask"])
+            args = (vec, r, slot["off"], slot["mask"])
         else:
             words = _vector.BitCastOp(ir.VectorType.get([n], word_t), vec).result
             if n == 1:
                 words = _vector.ExtractOp(
                     words, static_position=[0], dynamic_position=[]
                 ).result
-            _bstore(words, r, idiv(slot["off"], ratio), slot["mask"])
-        if seed is not None:
+            args = (words, r, idiv(slot["off"], ratio), slot["mask"])
+        if seed is None:
+            _bstore(*args)
+        else:
             # A later unrolled loop reading the stored elements back takes the register,
             # in exactly vload's form, instead of a round trip through memory.
             lc, lkey = seed
+            if slot["mask"] is not None:
+                # What the masked reload would read: 0 where the store was masked off.
+                zero = _arith.ConstantOp(
+                    vt, ir.DenseElementsAttr.get_splat(vt, _zero_attr(_STORAGE_IR[st]()))
+                ).result
+                vec = _arith.SelectOp(slot["mask"], vec, zero).result
             lc[(lkey, j // w)] = vec
             lc.setdefault(_FRESH, OrderedSet()).add((lkey, j // w))
+            # Held back to the loop's forget: LLVM keeps a buffer load after a store it
+            # cannot prove apart, so storing as it went left each of a gather's loads
+            # (GPT's embedding + LayerNorm) a full memory round trip behind the last.
+            lc.setdefault(_PENDING, []).append((lkey[0], *args))
 
 
 def _packed_half(o, value, st: str):
