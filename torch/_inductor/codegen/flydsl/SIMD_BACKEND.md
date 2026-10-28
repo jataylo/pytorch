@@ -580,12 +580,21 @@ kernel, or raise under `flydsl.simd_strict`.
   the NCHW -> NHWC copy at 40.8 µs in a kernel trace against 49.2 for the default, but
   52 against 48.6 under the suite's graph replay, and made no difference in ResNet; the
   two timings disagree on which tile is better.
-- The per-op losers above and the standalone `sum_short_rows`. GPT's embedding +
-  LayerNorm moves the same bytes as Triton's (same L2 hits, misses and DRAM requests)
-  and runs fewer instructions, but its waves spend 60% more cycles waiting on memory
-  (15.2 vs 13.1 µs alone). `softmax_bwd_512` is bimodal (39.8 or 45.3 µs): its two
-  candidates are close with the last-level cache flushed, as `pick_fastest` times them,
-  and apart in the suite's hot loop.
+- The per-op losers above and the standalone `sum_short_rows` (2% in a kernel trace,
+  7% under graph replay). GPT's embedding + LayerNorm alone runs 15.2 µs against 13.1,
+  its waves waiting 60% more cycles on memory for the same bytes, but in the model it is
+  the faster one (17.9 against 22.3 µs). `softmax_bwd_512` is bimodal (40 or 45 µs):
+  its default launch is 12% faster back to back, the suite's hot loop, but 3-8% slower
+  with the cache flushed, so the pick turns on whether the cold margin falls under the
+  3% that sends it to the warm tie-break.
+- Mix-order reductions: Qwen3-0.6B's training step has 591 kernels against Triton's
+  457, as Triton folds each RMSNorm backward's weight-gradient column sum into it and
+  this backend runs those sums alone (about 2.5 ms of a 633 ms step). The generated
+  kernels are still 40.2 ms against 61.1; attention and matmuls are the other 593 ms.
+- Under `max-autotune-no-cudagraphs` (GPT, Llama, BERT training) FlyDSL's kernels sit
+  next to the Triton matmul templates that take their epilogues, and stay ahead of the
+  coordinate-descent-tuned Triton kernels kernel by kernel: matched, 1.94 against 2.59
+  ms on Llama, 5.16 against 8.48 on BERT, no kernel losing by more than 11 µs a step.
 - The AdamW combo kernel is the longest single compile (1.0 s of Llama's, after its
   matrices of different sizes came to share a body). Its 2816 x 1024 and embedding
   members still take their own bodies for their unroll of 2; one unroll for the whole
