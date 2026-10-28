@@ -3145,7 +3145,16 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             and "xunroll" not in tuned
         ):
             # Fewer lanes a row: Qwen3's q-norm + RoPE (128 wide) 134us -> 85us at 8.
-            cands = [{"row_tpr": kernel.tpr // 2}] if kernel.tpr > 1 else []
+            # Not when that loops over the row instead: it lost all 55 such kernels
+            # across ten models, by 13-76%.
+            half = kernel.tpr // 2
+            cands = (
+                [{"row_tpr": half}]
+                if half
+                and -(-kernel.rnumel // (half * kernel.ept)) * kernel.ept
+                <= PERSISTENT_MAX_UNROLL
+                else []
+            )
             if kernel.tpr < WAVE:
                 # Or more, up to a wave: GPT-2's masked softmax backward (512 bf16)
                 # 62.5us -> 58.4us in the model (Triton 61us).

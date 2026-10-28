@@ -380,7 +380,14 @@ row reductions half and twice the lanes a row and half the elements a lane, colu
 reductions twice the threads (a column reduction too small to fill the GPU takes 1024
 threads outright), transposing tiles a tile twice as wide (from 1M elements, against
 4M for the rest). Candidates that never won
-across the ten models' autotuned kernels were dropped. Each round of candidate calls is
+across the ten models' autotuned kernels were dropped, as was half the lanes a row where
+that would loop over the row rather than hold it in registers (0 of 55 wins, losing by
+13-76%; 3 s of a ten-model cold compile). Of 143 autotuned kernels the rules' choice
+kept 73. The wide tile won all six tiles that reached the floor, by 3-27%, but is no
+default: it loses 24% on a heads permute and is 3-5x slower on NCHW -> NHWC copies. Nor
+does the rules' choice win near-ties: 19 picks were within 3%, and keeping the rules'
+choice for those cost a bf16 embedding 10% in the steady state, where the cold-flushed
+timing had seen under 3%. Each round of candidate calls is
 queued behind a GPU sleep and timed as an average of back-to-back calls: Python launches
 outlast a 20 µs kernel, and the fastest single call favoured high-variance candidates.
 A round whose launches took longer to queue than the sleep covering them (a host busy
