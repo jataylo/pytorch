@@ -1251,7 +1251,10 @@ def sqrt(x):
 
 
 def rsqrt(x):
-    return ArithValue(fmath.rsqrt(_require_f32("rsqrt", x)))
+    """``v_rsq_f32`` (1 ulp), as Triton's ``tl.rsqrt``: ``math.rsqrt`` lowers to a
+    correctly rounded sqrt and an IEEE divide, ~40 dependent instructions on a norm's
+    critical path -- GPT's embedding + LayerNorm 15.5us against Triton's 12.8us."""
+    return ArithValue(_rocdl.rsq(T.f32(), _val(_require_f32("rsqrt", x))))
 
 
 def reciprocal(x):

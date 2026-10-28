@@ -589,9 +589,13 @@ kernel, or raise under `flydsl.simd_strict`.
   52 against 48.6 under the suite's graph replay, and made no difference in ResNet; the
   two timings disagree on which tile is better.
 - The per-op losers above and the standalone `sum_short_rows` (2% in a kernel trace,
-  7% under graph replay). GPT's embedding + LayerNorm alone runs 15.2 µs against 13.1,
-  its waves waiting 60% more cycles on memory for the same bytes, but in the model it is
-  the faster one (17.9 against 22.3 µs). `softmax_bwd_512` is bimodal (40 or 45 µs):
+  7% under graph replay). GPT's embedding + LayerNorm alone runs 14.2 µs against 12.9
+  (from 15.5: `rsqrt` as Triton's single `v_rsq_f32` rather than a correctly rounded
+  sqrt and divide, and 8 elements a lane for a gathered row), but in the model it is the
+  faster one (17.9 against 22.3 µs). What remains is mostly vector ALU: Triton's LLVM
+  pairs the f32 math into `v_pk_*` ops (275 VALU a wave against 367), while SLP
+  vectorization stays off for reductions, where it loses on the backward norms; turned
+  on, this kernel gains only 0.4 µs. `softmax_bwd_512` is bimodal (40 or 45 µs):
   its default launch is 12% faster back to back, the suite's hot loop, but 3-8% slower
   with the cache flushed, so the pick turns on whether the cold margin falls under the
   3% that sends it to the warm tie-break.

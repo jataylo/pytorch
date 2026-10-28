@@ -1254,10 +1254,13 @@ class FlyDSLKernel(SIMDKernel):
             # leave a partly masked last run: 768 = 64 lanes x 3 runs of 4. Not with
             # many row-sized inputs, where the wider loads' fewer instructions win
             # (these kernels are vector-ALU-bound): 49us vs 63us on a 4-input add +
-            # LayerNorm over 768, against 20us vs 19.6us with 2 inputs.
+            # LayerNorm over 768, against 20us vs 19.6us with 2 inputs. Nor with a
+            # gathered row, whose loads wait on the index load: GPT's embedding +
+            # LayerNorm 15.3us -> 14.3us at 8 a lane (Triton 12.9us).
             ept = self.ept
             while (
                 ept > 1
+                and not self._has_gather()
                 and self._row_inputs() < 4
                 and self.rnumel % (WAVE * ept)
                 and WAVE * self.ept < self.rnumel <= WAVE * PERSISTENT_MAX_UNROLL
