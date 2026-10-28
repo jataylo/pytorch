@@ -2247,38 +2247,52 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
     ev[1].record()
     ev[1].synchronize()
     reps = max(1, min(10, int(0.3 / max(ev[0].elapsed_time(ev[1]), 1e-3))))
-    times = [float("inf")] * len(mains)
-    # ~60us a launch (four with the flush and events); over-sleeping is cheap.
-    sleep_us = len(mains) * reps * 4 * 60
-    rounds = tries = 0
-    while rounds < 3:
-        tries += 1
-        start = _time.perf_counter()
-        torch.cuda._sleep(int(sleep_us * 2.1e3))  # cycles: gfx942 at 2.1 GHz
-        events = []
-        for fn in mains:
-            pairs = []
-            for _ in range(reps):
-                before()
-                pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-                pair[0].record()
-                fn(*scratch, stream=stream)
-                pair[1].record()
-                pairs.append(pair)
-            events.append(pairs)
-        queued_us = (_time.perf_counter() - start) * 1e6
-        events[-1][-1][1].synchronize()
-        if queued_us > sleep_us and tries < 8:
-            # The GPU outran the launches (a host busy compiling other kernels), so
-            # this round timed them too: a [32, 512, 768] heads permute picked a
-            # variant 2.5x slower next to a pytest run.
-            sleep_us *= 2
-            continue
-        rounds += 1
-        for k, pairs in enumerate(events):
-            times[k] = min(times[k], sum(s.elapsed_time(e) for s, e in pairs))
+
+    def measure(fns, before):
+        times = [float("inf")] * len(fns)
+        # ~60us a launch (four with the flush and events); over-sleeping is cheap.
+        sleep_us = len(fns) * reps * 4 * 60
+        rounds = tries = 0
+        while rounds < 3:
+            tries += 1
+            start = _time.perf_counter()
+            torch.cuda._sleep(int(sleep_us * 2.1e3))  # cycles: gfx942 at 2.1 GHz
+            events = []
+            for fn in fns:
+                pairs = []
+                for _ in range(reps):
+                    if before is not None:
+                        before()
+                    pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+                    pair[0].record()
+                    fn(*scratch, stream=stream)
+                    pair[1].record()
+                    pairs.append(pair)
+                events.append(pairs)
+            queued_us = (_time.perf_counter() - start) * 1e6
+            events[-1][-1][1].synchronize()
+            if queued_us > sleep_us and tries < 8:
+                # The GPU outran the launches (a host busy compiling other kernels),
+                # so this round timed them too: a [32, 512, 768] heads permute picked
+                # a variant 2.5x slower next to a pytest run.
+                sleep_us *= 2
+                continue
+            rounds += 1
+            for k, pairs in enumerate(events):
+                times[k] = min(times[k], sum(s.elapsed_time(e) for s, e in pairs))
+        return times
+
+    times = measure(mains, before)
     del flush
-    best = mains[times.index(min(times))]
+    # Candidates within 3% of each other cold are told apart warm, where their cache
+    # behaviour differs: a bf16 embedding's two launches timed within 3% cold, then
+    # 10% apart in the steady state, and which one won the cold timing varied by run.
+    close = [m for m, t in zip(mains, times) if t <= min(times) * 1.03]
+    if len(close) > 1:
+        warm_times = measure(close, None)
+        best = close[warm_times.index(min(warm_times))]
+    else:
+        best = mains[times.index(min(times))]
     if path is not None:
         tmp = f"{path}.{_os.getpid()}"
         try:
