@@ -810,6 +810,9 @@ class FlyDSLKernel(SIMDKernel):
         self.chunk_post = IndentedBuffer()
         # Pointwise only: the indexing and loads alone, replayed ahead of the body.
         self.prefetch = IndentedBuffer()
+        # Elements between those of the prefetch that can issue a load: the gcd of its
+        # loads' runs (0: none yet).
+        self.prefetch_step = 0
         self._node_index_vars: list[list[list[sympy.Expr]]] = []
         self.acc_counter = 0
         self.uses_smem = False
@@ -1579,7 +1582,7 @@ class FlyDSLKernel(SIMDKernel):
                 self.outside_loop_vars.add(result)
             return result
         if kind == "contig":
-            line = f"fdp.vload({self._cache()}, {key}, _j, {w}, _r_{arg}, {index_str}, {st!r}{mask})"
+            line = f"fdp.vload({self._cache()}, {key}, _j, {w}, _r_{arg}, lambda: {index_str}, {st!r}{mask})"
         elif (
             kind == "uniform"
             and not self.is_reduction_kernel
@@ -1590,9 +1593,9 @@ class FlyDSLKernel(SIMDKernel):
         ):
             # A wave's lanes cover an aligned WAVE * ept elements, all reading one
             # address; a masked lane's value is unused, so the mask is not needed.
-            line = f"fdp.wload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r})"
+            line = f"fdp.wload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, lambda: {index_str}, {st!r})"
         elif kind == "uniform":
-            line = f"fdp.uload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, {index_str}, {st!r}{mask})"
+            line = f"fdp.uload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, lambda: {index_str}, {st!r}{mask})"
         elif self.cpair > 1 and not hoist and r is not None and r in root.free_symbols:
             x = self._x_sym()
             # Only 2-byte loads: f32 pairs (dwordx2) took an 8192^2 column sum 85us ->
@@ -1615,6 +1618,9 @@ class FlyDSLKernel(SIMDKernel):
             line = f"fdp.load(_r_{arg}, {index_str}, {st!r}{mask})"
             if self._persistent_region() and not hoist and not dependent:
                 line = f"fdp.memo(_lc, ({key}, _j), lambda: {line})"
+        if buffer is self.loads:
+            run = w if kind == "contig" else self.ept if kind == "uniform" else 1
+            self.prefetch_step = math.gcd(self.prefetch_step, run)
         result = self.cse.generate(buffer, line, dtype=dtype)
         if kind in ("uniform", "hoisted") or (
             self.is_reduction_kernel and not self._in_loop_region()
@@ -2527,6 +2533,14 @@ class FlyDSLKernel(SIMDKernel):
         emit(tree)
         return out
 
+    def _pass_range(self, part: IndentedBuffer) -> str:
+        """The elements a pointwise or tile pass traces: all of a thread's for the body,
+        only those that can issue a load for the prefetch -- the rest of a 64-element
+        RoPE variant's prefetch traced index math for nothing (0.76 s to compile)."""
+        n = self.ept * self.unroll
+        step = math.gcd(self.prefetch_step, self.ept) if part is self.prefetch else 1
+        return f"range_constexpr(0, {n}, {step})" if step > 1 else f"range_constexpr({n})"
+
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
         if self.tile2d:
@@ -2545,7 +2559,7 @@ class FlyDSLKernel(SIMDKernel):
                 else [self.body]
             )
             for part in passes:
-                code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
+                code.writeline(f"for _j in {self._pass_range(part)}:")
                 with code.indent():
                     code.writeline(
                         f"xindex = _b * {span * self.unroll} + (_j // {ept}) * {span} + _t * {ept} + _j % {ept}"
@@ -2797,7 +2811,7 @@ class FlyDSLKernel(SIMDKernel):
         ept, tpf = self.ept, tf // self.ept
         passes = [self.prefetch, self.body] if self.prefetch else [self.body]
         for part in passes:
-            code.writeline(f"for _j in range_constexpr({ept * self.unroll}):")
+            code.writeline(f"for _j in {self._pass_range(part)}:")
             with code.indent():
                 coords(
                     f"(_t % {tpf}) * {ept} + _j % {ept}",

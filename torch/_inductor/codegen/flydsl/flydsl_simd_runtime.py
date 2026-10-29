@@ -649,11 +649,18 @@ def sload(r, off: int, st: str):
     return ArithValue(_cvt(raw, _MEM_KIND.get(st, st), _COMPUTE_OF[st]))
 
 
+def _offset(off):
+    # Offsets of loads repeated across an unrolled region come as thunks: evaluated
+    # for every element, most of a 64-element RoPE variant's 4400 traced ops.
+    return off() if callable(off) else off
+
+
 def wload(cache: dict, key, chunk: int, r, off, st: str):
     """``sload`` at an offset computed at run time but the same across the wave: lane
     0's offset, read into an SGPR. Read-only buffers only, as for ``sload``."""
     if (key, "w", chunk) in cache:
         return cache[(key, "w", chunk)]
+    off = _offset(off)
     if isinstance(r, _Flat):
         cache[(key, "w", chunk)] = load(r, off, st)
         return cache[(key, "w", chunk)]
@@ -706,9 +713,10 @@ def vload(cache: dict, key, j: int, w: int, r, off, st: str, mask=None):
 
     Called once per unrolled element. The first element of each aligned chunk issues the
     vector load and caches it (trace time, so the cache is a Python dict), and the rest
-    extract from it; their own ``off`` is computed and left for DCE.
+    extract from it. ``off`` may be a thunk, called only to issue the load.
     """
     if (key, j // w) not in cache:
+        off = _offset(off)
         # Usually issued by the chunk's first element, but a store to the same buffer
         # (see forget) can drop the vector mid-chunk; the load always starts at the base.
         base = idx(off if j % w == 0 else off - j % w)
@@ -763,7 +771,7 @@ def uload(cache: dict, key, chunk: int, r, off, st: str, mask=None):
     """A load whose address is the same across one contiguous run of elements a thread
     owns (``chunk`` numbers the runs when the thread owns several): issue it once."""
     if (key, "u", chunk) not in cache:
-        cache[(key, "u", chunk)] = load(r, off, st, mask)
+        cache[(key, "u", chunk)] = load(r, _offset(off), st, mask)
     return cache[(key, "u", chunk)]
 
 
@@ -2466,10 +2474,12 @@ def warm_worker(arch: str | None = None) -> None:
 def preload_worker(arch: str | None = None) -> None:
     """Run in the compile pool's sidecar before it forks its workers, so each inherits
     FlyDSL's imports and the gfx target rather than paying for them itself."""
-    from flydsl.runtime.device import get_rocm_arch
-
     _set_arch(arch)
-    _os.environ.setdefault("FLYDSL_GPU_ARCH", get_rocm_arch())
+    if "FLYDSL_GPU_ARCH" not in _os.environ:
+        # Queries the driver, 0.3 s of the pool's startup, so only without ``arch``.
+        from flydsl.runtime.device import get_rocm_arch
+
+        _os.environ["FLYDSL_GPU_ARCH"] = get_rocm_arch()
     warm_worker()
 
 
