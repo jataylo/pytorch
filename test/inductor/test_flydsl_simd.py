@@ -438,6 +438,22 @@ class TestFlyDSLSIMD(TestCase):
         torch._dynamo.reset()
         self.check(lambda x, w: F.layer_norm(x, (4096,), w), h, w, atol=tol, rtol=tol)
 
+    @parametrize("cols", [2048, 3072])
+    def test_rmsnorm_rows_across_waves(self, cols):
+        # The row held in registers across two and three waves, the backward too.
+        x = torch.randn(300, cols, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(cols, device="cuda", dtype=torch.bfloat16)
+        g = torch.randn(300, cols, device="cuda", dtype=torch.bfloat16)
+
+        def fn(x, w, g):
+            xf = x.float()
+            r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)
+            n, gw = xf * r, g.float() * w.float()
+            dx = r * (gw - n * (gw * n).mean(-1, keepdim=True))
+            return (n * w).to(x.dtype), dx.to(x.dtype)
+
+        self.check(fn, x, w, g, atol=5e-2, rtol=5e-2)
+
     @parametrize("width", [32, 8])
     def test_short_rows_stored_together(self, width):
         # Each row group's results go out in one store, a lane a row.

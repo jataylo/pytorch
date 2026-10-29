@@ -1340,13 +1340,14 @@ class FlyDSLKernel(SIMDKernel):
                 and not self._pure_reduction()
                 and self.rnumel % PERSISTENT_MAX_UNROLL == 0
                 and WAVE < (fit := self.rnumel // PERSISTENT_MAX_UNROLL) <= self.threads
-                and fit & (fit - 1) == 0
+                and fit % WAVE == 0
             ):
-                # Rows a whole number of power-of-two waves hold in registers, a full
-                # unroll a lane: a normalization reads its row more than once, which the
-                # one-step loop goes back to L2 for. A 4096-wide bf16 RMSNorm 107us ->
-                # 93us (Triton 147us) and its backward 95us -> 57us; 2048-wide 53us ->
-                # 47us and 74us -> 65us. Not 1536 or 3072 wide, masked to 12 a lane.
+                # Rows a whole number of waves hold in registers, a full unroll a lane:
+                # a normalization reads its row more than once, which the one-step loop
+                # goes back to L2 for. A 4096-wide bf16 RMSNorm 107us -> 93us (Triton
+                # 147us) and its backward 95us -> 57us; 2048-wide 53us -> 47us and
+                # 74us -> 65us; 3072-wide (three waves) 77us -> 80us but its backward
+                # 124us -> 93us.
                 tpr = fit
             elif (
                 tpr > WAVE
@@ -1381,6 +1382,9 @@ class FlyDSLKernel(SIMDKernel):
                 # reduction of short rows, each thread group several of them: a sum of
                 # 32-wide rows 38.5us -> 35.7us in 256-thread blocks (Triton 35.5us).
                 self.threads = WAVE
+            elif self.threads % self.tpr:
+                # Whole rows a block: the spare waves would take a part of the next.
+                self.threads = self.tpr * max(1, self.threads // self.tpr)
             interleave = _tune(
                 "row_stride",
                 ROW_INTERLEAVE
