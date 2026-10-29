@@ -10,7 +10,8 @@ destination depends on) and
 
   1. computes each token's destination key from the fused index expression,
   2. estimates its distinct destinations, and issues plain atomics in token
-     order, like regular Inductor, when pre-aggregating would save few,
+     order, like regular Inductor, when pre-aggregating would save few or
+     its keys come in short runs,
   3. otherwise sorts (key, position) pairs so equal destinations become
      contiguous, evaluates the fused value expression at the sorted token
      positions and sums runs of equal keys with a segmented associative scan
@@ -691,6 +692,15 @@ for it in tl.range(0, D_ITERS):
     next_key = tl.gather(sorted_key, tl.minimum(pos + 1, BLOCK_T - 1), 0)
     heads = (sorted_key != next_key) | (pos == BLOCK_T - 1)
     distinct = tl.sum(heads.to(tl.int32), 0)
+    plain = BLOCK_T - distinct < BLOCK_T * SORT_SAVED
+    if RUN_MAX:
+        # Short runs take plain atomics as below, unless keys recur in more
+        # than a sixteenth of the block, which lets a hot key serialize them
+        # (up to 3x on gfx942).
+        next_dest = tl.gather(dest, tl.minimum(pos + 1, BLOCK_T - 1), 0)
+        runs = tl.sum(((dest != next_dest) | (pos == BLOCK_T - 1)).to(tl.int32), 0)
+        in_order = runs - distinct <= BLOCK_T // 16
+        plain = plain | (in_order & (runs * RUN_MAX >= BLOCK_T))
 {% else %}
     # Runs of equal keys in token order: a segmented scan sums them without
     # the sort, which pays when sorting would save few more atomics.
@@ -718,9 +728,14 @@ for it in tl.range(0, D_ITERS):
         ) * HIST_BINS
         empty = tl.maximum(tl.sum(empty, 0), 1.0)
         distinct = -HIST_BINS * tl.log(empty / HIST_BINS)
-    in_order = runs - tl.maximum(distinct, 1.0) <= BLOCK_T * MIN_SAVED
+    in_order = runs - tl.maximum(distinct, 1.0) <= BLOCK_T * SORT_SAVED
+    plain = BLOCK_T - distinct < BLOCK_T * SORT_SAVED
+    if RUN_MAX:
+        # Plain atomics of short runs hit lines just updated, which costs
+        # less than the scan.
+        plain = plain | (in_order & (runs * RUN_MAX >= BLOCK_T))
 {% endif %}
-    if BLOCK_T - distinct < BLOCK_T * MIN_SAVED:
+    if plain:
         # Plain atomics in token order, like regular Inductor. Rows of PLAIN_D
         # put fewer tokens in each atomic instruction than BLOCK_D-wide tiles,
         # which matters when hot keys collide within one.
@@ -1417,24 +1432,13 @@ def _lower_atomic(
     # wavefront updates whole cache lines (fewer L2 atomic transactions, which
     # bound hot destinations). The sort path keeps two: one word per lane costs
     # it registers for a layout conversion after the scan. So do outputs of
-    # 2GB or more, whose 64-bit addresses already halve occupancy. The word
-    # also sets the width of value loads, which 16-bit inputs keep at 32 bits
-    # once the output outgrows L2, and atomics wait on memory rather than
-    # issue.
+    # 2GB or more, whose 64-bit addresses already halve occupancy. 16-bit
+    # inputs staged in fp32 keep one word too, though it halves their loads
+    # (up to 1.8x on gfx942).
     plain_vec = atomic_vec
     out_bytes = _hint(out.get_layout().storage_size()) * dtype.itemsize
     if target.cdna3_or_later and out_bytes < 2**31:
-        elem_bytes = dtype.itemsize
-        if out_bytes > target.l2_bytes:
-            elem_bytes = min(
-                [elem_bytes]
-                + [
-                    i.get_dtype().itemsize
-                    for i in inputs
-                    if i.get_dtype().is_floating_point
-                ]
-            )
-        plain_vec = max(1, 4 // elem_bytes)
+        plain_vec = max(1, 4 // dtype.itemsize)
 
     # Sorting pays less on wide rows, whose scans cost more than the atomics
     # they save, and with at least as many destinations as tokens, whose
@@ -1469,6 +1473,11 @@ def _lower_atomic(
             "HIST_BINS": hist_bins,
             "LOG_HIST_BINS": hist_bins.bit_length() - 1,
             "MIN_SAVED": block_min_saved,
+            # Single columns' plain atomics cost more against their sort,
+            # which then pays at half the saving (~1.3x for a fifth of tokens
+            # on ten hot destinations, gfx942).
+            "SORT_SAVED": block_min_saved / (2 if cfg.block_d == 1 else 1),
+            "RUN_MAX": 0,
         }
         if not plan.inner_contiguous:
             # Strided inner elements take a transaction each, so the plain
@@ -1502,6 +1511,13 @@ def _lower_atomic(
 
             while widen > 1 and too_wide(widen):
                 widen //= 2
+        if dtype != torch.bfloat16 and cfg.block_d * widen >= 8:
+            # Runs of up to 4 tokens on average take plain atomics, which beat
+            # the scan by up to 1.5x (gfx942). Longer runs serialize, as do
+            # narrower rows, whose atomic instructions take several tokens of
+            # a run, and bf16, whose compare-and-swap atomics retry on every
+            # duplicate.
+            adaptive["RUN_MAX"] = 4
         return adaptive | {
             "PLAIN_VEC": plain_vec,
             "PLAIN_T": cfg.block_t // widen,

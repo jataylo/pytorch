@@ -623,6 +623,19 @@ class TestScatterPreagg(TestCase):
 
         self._check(fn, x, idx, v, atol=1e-2, rtol=1e-3)
 
+    @parametrize("dtype", [torch.float32, torch.float16])
+    def test_adaptive_short_runs(self, dtype):
+        # Sorted keys in runs of about two take plain atomics, also on the
+        # 16-bit matrix product's blocks.
+        idx = torch.sort(torch.randint(0, 16384, (32768,), device=GPU_TYPE))[0]
+        x = torch.zeros(16384, 64, device=GPU_TYPE, dtype=dtype)
+        v = torch.randn(idx.numel(), 64, device=GPU_TYPE, dtype=dtype)
+
+        def fn(x, i, v):
+            return x.index_add(0, i, v)
+
+        self._check(fn, x, idx, v, atol=1e-2, rtol=1e-2)
+
     @parametrize("min_saved", [-1.0, 2.0])
     def test_constant_values(self, min_saved):
         # Counting with scattered ones leaves a rank-1 constant as the value.

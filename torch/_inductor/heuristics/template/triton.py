@@ -425,7 +425,6 @@ class ScatterPreaggTarget:
     arch: str = ""
     warp_size: int = 64
     lds_bytes: int = 64 * 1024
-    l2_bytes: int = 4 * 1024 * 1024
 
     @property
     def cdna3_or_later(self) -> bool:
@@ -471,7 +470,7 @@ def _scatter_preagg_target(index: int) -> ScatterPreaggTarget:
     # torch.cuda._utils.set_shared_memory_config); other targets keep the 64KB
     # the LDS-bound choices were measured with.
     lds_bytes = {"gfx950": 160 * 1024, "gfx1250": 320 * 1024}.get(arch, 64 * 1024)
-    return ScatterPreaggTarget(arch, props.warp_size, lds_bytes, props.L2_cache_size)
+    return ScatterPreaggTarget(arch, props.warp_size, lds_bytes)
 
 
 class BaseHeuristicSingleton(type):
