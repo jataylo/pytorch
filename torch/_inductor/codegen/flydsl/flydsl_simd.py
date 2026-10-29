@@ -508,6 +508,24 @@ class FlyDSLKernelOverrides(OpOverrides):
         return f"fdp.bitcast({x}, {src!r}, {dst!r})"
 
     @staticmethod
+    def inline_asm_elementwise(
+        *inputs,
+        asm,
+        constraints=None,
+        dtype=torch.float32,
+        is_pure=True,
+        pack=1,
+        input_dtypes=None,
+    ):
+        if pack != 1 or dtype == torch.bool:
+            raise FlyDSLUnsupported("inline asm with pack > 1")
+        if constraints is None:
+            constraints = ",".join(["=v"] + ["v"] * len(inputs))
+        out = storage_kind(dtype)
+        args = ", ".join(_a(x) for x in inputs)
+        return f"fdp.inline_asm({asm!r}, {constraints!r}, {out!r}, {bool(is_pure)}, {args})"
+
+    @staticmethod
     def frexp(x):
         key = f"frexp({x})"
         if cached := V.kernel.cse.try_get(key):

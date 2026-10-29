@@ -535,6 +535,29 @@ class TestFlyDSLSIMD(TestCase):
             # Eager's own f32 erfcx is 32 ulp out where ocml's is 2.
             self.check(fn, *a, atol=1e-6, rtol=1e-5)
 
+    def test_inline_asm(self):
+        # AMDGCN inline asm, fused with the ops around it; one element a call.
+        from torch._higher_order_ops.inline_asm_elementwise import (
+            inline_asm_elementwise,
+        )
+
+        x = torch.randn(1000, 333, device="cuda")
+        y = torch.randn(1000, 333, device="cuda")
+
+        def fn(x, y):
+            s = inline_asm_elementwise(
+                x * 2, y, asm_str="v_add_f32 $0, $1, $2", constraints="=v,v,v",
+                dtype=torch.float32,
+            )
+            e = inline_asm_elementwise(
+                x, asm_str="v_bfe_u32 $0, $1, 23, 8", constraints="=v,v",
+                dtype=torch.int32,
+            )
+            # Eager's result comes back float32 whatever `dtype` says; Triton's is int32.
+            return s.relu(), (e + 1).float()
+
+        self.check(fn, x, y, atol=0, rtol=0)
+
     @parametrize("right", [False, True])
     def test_bucketize(self, right):
         # One shared table (staged in LDS; 3000 elements is past that, gathered), per-row

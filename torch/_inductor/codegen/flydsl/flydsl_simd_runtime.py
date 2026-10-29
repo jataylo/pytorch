@@ -1682,6 +1682,18 @@ def ldexp(x, n):
     return _ocml(f"ldexp_{k}", k, _val(to(x, k)), _val(idx(n)))
 
 
+def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs):
+    """``tl.inline_asm_elementwise`` with ``pack=1``: the operands in their compute
+    kinds, the result in storage kind ``out`` (as Triton types them), widened back."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    vals = [_val(_canon(x) if not isinstance(x, (bool, int, float)) else const(x, kind(x))) for x in xs]
+    op = _llvm.InlineAsmOp(
+        _STORAGE_IR[out](), vals, asm, constraints, has_side_effects=not pure
+    )
+    return ArithValue(_cvt(op.result, _MEM_KIND.get(out, out), _COMPUTE_OF[out]))
+
+
 def frexp(x):
     """(mantissa in [0.5, 1) with x's sign, exponent): ``x`` itself and 0 for zero,
     inf and NaN. A denormal is scaled into the normal range first."""
