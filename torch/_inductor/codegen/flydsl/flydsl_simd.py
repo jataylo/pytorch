@@ -481,7 +481,10 @@ class FlyDSLKernelOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype_bitcast(x, dtype, src_dtype):
-        raise FlyDSLUnsupported("bitcast")
+        if dtype.itemsize != src_dtype.itemsize or torch.bool in (dtype, src_dtype):
+            raise FlyDSLUnsupported("bitcast across widths")
+        src, dst = storage_kind(src_dtype), storage_kind(dtype)
+        return f"fdp.bitcast({x}, {src!r}, {dst!r})"
 
     @staticmethod
     # pyrefly: ignore [bad-override]

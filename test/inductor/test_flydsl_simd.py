@@ -491,6 +491,23 @@ class TestFlyDSLSIMD(TestCase):
             rtol=0,
         )
 
+    def test_bitcast(self):
+        # x.view(dtype) at one width: rounded back to storage (exactly), reinterpreted.
+        x = torch.randn(1000, 333, device="cuda")
+        x[0, :3] = torch.tensor([float("nan"), float("inf"), -0.0])
+        f8 = torch.float8_e4m3fnuz
+        cases = [
+            (lambda x: (0x5F3759DF - (x.abs().view(torch.int32) >> 1)).view(torch.float32) * 1, x),
+            (lambda b: (b * 1).view(torch.int16) >> 3, x.bfloat16()),
+            (lambda i: (i & 0x3FFF).view(torch.bfloat16) + 1, (x * 1000).to(torch.int16)),
+            (lambda q: q.float().to(f8).view(torch.uint8).int() + 1, x.to(f8)),
+            (lambda u: (u & 0x7F).view(f8).float() * 3, (x * 50).to(torch.uint8)),
+            (lambda d: (d * 3).view(torch.int64) >> 2, x.double()),
+        ]
+        for fn, a in cases:
+            torch._dynamo.reset()
+            self.check(fn, a, atol=0, rtol=0)
+
     @parametrize("width", [32, 8])
     def test_short_rows_stored_together(self, width):
         # Each row group's results go out in one store, a lane a row.

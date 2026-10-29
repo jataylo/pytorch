@@ -264,6 +264,17 @@ def to(x, k: str):
     return ArithValue(_cvt(v, kind_of_type(v.type), k))
 
 
+def bitcast(x, src: str, dst: str):
+    """``x.view(dst)`` of a value of storage kind ``src`` held in its compute kind: back
+    to storage (exact), the bits reinterpreted, out to ``dst``'s compute kind."""
+    v = _val(to(x, _COMPUTE_OF[src]))
+    v = _cvt(v, kind_of_type(v.type), src)
+    dst_t = _STORAGE_IR[dst]()
+    if v.type != dst_t:
+        v = _arith.BitcastOp(dst_t, v).result
+    return ArithValue(_cvt(v, dst, _COMPUTE_OF[dst]))
+
+
 def _canon(x):
     """A value already in a compute kind (Python scalars left alone)."""
     if isinstance(x, (bool, int, float)):
