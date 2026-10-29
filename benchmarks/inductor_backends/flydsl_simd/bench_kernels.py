@@ -130,6 +130,11 @@ CASES = {
         lambda w, ix: F.embedding(ix, w),
         [_r(32000, 4096, dtype=bf16), _i(32000, 8192)],
     ),
+    # An embedding gradient on its own: zero fill, f32 scatter-add, cast to bf16
+    "embedding_bwd_bf16": (
+        lambda g, ix: torch.ops.aten.embedding_dense_backward(g, ix, 32000, -1, False),
+        [_r(8192, 1024, dtype=bf16), _i(32000, 8192)],
+    ),
     # reductions
     "sum_rows_f32": (lambda a: a.sum(-1), [_r(8192, 8192)]),
     "sum_cols_f32": (lambda a: a.sum(0), [_r(8192, 8192)]),

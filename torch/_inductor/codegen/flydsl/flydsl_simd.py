@@ -1179,7 +1179,8 @@ class FlyDSLKernel(SIMDKernel):
         # Enough blocks to fill the GPU a few times over before a thread takes more work.
         enough_blocks = 4 * _num_cus()
         atomic = self._has_atomic()
-        if self._has_atomic(per_element=True):
+        atomic_elems = self._has_atomic(per_element=True)
+        if atomic_elems:
             # Atomics are issued an element at a time, and a wave's spread over more
             # than two elements a lane goes slower: an embedding-gradient scatter
             # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
@@ -1201,9 +1202,11 @@ class FlyDSLKernel(SIMDKernel):
                 widest_vec = min(widest_vec, max(1, 16 // max(streams)))
                 # Unless that leaves every store short of a 16-byte vector: twice as
                 # wide, an f32 -> bf16 cast stores 16 bytes a lane for two strided
-                # loads, 44.7us -> 41.3us on 24M elements (Triton 41.9us).
+                # loads, 44.7us -> 41.3us on 24M elements (Triton 41.9us). Not past the
+                # atomics' two: the f32 scatter of a standalone embedding gradient went
+                # back to 100us at four (Triton 51us, 48us at two).
                 stores = self._stream_itemsizes(loads=False)
-                if stores and 16 // max(stores) > widest_vec:
+                if stores and not atomic_elems and 16 // max(stores) > widest_vec:
                     widest_vec = min(2 * widest_vec, 16 // max(stores))
             self.ept = _tune("ept", _largest_pow2_dividing(self.xnumel, widest_vec))
             # Two runs per thread keep two vector loads in flight per input, as Triton's
