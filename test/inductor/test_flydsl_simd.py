@@ -537,7 +537,7 @@ class TestFlyDSLSIMD(TestCase):
 
     @parametrize(
         "case",
-        ["bias_gelu", "seq_bcast", "permute", "rmsnorm", "softmax", "argmax", "sum_dyn_rows", "col_sum", "cross_entropy"],
+        ["bias_gelu", "seq_bcast", "permute", "transpose", "transpose_both", "nchw_nhwc", "rmsnorm", "softmax", "argmax", "sum_dyn_rows", "col_sum", "cross_entropy"],
     )
     def test_dynamic_shapes(self, case):
         # One compiled graph over every size: the dynamic extents are kernel arguments
@@ -552,6 +552,9 @@ class TestFlyDSLSIMD(TestCase):
             "bias_gelu": (lambda a, b: F.gelu(a + b), lambda n: (torch.randn(n, 768, device="cuda", dtype=bf16), torch.randn(768, device="cuda", dtype=bf16)), [(0,), ()]),
             "seq_bcast": (lambda a, b: a * b[None], lambda n: (torch.randn(4, n, 64, device="cuda"), torch.randn(n, 64, device="cuda")), [(1,), (0,)]),
             "permute": (lambda a: a.view(2, a.shape[1], 8, 64).permute(0, 2, 1, 3).contiguous() * 2, lambda n: (torch.randn(2, n, 512, device="cuda"),), [(1,)]),
+            "transpose": (lambda a: a.transpose(1, 2).contiguous(), lambda n: (torch.randn(3, n, 200, device="cuda", dtype=bf16),), [(1,)]),
+            "transpose_both": (lambda a: a.t().contiguous() * 2, lambda n: (torch.randn(n, n // 2 + 5, device="cuda"),), [(0, 1)]),
+            "nchw_nhwc": (lambda a: a.permute(0, 2, 3, 1).contiguous() + 1, lambda n: (torch.randn(2, 32, n // 8 + 1, 40, device="cuda"),), [(2,)]),
             "rmsnorm": (rms, lambda n: (torch.randn(n, 2048, device="cuda", dtype=bf16), torch.randn(2048, device="cuda", dtype=bf16)), [(0,), ()]),
             "softmax": (lambda a: a.softmax(-1), lambda n: (torch.randn(n, 512, device="cuda"),), [(0,)]),
             "argmax": (lambda a: a.argmax(-1), lambda n: (torch.randn(n, 1000, device="cuda"),), [(0,)]),

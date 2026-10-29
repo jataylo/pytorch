@@ -762,7 +762,11 @@ def _aligned_shift(arg: sympy.Expr, var: sympy.Symbol, w: int) -> bool:
 
 
 def classify_access(
-    expr: sympy.Expr, var: sympy.Symbol, w: int, uniform: frozenset[str] = frozenset()
+    expr: sympy.Expr,
+    var: sympy.Symbol,
+    w: int,
+    uniform: frozenset[str] = frozenset(),
+    any_base: bool = False,
 ) -> str:
     """How ``expr`` (in terms of the root index symbols) behaves over an aligned run of
     ``w`` consecutive values of ``var``.
@@ -831,9 +835,15 @@ def classify_access(
         return "other"
     if linear == 0:
         return "uniform"
-    if linear == 1 and aligned:
+    if linear == 1 and (aligned or any_base):
         return "contig"
     return "other"
+
+
+def _linear_in(expr: sympy.Expr, var: sympy.Symbol) -> bool:
+    """Whether ``expr`` steps by one element with ``var``, its runs aligned or not (a
+    row pitch of 8197, or ``ks0``)."""
+    return classify_access(expr, var, 2, any_base=True) == "contig"
 
 
 # ---------------------------------------------------------------------------------------
@@ -860,8 +870,6 @@ class FlyDSLKernel(SIMDKernel):
         self.xnumel_dyn: sympy.Expr | None = None
         xs = V.graph.sizevars.simplify(self.numels["x"])
         if _int_or_none(xs) is None:
-            if "y" in self.numels:
-                raise FlyDSLUnsupported("dynamic xnumel in a tiled kernel")
             self.xnumel_dyn = xs
             self.xnumel = int(V.graph.sizevars.optimization_hint(xs, fallback=8192))
         else:
@@ -880,19 +888,29 @@ class FlyDSLKernel(SIMDKernel):
                 self.rnumel = int(rs)
         # A {y, x} pointwise kernel runs tile_f x tile_s tiles: see _finalize_tile2d.
         self.tile2d = "y" in self.numels
-        self.ynumel = self._static(self.numels["y"], "ynumel") if self.tile2d else 1
+        self.ynumel_dyn: sympy.Expr | None = None
+        self.ynumel = 1
+        if self.tile2d:
+            ys = V.graph.sizevars.simplify(self.numels["y"])
+            if _int_or_none(ys) is None:
+                self.ynumel_dyn = ys
+                self.ynumel = int(V.graph.sizevars.optimization_hint(ys, fallback=8192))
+            else:
+                self.ynumel = int(ys)
         self.fast = "x"  # the dimension a thread's vector runs follow
         # Tile edges along the fast and slow dimensions.
         self.tile_f = self.tile_s = TILE
         self.staged: list[dict[str, Any]] = []
-        if self.xnumel_dyn is None and self.rnumel_dyn is None:
+        if not self.is_dynamic:
             if self.xnumel * self.rnumel * self.ynumel > _I32_LIMIT:
                 raise FlyDSLUnsupported("more than 2**31 elements")
         else:
             # i32 offsets, as Inductor guards for Triton's 32-bit indexing; the bound
             # leaves room for a mask's block-sized overshoot.
             total = V.graph.sizevars.simplify(
-                self.numels["x"] * self.numels.get("r0_", 1)
+                self.numels["x"]
+                * self.numels.get("r0_", 1)
+                * self.numels.get("y", 1)
             )
             if not expr_fits_within_32bit(total):
                 raise FlyDSLUnsupported("dynamic extent not known to fit int32")
@@ -1062,15 +1080,13 @@ class FlyDSLKernel(SIMDKernel):
         """
         stores = self._memory_roots(loads=False) or []
         x, y = self._x_sym(), self._tree_sym("y")
-        x_st = sum(classify_access(e, x, 2) == "contig" for e in stores)
-        y_st = sum(classify_access(e, y, 2) == "contig" for e in stores)
+        x_st = sum(_linear_in(e, x) for e in stores)
+        y_st = sum(_linear_in(e, y) for e in stores)
         self.fast = "y" if y_st > x_st else "x"
         f = self._tree_sym(self.fast)
-        fast_roots = [
-            e
-            for e in (self._memory_roots() or [])
-            if classify_access(e, f, 2) == "contig"
-        ]
+        # A dynamic row pitch leaves the runs unaligned: ept falls to what is provable,
+        # down to 1, where a wave's lanes still write consecutive elements.
+        fast_roots = [e for e in (self._memory_roots() or []) if _linear_in(e, f)]
         ept = widest_vec
         while ept > 1 and not all(
             classify_access(e, f, ept) == "contig" for e in fast_roots
@@ -1086,7 +1102,7 @@ class FlyDSLKernel(SIMDKernel):
         pitch = [
             e.subs({f: 0, s: 1}) - e.subs({f: 0, s: 0})
             for e in stores
-            if classify_access(e, f, 2) == "contig"
+            if _linear_in(e, f)
         ]
         narrow = bool(pitch) and all(p.is_Integer and 0 < p <= 64 for p in pitch)
         self.tile_f = _tune("tile_f", TILE // 2 if narrow else TILE)
@@ -1606,18 +1622,37 @@ class FlyDSLKernel(SIMDKernel):
 
     def _xmask(self) -> str | None:
         if self.tile2d:
-            return None if self.xnumel % self._tile_edge("x") == 0 else "xmask"
+            return None if self._dim_multiple("x", self._tile_edge("x")) else "xmask"
         if self.is_reduction_kernel:
             block = self.rpb * self.xunroll * self.cpair
         else:
             block = self.threads * self.ept * self.unroll
         return None if self._x_multiple(block) else "xmask"
 
+    @property
+    def is_dynamic(self) -> bool:
+        return not (
+            self.xnumel_dyn is None
+            and self.rnumel_dyn is None
+            and self.ynumel_dyn is None
+        )
+
+    def _dim_multiple(self, dim: str, n: int) -> bool:
+        """Whether the ``dim`` extent is a multiple of ``n`` (a dynamic one: provably)."""
+        dyn = self.xnumel_dyn if dim == "x" else self.ynumel_dyn
+        if dyn is None:
+            return (self.xnumel if dim == "x" else self.ynumel) % n == 0
+        return _multiple(dyn, n)
+
+    def _dim_n(self, dim: str) -> str:
+        """The ``dim`` extent in the kernel: a constant, or computed from size arguments."""
+        dyn = self.xnumel_dyn if dim == "x" else self.ynumel_dyn
+        if dyn is None:
+            return str(self.xnumel if dim == "x" else self.ynumel)
+        return self.kexpr(self.rename_indexing(dyn))
+
     def _x_multiple(self, n: int) -> bool:
-        """Whether the x extent is a multiple of ``n`` (for a dynamic one: provably)."""
-        if self.xnumel_dyn is None:
-            return self.xnumel % n == 0
-        return V.graph.sizevars.statically_known_multiple_of(self.xnumel_dyn, n)
+        return self._dim_multiple("x", n)
 
     def _x_pow2_dividing(self, cap: int) -> int:
         p = 1
@@ -1627,10 +1662,7 @@ class FlyDSLKernel(SIMDKernel):
 
     @property
     def _xn(self) -> str:
-        """The x extent in the kernel: a constant, or computed from its size arguments."""
-        if self.xnumel_dyn is None:
-            return str(self.xnumel)
-        return self.kexpr(self.rename_indexing(self.xnumel_dyn))
+        return self._dim_n("x")
 
     def _rmask(self) -> str | None:
         if not self.is_reduction_kernel or not self.inside_reduction:
@@ -1662,7 +1694,7 @@ class FlyDSLKernel(SIMDKernel):
         ms = []
         if (m := self._xmask()) is not None:
             ms.append(m)
-        if self.tile2d and self.ynumel % self._tile_edge("y"):
+        if self.tile2d and not self._dim_multiple("y", self._tile_edge("y")):
             ms.append("ymask")
         if include_r and (m := self._rmask()) is not None:
             ms.append(m)
@@ -1825,7 +1857,7 @@ class FlyDSLKernel(SIMDKernel):
         # A staging pass's threads must fit the tile, or it loads nothing.
         while w > 1 and (self.tile_s // w) * self.tile_f < self.threads:
             w //= 2
-        if w == 1:
+        if w == 1 and not _linear_in(root, slow):
             return None
         ck = compute_kind(dtype)
         words = 2 if ck in ("i64", "f64") else 1
@@ -2688,9 +2720,23 @@ class FlyDSLKernel(SIMDKernel):
     def _grid(self) -> int | str:
         """``num_blocks``, or for a dynamic extent the expression ``_main`` computes it
         by from its size arguments."""
+        if self.tile2d:
+            if self.xnumel_dyn is None and self.ynumel_dyn is None:
+                return self.num_blocks
+
+            def tiles(d: str) -> str:
+                dyn = self.xnumel_dyn if d == "x" else self.ynumel_dyn
+                n = (
+                    (self.xnumel if d == "x" else self.ynumel)
+                    if dyn is None
+                    else PythonPrinter().doprint(self.rename_indexing(dyn))
+                )
+                return f"(-(-({n}) // {self._tile_edge(d)}))"
+
+            return f"max(1, {tiles('x')} * {tiles('y')})"
         if self.xnumel_dyn is None:
             return self.num_blocks
-        if self.tile2d or self.mix_order_reduction:
+        if self.mix_order_reduction:
             raise FlyDSLUnsupported("dynamic grid")
         if self.is_reduction_kernel:
             pairs = 2 if self._pair_lines is not None else 1
@@ -3078,15 +3124,22 @@ class FlyDSLKernel(SIMDKernel):
     def _emit_tile2d(self, code: IndentedBuffer) -> None:
         f = self.fast
         s = "y" if f == "x" else "x"
-        nf, _ = self._tile_counts()
+        tf, ts, pitch = self.tile_f, self.tile_s, self._tile_pitch
+        fdyn = self.xnumel_dyn if f == "x" else self.ynumel_dyn
+        if fdyn is None:
+            nf = str(self._tile_counts()[0])
+        else:
+            code.writeline(
+                f"_nf = {self.kexpr(self.rename_indexing(FloorDiv(fdyn + tf - 1, tf)))}"
+            )
+            nf = "_nf"
         code.writeline(f"_bf = _b % {nf}")
         code.writeline(f"_bs = _b // {nf}")
-        tf, ts, pitch = self.tile_f, self.tile_s, self._tile_pitch
-        masks = []
-        if self.xnumel % self._tile_edge("x"):
-            masks.append(f"xmask = xindex < {self._xn}")
-        if self.ynumel % self._tile_edge("y"):
-            masks.append(f"ymask = yindex < {self.ynumel}")
+        masks = [
+            f"{d}mask = {d}index < {self._dim_n(d)}"
+            for d in ("x", "y")
+            if not self._dim_multiple(d, self._tile_edge(d))
+        ]
         entries = [
             f"{e.name} = {self.kexpr(self.rename_indexing(e.expr))}"
             for e in self.range_tree_nodes.values()
@@ -3116,10 +3169,15 @@ class FlyDSLKernel(SIMDKernel):
                 )
                 for e in entries:
                     code.writeline(e)
-                code.writeline(
-                    f"_v = fdp.vload(_vs{i}, 'stage', _j, {w}, _r_{st['arg']}, {st['index']}, "
-                    f"{st['st']!r}{mask_arg})"
-                )
+                if w == 1:
+                    code.writeline(
+                        f"_v = fdp.load(_r_{st['arg']}, {st['index']}, {st['st']!r}{mask_arg})"
+                    )
+                else:
+                    code.writeline(
+                        f"_v = fdp.vload(_vs{i}, 'stage', _j, {w}, _r_{st['arg']}, "
+                        f"{st['index']}, {st['st']!r}{mask_arg})"
+                    )
                 code.writeline(
                     f"fdp.tile_put(_smem, {st['base']}, {tf * pitch}, "
                     f"_fl * {pitch} + _sl, _v)"
@@ -3414,7 +3472,7 @@ def _merge_identical(
 def _combo_source(kernels: list[FlyDSLKernel]) -> str:
     """One launch for several kernels sharing a KernelArgs: each owns a contiguous range
     of block ids and runs, with ``_b`` rebased, under a branch on the block id."""
-    if any(k.xnumel_dyn is not None or k.rnumel_dyn is not None for k in kernels):
+    if any(k.is_dynamic for k in kernels):
         raise FlyDSLUnsupported("dynamic sizes in a combo kernel")
     inners = []
     for k in kernels:
