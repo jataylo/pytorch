@@ -970,13 +970,53 @@ class TestFlyDSLSIMD(TestCase):
         )
         self.assertEqual(fly, tri, atol=0.25, rtol=1e-2)  # one bf16 ulp
 
-    def test_chained_scans_fall_back(self):
-        a = torch.randn(16, 1024, device="cuda")
-        fn = lambda x: x.cumsum(-1).cumsum(-1)  # noqa: E731
-        with config.patch({"flydsl.simd_strict": False}):
+    def test_chained_scans(self):
+        # A scan of a scan's result: one traced pass more per level of nesting.
+        for fn, a in (
+            (lambda x: x.cumsum(-1).cumsum(-1), torch.randn(16, 1024)),
+            (lambda x: torch.cummax(x.cumsum(-1), -1)[0], torch.randn(32, 2000)),
+            (lambda x: x.cumsum(-1) + x.sin().cumsum(-1), torch.randn(64, 3000)),
+        ):
+            torch._dynamo.reset()
+            counters.clear()
+            self.check(fn, a.cuda(), atol=1e-2, rtol=1e-3)
+
+    def test_sort(self):
+        # A row's (key, index) pairs through LDS, NaN last and ties stable.
+        nan = torch.where(torch.rand(8, 77) < 0.2, float("nan"), torch.randn(8, 77))
+        for fn, a in (
+            (lambda x: torch.sort(x, dim=-1), torch.randn(64, 128)),
+            (lambda x: torch.sort(x, dim=-1, descending=True), torch.randn(33, 500)),
+            (
+                lambda x: torch.sort(x, dim=-1, stable=True),
+                torch.randint(0, 5, (16, 300)).float(),
+            ),
+            (lambda x: torch.argsort(x, dim=-1, stable=True), nan),
+            (
+                lambda x: torch.sort(x, dim=-1, stable=True),
+                torch.randint(-1000, 1000, (20, 200)),
+            ),
+            (
+                lambda x: torch.sort(x, dim=-1, stable=True),
+                torch.randn(40, 256).bfloat16(),
+            ),
+            (lambda x: torch.sort(x, dim=0, stable=True), torch.randn(100, 64)),
+        ):
+            torch._dynamo.reset()
+            counters.clear()
+            a = a.cuda()
             out = torch.compile(fn, dynamic=False)(a)
-        torch.testing.assert_close(out, fn(a), atol=1e-2, rtol=1e-3)
-        self.assertGreater(counters["flydsl_simd"]["fallback: chained scans"], 0)
+            self._check_sorted(a, out, fn(a))
+            self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+            self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
+    def _check_sorted(self, a, out, ref):
+        # Values must match exactly; indices too, except an unstable sort's ties.
+        outs = out if isinstance(out, tuple) else (out,)
+        refs = ref if isinstance(ref, tuple) else (ref,)
+        torch.testing.assert_close(outs[0], refs[0], equal_nan=True, atol=0, rtol=0)
+        if len(outs) == 2 and a.unique().numel() == a.numel():
+            self.assertTrue(torch.equal(outs[1], refs[1]))
 
     def test_cumsum(self):
         # One run per step, scanned across a wave with the carry of earlier runs: short

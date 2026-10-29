@@ -132,6 +132,10 @@ SPLIT_SCAN_MIN_CHUNKS = 4
 # 134 us, 8 74 us, 16 48 us, 32 44 us (Triton 46 us).
 SPLIT_SCAN_EPT = 16
 SPLIT_SLOT_WORDS = 8  # a chunk's workspace slot: fdp.SPLIT_SLOT_WORDS
+# A sort's row across at most this many threads (the rest in runs of each thread).
+SORT_MAX_THREADS = 256
+SORT_MAX_LDS_BYTES = 64 * 1024
+SORT_REG_RUN = 2  # consecutive slots a thread sorts in registers: see fdp._bitonic
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
 # Preloaded f16/bf16 elements a thread converts to f32 ahead of the reduction (fdp.widen).
 WIDEN_MAX_ELEMENTS = 32
@@ -1021,6 +1025,8 @@ class FlyDSLKernel(SIMDKernel):
         self.has_scan = False
         self.scan_components = 0  # of the widest scan whose rows span several waves
         self.split_chunks = 0  # blocks a row of a split scan takes (_finalize_scan)
+        self.has_sort = False
+        self.sort_words = 0  # LDS words of the kernel's sorts, after _scan_base
         self.rstep = 1
         self.load_site = 0
         self.region = 0  # bumped per flushed scf.for loop: see _site_key
@@ -1216,6 +1222,22 @@ class FlyDSLKernel(SIMDKernel):
                 max(1, min(4, PERSISTENT_MAX_UNROLL // self.ept, iters // 2)),
             )
         self.rstep = self.tpr * self.ept * self.unroll
+
+    def _finalize_sort(self) -> None:
+        """Layout of a sort: the whole row in one persistent step, an element a thread
+        a run, for fdp.row_sort to stage it in LDS."""
+        if self.rnumel_dyn is not None:
+            raise FlyDSLUnsupported("sort over a dynamic row")
+        self.stride = self.ept = 1
+        self.tpr = min(_tune("sort_tpr", SORT_MAX_THREADS), _pow2_ceil(self.rnumel))
+        self.threads = _tune("sort_threads", max(self.threads, self.tpr))
+        self.rpb = self.threads // self.tpr
+        # Every one of the row's power-of-two slots some element's: see fdp.row_sort.
+        self.unroll = _pow2_ceil(self.rnumel) // self.tpr
+        if self.unroll > PERSISTENT_MAX_UNROLL:
+            raise FlyDSLUnsupported("sort of a long row")
+        self.persistent = True
+        self.rstep = self.tpr * self.unroll
 
     def _split_scan_ok(self) -> bool:
         """Inductor split this scan (``ir.SplitScan``: one value, a long row), and the
@@ -1433,6 +1455,9 @@ class FlyDSLKernel(SIMDKernel):
         x_contig = sum(
             classify_access(e, x, 2) == "contig" for e in votes if r in e.free_symbols
         )
+        if self.features.contains_op("sort"):
+            self._finalize_sort()
+            return
         if self.features.contains_op("scan"):
             # A column per thread only with columns to fill the GPU: otherwise the
             # row's lanes share each column, its loads gathered. cumsum(0) of 8192 x 64
@@ -2141,6 +2166,8 @@ class FlyDSLKernel(SIMDKernel):
         self.has_scan = True
         if self._load_mask:
             raise FlyDSLUnsupported("scan inside ops.masked")
+        if self.features.contains_op("sort"):
+            raise FlyDSLUnsupported("sort with a scan")
         if self.tpr * self.stride > self.threads or (
             self.tpr > WAVE and self.tpr % WAVE
         ):
@@ -2207,8 +2234,43 @@ class FlyDSLKernel(SIMDKernel):
         self.helpers[name] = f"def {name}(_a, _b):\n{body}"
         return name
 
-    def sort(self, *args, **kwargs):
-        raise FlyDSLUnsupported("sort")
+    def sort(self, dtypes, values, stable, descending):
+        """A row's (key, index) pairs sorted, through LDS (``_finalize_sort``)."""
+        if not self.inside_reduction:
+            raise FlyDSLUnsupported("sort outside a reduction loop")
+        if self._load_mask:
+            raise FlyDSLUnsupported("sort inside ops.masked")
+        if len(values) != 2:
+            raise FlyDSLUnsupported("sort of other than a (key, index) pair")
+        if self.has_scan or not self.features.contains_op("sort"):
+            raise FlyDSLUnsupported("sort with a scan")
+        dtypes = tuple(upcast_compute_type(d) for d in dtypes)
+        kinds = tuple(compute_kind(d) for d in dtypes)
+        # Inductor sorts a row once for its values and once for its indices.
+        cache_key = (tuple(str(v) for v in values), kinds, stable, descending)
+        cache = self.__dict__.setdefault("_sorts", {})
+        if cache_key in cache:
+            return cache[cache_key]
+        p = _pow2_ceil(self.rnumel)
+        # Mirrors fdp.sort_smem_words.
+        words = self.rpb * p * (1 + sum(2 if k in ("i64", "f64") else 1 for k in kinds))
+        at = self.sort_words
+        self.sort_words += words
+        if 4 * (self.sort_words + self._scan_base) > SORT_MAX_LDS_BYTES:
+            raise FlyDSLUnsupported("sort beyond LDS")
+        self.has_sort = self.scan_runs = True
+        self.acc_counter += 1
+        results = [self.cse.newvar(dtype=d) for d in dtypes]
+        vals = "".join(f"{v}, " for v in values)
+        self.compute.writeline(
+            f"{', '.join(str(r) for r in results)}, = fdp.row_sort(_sc, "
+            f"'sort{self.acc_counter}', {SCAN_PHASE}, ({vals}), r0_index, "
+            f"_t // {self.tpr}, _smem, _sb + {at}, {self.rnumel}, {p}, {self.rpb}, "
+            f"{self.threads}, {kinds!r}, {bool(stable)}, {bool(descending)}, "
+            f"{_tune('sort_run', SORT_REG_RUN)})"
+        )
+        cache[cache_key] = tuple(results)
+        return cache[cache_key]
 
     def bucketize(
         self,
@@ -2554,18 +2616,35 @@ class FlyDSLKernel(SIMDKernel):
             text = str(li)
             m = defines.match(text)
             outs = OrderedSet(ident.findall(m.group(1))) if m else OrderedSet()
-            if SCAN_PHASE in text:
-                outs = OrderedSet(o for o in outs if not o.startswith("_scan"))
-                if outs & needed:
-                    # A scan of another scan's result has its input only in the
-                    # second pass.
-                    raise FlyDSLUnsupported("chained scans")
-            elif not (outs & needed):
+            if SCAN_PHASE not in text and not (outs & needed):
                 continue
             rhs = text[m.end() :] if m else text
             needed |= OrderedSet(ident.findall(rhs))
             keep.append(li)
         return keep[::-1]
+
+    @staticmethod
+    def _scan_depths(lines: list[Any]) -> dict[int, int]:
+        """Each multi-element scan line's nesting (by ``id``): 1 for a scan of no other
+        scan's result, one more than the deepest scan its inputs derive from else."""
+        ident = re.compile(r"\b[A-Za-z_]\w*\b")
+        defines = re.compile(r"^\s*([\w\s,]+?)\s*=(?!=)")
+        depth_of: dict[str, int] = {}
+        out: dict[int, int] = {}
+        for li in lines:
+            text = str(li)
+            m = defines.match(text)
+            if not m:
+                continue
+            rhs = text[m.end() :]
+            d = max((depth_of.get(v, 0) for v in ident.findall(rhs)), default=0)
+            if SCAN_PHASE in text:
+                d += 1
+                out[id(li)] = d
+            for v in ident.findall(m.group(1)):
+                if not v.startswith("_scan"):
+                    depth_of[v] = d
+        return out
 
     def _queue_preload(self) -> None:
         """Issue this unrolled pass's loads ahead of the first pass.
@@ -2672,7 +2751,12 @@ class FlyDSLKernel(SIMDKernel):
                 self.body.splice(self.chunk_pre)
                 # A multi-element scan first traces the step for its inputs alone: see
                 # fdp.group_scan_runs.
-                for phase in (0, 1) if self.scan_runs else (None,):
+                lines = self.compute.get_lines_ref()
+                depths = self._scan_depths(lines) if self.scan_runs else {}
+                # A scan of depth d records its inputs in pass d - 1 and has its
+                # results from pass d on: one pass more than the deepest.
+                last = max(depths.values(), default=0)
+                for phase in range(last + 1) if self.scan_runs else (None,):
                     self.body.writeline(
                         f"for _j in range_constexpr({self.ept * self.unroll}):"
                     )
@@ -2692,18 +2776,18 @@ class FlyDSLKernel(SIMDKernel):
                             self.body.splice(self.compute)
                             self.body.splice(self.stores)
                         else:
-                            lines = self.compute.get_lines_ref()
-                            if phase == 0:
-                                lines = self._scan_inputs(lines)
+                            part = lines if phase == last else self._scan_inputs(lines)
                             traced = IndentedBuffer()
                             traced.get_lines_ref().extend(
-                                li.replace(SCAN_PHASE, str(phase))
+                                li.replace(
+                                    SCAN_PHASE, str(phase - depths.get(id(li), 1) + 1)
+                                )
                                 if isinstance(li, str)
                                 else li
-                                for li in lines
+                                for li in part
                             )
                             self.body.splice(traced)
-                            if phase:
+                            if phase == last:
                                 self.body.splice(self.stores)
                 self.body.splice(self.chunk_post)
             for arg, name in self.loop_stored_args.items():
@@ -2713,6 +2797,7 @@ class FlyDSLKernel(SIMDKernel):
             self.loop_stored_args.clear()
             self.cse.invalidate(self.outside_loop_vars)
             self.range_trees[-1].cache_clear()
+            self.__dict__.pop("_sorts", None)
             self.region += 1
         else:
             # The body so far holds the pointwise index entries.
@@ -2843,6 +2928,8 @@ class FlyDSLKernel(SIMDKernel):
     @property
     def smem_words(self) -> int:
         n = self.scan_components
+        if self.sort_words:
+            return self._scan_base + self.sort_words
         if self.split_chunks:
             # Mirrors fdp.split_smem_words.
             return self._scan_base + 2 * (self.threads // WAVE) * n + 2 * n
@@ -3100,7 +3187,7 @@ class FlyDSLKernel(SIMDKernel):
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
         self._emit_lds_tables(code)
-        if self.scan_components:
+        if self.scan_components or self.sort_words:
             code.writeline(f"_sb = {self._scan_base}")
         if self.tile2d:
             self._emit_tile2d(code)

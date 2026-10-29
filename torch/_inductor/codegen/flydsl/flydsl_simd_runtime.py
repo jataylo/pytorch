@@ -2239,17 +2239,23 @@ def group_scan_runs(
 ):
     """``group_scan`` where each thread owns runs of ``ept`` contiguous elements.
 
-    The body is traced twice per step. Phase 0 only records element ``j``'s value (its
-    results are unused, so the trace is dead code). In phase 1 the run's first element
-    scans the thread's values in registers, scans the per-thread totals across the
-    lanes, and then offsets every element by the lanes before it and the carry, so a
-    run costs one cross-lane scan rather than ``ept``.
+    The body is traced at least twice per step. Phase 0 only records element ``j``'s
+    value (its results are unused, so the trace is dead code). In phase 1 the run's
+    first element scans the thread's values in registers, scans the per-thread totals
+    across the lanes, and then offsets every element by the lanes before it and the
+    carry, so a run costs one cross-lane scan rather than ``ept``; later phases (for a
+    scan of this one's results) reuse those. Codegen numbers the phases relative to
+    the scan's nesting.
     """
     run, e = j // ept, j % ept
-    if phase == 0:
+    if phase <= 0:
+        # A chained scan's earlier passes see its input unfinished; the last before
+        # its results records it.
+        if e == 0:
+            state.pop((key, run, "out"), None)
         state[(key, run, e)] = tuple(_canon(v) for v in values)
         return (*state[(key, run, e)], *carry)
-    if e == 0:
+    if e == 0 and (key, run, "out") not in state:
         pre = [state[(key, run, 0)]]
         for k in range(1, ept):
             pre.append(tuple(_canon(v) for v in fn(pre[-1], state[(key, run, k)])))
@@ -2475,6 +2481,165 @@ def _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base):
         tuple(where(first, t, n) for t, n in zip(total, nxt)),
         before,
     )
+
+
+def _words_of(k: str) -> int:
+    return 2 if k in ("i64", "f64") else 1
+
+
+def sort_smem_words(rows: int, p: int, kinds) -> int:
+    """LDS words ``row_sort`` needs: ``p`` (key, index, valid) slots for each of
+    ``rows``."""
+    return rows * p * (1 + sum(_words_of(k) for k in kinds))
+
+
+def row_sort(
+    state: dict,
+    key,
+    phase: int,
+    values,
+    pos,
+    row,
+    smem,
+    base: int,
+    n: int,
+    p: int,
+    rows: int,
+    threads: int,
+    kinds,
+    stable: bool,
+    descending: bool,
+    run: int = 1,
+):
+    """(key, index) pairs of a row sorted along it, as Triton's ``sort_with_index``:
+    NaN after every number, and a stable sort's ties in index order.
+
+    Traced in phases like ``group_scan_runs``: in phase 0 each element parks its pair
+    in the row's ``p`` LDS slots (``p`` the row's power-of-two ceiling, ``row`` its
+    place in the block, ``pos`` its position in the row of ``n``; every position below
+    ``p`` is some element's), with whether it is past the row's end, which travels with
+    it; the first element of phase 1 runs a bitonic network over every row with the
+    whole block, then every element reads back the pair now at its position.
+    """
+    lds = _SortLds(smem, base, rows * p, kinds)
+    at = idx(row) * p + idx(pos)
+    if phase <= 0:
+        state.pop((key, "sorted"), None)
+        k, i = (_canon(v) for v in values)
+        lds.put(at, (k, i, lt(pos, n)))
+        return (k, i)
+    if (key, "sorted") not in state:
+        state[(key, "sorted")] = True
+        barrier()
+        _bitonic(lds, p, rows, threads, kinds[0], stable, descending, run)
+    return lds.get(at)[:2]
+
+
+class _SortLds:
+    """A sort's slots as planes -- keys, indices, valid flags -- each word of a 64-bit
+    value a plane of its own, so neighbouring slots are neighbouring banks."""
+
+    def __init__(self, smem, base: int, total: int, kinds):
+        self.smem, self.total = smem, total
+        self.kinds = (*kinds, "b1")
+        self.bases = []
+        for k in self.kinds:
+            self.bases.append(base)
+            base += _words_of(k) * total
+
+    def get(self, at):
+        return tuple(
+            tile_get(self.smem, b, self.total, at, k)
+            for b, k in zip(self.bases, self.kinds)
+        )
+
+    def put(self, at, vals):
+        for b, v in zip(self.bases, vals):
+            tile_put(self.smem, b, self.total, at, v)
+
+
+def _sort_after(a, b, ai, bi, kind_: str, stable: bool, descending: bool):
+    """Whether ``a`` (at index ``ai``) belongs after ``b`` in the sorted row."""
+    out = lt(a, b) if descending else gt(a, b)
+    if _is_f(kind_):
+        an, bn = isnan(a), isnan(b)
+        nan_first = (bn, an) if descending else (an, bn)
+        out = logical_or(out, logical_and(nan_first[0], logical_not(nan_first[1])))
+        tie = logical_or(eq(a, b), logical_and(an, bn))
+    else:
+        tie = eq(a, b)
+    if stable:
+        out = logical_or(out, logical_and(tie, gt(ai, bi)))
+    return out
+
+
+def _compare_swap(x, y, i, k: int, p: int, kind_, stable, descending):
+    """Elements ``x`` (at ``i``) and ``y`` of a bitonic step ordered."""
+    (a, ai, va), (b, bi, vb) = x, y
+    order = _sort_after(a, b, ai, bi, kind_, stable, descending)
+    # Padding past the row's end sorts after every element.
+    cond = logical_or(
+        logical_and(vb, logical_not(va)), logical_and(eq(va, vb), order)
+    )
+    if k < p:
+        # Alternate blocks of k run the other way.
+        cond = ne(cond, ne(i & k, 0))
+    return (
+        tuple(where(cond, v, u) for u, v in zip(x, y)),
+        tuple(where(cond, u, v) for u, v in zip(x, y)),
+    )
+
+
+def _bitonic(lds, p, rows, threads, kind_, stable, descending, run: int):
+    """The network over every row: steps of a distance under ``run`` on a thread's
+    run of that many slots in registers, longer ones a pair a thread."""
+    t = _tid()
+    m = min(p, run)
+
+    def over(work: int, body):
+        for it in range(-(-work // threads)):
+            g = t + it * threads
+            if work % threads and (it + 1) * threads > work:
+                _when(_val(lt(g, work)), lambda g=g: body(g))
+            else:
+                body(g)
+        barrier()
+
+    k = 2
+    while k <= p:
+        j = k // 2
+        while j >= m:
+
+            def pair(g, j=j, k=k):
+                q, h = g // (p // 2), g % (p // 2)
+                i = (h // j) * (2 * j) + h % j
+                x, y = lds.get(idx(q) * p + idx(i)), lds.get(idx(q) * p + idx(i + j))
+                x, y = _compare_swap(x, y, i, k, p, kind_, stable, descending)
+                lds.put(idx(q) * p + idx(i), x)
+                lds.put(idx(q) * p + idx(i + j), y)
+
+            over(rows * p // 2, pair)
+            j //= 2
+
+        def run(g, j=j, k=k):
+            q, r = g // (p // m), g % (p // m)
+            e0 = r * m
+            at = idx(q) * p + idx(e0)
+            vals = [lds.get(at + e) for e in range(m)]
+            jj = j
+            while jj >= 1:
+                for e in range(m):
+                    if e & jj:
+                        continue
+                    vals[e], vals[e + jj] = _compare_swap(
+                        vals[e], vals[e + jj], e0 + e, k, p, kind_, stable, descending
+                    )
+                jj //= 2
+            for e in range(m):
+                lds.put(at + e, vals[e])
+
+        over(rows * (p // m), run)
+        k *= 2
 
 
 def barrier():
