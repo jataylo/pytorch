@@ -2038,11 +2038,13 @@ class FlyDSLKernel(SIMDKernel):
             (result,) = self._post(
                 f"fdp.group_reduce({reduction_type!r}, {acc}, {geo})", 1, dtype
             )
-        elif reduction_type in ("argmax", "argmin"):
+        elif reduction_type.startswith(("argmax", "argmin")):
+            # argmax (the index), argmax_value (the value) and argmax_with_value (both:
+            # torch.max(x, dim)), the value in its accumulator type as Triton's.
             logical_index = None
             if isinstance(value, tuple):
                 value, logical_index = value
-            op = "max" if reduction_type == "argmax" else "min"
+            op = "max" if reduction_type.startswith("argmax") else "min"
             k = compute_kind(src_dtype)
             acc = self._new_acc()
             self.body.writeline(f"{acc}_v, {acc}_i = fdp.arg_default({op!r}, {k!r})")
@@ -2050,8 +2052,21 @@ class FlyDSLKernel(SIMDKernel):
             self.compute.writeline(
                 f"{acc}_v, {acc}_i = fdp.arg_combine({op!r}, {acc}_v, {acc}_i, {value}, {index_var}{mask})"
             )
-            _, result = self._post(
-                f"fdp.group_arg_reduce({op!r}, {acc}_v, {acc}_i, {geo})", 2, dtype
+            half = src_dtype in (torch.float16, torch.bfloat16)
+            val = self.cse.newvar(dtype=torch.float32 if half else src_dtype)
+            idx = self.cse.newvar(dtype=torch.int64)
+            self.post_loop_combine.writeline(
+                f"{val}, {idx} = fdp.group_arg_reduce({op!r}, {acc}_v, {acc}_i, {geo})"
+            )
+            for v in (val, idx):
+                self.outside_loop_vars.add(v)
+                self.uniform_vars.add(str(v))
+            result = (
+                (val, idx)
+                if reduction_type.endswith("_with_value")
+                else val
+                if reduction_type.endswith("_value")
+                else idx
             )
             self.max_components = max(self.max_components, 2)
         elif reduction_type == "welford_reduce" and self.persistent:
@@ -2538,11 +2553,15 @@ class FlyDSLKernel(SIMDKernel):
         if tree is None:
             unpaired()
             return None
+        # Every target, a tuple's too: an arg reduction's value and index (or a
+        # welford's three) shared by both columns took the pair's combined result.
         assigned = OrderedSet(
-            m.group(1)
+            name
             for _, li in template
-            for m in [re.match(r"\s*([A-Za-z_]\w*)\s*=(?!=)", text_of(li))]
-            if m and m.group(1) not in ("r0_offset", "_j", "_pc")
+            for m in [re.match(r"\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)", text_of(li))]
+            if m
+            for name in re.split(r"\s*,\s*", m.group(1))
+            if name not in ("r0_offset", "_j", "_pc")
         )
         names = re.compile(r"\b(" + "|".join(map(re.escape, assigned)) + r")\b")
 

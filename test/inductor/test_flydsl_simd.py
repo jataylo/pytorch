@@ -457,6 +457,15 @@ class TestFlyDSLSIMD(TestCase):
 
         self.check(fn, x, w, g, atol=5e-2, rtol=5e-2)
 
+    @parametrize("width", [1024, 7])
+    @parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_max_with_indices(self, width, dtype):
+        # torch.max(x, dim): value and index from one reduction. Seven wide, Inductor
+        # unrolls it into compares of NaN flags (booleans, compared unsigned).
+        x = torch.randn(300, width, device="cuda").to(dtype)
+        x[0, 3] = x[5, 0] = float("nan")
+        self.check(lambda x: (torch.max(x, -1), torch.min(x, 0)), x, atol=0, rtol=0)
+
     @parametrize("width", [32, 8])
     def test_short_rows_stored_together(self, width):
         # Each row group's results go out in one store, a lane a row.

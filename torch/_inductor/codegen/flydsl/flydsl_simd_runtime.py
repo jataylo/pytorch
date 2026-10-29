@@ -1092,10 +1092,16 @@ def minimum(a, b):
     return ArithValue(_arith.MinSIOp(_val(x), _val(y)).result)
 
 
+_UNSIGNED_PRED = {"slt": "ult", "sle": "ule", "sgt": "ugt", "sge": "uge"}
+
+
 def _cmp(a, b, ipred, fpred):
     k, (x, y) = _promote(a, b)
     if _is_f(k):
         return ArithValue(_arith.CmpFOp(fpred, _val(x), _val(y)).result)
+    if k == "b1" and ipred.name in _UNSIGNED_PRED:
+        # Signed, true is -1 < false: Inductor's unrolled argmax orders NaN flags so.
+        ipred = getattr(_arith.CmpIPredicate, _UNSIGNED_PRED[ipred.name])
     return ArithValue(_arith.CmpIOp(ipred, _val(x), _val(y)).result)
 
 
