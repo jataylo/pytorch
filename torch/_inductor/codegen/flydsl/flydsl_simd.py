@@ -1361,14 +1361,14 @@ class FlyDSLKernel(SIMDKernel):
                 and not self._pure_reduction()
                 and self.rnumel % PERSISTENT_MAX_UNROLL == 0
                 and WAVE < (fit := self.rnumel // PERSISTENT_MAX_UNROLL) <= self.threads
-                and fit % WAVE == 0
+                and fit % (WAVE // 2) == 0
             ):
-                # Rows a whole number of waves hold in registers, a full unroll a lane:
-                # a normalization reads its row more than once, which the one-step loop
-                # goes back to L2 for. A 4096-wide bf16 RMSNorm 107us -> 93us (Triton
-                # 147us) and its backward 95us -> 57us; 2048-wide 53us -> 47us and
-                # 74us -> 65us; 3072-wide (three waves) 77us -> 80us but its backward
-                # 124us -> 93us.
+                # Rows that waves (or half waves) hold in registers, a full unroll a
+                # lane: a normalization reads its row more than once, which the
+                # one-step loop goes back to L2 for. A 4096-wide bf16 RMSNorm 107us ->
+                # 93us (Triton 147us) and its backward 95us -> 57us; 2048-wide 53us ->
+                # 47us and 74us -> 65us; 3072-wide (three waves) 77us -> 80us but its
+                # backward 124us -> 93us; 1536-wide (96 lanes) backward 55us -> 47us.
                 tpr = fit
             elif (
                 tpr > WAVE

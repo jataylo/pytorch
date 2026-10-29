@@ -1814,15 +1814,18 @@ def _group_reduce(
     vals = tuple(_canon(v) for v in vals)
     if tpr <= 1:
         return vals
+    # A group not a whole number of waves (96 lanes) starts mid-wave: within a wave,
+    # combine over the power-of-two segments its groups are made of.
+    seg = min(tpr & -tpr, WAVE) if stride == 1 else WAVE // stride
     if stride == 1:
-        vals = _dpp_reduce(vals, comb, min(tpr, WAVE), ident)
+        vals = _dpp_reduce(vals, comb, seg, ident)
     else:
         off = stride
         while off < WAVE and off < stride * tpr:
             peer = tuple(_shfl(v, off, WAVE) for v in vals)
             vals = comb(vals, peer)
             off *= 2
-    if stride * tpr <= WAVE:
+    if stride * tpr <= WAVE and (stride > 1 or seg == tpr):
         return vals
     t = _tid()
     kinds = [kind(v) for v in vals]
@@ -1835,7 +1838,7 @@ def _group_reduce(
     gpu.barrier()
     rank = (t // stride) % tpr
     base = t - rank * stride
-    kstep = max(1, WAVE // stride)
+    kstep = max(1, seg)
     acc = None
     for k in range(0, tpr, kstep):
         member = base + k * stride
