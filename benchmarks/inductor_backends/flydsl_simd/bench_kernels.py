@@ -158,6 +158,20 @@ CASES = {
         [_r(16384, 4096, dtype=bf16), _r(4096, dtype=bf16), _r(4096, dtype=bf16)],
     ),
     "rmsnorm_bf16": (_rms, [_r(16384, 4096, dtype=bf16), _r(4096, dtype=bf16)]),
+    # FP8 rowwise quantization (gfx942's e4m3 FNUZ): a row's amax, its scale, the cast.
+    "fp8_rowwise_quant": (
+        lambda a: (
+            (a.float() * (240.0 / a.float().abs().amax(-1, keepdim=True)))
+            .clamp(-240.0, 240.0)
+            .to(torch.float8_e4m3fnuz),
+            a.float().abs().amax(-1) / 240.0,
+        ),
+        [_r(16384, 4096, dtype=bf16)],
+    ),
+    "fp8_dequant_bf16": (
+        lambda q, s: (q.float() * s).to(bf16),
+        [lambda: torch.randn(16384, 4096, device="cuda").to(torch.float8_e4m3fnuz), _r(16384, 1)],
+    ),
     "rmsnorm_3072_bf16": (_rms, [_r(16384, 3072, dtype=bf16), _r(3072, dtype=bf16)]),
     "rmsnorm_bwd_2048_bf16": (
         _rms_bwd,
@@ -405,6 +419,16 @@ def _call_time_us(fn, args, reps=200) -> float:
     return best
 
 
+def _f8_up(t):
+    """FP8 outputs as f32: assert_close takes no tolerance on them."""
+    return pytree.tree_map(
+        lambda a: a.float()
+        if isinstance(a, torch.Tensor) and a.dtype.itemsize == 1 and a.is_floating_point()
+        else a,
+        t,
+    )
+
+
 def _upcast_ref(fn, args, ref):
     def up(a):
         if isinstance(a, torch.Tensor) and a.dtype in (torch.float16, bf16):
@@ -436,13 +460,14 @@ def run_case(name, fn, factories):
         torch.cuda.synchronize()
         row[f"{backend}_compile_s"] = time.perf_counter() - t0
         if name not in RANDOM:
+            out, ref = _f8_up(out), _f8_up(ref)
             # Eager rounds bf16 intermediates the compiled kernels keep in f32, and
             # lands an element past the tolerance now and then: then hold both to an
             # f32 evaluation instead.
             try:
                 torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
             except AssertionError:
-                ref = _upcast_ref(fn, args, ref)
+                ref = _f8_up(_upcast_ref(fn, args, ref))
                 torch.testing.assert_close(out, ref, atol=5e-2, rtol=5e-2, equal_nan=True)
         if backend == "flydsl":
             c = counters["flydsl_simd"]

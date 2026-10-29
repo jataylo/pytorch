@@ -78,6 +78,14 @@ _STORAGE_IR = {
     "i8": T.i8,
     "u8": T.i8,
     "b1": T.i8,  # torch.bool is a byte in memory
+    # FP8 (gfx942's FNUZ formats) is a byte in memory, converted by the hardware's
+    # v_cvt instructions at the load or store; values in between are f32.
+    "f8e4": T.i8,
+    "f8e5": T.i8,
+}
+_FP8 = {
+    "f8e4": (_rocdl.CvtF32Fp8Op, _rocdl.CvtPkFp8F32Op),
+    "f8e5": (_rocdl.CvtF32Bf8Op, _rocdl.CvtPkBf8F32Op),
 }
 
 # How a storage kind is laid out in memory, where that differs from the kind itself:
@@ -95,6 +103,8 @@ _COMPUTE_OF = {
     "i8": "i32",
     "u8": "i32",
     "b1": "b1",
+    "f8e4": "f32",
+    "f8e5": "f32",
 }
 
 _COMPUTE_IR = {"b1": T.bool, "i32": T.i32, "i64": T.i64, "f32": T.f32, "f64": T.f64}
@@ -188,6 +198,15 @@ def _cvt(v, src: str, dst: str, unsigned: bool = False):
         src = "i64"
     if src == dst:
         return v
+    if src in _FP8:
+        word = _arith.ExtUIOp(T.i32(), v).result
+        v = _FP8[src][0](T.f32(), word, 0).result
+        return _cvt(v, "f32", dst, unsigned)
+    if dst in _FP8:
+        f = _cvt(v, src, "f32", unsigned)
+        zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
+        word = _FP8[dst][1](T.i32(), f, f, zero, False).result
+        return _arith.TruncIOp(T.i8(), word).result
     src_int = src in ("b1", "i8", "u8", "i16", "i32", "i64")
     dst_int = dst in ("b1", "i8", "u8", "i16", "i32", "i64")
     if dst == "b1":
@@ -237,8 +256,11 @@ def _cvt(v, src: str, dst: str, unsigned: bool = False):
 def to(x, k: str):
     """Convert to compute kind ``k``. Python scalars become constants."""
     if isinstance(x, (bool, int, float)):
-        return const(x, k)
+        x = const(x, "f32" if k in _FP8 else k)
     v = _val(x)
+    if k in _FP8:
+        # Rounded to FP8 and back: in compute an FP8 value is the f32 it stands for.
+        return ArithValue(_cvt(_cvt(v, kind_of_type(v.type), k), k, "f32"))
     return ArithValue(_cvt(v, kind_of_type(v.type), k))
 
 
@@ -689,7 +711,7 @@ def _packing(st: str, w: int):
     on either side. Returns ``(word type, word count, elements per word)``, or ``None``
     as the type for kinds that go through unchanged.
     """
-    nbytes = {"f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1}.get(st)
+    nbytes = {"f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1, "f8e4": 1, "f8e5": 1}.get(st)
     if nbytes is None:
         return None, w, 1
     total = nbytes * w
@@ -856,7 +878,9 @@ def vstore(
     ``seed``, a ``(load cache, load key)`` pair, also enters the stored vector there.
     """
     v = _val(_canon(value))
-    raw = _cvt(v, kind_of_type(v.type), _MEM_KIND.get(st, st))
+    # FP8 elements stay f32 until the vector goes out, to convert two to a word half.
+    f8 = st in _FP8 and w % 4 == 0
+    raw = _cvt(v, kind_of_type(v.type), "f32" if f8 else _MEM_KIND.get(st, st))
     if j % w == 0:
         # A fresh slot: the same site is traced again by every unrolled loop iteration.
         cache[(key, j // w)] = {"elems": [], "off": idx(off), "mask": _mask(mask)}
@@ -865,8 +889,19 @@ def vstore(
     if j % w == w - 1:
         del cache[(key, j // w)]
         vt = ir.VectorType.get([w], _STORAGE_IR[st]())
-        vec = _vector.FromElementsOp(vt, slot["elems"]).result
         word_t, n, ratio = _packing(st, w)
+        if f8:
+            e = slot["elems"]
+            pk = _FP8[st][1]
+            word = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
+            ws = []
+            for q in range(0, w, 4):
+                lo = pk(T.i32(), e[q], e[q + 1], word, False).result
+                ws.append(pk(T.i32(), e[q + 2], e[q + 3], lo, True).result)
+            wv = _vector.FromElementsOp(ir.VectorType.get([n], T.i32()), ws).result
+            vec = _vector.BitCastOp(vt, wv).result
+        else:
+            vec = _vector.FromElementsOp(vt, slot["elems"]).result
         if word_t is None:
             args = (vec, r, slot["off"], slot["mask"])
         else:

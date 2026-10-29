@@ -466,6 +466,31 @@ class TestFlyDSLSIMD(TestCase):
         x[0, 3] = x[5, 0] = float("nan")
         self.check(lambda x: (torch.max(x, -1), torch.min(x, 0)), x, atol=0, rtol=0)
 
+    @parametrize("width", [4096, 777])
+    @parametrize("dtype", [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz])
+    def test_fp8_casts(self, width, dtype):
+        # gfx942's FNUZ formats through the hardware conversions, bit-exact with eager
+        # past the finite range (saturating), at denormals, NaN and inf.
+        mx = torch.finfo(dtype).max
+        x = torch.randn(64, width, device="cuda") * mx / 3
+        x[0, :8] = torch.tensor(
+            [0.0, -0.0, mx, -mx, 1.2 * mx, 1e-9, float("nan"), float("inf")]
+        )
+        self.check(lambda x: x.to(dtype), x, atol=0, rtol=0)
+        torch._dynamo.reset()
+        self.check(lambda b: b.to(dtype), x.bfloat16(), atol=0, rtol=0)
+        torch._dynamo.reset()
+        q = x.to(dtype)
+        self.check(lambda q: (q.float() * 0.5, q.bfloat16()), q, atol=0, rtol=0)
+        torch._dynamo.reset()
+        b = x[1:].bfloat16()
+        self.check(
+            lambda b: (b.float() * (mx / b.float().abs().amax(-1, keepdim=True))).to(dtype),
+            b,
+            atol=0,
+            rtol=0,
+        )
+
     @parametrize("width", [32, 8])
     def test_short_rows_stored_together(self, width):
         # Each row group's results go out in one store, a lane a row.

@@ -148,8 +148,12 @@ _STORAGE = {
     torch.int8: "i8",
     torch.uint8: "u8",
     torch.bool: "b1",
+    torch.float8_e4m3fnuz: "f8e4",
+    torch.float8_e5m2fnuz: "f8e5",
 }
 _COMPUTE = {
+    "f8e4": "f32",
+    "f8e5": "f32",
     "f32": "f32",
     "f16": "f32",
     "bf16": "f32",
@@ -461,6 +465,10 @@ class FlyDSLKernelOverrides(OpOverrides):
         k = storage_kind(dtype)
         if k in ("i8", "u8", "i16"):
             return f"fdp.to(fdp.to({x}, {k!r}), 'i32')"
+        if k in ("f8e4", "f8e5"):
+            # Always rounded (to the f32 the FP8 value stands for): unlike bf16's,
+            # FP8's rounding is what a quantizing graph computes with.
+            return f"fdp.to({x}, {k!r})"
         if k in ("f16", "bf16"):
             # Computed in f32, as Triton does: Inductor asks for a rounding explicitly
             # (use_compute_types=False, then an upcast) where eager's must be kept --
