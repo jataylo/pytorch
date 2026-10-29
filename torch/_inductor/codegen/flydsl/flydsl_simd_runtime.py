@@ -466,11 +466,21 @@ def rsrc(addr, nbytes: int):
     ``nbytes`` must be exact: it is what makes a masked access (offset 0x7FFFFFFF) fall
     out of range.
     """
+    if not isinstance(nbytes, int):
+        # Computed from the size arguments; guarded below 2**31 at compile time.
+        return buffer_ops.create_buffer_resource_from_addr(
+            _val(addr), num_records_bytes=_val(idx(nbytes))
+        )
     if nbytes >= 2**31 - 1:
         return _Flat(_val(addr))
     return buffer_ops.create_buffer_resource_from_addr(
         _val(addr), num_records_bytes=int(nbytes)
     )
+
+
+def size_arg(v):
+    """A size argument (passed as 64 bits, like the addresses) as an i32 index."""
+    return ArithValue(_arith.TruncIOp(T.i32(), _val(v)).result)
 
 
 def _type_bytes(t) -> int:

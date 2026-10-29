@@ -535,6 +535,43 @@ class TestFlyDSLSIMD(TestCase):
             # Eager's own f32 erfcx is 32 ulp out where ocml's is 2.
             self.check(fn, *a, atol=1e-6, rtol=1e-5)
 
+    @parametrize(
+        "case",
+        ["bias_gelu", "seq_bcast", "permute", "rmsnorm", "softmax", "argmax", "sum_dyn_rows", "col_sum", "cross_entropy"],
+    )
+    def test_dynamic_shapes(self, case):
+        # One compiled graph over every size: the dynamic extents are kernel arguments
+        # (the grid, masks, descriptor sizes and row loops computed from them).
+        bf16 = torch.bfloat16
+
+        def rms(x, w):
+            xf = x.float()
+            return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * w).to(bf16)
+
+        fns = {
+            "bias_gelu": (lambda a, b: F.gelu(a + b), lambda n: (torch.randn(n, 768, device="cuda", dtype=bf16), torch.randn(768, device="cuda", dtype=bf16)), [(0,), ()]),
+            "seq_bcast": (lambda a, b: a * b[None], lambda n: (torch.randn(4, n, 64, device="cuda"), torch.randn(n, 64, device="cuda")), [(1,), (0,)]),
+            "permute": (lambda a: a.view(2, a.shape[1], 8, 64).permute(0, 2, 1, 3).contiguous() * 2, lambda n: (torch.randn(2, n, 512, device="cuda"),), [(1,)]),
+            "rmsnorm": (rms, lambda n: (torch.randn(n, 2048, device="cuda", dtype=bf16), torch.randn(2048, device="cuda", dtype=bf16)), [(0,), ()]),
+            "softmax": (lambda a: a.softmax(-1), lambda n: (torch.randn(n, 512, device="cuda"),), [(0,)]),
+            "argmax": (lambda a: a.argmax(-1), lambda n: (torch.randn(n, 1000, device="cuda"),), [(0,)]),
+            "sum_dyn_rows": (lambda a: (a * 2).sum(-1), lambda n: (torch.randn(n, n + 3, device="cuda"),), [(0, 1)]),
+            "col_sum": (lambda a: a.sum(0), lambda n: (torch.randn(n, 256, device="cuda"),), [(0,)]),
+            "cross_entropy": (lambda a, t: F.cross_entropy(a, t), lambda n: (torch.randn(n, 1000, device="cuda"), torch.randint(0, 1000, (n,), device="cuda")), [(0,), (0,)]),
+        }
+        fn, make, dims = fns[case]
+        cf = torch.compile(fn)
+        for n in (1000, 1537, 64, 3001):
+            args = make(n)
+            for a, ds in zip(args, dims):
+                for d in ds:
+                    torch._dynamo.mark_dynamic(a, d)
+            tol = 2e-2 if args[0].dtype == bf16 else 1e-4
+            torch.testing.assert_close(cf(*args), fn(*args), atol=tol, rtol=tol)
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+        self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     @config.patch(align_random_eager=True)
     def test_rand_eager(self):
         # Eager's Philox stream: a compiled f32 dropout's mask is eager's, bit for bit.
@@ -1063,8 +1100,8 @@ class TestFlyDSLSIMDFallback(TestCase):
             {"flydsl.simd": True, "flydsl.simd_strict": True, "fx_graph_cache": False}
         ):
             with self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"):
-                torch.compile(lambda x: x + 1, dynamic=True)(
-                    torch.randn(100, device="cuda")
+                torch.compile(lambda x: x.cumsum(-1), dynamic=True)(
+                    torch.randn(100, 77, device="cuda")
                 )
 
 
