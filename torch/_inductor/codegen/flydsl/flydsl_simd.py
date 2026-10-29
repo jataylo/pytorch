@@ -170,6 +170,8 @@ _STORAGE = {
     torch.int16: "i16",
     torch.int8: "i8",
     torch.uint8: "u8",
+    torch.uint16: "u16",
+    torch.uint32: "u32",
     torch.bool: "b1",
     torch.float8_e4m3fnuz: "f8e4",
     torch.float8_e5m2fnuz: "f8e5",
@@ -186,6 +188,8 @@ _COMPUTE = {
     "i16": "i32",
     "i8": "i32",
     "u8": "i32",
+    "u16": "i32",
+    "u32": "i64",  # past i32's range
     "b1": "b1",
 }
 
@@ -523,8 +527,8 @@ class FlyDSLKernelOverrides(OpOverrides):
         # Narrow integers stay in i32 between ops, so a cast *to* one has to truncate and
         # re-extend here or `x.to(int8)` would keep bits torch drops.
         k = storage_kind(dtype)
-        if k in ("i8", "u8", "i16"):
-            return f"fdp.to(fdp.to({x}, {k!r}), 'i32')"
+        if k in ("i8", "u8", "i16", "u16", "u32"):
+            return f"fdp.to(fdp.to({x}, {k!r}), {_COMPUTE[k]!r})"
         if k in ("f8e4", "f8e5"):
             # Always rounded (to the f32 the FP8 value stands for): unlike bf16's,
             # FP8's rounding is what a quantizing graph computes with.
@@ -541,9 +545,13 @@ class FlyDSLKernelOverrides(OpOverrides):
 
     @staticmethod
     def to_dtype_bitcast(x, dtype, src_dtype):
-        if dtype.itemsize != src_dtype.itemsize or torch.bool in (dtype, src_dtype):
+        if dtype.itemsize != src_dtype.itemsize:
+            # Triton's to_dtype_bitcast asserts the same; Inductor never asks.
             raise FlyDSLUnsupported("bitcast across widths")
         src, dst = storage_kind(src_dtype), storage_kind(dtype)
+        if torch.bool in (dtype, src_dtype):
+            # A bool is the byte 0 or 1.
+            return f"fdp.to({x}, {_COMPUTE[dst]!r})"
         return f"fdp.bitcast({x}, {src!r}, {dst!r})"
 
     @staticmethod
@@ -556,13 +564,14 @@ class FlyDSLKernelOverrides(OpOverrides):
         pack=1,
         input_dtypes=None,
     ):
-        if pack != 1 or dtype == torch.bool:
-            raise FlyDSLUnsupported("inline asm with pack > 1")
+        if dtype == torch.bool:
+            raise FlyDSLUnsupported("inline asm returning bool")
         if constraints is None:
             constraints = ",".join(["=v"] + ["v"] * len(inputs))
         out = storage_kind(dtype)
         args = ", ".join(_a(x) for x in inputs)
-        return f"fdp.inline_asm({asm!r}, {constraints!r}, {out!r}, {bool(is_pure)}, {args})"
+        packed = f", pack={pack}" if pack != 1 else ""
+        return f"fdp.inline_asm({asm!r}, {constraints!r}, {out!r}, {bool(is_pure)}, {args}{packed})"
 
     @staticmethod
     def frexp(x):
@@ -2039,7 +2048,7 @@ class FlyDSLKernel(SIMDKernel):
         arg = self.args.output(name)
         dtype = V.graph.get_dtype(name)
         st = storage_kind(dtype)
-        if mode == "atomic_add" and st not in ("f32", "f64", "f16", "bf16"):
+        if mode == "atomic_add" and st not in ("f32", "f64", "f16", "bf16", "i32", "i64"):
             raise FlyDSLUnsupported(f"atomic_add of {dtype}")
         index = self.prepare_indexing(index)
         index_str = self.kexpr(self.rename_indexing(index))
@@ -2051,7 +2060,7 @@ class FlyDSLKernel(SIMDKernel):
                 ms.append("_lane0")
             fn, target = (
                 ("atomic_add_global", arg)
-                if st == "bf16"
+                if st in ("bf16", "i32", "i64")
                 else ("atomic_add", f"_r_{arg}")
             )
             line = (
@@ -2417,7 +2426,12 @@ class FlyDSLKernel(SIMDKernel):
     def partial_accumulate(self, name, reduction_type, value, extra_meta) -> None:
         """A mix-order reduction's column partial: the row's elements, collected in
         order for _emit_mix_order to fold into the row group's accumulators."""
-        if not self.mix_order_reduction or reduction_type not in ("sum", "prod"):
+        if not self.mix_order_reduction or reduction_type not in (
+            "sum",
+            "prod",
+            "max",
+            "min",
+        ):
             raise FlyDSLUnsupported(f"partial_accumulate {reduction_type}")
         i = len(self.saved_partial_accumulate)
         self.saved_partial_accumulate.append(
@@ -2478,7 +2492,7 @@ class FlyDSLKernel(SIMDKernel):
             (result,) = self._post(f"fdp.group_reduce('sum', {acc}, {geo})", 1, dtype)
         elif reduction_type in ("prod", "max", "min", "fmax", "any", "xor_sum"):
             if reduction_type == "fmax" and not dtype.is_floating_point:
-                raise FlyDSLUnsupported("fmax on integers")
+                reduction_type = "max"  # no NaN to skip
             k = compute_kind(dtype)
             acc = self._new_acc()
             self.body.writeline(f"{acc} = fdp.default({reduction_type!r}, {k!r})")

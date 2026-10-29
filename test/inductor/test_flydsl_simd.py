@@ -1035,6 +1035,54 @@ class TestFlyDSLSIMD(TestCase):
             lambda x: x.cumsum(-1), torch.randint(0, 5, (50, 777), device="cuda")
         )
 
+    def test_unsigned_bitcast_atomics_asm(self):
+        from torch._higher_order_ops.inline_asm_elementwise import (
+            inline_asm_elementwise,
+        )
+
+        big = torch.randint(0, 2**32 - 1, (1000,), device="cuda")
+        idx = torch.randint(0, 64, (5000,), device="cuda")
+
+        def pack2(x, y):
+            return inline_asm_elementwise(
+                x,
+                y,
+                asm_str="v_add_f32 $0, $2, $4\nv_add_f32 $1, $3, $5",
+                constraints="=v,=v,v,v,v,v",
+                dtype=torch.float32,
+                pack=2,
+            )
+
+        for fn, args, ref in (
+            # uint32 computes in i64: past 2**31 it still compares and divides right.
+            (lambda x: (x // 7 + x % 5).to(torch.int64), (big.to(torch.uint32),), big // 7 + big % 5),
+            (lambda x: (x + 3).to(torch.uint16), (big % 60000,), None),
+            (lambda x: x.view(torch.uint8) + 1, (big % 2 == 0,), None),
+            (lambda x: torch.fmax(x, x.flip(0)).amax(), (big % 200 - 100,), None),
+            (
+                lambda i, v: torch.zeros(64, dtype=torch.int64, device="cuda").index_add_(0, i, v),
+                (idx, idx % 7 - 3),
+                None,
+            ),
+            (
+                lambda i, v: torch.zeros(64, dtype=torch.int32, device="cuda").index_put_(
+                    (i,), v, accumulate=True
+                ),
+                (idx, (idx % 5).int()),
+                None,
+            ),
+        ):
+            torch._dynamo.reset()
+            counters.clear()
+            out = torch.compile(fn, dynamic=False)(*args)
+            self.assertEqual(out, fn(*args) if ref is None else ref)
+            self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+        torch._dynamo.reset()
+        counters.clear()
+        a, b = torch.randn(1000, device="cuda"), torch.randn(1000, device="cuda")
+        torch.testing.assert_close(torch.compile(pack2)(a, b), a + b)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     def test_wide_row_scans(self):
         # Few rows: a row spans several waves, their totals exchanged through LDS.
         for fn, a in (

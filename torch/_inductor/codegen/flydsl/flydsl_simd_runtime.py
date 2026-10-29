@@ -77,6 +77,8 @@ _STORAGE_IR = {
     "i16": T.i16,
     "i8": T.i8,
     "u8": T.i8,
+    "u16": T.i16,
+    "u32": T.i32,
     "b1": T.i8,  # torch.bool is a byte in memory
     # FP8 (gfx942's FNUZ formats) is a byte in memory, converted by the hardware's
     # v_cvt instructions at the load or store; values in between are f32.
@@ -102,10 +104,16 @@ _COMPUTE_OF = {
     "i16": "i32",
     "i8": "i32",
     "u8": "i32",
+    "u16": "i32",
+    # Past i32's range, so computed in i64; uint64 has no compute kind.
+    "u32": "i64",
     "b1": "b1",
     "f8e4": "f32",
     "f8e5": "f32",
 }
+
+_INT_KINDS = ("b1", "i8", "u8", "i16", "u16", "i32", "u32", "i64")
+_UNSIGNED_KINDS = ("b1", "u8", "u16", "u32")
 
 _COMPUTE_IR = {"b1": T.bool, "i32": T.i32, "i64": T.i64, "f32": T.f32, "f64": T.f64}
 
@@ -207,8 +215,8 @@ def _cvt(v, src: str, dst: str, unsigned: bool = False):
         zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
         word = _FP8[dst][1](T.i32(), f, f, zero, False).result
         return _arith.TruncIOp(T.i8(), word).result
-    src_int = src in ("b1", "i8", "u8", "i16", "i32", "i64")
-    dst_int = dst in ("b1", "i8", "u8", "i16", "i32", "i64")
+    src_int = src in _INT_KINDS
+    dst_int = dst in _INT_KINDS
     if dst == "b1":
         if src_int:
             zero = _arith.ConstantOp(v.type, ir.IntegerAttr.get(v.type, 0)).result
@@ -221,16 +229,16 @@ def _cvt(v, src: str, dst: str, unsigned: bool = False):
         if sw == dw:
             return v
         if sw < dw:
-            if src == "b1" or src == "u8" or unsigned:
+            if src in _UNSIGNED_KINDS or unsigned:
                 return _arith.ExtUIOp(dst_t, v).result
             return _arith.ExtSIOp(dst_t, v).result
         return _arith.TruncIOp(dst_t, v).result
     if src_int and not dst_int:
-        if src == "b1" or src == "u8" or unsigned:
+        if src in _UNSIGNED_KINDS or unsigned:
             return _arith.UIToFPOp(dst_t, v).result
         return _arith.SIToFPOp(dst_t, v).result
     if not src_int and dst_int:
-        if dst == "u8":
+        if dst in _UNSIGNED_KINDS:
             return _arith.FPToUIOp(dst_t, v).result
         return _arith.FPToSIOp(dst_t, v).result
     sw = {"f16": 16, "bf16": 16, "f32": 32, "f64": 64}
@@ -707,6 +715,8 @@ _ITEMSIZE = {
     "i16": 2,
     "i8": 1,
     "u8": 1,
+    "u16": 2,
+    "u32": 4,
     "b1": 1,
 }
 
@@ -777,7 +787,7 @@ def _packing(st: str, w: int):
     on either side. Returns ``(word type, word count, elements per word)``, or ``None``
     as the type for kinds that go through unchanged.
     """
-    nbytes = {"f16": 2, "bf16": 2, "i16": 2, "i8": 1, "u8": 1, "b1": 1, "f8e4": 1, "f8e5": 1}.get(st)
+    nbytes = {"f16": 2, "bf16": 2, "i16": 2, "u16": 2, "i8": 1, "u8": 1, "b1": 1, "f8e4": 1, "f8e5": 1}.get(st)
     if nbytes is None:
         return None, w, 1
     total = nbytes * w
@@ -1026,9 +1036,32 @@ def _when(m, emit):
 def atomic_add_global(addr, off, value, st: str, mask=None):
     """bf16 ``*(addr + off) += value``: gfx942 has a packed bf16 atomic add only on
     global pointers (``buffer_atomic_pk_add_bf16`` is gfx950), so this one goes through
-    an LLVM ``atomicrmw`` on the raw address instead of the buffer descriptor."""
+    an LLVM ``atomicrmw`` on the raw address instead of the buffer descriptor. Integer
+    adds (i32, i64) go the same way."""
+    r = _Flat(_val(to(addr, "i64")))
+    if st in ("i32", "i64"):
+        _global_add(r, idx(off), 4 if st == "i32" else 8, _val(to(value, st)), mask)
+        return
     v, word = _packed_half(idx(off), value, st)
-    _global_fadd(_Flat(_val(to(addr, "i64"))), word, 2, v, mask)
+    _global_fadd(r, word, 2, v, mask)
+
+
+def _global_add(r: _Flat, off, unit: int, v, mask):
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    ptr = _flat_ptr(r, off, unit)
+
+    def emit():
+        _llvm.AtomicRMWOp(
+            _llvm.AtomicBinOp.add,
+            ptr,
+            v,
+            _llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=unit,
+        )
+
+    _when(_mask(mask), emit)
 
 
 def atomic_add_pair(cache, key, j: int, target, off, value, st: str, mask=None):
@@ -1771,16 +1804,33 @@ def ldexp(x, n):
     return _ocml(f"ldexp_{k}", k, _val(to(x, k)), _val(idx32(n)))
 
 
-def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs):
-    """``tl.inline_asm_elementwise`` with ``pack=1``: the operands in their compute
-    kinds, the result in storage kind ``out`` (as Triton types them), widened back."""
+def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs, pack: int = 1):
+    """``tl.inline_asm_elementwise``: the operands in their compute kinds, the result
+    in storage kind ``out`` (as Triton types them), widened back.
+
+    With ``pack`` > 1 an instance takes ``pack`` elements: Triton's operands are the
+    outputs, then each input's ``pack`` elements, results narrower than 32 bits packed
+    into 32-bit registers. Elementwise asm computes each element alone, so this
+    element fills every slot and keeps the first result.
+    """
     from flydsl._mlir.dialects import llvm as _llvm
 
     vals = [_val(_canon(x) if not isinstance(x, (bool, int, float)) else const(x, kind(x))) for x in xs]
-    op = _llvm.InlineAsmOp(
-        _STORAGE_IR[out](), vals, asm, constraints, has_side_effects=not pure
-    )
-    return ArithValue(_cvt(op.result, _MEM_KIND.get(out, out), _COMPUTE_OF[out]))
+    et = _STORAGE_IR[out]()
+    if pack == 1:
+        op = _llvm.InlineAsmOp(et, vals, asm, constraints, has_side_effects=not pure)
+        res = op.result
+    else:
+        per_reg = max(1, min(pack, 32 // (8 * _type_bytes(et))))
+        reg = et if per_reg == 1 else ir.VectorType.get([per_reg], et)
+        regs = pack // per_reg
+        st = _llvm.StructType.get_literal([reg] * regs)
+        operands = [v for v in vals for _ in range(pack)]
+        op = _llvm.InlineAsmOp(st, operands, asm, constraints, has_side_effects=not pure)
+        res = _llvm.ExtractValueOp(reg, op.result, [0]).result
+        if per_reg > 1:
+            res = _vector.ExtractOp(res, static_position=[0], dynamic_position=[]).result
+    return ArithValue(_cvt(res, _MEM_KIND.get(out, out), _COMPUTE_OF[out]))
 
 
 def frexp(x):
