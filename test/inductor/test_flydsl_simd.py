@@ -491,6 +491,50 @@ class TestFlyDSLSIMD(TestCase):
             rtol=0,
         )
 
+    def test_device_library_ops(self):
+        # Through ocml, as Triton's libdevice on ROCm; the tails of the f32 formulas they
+        # replaced (log1p(1e-20) == 0) checked too.
+        S = torch.special
+        x = torch.cat(
+            [
+                torch.linspace(-9, 9, 4096, device="cuda"),
+                torch.logspace(-20, 0, 1024, device="cuda"),
+                -torch.logspace(-20, 0, 1024, device="cuda"),
+            ]
+        )
+        unit = x / 9.01
+        pos = x.abs() + 0.05
+        n = torch.randint(-8, 8, x.shape, device="cuda")
+        cases = [
+            (torch.lgamma, pos * 10),
+            (torch.erfinv, unit),
+            (S.erfcx, x),
+            (S.log_ndtr, x),
+            (torch.erfc, x),
+            (S.bessel_j0, x),
+            (S.bessel_j1, x),
+            (S.bessel_y0, pos),
+            (S.bessel_y1, pos),
+            (torch.i0, x),
+            (S.i1, x),
+            (S.modified_bessel_i0, x),
+            (lambda a: torch.nextafter(a, a * 2 + 1), x),
+            (lambda a: torch.copysign(a + 1, a.sin()), x),
+            (lambda a, k: torch.ldexp(a, k), x, n),
+            (lambda a: torch.frexp(a * 3), x),
+            (torch.log1p, x.clamp(min=-0.99)),
+            (torch.expm1, x),
+            (torch.sinh, x),
+            (torch.asinh, x),
+            (torch.atanh, unit),
+            (torch.asin, unit),
+            (lambda a: torch.atan2(a, a.flip(0)), x),
+        ]
+        for fn, *a in cases:
+            torch._dynamo.reset()
+            # Eager's own f32 erfcx is 32 ulp out where ocml's is 2.
+            self.check(fn, *a, atol=1e-6, rtol=1e-5)
+
     @parametrize("right", [False, True])
     def test_bucketize(self, right):
         # One shared table (staged in LDS; 3000 elements is past that, gathered), per-row

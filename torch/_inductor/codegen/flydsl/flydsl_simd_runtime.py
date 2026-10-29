@@ -1585,23 +1585,120 @@ def cos(x):
 
 exp = _unary_f32("exp", fdu.exp)
 exp2 = _unary_f32("exp2", fdu.exp2)
-expm1 = _unary_f32("expm1", fdu.expm1)
 log = _unary_f32("log", fdu.log)
 log2 = _unary_f32("log2", fdu.log2)
 log10 = _unary_f32("log10", fdu.log10)
-log1p = _unary_f32("log1p", fdu.log1p)
 tanh = _unary_f32("tanh", _tanh_rcp)
 sigmoid = _unary_f32("sigmoid", _sigmoid_rcp)
-sinh = _unary_f32("sinh", fdu.sinh)
-cosh = _unary_f32("cosh", fdu.cosh)
-asin = _unary_f32("asin", fdu.asin)
-acos = _unary_f32("acos", fdu.acos)
-atan = _unary_f32("atan", fdu.atan)
-asinh = _unary_f32("asinh", fdu.asinh)
-acosh = _unary_f32("acosh", fdu.acosh)
-atanh = _unary_f32("atanh", fdu.atanh)
 erf = _unary_f32("erf", _erf_rcp)
-erfc = _unary_f32("erfc", fdu.erfc)
+
+
+# -- ROCm device library (ocml), as Triton's libdevice on ROCm -----------------------------
+
+_OCML_TYPES = {"f32": "float32", "f64": "float64", "i32": "int32"}
+
+
+def _device_libs() -> list:
+    """ocml and the control libraries it reads, as Triton sets them: IEEE (not finite
+    only, no unsafe math, denormals kept), a correctly rounded sqrt, wave64."""
+    from flydsl.runtime.device import get_rocm_arch
+
+    root = _os.path.join(
+        _os.environ.get("ROCM_PATH", "/opt/rocm"), "amdgcn", "bitcode"
+    )
+    names = [
+        "ocml",
+        "oclc_finite_only_off",
+        "oclc_unsafe_math_off",
+        "oclc_daz_opt_off",
+        "oclc_correctly_rounded_sqrt_on",
+        "oclc_wavefrontsize64_on",
+        f"oclc_isa_version_{get_rocm_arch()[3:]}",
+        "oclc_abi_version_500",
+    ]
+    return [_os.path.join(root, f"{n}.bc") for n in names]
+
+
+def _ocml(name: str, ret: str, *args):
+    """``__ocml_<name>`` on bare values of the kinds their types name (``ret`` the
+    result's): a pure call into the linked device library."""
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.expr.extern import ExternFunction
+
+    ctx = CompilationContext.get_current()
+    for lib in _device_libs():
+        ctx.add_link_lib(lib)
+    types = [_OCML_TYPES[kind_of_type(a.type)] for a in args]
+    fn = ExternFunction(f"__ocml_{name}", types, _OCML_TYPES[ret], is_pure=True)
+    return ArithValue(fn(*args))
+
+
+def _ocml_unary(name: str):
+    def fn(x):
+        k = _float_kind(x)
+        return _ocml(f"{name}_{k}", k, _val(to(x, k)))
+
+    fn.__name__ = name
+    return fn
+
+
+# The f32 formulas these replace lost the tails: log1p(x) as log(1 + x), expm1, sinh,
+# asinh and atanh 8e6 ulp at small x, erfc as it nears denormal, the inverse
+# trigonometric functions 1e3 ulp.
+erfc = _ocml_unary("erfc")
+expm1 = _ocml_unary("expm1")
+log1p = _ocml_unary("log1p")
+sinh = _ocml_unary("sinh")
+cosh = _ocml_unary("cosh")
+asin = _ocml_unary("asin")
+acos = _ocml_unary("acos")
+atan = _ocml_unary("atan")
+asinh = _ocml_unary("asinh")
+acosh = _ocml_unary("acosh")
+atanh = _ocml_unary("atanh")
+lgamma = _ocml_unary("lgamma")
+erfinv = _ocml_unary("erfinv")
+erfcx = _ocml_unary("erfcx")
+bessel_j0 = _ocml_unary("j0")
+bessel_j1 = _ocml_unary("j1")
+bessel_y0 = _ocml_unary("y0")
+bessel_y1 = _ocml_unary("y1")
+i0 = modified_bessel_i0 = _ocml_unary("i0")
+i1 = modified_bessel_i1 = _ocml_unary("i1")
+
+
+def nextafter(a, b):
+    k = _float_kind(a, b)
+    return _ocml(f"nextafter_{k}", k, _val(to(a, k)), _val(to(b, k)))
+
+
+def copysign(a, b):
+    k = _float_kind(a, b)
+    return ArithValue(fmath.copysign(to(a, k), to(b, k)))
+
+
+def ldexp(x, n):
+    k = _float_kind(x)
+    return _ocml(f"ldexp_{k}", k, _val(to(x, k)), _val(idx(n)))
+
+
+def frexp(x):
+    """(mantissa in [0.5, 1) with x's sign, exponent): ``x`` itself and 0 for zero,
+    inf and NaN. A denormal is scaled into the normal range first."""
+    x = to(x, "f32")
+    i32 = lambda c: const(c, "i32")
+    bits = ArithValue(_arith.BitcastOp(T.i32(), _val(x)).result)
+    tiny = ArithValue(fmath.absf(x)) < fdu.const_f32(1.1754943508222875e-38)
+    scaled = ArithValue(_arith.BitcastOp(T.i32(), _val(x * fdu.const_f32(16777216.0))).result)
+    bits = where(tiny, scaled, bits)
+    biased = bitwise_and(bitwise_right_shift(bits, i32(23)), i32(0xFF))
+    e = sub(biased, where(tiny, i32(126 + 24), i32(126)))
+    m = bitwise_or(bitwise_and(bits, i32(-0x7F800001)), i32(126 << 23))
+    mant = ArithValue(_arith.BitcastOp(T.f32(), _val(m)).result)
+    special = logical_or(
+        eq(x, fdu.const_f32(0.0)), logical_or(isnan(x), isinf(x))
+    )
+    return where(special, x, mant), where(special, i32(0), e)
 
 
 def tan(x):
@@ -1609,7 +1706,8 @@ def tan(x):
 
 
 def atan2(a, b):
-    return ArithValue(fdu.atan2(_require_f32("atan2", a), _require_f32("atan2", b)))
+    k = _float_kind(a, b)
+    return _ocml(f"atan2_{k}", k, _val(to(a, k)), _val(to(b, k)))
 
 
 def pow(a, b):

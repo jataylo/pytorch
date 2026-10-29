@@ -361,6 +361,18 @@ _UNARY = [
     "logical_not",
     "bitwise_not",
     "identity",
+    # ocml's, as Triton's libdevice on ROCm.
+    "lgamma",
+    "erfinv",
+    "erfcx",
+    "bessel_j0",
+    "bessel_j1",
+    "bessel_y0",
+    "bessel_y1",
+    "i0",
+    "i1",
+    "modified_bessel_i0",
+    "modified_bessel_i1",
 ]
 _BINARY = [
     "add",
@@ -392,6 +404,9 @@ _BINARY = [
     "bitwise_xor",
     "bitwise_left_shift",
     "bitwise_right_shift",
+    "copysign",
+    "nextafter",
+    "ldexp",
 ]
 _ALIASES = {
     "square": lambda x: _call("mul", x, x),
@@ -426,6 +441,10 @@ _KEEP = OrderedSet(
         "output",
         "partial_accumulate",
         "device_assert_async",
+        "floor_to_int",
+        "ceil_to_int",
+        "trunc_to_int",
+        "round_to_int",
     ]
 )
 
@@ -487,6 +506,17 @@ class FlyDSLKernelOverrides(OpOverrides):
             raise FlyDSLUnsupported("bitcast across widths")
         src, dst = storage_kind(src_dtype), storage_kind(dtype)
         return f"fdp.bitcast({x}, {src!r}, {dst!r})"
+
+    @staticmethod
+    def frexp(x):
+        key = f"frexp({x})"
+        if cached := V.kernel.cse.try_get(key):
+            return cached
+        mantissa = V.kernel.cse.newvar(dtype=x.dtype)
+        exponent = V.kernel.cse.newvar(dtype=torch.int32)
+        V.kernel.compute.writeline(f"{mantissa}, {exponent} = fdp.frexp({x})")
+        V.kernel.cse.put(key, (mantissa, exponent))
+        return (mantissa, exponent)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
