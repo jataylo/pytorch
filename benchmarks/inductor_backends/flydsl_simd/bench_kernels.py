@@ -172,6 +172,15 @@ CASES = {
         lambda q, s: (q.float() * s).to(bf16),
         [lambda: torch.randn(16384, 4096, device="cuda").to(torch.float8_e4m3fnuz), _r(16384, 1)],
     ),
+    # A binary search of a sorted table per element, a gather a step.
+    "bucketize_16M_1k": (
+        lambda x, b: torch.bucketize(x, b),
+        [_r(1 << 24), lambda: torch.sort(torch.randn(1024, device="cuda")).values],
+    ),
+    "searchsorted_rows": (
+        lambda b, x: torch.searchsorted(b, x),
+        [lambda: torch.sort(torch.randn(8192, 64, device="cuda"), -1).values, _r(8192, 1024)],
+    ),
     "rmsnorm_3072_bf16": (_rms, [_r(16384, 3072, dtype=bf16), _r(3072, dtype=bf16)]),
     "rmsnorm_bwd_2048_bf16": (
         _rms_bwd,

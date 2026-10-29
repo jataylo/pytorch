@@ -1240,6 +1240,51 @@ def where(c, a, b):
     return ArithValue(_arith.SelectOp(_b(c), _val(x), _val(y)).result)
 
 
+def bucketize(
+    r, st, values, base, size, numel, stride, right, sr, sst, sstride, sbase, out,
+    mask=None,
+):
+    """``triton_helpers.bucketize_binary_search``, its ``log2(size + 1)`` steps unrolled:
+    boundaries ``r`` (storage kind ``st``) from element ``base`` at ``stride``, through
+    the optional sorter ``sr``; the bucket in compute kind ``out``. NaN goes last."""
+    v = _canon(values)
+    nan = ne(v, v) if _is_f(kind(v)) else None
+    lo, hi = const(0, "i32"), const(size, "i32")
+    full = size + 1
+    while full > 1:
+        mid = idiv(add(lo, hi), 2)
+        m = land(lt(add(mul(mid, stride), base), numel), lt(mid, size), mask)
+        at = mid if sr is None else load(sr, add(sbase, mul(mid, sstride)), sst, mask=m)
+        b = load(r, add(base, mul(at, stride)), st, mask=m)
+        above = ge(v, b) if right else gt(v, b)
+        if nan is not None:
+            above = logical_or(above, nan)
+        lo = where(land(above, m), add(mid, 1), lo)
+        hi = where(above, hi, mid)
+        full = (full + 1) // 2
+    return to(lo, out)
+
+
+def bucketize_lds(smem, base, size, k, values, right, out):
+    """``bucketize`` against one table of ``size`` elements (compute kind ``k``)
+    staged at word ``base`` of LDS."""
+    v = _canon(values)
+    nan = ne(v, v) if _is_f(kind(v)) else None
+    lo, hi = const(0, "i32"), const(size, "i32")
+    full = size + 1
+    while full > 1:
+        mid = idiv(add(lo, hi), 2)
+        m = lt(mid, size)
+        b = tile_get(smem, base, size, imin(mid, size - 1), k)
+        above = ge(v, b) if right else gt(v, b)
+        if nan is not None:
+            above = logical_or(above, nan)
+        lo = where(land(above, m), add(mid, 1), lo)
+        hi = where(above, hi, mid)
+        full = (full + 1) // 2
+    return to(lo, out)
+
+
 def neg(x):
     x = _canon(x)
     k = kind(x)

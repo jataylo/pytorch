@@ -113,6 +113,8 @@ ROW_INTERLEAVE_MAX = 4096
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
 PERSISTENT_MAX_UNROLL = 16
+# Elements of a bucketize table staged in LDS (two words each): 16 KB at most.
+LDS_TABLE_MAX = 2048
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
 # Preloaded f16/bf16 elements a thread converts to f32 ahead of the reduction (fdp.widen).
 WIDEN_MAX_ELEMENTS = 32
@@ -827,6 +829,8 @@ class FlyDSLKernel(SIMDKernel):
         self._node_index_vars: list[list[list[sympy.Expr]]] = []
         self.acc_counter = 0
         self.uses_smem = False
+        # Search tables staged in LDS by the block before its body: arg -> (kind, size).
+        self.lds_tables: dict[str, tuple[str, int]] = {}
         self.max_components = 1
         self.reduction_cache: dict[Any, Any] = {}
         self.loop_stored_args: dict[str, str] = {}
@@ -1934,8 +1938,68 @@ class FlyDSLKernel(SIMDKernel):
     def sort(self, *args, **kwargs):
         raise FlyDSLUnsupported("sort")
 
-    def bucketize(self, *args, **kwargs):
-        raise FlyDSLUnsupported("bucketize")
+    def bucketize(
+        self,
+        values,
+        boundaries,
+        boundary_indices,
+        indexing_dtype,
+        right,
+        sorter=None,
+        sorter_indices=None,
+    ):
+        """See [Note: Inductor bucketize op]: the binary search unrolled, a gather per
+        step, as ``triton_helpers.bucketize_binary_search``."""
+        if indexing_dtype not in (torch.int32, torch.int64):
+            raise FlyDSLUnsupported("bucketize indexing dtype")
+        sizes = [boundaries[1], boundaries[2], boundaries[3]]
+        if sorter:
+            sizes.append(sorter[1])
+        if not all(sympy.sympify(s).is_Integer for s in sizes):
+            raise FlyDSLUnsupported("bucketize over a dynamic size")
+        size, numel, stride = (int(s) for s in sizes[:3])
+        mask = self._mask_arg(self._masks())
+        barg = self.args.input(boundaries[0])
+        bst = storage_kind(V.graph.get_dtype(boundaries[0]))
+        if (
+            not sorter
+            and numel == size
+            and stride == 1
+            and size <= LDS_TABLE_MAX
+            and not self.tile2d
+            and not self.mix_order_reduction
+        ):
+            # One table every element searches: read from LDS, staged by the block.
+            self.lds_tables[barg] = (bst, size)
+            return self.cse.generate(
+                self.compute,
+                f"fdp.bucketize_lds(_smem, _tb_{barg}, {size}, {_COMPUTE[bst]!r}, "
+                f"{values}, {bool(right)}, {compute_kind(indexing_dtype)!r})",
+                dtype=indexing_dtype,
+            )
+        args = [
+            f"_r_{barg}",
+            repr(bst),
+            str(values),
+            str(boundary_indices),
+            str(size),
+            str(numel),
+            str(stride),
+            str(bool(right)),
+        ]
+        if sorter:
+            args += [
+                f"_r_{self.args.input(sorter[0])}",
+                repr(storage_kind(V.graph.get_dtype(sorter[0]))),
+                str(int(sorter[1])),
+                str(sorter_indices),
+            ]
+        else:
+            args += ["None", "None", "None", "None"]
+        args.append(repr(compute_kind(indexing_dtype)))
+        return self.cse.generate(
+            self.compute, f"fdp.bucketize({', '.join(args)}{mask})", dtype=indexing_dtype
+        )
 
     def _finalize_mix_order(self) -> None:
         """A block runs ``rsplit_size`` rows over ``rpb`` row groups, each of its rows
@@ -2441,6 +2505,12 @@ class FlyDSLKernel(SIMDKernel):
 
     @property
     def smem_words(self) -> int:
+        return self._smem_body_words + sum(
+            2 * size for _, size in self.lds_tables.values()
+        )
+
+    @property
+    def _smem_body_words(self) -> int:
         if self.staged:
             return sum(s["words"] * self.tile_f * self._tile_pitch for s in self.staged)
         # Mirrors fdp.smem_words: a slot per thread per 32-bit word of each component.
@@ -2448,6 +2518,21 @@ class FlyDSLKernel(SIMDKernel):
         if self.mix_order_reduction and self.rpb > 1:
             words += self.rpb * self._mix_cols(self.threads)
         return words
+
+    def _emit_lds_tables(self, code: IndentedBuffer) -> None:
+        """Each table into LDS by the whole block, then one barrier: ``_tb_<arg>`` its
+        first word, a 64-bit element's second word ``size`` further on."""
+        base = self._smem_body_words
+        for arg, (st, size) in self.lds_tables.items():
+            code.writeline(f"_tb_{arg} = {base}")
+            for k in range(-(-size // self.threads)):
+                i = f"fdp.imin(_t + {k * self.threads}, {size - 1})"
+                code.writeline(
+                    f"fdp.tile_put(_smem, _tb_{arg}, {size}, {i}, fdp.load(_r_{arg}, {i}, {st!r}))"
+                )
+            base += 2 * size
+        if self.lds_tables:
+            code.writeline("fdp.barrier()")
 
     @property
     def num_blocks(self) -> int:
@@ -2618,6 +2703,7 @@ class FlyDSLKernel(SIMDKernel):
 
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
+        self._emit_lds_tables(code)
         if self.tile2d:
             self._emit_tile2d(code)
         elif not self.is_reduction_kernel:

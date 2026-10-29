@@ -491,6 +491,34 @@ class TestFlyDSLSIMD(TestCase):
             rtol=0,
         )
 
+    @parametrize("right", [False, True])
+    def test_bucketize(self, right):
+        # One shared table (staged in LDS; 3000 elements is past that, gathered), per-row
+        # tables and integer ones; NaN goes past the last boundary.
+        x = torch.randn(1 << 18, device="cuda") * 3
+        x[:4] = torch.tensor([float("nan"), float("inf"), -float("inf"), 0.0])
+        for n in (1, 37, 3000):
+            torch._dynamo.reset()
+            b = torch.sort(torch.randn(n, device="cuda")).values
+            self.check(lambda x, b: torch.bucketize(x, b, right=right), x, b)
+        torch._dynamo.reset()
+        self.check(
+            lambda x, b: torch.bucketize(x * 2, b, right=right, out_int32=True),
+            x.bfloat16(),
+            torch.linspace(-4, 4, 37, device="cuda").bfloat16(),
+        )
+        torch._dynamo.reset()
+        xi = torch.randint(-(1 << 40), 1 << 40, (100000,), device="cuda")
+        bi = torch.sort(torch.randint(-(1 << 40), 1 << 40, (100,), device="cuda")).values
+        self.check(lambda x, b: torch.bucketize(x + 1, b, right=right), xi, bi)
+        torch._dynamo.reset()
+        rows = torch.sort(torch.randn(512, 17, device="cuda"), -1).values
+        self.check(
+            lambda b, x: torch.searchsorted(b, x, right=right),
+            rows,
+            torch.randn(512, 300, device="cuda"),
+        )
+
     def test_bitcast(self):
         # x.view(dtype) at one width: rounded back to storage (exactly), reinterpreted.
         x = torch.randn(1000, 333, device="cuda")
