@@ -1145,14 +1145,37 @@ def _buffer_add(r, off, unit: int, v, mask):
 # ---------------------------------------------------------------------------------------
 
 
+def _is_one(v) -> bool:
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v == 1
+    try:
+        op = _val(v).owner.opview
+    except (AttributeError, ValueError):
+        return False
+    if not isinstance(op, _arith.ConstantOp):
+        return False
+    attr = op.value
+    return (
+        isinstance(attr, ir.FloatAttr)
+        and kind_of_type(attr.type) == "f32"
+        and attr.value == 1.0
+    )
+
+
 def add(a, b):
+    for one, other in ((a, b), (b, a)):
+        if _is_one(one) and (alt := _one_plus_of(other)) is not None:
+            return alt
     _, (x, y) = _promote(a, b)
     return ArithValue(x + y)
 
 
 def sub(a, b):
-    _, (x, y) = _promote(a, b)
-    return ArithValue(x - y)
+    k, (x, y) = _promote(a, b)
+    r = ArithValue(x - y)
+    if k == "f32" and (_derived(b) or (None,))[0] == "rowmax":
+        return _derive(r, "le0")
+    return r
 
 
 def mul(a, b):
@@ -1165,6 +1188,10 @@ def mul(a, b):
 def truediv(a, b):
     k = _float_kind(a, b)
     x, y = to(a, k), to(b, k)
+    if k == "f32" and (_derived(b) or (None,))[0] == "ge1":
+        # IEEE's ~10-instruction divide sequence for a denominator v_rcp gets within
+        # 1 ulp of: SiLU's x / (1 + exp(-x)).
+        return ArithValue(x * _rcp(y))
     return ArithValue(_arith.DivFOp(_val(x), _val(y)).result)
 
 
@@ -1632,6 +1659,65 @@ def _tanh_rcp(x):
     return _copysign(r, x)
 
 
+# What a value was computed as -- (op, argument) -- for the rewrites below of the tanh
+# GELU's 1 + tanh(u), SiLU's x / (1 + exp(-x)) and a softmax's exp(x - max) / sum:
+# "ge1" marks a denominator >= 1 (or NaN), "rowmax" a softmax's row max and "le0" an
+# x - rowmax. Those kernels are ALU-bound on MI300 (24-30 instructions an element); the
+# ops a rewrite replaces are left unused, dead code.
+_derived_memo: dict = {"ctx": None, "map": {}}
+
+
+def _derived(v):
+    if _derived_memo["ctx"] is not ir.Context.current:
+        return None
+    try:
+        return _derived_memo["map"].get(_val(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _derive(r, op: str, arg=None):
+    if _derived_memo["ctx"] is not ir.Context.current:
+        _derived_memo.update(ctx=ir.Context.current, map={})
+    _derived_memo["map"][_val(r)] = (op, arg)
+    return r
+
+
+def _one_plus_of(v):
+    """``1 + v`` rewritten, for a ``v`` that ``tanh`` or ``exp`` registered, else
+    None. (Not erf: a branch-free rational erf ran the GELU 8% faster at 3x eager's
+    error, an f32 evaluation floor of ~3e-7.)"""
+    d = _derived(v)
+    if d is None:
+        return None
+    op, u = d
+    one = fdu.const_f32(1.0)
+    if op == "tanh":
+        # 2 sigmoid(2u): one exp and one rcp, no cancellation as tanh nears -1.
+        e = _exp2_raw(ArithValue(u * fdu.const_f32(-2.0 * _LOG2E)))
+        return ArithValue(_rcp(e + one) * fdu.const_f32(2.0))
+    if op == "exp":
+        # >= 1, so a division by it can take v_rcp; a denormal exp is as good as 0.
+        e = _exp2_raw(ArithValue(u * fdu.const_f32(_LOG2E)))
+        return _derive(ArithValue(e + one), "ge1")
+    return None
+
+
+def _tanh_registered(x):
+    x = _f32(_require_f32("tanh", x))
+    return _derive(ArithValue(_tanh_rcp(x)), "tanh", x)
+
+
+def _exp_registered(x):
+    x = _f32(_require_f32("exp", x))
+    if (_derived(x) or (None,))[0] == "le0":
+        # A softmax's exp(x - max) <= 1: a result in the denormal range, a probability
+        # below 1e-38, may as well be 0. LLVM's range fix-up is 5 of the ~27
+        # instructions an element of GPT-2's causal softmax.
+        return _derive(_exp2_raw(ArithValue(x * fdu.const_f32(_LOG2E))), "exp", x)
+    return _derive(ArithValue(fdu.exp(x)), "exp", x)
+
+
 def _sigmoid_rcp(x):
     # 1 / (1 + exp(-x)): the denominator is >= 1, and rcp(inf) = 0 for very negative x.
     e = _exp2_raw(ArithValue(_f32(x) * fdu.const_f32(-_LOG2E)))
@@ -1705,12 +1791,12 @@ def cos(x):
     return _trig(_require_f32("cos", x), True)
 
 
-exp = _unary_f32("exp", fdu.exp)
+exp = _exp_registered
 exp2 = _unary_f32("exp2", fdu.exp2)
 log = _unary_f32("log", fdu.log)
 log2 = _unary_f32("log2", fdu.log2)
 log10 = _unary_f32("log10", fdu.log10)
-tanh = _unary_f32("tanh", _tanh_rcp)
+tanh = _tanh_registered
 sigmoid = _unary_f32("sigmoid", _sigmoid_rcp)
 erf = _unary_f32("erf", _erf_rcp)
 
@@ -2821,6 +2907,46 @@ def welford_merge(a, b, mask=None):
     )
 
 
+def welford_block(acc, items, combine: bool):
+    """``acc`` merged with a chunk of samples ``(x, mask)``, or of ``((mean, m2,
+    weight), mask)`` triples for a combine: the chunk's weighted mean, then its
+    squared deviations from it (Chan's formula over the chunk), then one merge -- a
+    divide or two a chunk rather than an IEEE divide an element. A split BatchNorm's
+    statistics were ALU-bound at 770 GB/s on it."""
+    zero = const(0.0, "f32")
+    sel = lambda m, v, o: v if m is None else ArithValue(  # noqa: E731
+        _arith.SelectOp(m, _val(v), _val(o)).result
+    )
+    ms = [_mask(m) for _, m in items]
+    if combine:
+        trip = [
+            (_f32(v[0]), sel(m, _f32(v[1]), zero), sel(m, _f32(v[2]), zero))
+            for (v, _), m in zip(items, ms)
+        ]
+        w_c = _tree([w for _, _, w in trip], add)
+        wx = _tree([ArithValue(mu * w) for mu, _, w in trip], add)
+        mean_c = where(eq(w_c, zero), zero, truediv(wx, w_c))
+        devs = []
+        for mu, s, w in trip:
+            d = ArithValue(mu - mean_c)
+            devs.append(ArithValue(fmath.fma(ArithValue(d * w), d, s)))
+    else:
+        xs = [_f32(v) for v, _ in items]
+        if all(m is None for m in ms):
+            w_c = const(float(len(xs)), "f32")
+            mean_c = mul(_tree(xs, add), const(1.0 / len(xs), "f32"))
+        else:
+            w_c = _tree([sel(m, const(1.0, "f32"), zero) for m in ms], add)
+            sx = _tree([sel(m, x, zero) for x, m in zip(xs, ms)], add)
+            mean_c = where(eq(w_c, zero), zero, truediv(sx, w_c))
+        devs = []
+        for x, m in zip(xs, ms):
+            d = ArithValue(x - mean_c)
+            devs.append(sel(m, ArithValue(d * d), zero))
+    m2_c = _tree(devs, add)
+    return welford_merge(acc, (_canon(mean_c), _canon(m2_c), _canon(w_c)))
+
+
 def group_welford(mean, m2, weight, tpr: int, smem, threads: int, stride: int = 1):
     return _group_reduce((mean, m2, weight), welford_merge, tpr, smem, threads, stride)
 
@@ -2860,7 +2986,9 @@ def online_softmax_merge(a, b):
 
 
 def group_online_softmax(mx, s, tpr: int, smem, threads: int, stride: int = 1):
-    return _group_reduce((mx, s), online_softmax_merge, tpr, smem, threads, stride)
+    # The sum holds exp(max - max) = 1, as group_softmax_twopass's.
+    m, s = _group_reduce((mx, s), online_softmax_merge, tpr, smem, threads, stride)
+    return _derive(m, "rowmax"), _derive(s, "ge1")
 
 
 # -- chunked forms -----------------------------------------------------------------------
@@ -2920,11 +3048,18 @@ def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
     exp-sum pass, as Triton does for a persistent reduction. ``exp(x - max)`` exactly as
     the kernel's normalizing pass writes it -- no -inf guard; an all -inf row is NaN
     either way, as in eager and Triton -- so LLVM shares each exp between the two
-    passes: 268us vs 317us on a causal softmax over 512."""
+    passes: 268us vs 317us on a causal softmax over 512.
+
+    The sum holds exp(max - max) = 1, so the normalizing divide takes the row's v_rcp
+    (or is NaN either way). The max needn't carry a NaN, a cmp and a select an element:
+    exp(NaN - max) puts it in the sum, and so in every output, as eager's."""
     xs = _masked_items(items, "f32", float("-inf"))
-    gm = group_reduce("max", _tree(xs, maximum), tpr, smem, threads, stride)
+    maxnum = lambda a, b: ArithValue(_arith.MaxNumFOp(_val(a), _val(b)).result)  # noqa: E731
+    gm = _derive(
+        group_reduce("max", _tree(xs, maxnum), tpr, smem, threads, stride), "rowmax"
+    )
     ls = _tree([exp(sub(x, gm)) for x in xs], add)
-    return gm, group_reduce("sum", ls, tpr, smem, threads, stride)
+    return gm, _derive(group_reduce("sum", ls, tpr, smem, threads, stride), "ge1")
 
 
 def group_welford_twopass(

@@ -1083,6 +1083,37 @@ class TestFlyDSLSIMD(TestCase):
         torch.testing.assert_close(torch.compile(pack2)(a, b), a + b)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
+    def test_activation_softmax_welford_rewrites(self):
+        # 1 + tanh(u) as 2 sigmoid(2u), x / (1 + exp(y)) by v_rcp, a softmax's
+        # exp(x - max) without the denormal fix-up, chunked welford merges.
+        sp = torch.tensor([float("inf"), -float("inf"), float("nan"), 0.0, -0.0, 30.0, -30.0])
+        x = torch.cat([torch.linspace(-12, 12, 4099), sp]).cuda()
+        rows = torch.randn(6, 300, device="cuda") * 4
+        rows[1, 7] = float("nan")
+        rows[2] = float("-inf")
+        rows[3, :5] = float("inf")
+        for fn, a in (
+            (lambda x: F.gelu(x, approximate="tanh"), x),
+            (lambda x: 1 + torch.tanh(x), x),
+            (F.silu, x),
+            (lambda x: (x * 3) / (1 + torch.exp(x * 0.5)), x),
+            (lambda x: torch.softmax(x, -1), rows),
+            (lambda x: torch.log_softmax(x, -1), rows),
+        ):
+            torch._dynamo.reset()
+            self.check(fn, a, atol=1e-5, rtol=2e-6)
+        nchw = torch.randn(8, 16, 96, 96, device="cuda") * 3 + 1.5
+        for fn, a in (
+            (lambda x: torch.var_mean(x, dim=(0, 2, 3), correction=0), nchw),
+            (lambda x: torch.var_mean(x, -1), torch.randn(4, 50000, device="cuda") + 7),
+            (
+                lambda x: F.batch_norm(x, None, None, training=True),
+                nchw[:, :, :37, :41].contiguous(),
+            ),
+        ):
+            torch._dynamo.reset()
+            self.check(fn, a, atol=1e-4, rtol=1e-4)
+
     def test_wide_row_scans(self):
         # Few rows: a row spans several waves, their totals exchanged through LDS.
         for fn, a in (

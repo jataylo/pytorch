@@ -137,6 +137,7 @@ SORT_MAX_THREADS = 256
 SORT_MAX_LDS_BYTES = 64 * 1024
 SORT_REG_RUN = 2  # consecutive slots a thread sorts in registers: see fdp._bitonic
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
+WELFORD_CHUNK = 32  # elements per thread per loop step of a looped welford
 # Preloaded f16/bf16 elements a thread converts to f32 ahead of the reduction (fdp.widen).
 WIDEN_MAX_ELEMENTS = 32
 # A mix-order reduction's block (see FlyDSLKernel._finalize_mix_order): its threads,
@@ -1712,6 +1713,11 @@ class FlyDSLKernel(SIMDKernel):
                 1,
                 min(8 if gather else 4, PERSISTENT_MAX_UNROLL // self.ept, iters // 2),
             )
+            if any(t.startswith("welford") for t in self._reduction_types()):
+                # A welford merges each chunk into its running triple with a divide or
+                # two (fdp.welford_block): 32 elements a chunk. A split BatchNorm's
+                # statistics over NCHW 51us -> 39us (Triton 100us).
+                self.unroll = max(1, min(WELFORD_CHUNK // self.ept, iters // 2))
             if self.one_step and self.tpr == WAVE:
                 self.unroll = iters
             self.unroll = _tune(
@@ -2550,16 +2556,17 @@ class FlyDSLKernel(SIMDKernel):
         elif reduction_type in ("welford_reduce", "welford_combine"):
             acc = self._new_acc()
             self.body.writeline(f"{acc}_m, {acc}_s, {acc}_w = fdp.welford_default()")
-            if reduction_type == "welford_reduce":
-                self.compute.writeline(
-                    f"{acc}_m, {acc}_s, {acc}_w = fdp.welford_update({acc}_m, {acc}_s, {acc}_w, {value}{mask})"
-                )
-            else:
+            combine = reduction_type == "welford_combine"
+            if combine:
                 m, s, w = value
-                self.compute.writeline(
-                    f"{acc}_m, {acc}_s, {acc}_w = fdp.welford_merge(({acc}_m, {acc}_s, {acc}_w), "
-                    f"({m}, {s}, {w}){mask})"
-                )
+                item = f"(({m}, {s}, {w}), {rmask or 'None'})"
+            # A chunk at a time (fdp.welford_block), as sum.
+            self.chunk_pre.writeline(f"{acc}_items = []")
+            self.compute.writeline(f"{acc}_items.append({item})")
+            self.chunk_post.writeline(
+                f"{acc}_m, {acc}_s, {acc}_w = fdp.welford_block(({acc}_m, {acc}_s, {acc}_w), "
+                f"{acc}_items, {combine})"
+            )
             result = tuple(
                 self._post(
                     f"fdp.group_welford({acc}_m, {acc}_s, {acc}_w, {geo})",
