@@ -43,6 +43,14 @@ def _rms(x, w):
     return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)).to(x.dtype) * w
 
 
+def _rms_bwd(x, w, g, rs):
+    # RMSNorm's backward from its saved rstd: the input gradient (a row reduction) and
+    # the weight gradient (a column reduction), one mix-order kernel.
+    n, gw = x.float() * rs, g.float() * w.float()
+    dx = rs * (gw - n * (gw * n).mean(-1, keepdim=True))
+    return dx.to(x.dtype), (g.float() * n).sum(0).to(x.dtype)
+
+
 def _qk_norm_rope(x, w, cos, sin):
     b, t, d = cos.shape
     q = _rms(x.view(b, t, -1, d), w).transpose(1, 2)
@@ -150,6 +158,17 @@ CASES = {
         [_r(16384, 4096, dtype=bf16), _r(4096, dtype=bf16), _r(4096, dtype=bf16)],
     ),
     "rmsnorm_bf16": (_rms, [_r(16384, 4096, dtype=bf16), _r(4096, dtype=bf16)]),
+    "rmsnorm_3072_bf16": (_rms, [_r(16384, 3072, dtype=bf16), _r(3072, dtype=bf16)]),
+    "rmsnorm_bwd_2048_bf16": (
+        _rms_bwd,
+        [_r(16384, 2048, dtype=bf16), _r(2048, dtype=bf16)]
+        + [_r(16384, 2048, dtype=bf16), _r(16384, 1)],
+    ),
+    "rmsnorm_bwd_3072_bf16": (
+        _rms_bwd,
+        [_r(16384, 3072, dtype=bf16), _r(3072, dtype=bf16)]
+        + [_r(16384, 3072, dtype=bf16), _r(16384, 1)],
+    ),
     "cross_entropy_32K": (
         lambda x, t: F.cross_entropy(x, t),
         [_r(4096, 32000), _i(32000, 4096)],

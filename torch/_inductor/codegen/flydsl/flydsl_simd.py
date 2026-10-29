@@ -1336,6 +1336,27 @@ class FlyDSLKernel(SIMDKernel):
                 tpr = WAVE
             elif (
                 tpr > WAVE
+                and self.mix_order_reduction
+                and self.rnumel % self.ept == 0
+                and (
+                    fit := next(
+                        (
+                            t
+                            for t in range(self.threads // WAVE * WAVE, WAVE, -WAVE)
+                            if (self.rnumel // self.ept) % t == 0
+                        ),
+                        None,
+                    )
+                )
+            ):
+                # A mix-order row as wide as whole waves that tile it exactly go: its
+                # column partials take a register a lane per element, so more lanes,
+                # not fewer, beat more elements a lane. A 16384 x 1536 RMSNorm backward
+                # 76us -> 60us at 192 lanes of 8, 3072 wide 174us -> 153us at 192 of
+                # 16; 2048 wide 172us at 256 lanes of 8 against 192us at 128 of 16.
+                tpr = fit
+            elif (
+                tpr > WAVE
                 and not self.mix_order_reduction
                 and not self._pure_reduction()
                 and self.rnumel % PERSISTENT_MAX_UNROLL == 0
