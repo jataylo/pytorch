@@ -1755,15 +1755,17 @@ def _u32c(v: int):
     return _val(const(v - 2**32 if v >= 2**31 else v, "i32"))
 
 
-def _philox(seed, offset):
-    """Four uint32 words (held as i32) for counter (offset, 0, 0, 0) under key ``seed``."""
+def _philox(seed, offset, c1=None, c2=None, c3=None):
+    """Four uint32 words (held as i32) for counter (offset, c1, c2, c3) under key
+    ``seed``; a counter word left None is 0."""
     s = _val(to(seed, "i64"))
     k0 = _arith.TruncIOp(T.i32(), s).result
     k1 = _arith.TruncIOp(
         T.i32(),
         _arith.ShRUIOp(s, _val(const(32, "i64"))).result,
     ).result
-    c0, c1, c2, c3 = _val(idx(offset)), None, None, None
+    c0 = _val(idx(offset))
+    c1, c2, c3 = (None if c is None else _val(idx(c)) for c in (c1, c2, c3))
     a, b = _u32c(_PHILOX_ROUND_A), _u32c(_PHILOX_ROUND_B)
     ka, kb = _u32c(_PHILOX_KEY_A), _u32c(_PHILOX_KEY_B)
 
@@ -1837,6 +1839,38 @@ def randn4(cache, key, j: int, seed, offset):
         return out
 
     return memo(cache, (key, "n", j // 4), normals)[j % 4]
+
+
+def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
+    """``triton_helpers.rand_eager_kernel``: eager's Philox stream for element ``tid``
+    (counter: 64-bit offset block, 64-bit subsequence), so a compiled ``rand`` matches
+    eager's under ``config.align_random_eager``."""
+    denom = vec * threads_per_round
+    t = _val(idx(tid))
+    i32 = lambda c: _val(const(c, "i32"))
+    t_round = _arith.DivUIOp(t, i32(denom)).result
+    t_trunc = _arith.RemUIOp(t, i32(denom)).result
+    subseq = _arith.DivUIOp(t_trunc, i32(vec)).result
+    which4 = _arith.DivUIOp(_arith.RemUIOp(t_trunc, i32(vec)).result, i32(4)).result
+    lane = _arith.RemUIOp(t_trunc, i32(4)).result
+    blocks = _arith.MulIOp(t_round, i32(vec // 4)).result
+    ext = lambda v: _arith.ExtUIOp(T.i64(), v).result
+    off = _arith.AddIOp(
+        _val(to(base_offset, "i64")), ext(_arith.AddIOp(blocks, which4).result)
+    ).result
+    lo = _arith.TruncIOp(T.i32(), off).result
+    hi = _arith.TruncIOp(
+        T.i32(), _arith.ShRUIOp(off, _val(const(32, "i64"))).result
+    ).result
+    u = _philox(seed, lo, hi, subseq, None)
+    pick = lambda c, a, b: _arith.SelectOp(
+        _arith.CmpIOp(_arith.CmpIPredicate.eq, lane, i32(c)).result, a, b
+    ).result
+    word = pick(0, u[0], pick(1, u[1], pick(2, u[2], u[3])))
+    f = _arith.UIToFPOp(T.f32(), word).result
+    inv = 1.0 / 4294967296.0
+    r = ArithValue(fmath.fma(f, fdu.const_f32(inv), fdu.const_f32(inv * 0.5)))
+    return sub(const(1.0, "f32"), r)
 
 
 def randint64(seed, offset, low, high):

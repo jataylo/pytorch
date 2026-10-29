@@ -422,6 +422,9 @@ _ALIASES = {
     "rand": lambda seed, offset: V.kernel.random("rand", seed, offset),
     "randn": lambda seed, offset: V.kernel.random("randn", seed, offset),
     "randint64": lambda seed, offset, lo, hi: _call("randint64", seed, offset, lo, hi),
+    "rand_eager": lambda seed, base, threads, tid, vec: _call(
+        "rand_eager", seed, base, int(threads), tid, int(vec)
+    ),
     "load_seed": lambda name, offset: V.kernel.load(name, sympy.Integer(offset)),
 }
 # Inherited from OpOverrides and still correct here: they emit no source of their own.

@@ -535,6 +535,22 @@ class TestFlyDSLSIMD(TestCase):
             # Eager's own f32 erfcx is 32 ulp out where ocml's is 2.
             self.check(fn, *a, atol=1e-6, rtol=1e-5)
 
+    @config.patch(align_random_eager=True)
+    def test_rand_eager(self):
+        # Eager's Philox stream: a compiled f32 dropout's mask is eager's, bit for bit.
+        x = torch.randn(4096, 1000, device="cuda")
+
+        def fn(x):
+            return F.dropout(x, 0.3, training=True) * 2
+
+        torch.manual_seed(7)
+        ref = fn(x)
+        torch.manual_seed(7)
+        out = torch.compile(fn)(x)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+        self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     def test_inline_asm(self):
         # AMDGCN inline asm, fused with the ops around it; one element a call.
         from torch._higher_order_ops.inline_asm_elementwise import (
