@@ -350,17 +350,17 @@ class Aff:
 
     def value(self):
         if self.base is None:
-            return const(self.c, "i32")
+            return const(self.c, _INDEX[0])
         return self.base + self.c if self.c else self.base
 
     @staticmethod
     def _of(o):
-        """``o`` as an Aff, or None when it is not an i32 index."""
+        """``o`` as an Aff, or None when it is not an index of the kernel's kind."""
         if isinstance(o, Aff):
             return o
         if isinstance(o, bool) or not isinstance(o, int):
             v = _val(o) if not isinstance(o, float) else None
-            if v is None or kind_of_type(v.type) != "i32":
+            if v is None or kind_of_type(v.type) != _INDEX[0]:
                 return None
             return Aff(ArithValue(v))
         return Aff(None, o)
@@ -372,7 +372,7 @@ class Aff:
         if a.base is None:
             base = self.base
         elif self.base is None:
-            base = a.base if sign > 0 else ArithValue(fx.Int32(0)) - a.base
+            base = a.base if sign > 0 else const(0, _INDEX[0]) - a.base
         else:
             base = self.base + a.base if sign > 0 else self.base - a.base
         return Aff(base, self.c + sign * a.c)
@@ -406,7 +406,7 @@ class Aff:
     def _opaque(self, o, op):
         o = o.value() if isinstance(o, Aff) else o
         r = op(self.value(), o)
-        return Aff(r) if kind_of_type(_val(r).type) == "i32" else r
+        return Aff(r) if kind_of_type(_val(r).type) == _INDEX[0] else r
 
     def __floordiv__(self, o):
         return self._opaque(o, lambda a, b: a // b)
@@ -435,12 +435,26 @@ class Aff:
     __hash__ = None
 
 
+# The kind of the kernel being traced's index values: i64 for one over 2**31 elements.
+_INDEX = ["i32"]
+
+
+def kernel_begin(wide: bool = False) -> None:
+    _INDEX[0] = "i64" if wide else "i32"
+
+
+def _widen(v):
+    if _INDEX[0] == "i32":
+        return ArithValue(v)
+    return ArithValue(_arith.ExtUIOp(T.i64(), v).result)
+
+
 def tid():
-    return Aff(ArithValue(_val(_tid())))
+    return Aff(_widen(_val(_tid())))
 
 
 def bid():
-    return Aff(ArithValue(_val(fx.Int32(gpu.block_idx.x))))
+    return Aff(_widen(_val(fx.Int32(gpu.block_idx.x))))
 
 
 def _tid():
@@ -469,7 +483,7 @@ def rsrc(addr, nbytes: int):
     if not isinstance(nbytes, int):
         # Computed from the size arguments; guarded below 2**31 at compile time.
         return buffer_ops.create_buffer_resource_from_addr(
-            _val(addr), num_records_bytes=_val(idx(nbytes))
+            _val(addr), num_records_bytes=_val(idx32(nbytes))
         )
     if nbytes >= 2**31 - 1:
         return _Flat(_val(addr))
@@ -479,7 +493,9 @@ def rsrc(addr, nbytes: int):
 
 
 def size_arg(v):
-    """A size argument (passed as 64 bits, like the addresses) as an i32 index."""
+    """A size argument (passed as 64 bits, like the addresses) as an index value."""
+    if _INDEX[0] == "i64":
+        return ArithValue(_val(v))
     return ArithValue(_arith.TruncIOp(T.i32(), _val(v)).result)
 
 
@@ -490,15 +506,16 @@ def _type_bytes(t) -> int:
 
 
 def _flat_ptr(r: _Flat, off, unit: int, mask=None):
-    """``r + off * unit`` bytes as a global pointer, ``off`` an unsigned i32 element
+    """``r + off * unit`` bytes as a global pointer, ``off`` an unsigned element
     offset; a masked lane points at the buffer's start instead."""
     from flydsl._mlir.dialects import llvm as _llvm
 
     o = _val(idx(off))
+    wide = kind_of_type(o.type) == "i64"
     if mask is not None:
-        o = _arith.SelectOp(mask, o, _val(fx.Int32(0))).result
+        o = _arith.SelectOp(mask, o, _val(const(0, "i64" if wide else "i32"))).result
     scaled = _arith.MulIOp(
-        _arith.ExtUIOp(T.i64(), o).result,
+        o if wide else _arith.ExtUIOp(T.i64(), o).result,
         _arith.ConstantOp(T.i64(), ir.IntegerAttr.get(T.i64(), unit)).result,
     ).result
     a = _arith.AddIOp(r.addr, scaled).result
@@ -508,6 +525,7 @@ def _flat_ptr(r: _Flat, off, unit: int, mask=None):
 def _bload(r, off, vec_width: int, dtype, mask=None, is_scalar: bool = False):
     """``buffer_ops.buffer_load``, or its 64-bit global form for a ``_Flat``."""
     if not isinstance(r, _Flat):
+        off = _narrow(off)
         if is_scalar:
             return buffer_ops.buffer_load(r, off, vec_width=1, is_scalar=True)
         return buffer_ops.buffer_load(
@@ -529,6 +547,17 @@ def _bload(r, off, vec_width: int, dtype, mask=None, is_scalar: bool = False):
     return _arith.SelectOp(mask, v, zero).result
 
 
+def _narrow(off):
+    """A descriptor's offset: its buffer is under 2 GiB, so an in-bounds offset fits
+    i32 (a masked lane's is replaced)."""
+    if isinstance(off, int) or _INDEX[0] == "i32":
+        return off
+    v = _val(off)
+    if kind_of_type(v.type) != "i64":
+        return off
+    return ArithValue(_arith.TruncIOp(T.i32(), v).result)
+
+
 def _zero_attr(t):
     if isinstance(t, ir.IntegerType):
         return ir.IntegerAttr.get(t, 0)
@@ -538,7 +567,7 @@ def _zero_attr(t):
 def _bstore(value, r, off, mask=None):
     """``buffer_ops.buffer_store``, or its 64-bit global form for a ``_Flat``."""
     if not isinstance(r, _Flat):
-        buffer_ops.buffer_store(value, r, off, mask=mask)
+        buffer_ops.buffer_store(value, r, _narrow(off), mask=mask)
         return
     from flydsl._mlir.dialects import llvm as _llvm
 
@@ -586,19 +615,35 @@ def pick(s, *members):
     return tuple(w(r) if w else r for w, r in zip(wrap, op.results))
 
 
-def idx(x):
-    """An i32 element offset from an index value of any integer kind."""
+def _as_int(x, k: str):
+    if isinstance(x, Aff):
+        x = x.value()
     if isinstance(x, int):
-        return fx.Int32(x)
+        return const(x, k)
     v = _val(x)
-    k = kind_of_type(v.type)
-    if k == "i32":
+    vk = kind_of_type(v.type)
+    if vk == k:
         return ArithValue(v)
-    if k == "index":
-        return ArithValue(_arith.IndexCastOp(T.i32(), v).result)
-    if _is_f(k):
-        return ArithValue(_arith.FPToSIOp(T.i32(), v).result)
-    return ArithValue(_cvt(v, k, "i32"))
+    if vk == "index":
+        return ArithValue(_arith.IndexCastOp(_COMPUTE_IR[k](), v).result)
+    if _is_f(vk):
+        return ArithValue(_arith.FPToSIOp(_COMPUTE_IR[k](), v).result)
+    return ArithValue(_cvt(v, vk, k))
+
+
+def idx(x):
+    """An element offset, of the kernel's index kind, from a value of any integer kind."""
+    return _as_int(x, _INDEX[0])
+
+
+def idx32(x):
+    """An i32 from an index value: LDS offsets, lanes, descriptor extents."""
+    return _as_int(x, "i32")
+
+
+def ic(v: int):
+    """An index constant: a loop bound or step, an extent past 2**31."""
+    return const(v, _INDEX[0])
 
 
 def bucket(o, ends):
@@ -708,7 +753,7 @@ def wload(cache: dict, key, chunk: int, r, off, st: str):
         cache[(key, "w", chunk)] = load(r, off, st)
         return cache[(key, "w", chunk)]
     size = _ITEMSIZE[st]
-    byte = _val(idx(off) * size)
+    byte = _val(idx32(off) * size)
     byte = _rocdl.readfirstlane(T.i32(), byte)
     two = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 2)).result
     word = _bload(r, _arith.ShRUIOp(byte, two).result, 1, T.i32(), is_scalar=True)
@@ -959,11 +1004,12 @@ def _packed_half(o, value, st: str):
     h = _cvt(_val(to(value, "f32")), "f32", st)
     et = _STORAGE_IR[st]()
     negz = _arith.ConstantOp(et, ir.FloatAttr.get(et, -0.0)).result
-    odd = _val(eq(ArithValue(_arith.AndIOp(_val(o), _val(fx.Int32(1))).result), 1))
+    ok = kind_of_type(_val(o).type)
+    odd = _val(eq(ArithValue(_arith.AndIOp(_val(o), _val(const(1, ok))).result), 1))
     lo = _arith.SelectOp(odd, negz, h).result
     hi = _arith.SelectOp(odd, h, negz).result
     v = _vector.FromElementsOp(ir.VectorType.get([2], et), [lo, hi]).result
-    return v, _arith.AndIOp(_val(o), _val(fx.Int32(-2))).result
+    return v, _arith.AndIOp(_val(o), _val(const(-2, ok))).result
 
 
 def _when(m, emit):
@@ -1045,7 +1091,7 @@ def _buffer_add(r, off, unit: int, v, mask):
     if isinstance(r, _Flat):
         _global_fadd(r, off, unit, v, mask)
         return
-    byte_off = _val(mul(ArithValue(off), unit))
+    byte_off = _val(mul(ArithValue(_val(_narrow(ArithValue(off)))), unit))
     m = _mask(mask)
     if m is None:
         zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
@@ -1689,7 +1735,7 @@ def copysign(a, b):
 
 def ldexp(x, n):
     k = _float_kind(x)
-    return _ocml(f"ldexp_{k}", k, _val(to(x, k)), _val(idx(n)))
+    return _ocml(f"ldexp_{k}", k, _val(to(x, k)), _val(idx32(n)))
 
 
 def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs):
@@ -1774,8 +1820,8 @@ def _philox(seed, offset, c1=None, c2=None, c3=None):
         T.i32(),
         _arith.ShRUIOp(s, _val(const(32, "i64"))).result,
     ).result
-    c0 = _val(idx(offset))
-    c1, c2, c3 = (None if c is None else _val(idx(c)) for c in (c1, c2, c3))
+    c0 = _val(idx32(offset))
+    c1, c2, c3 = (None if c is None else _val(idx32(c)) for c in (c1, c2, c3))
     a, b = _u32c(_PHILOX_ROUND_A), _u32c(_PHILOX_ROUND_B)
     ka, kb = _u32c(_PHILOX_KEY_A), _u32c(_PHILOX_KEY_B)
 
@@ -1856,7 +1902,7 @@ def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
     (counter: 64-bit offset block, 64-bit subsequence), so a compiled ``rand`` matches
     eager's under ``config.align_random_eager``."""
     denom = vec * threads_per_round
-    t = _val(idx(tid))
+    t = _val(idx32(tid))
     i32 = lambda c: _val(const(c, "i32"))
     t_round = _arith.DivUIOp(t, i32(denom)).result
     t_trunc = _arith.RemUIOp(t, i32(denom)).result
@@ -1947,7 +1993,7 @@ def _shfl(x, off, width: int, mode: str = "xor"):
 
     def one(word):
         return ShuffleOp(
-            word, _val(idx(off)), _val(fx.Int32(width)), mode=mode
+            word, _val(idx32(off)), _val(fx.Int32(width)), mode=mode
         ).shuffleResult
 
     words = _to_words(x)
@@ -2219,12 +2265,12 @@ def tile_put(smem, base: int, plane: int, off, value):
     """Park ``value`` at word ``off`` of a staged tile starting at ``base``; a 64-bit
     value's second word goes one ``plane`` further on."""
     for i, word in enumerate(_to_words(_canon(value))):
-        fx.memref_store(ArithValue(word), smem, idx(off) + (base + i * plane))
+        fx.memref_store(ArithValue(word), smem, idx32(off) + (base + i * plane))
 
 
 def tile_get(smem, base: int, plane: int, off, k: str):
     words = [
-        _val(ArithValue(fx.memref_load(smem, idx(off) + (base + i * plane))))
+        _val(ArithValue(fx.memref_load(smem, idx32(off) + (base + i * plane))))
         for i in range(2 if k in ("i64", "f64") else 1)
     ]
     return _from_words(words, k)

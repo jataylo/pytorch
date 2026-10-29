@@ -225,7 +225,11 @@ class FlyDSLSIMDPrinter(PythonPrinter):
     def _print_Integer(self, expr):
         v = int(expr)
         if not -_I32_LIMIT <= v <= _I32_LIMIT:
-            raise FlyDSLUnsupported("index constant outside int32")
+            kernel = V.kernel
+            if not isinstance(kernel, FlyDSLKernel) or kernel.is_dynamic:
+                raise FlyDSLUnsupported("index constant outside int32")
+            kernel.wide = True
+            return f"fdp.ic({v})"
         return str(v)
 
     def _print_FloorDiv(self, expr):
@@ -901,9 +905,12 @@ class FlyDSLKernel(SIMDKernel):
         # Tile edges along the fast and slow dimensions.
         self.tile_f = self.tile_s = TILE
         self.staged: list[dict[str, Any]] = []
+        # i64 index values, for 2**31 elements or more (a buffer or index constant past
+        # them sets it too); buffers under 2 GiB still take i32 descriptor offsets.
+        self.wide = False
         if not self.is_dynamic:
             if self.xnumel * self.rnumel * self.ynumel > _I32_LIMIT:
-                raise FlyDSLUnsupported("more than 2**31 elements")
+                self.wide = True
         else:
             # i32 offsets, as Inductor guards for Triton's 32-bit indexing; the bound
             # leaves room for a mask's block-sized overshoot.
@@ -2508,9 +2515,12 @@ class FlyDSLKernel(SIMDKernel):
                     f"for r0_offset in range_constexpr(0, {self.rnumel}, {self.rstep}):"
                 )
             else:
+                # FlyDSL loops count in i32; a wide kernel's index values are i64.
                 self.body.writeline(
-                    f"for r0_offset in range(fx.Int32(0), {self._rn_loop}, fx.Int32({self.rstep})):"
+                    f"for _ro in range(fx.Int32(0), {self._rn_loop}, fx.Int32({self.rstep})):"
                 )
+                with self.body.indent():
+                    self.body.writeline("r0_offset = fdp.idx(_ro)")
             with self.body.indent():
                 self.body.splice(self.chunk_pre)
                 # A multi-element scan first traces the step for its inputs alone: see
@@ -2629,9 +2639,9 @@ class FlyDSLKernel(SIMDKernel):
                 extents[a] = self.kexpr(self.rename_indexing(nbytes))
                 continue
             if n > _I32_LIMIT:
-                # Offsets are 32-bit element indices; 2 GiB or more is addressed
-                # with 64-bit pointers (fdp._Flat), but 2**31 elements is past them.
-                raise FlyDSLUnsupported("buffer of 2**31 elements or more")
+                if self.is_dynamic:
+                    raise FlyDSLUnsupported("buffer of 2**31 elements or more")
+                self.wide = True
             extents[a] = max(1, n) * node.get_dtype().itemsize
         return extents
 
@@ -2763,6 +2773,10 @@ class FlyDSLKernel(SIMDKernel):
         extents = self._arg_extents(self.arg_names())
         arg_names = self.arg_names()
         extents = self._arg_extents(arg_names)
+        # Emitted first: an index constant past 2**31 printed there makes it wide.
+        inner = IndentedBuffer()
+        inner.writeline("_b = fdp.bid()")
+        self.emit_inner(inner)
         code = _module_prologue(
             arg_names,
             extents,
@@ -2771,10 +2785,10 @@ class FlyDSLKernel(SIMDKernel):
             self.helpers,
             self.threads,
             self.size_args(),
+            self.wide,
         )
         with code.indent():
-            code.writeline("_b = fdp.bid()")
-            self.emit_inner(code)
+            code.splice(inner.getvalue())
         code.splice(
             _module_epilogue(
                 arg_names, grid, self.threads, self.slp, self.size_args()
@@ -2829,7 +2843,7 @@ class FlyDSLKernel(SIMDKernel):
         indents = [len(text_of(li)) - len(text_of(li).lstrip()) for li in body]
         base = min(indents, default=0)
         template.extend(((i - base) // 4, li) for i, li in zip(indents, body))
-        shared = ("for r0_offset in ", "for _j in range_constexpr(")
+        shared = ("for r0_offset in ", "for _ro in ", "for _j in range_constexpr(")
 
         # Parse into statements and shared loops by indentation.
         def parse(i: int, d: int):
@@ -3030,9 +3044,10 @@ class FlyDSLKernel(SIMDKernel):
         loop = contextlib.ExitStack()
         if iters > 1:
             code.writeline(
-                f"for _xc in range(fx.Int32(0), fx.Int32({iters}), fx.Int32(1)):"
+                f"for _xci in range(fx.Int32(0), fx.Int32({iters}), fx.Int32(1)):"
             )
             loop.enter_context(code.indent())
+            code.writeline("_xc = fdp.idx(_xci)")
         self._insert_widen()
         if xr > 1 and self.preload_lines:
             code.writeline("_caches = []")
@@ -3221,6 +3236,7 @@ def _module_prologue(
     helpers: dict[str, str],
     threads: int = THREADS,
     sizes: OrderedSet[str] = OrderedSet(),
+    wide: bool = False,
 ) -> IndentedBuffer:
     """Imports, the LDS struct, and the ``@flyc.kernel`` header up to ``_t``; the caller
     writes the rest of the body at the returned buffer's next indent."""
@@ -3254,6 +3270,7 @@ def _module_prologue(
         code.writeline(f"# runtime {_runtime_fingerprint()}")
         for note in notes:
             code.writeline(f"# {note}")
+        code.writeline(f"fdp.kernel_begin({'wide=True' if wide else ''})")
         for a in arg_names:
             if a in sizes:
                 code.writeline(f"{a} = fdp.size_arg({a})")
@@ -3493,6 +3510,7 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
         [k._describe() for k in kernels],
         helpers,
         kernels[0].threads,
+        wide=any(k.wide for k in kernels),
     )
     groups = _merge_identical(
         kernels, inners, OrderedSet(a for a, n in extents.items() if n >= _I32_LIMIT)

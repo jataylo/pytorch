@@ -575,6 +575,21 @@ class TestFlyDSLSIMD(TestCase):
         self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
+    def test_index64(self):
+        # Past 2**31 elements the index values are i64 (descriptors keep i32 offsets).
+        if torch.cuda.mem_get_info()[0] < 24 * 2**30:
+            self.skipTest("needs 24 GiB free")
+        n = 2**31 + 4096
+        x = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+        torch.testing.assert_close(torch.compile(lambda a: a * 2 + 1)(x), x * 2 + 1)
+        x2 = x.view(n // 4096, 4096)
+        fn = lambda a: a.float().softmax(-1).sum(-1)  # noqa: E731
+        torch.testing.assert_close(torch.compile(fn)(x2), fn(x2), atol=1e-3, rtol=1e-3)
+        fn = lambda a: a[n - 8192 :] * 3  # noqa: E731
+        torch.testing.assert_close(torch.compile(fn)(x), fn(x))
+        self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     @config.patch(align_random_eager=True)
     def test_rand_eager(self):
         # Eager's Philox stream: a compiled f32 dropout's mask is eager's, bit for bit.
