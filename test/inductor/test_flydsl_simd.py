@@ -354,7 +354,7 @@ class TestFlyDSLSIMD(TestCase):
         a = torch.randn(1000, 777, device="cuda")
         self.check(lambda x: x.sum(0), a, atol=1e-3, kinds=["reduction"])
 
-    @parametrize("cols,two", [(1024, False), (768, True)])
+    @parametrize("cols,two", [(1024, False), (768, True), (2048, False)])
     def test_mix_order_reduction(self, cols, two):
         # A row and a column reduction of the same input (a norm's backward) fuse into
         # one mix-order kernel, its column partials summed by a second.

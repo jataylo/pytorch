@@ -1336,6 +1336,21 @@ class FlyDSLKernel(SIMDKernel):
                 tpr = WAVE
             elif (
                 tpr > WAVE
+                and not self.mix_order_reduction
+                and not self._pure_reduction()
+                and self.rnumel % PERSISTENT_MAX_UNROLL == 0
+                and WAVE < (fit := self.rnumel // PERSISTENT_MAX_UNROLL) <= self.threads
+                and fit & (fit - 1) == 0
+            ):
+                # Rows a whole number of power-of-two waves hold in registers, a full
+                # unroll a lane: a normalization reads its row more than once, which the
+                # one-step loop goes back to L2 for. A 4096-wide bf16 RMSNorm 107us ->
+                # 93us (Triton 147us) and its backward 95us -> 57us; 2048-wide 53us ->
+                # 47us and 74us -> 65us. Not 1536 or 3072 wide, masked to 12 a lane.
+                tpr = fit
+            elif (
+                tpr > WAVE
+                and not self.mix_order_reduction
                 and self.rnumel % (WAVE * self.ept) == 0
                 and self.rnumel <= WAVE * self.ept * ONE_STEP_MAX_RUNS
                 and not any(t.startswith("welford") for t in self._reduction_types())
@@ -1344,7 +1359,9 @@ class FlyDSLKernel(SIMDKernel):
                 # re-reads the row from L2 rather than holding it, and the reduction
                 # needs no LDS or barrier. 154us vs 165us on a 4096-wide bf16 RMSNorm,
                 # 99us vs 112us on an amax. A welford instead pays for its looped
-                # (online) form: 254us vs 147us on a LayerNorm of the same shape.
+                # (online) form: 254us vs 147us on a LayerNorm of the same shape. Nor
+                # a mix-order reduction, which needs its row held: a 32768 x 2048 RMSNorm
+                # backward went to Triton's otherwise, 235us vs 184us.
                 tpr = WAVE
                 self.one_step = True
             self.tpr = _tune("row_tpr", tpr)
