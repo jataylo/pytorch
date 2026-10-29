@@ -1321,6 +1321,39 @@ def bucketize(
     return to(lo, out)
 
 
+def bsearch_steps(size):
+    """Halvings a search over ``size`` boundaries takes: ``size``'s bit length."""
+    from flydsl._mlir.dialects import math as _mlir_math
+
+    s = _val(idx32(size))
+    clz = _mlir_math.CountLeadingZerosOp(s).result
+    return ArithValue(_arith.SubIOp(_val(const(32, "i32")), clz).result)
+
+
+def bsearch_init(size):
+    return const(0, _INDEX[0]), idx(size)
+
+
+def bsearch_step(
+    lo, hi, r, st, values, base, size, numel, stride, right, sr, sst, sstride, sbase,
+    mask=None,
+):
+    """One step of ``bucketize`` for a size known only at run time, in a loop of
+    ``bsearch_steps(size)``; a search already settled (``lo == hi``) stays put."""
+    v = _canon(values)
+    live = lt(lo, hi)
+    mid = idiv(add(lo, hi), 2)
+    m = land(lt(add(mul(mid, stride), base), numel), lt(mid, size), mask, live)
+    at = mid if sr is None else load(sr, add(sbase, mul(mid, sstride)), sst, mask=m)
+    b = load(r, add(base, mul(at, stride)), st, mask=m)
+    above = ge(v, b) if right else gt(v, b)
+    if _is_f(kind(v)):
+        above = logical_or(above, ne(v, v))
+    lo = where(land(above, m), add(mid, 1), lo)
+    hi = where(logical_or(above, logical_not(live)), hi, mid)
+    return idx(lo), idx(hi)
+
+
 def bucketize_lds(smem, base, size, k, values, right, out):
     """``bucketize`` against one table of ``size`` elements (compute kind ``k``)
     staged at word ``base`` of LDS."""
@@ -2168,16 +2201,24 @@ def scan_init(*kinds):
     return tuple(const(0, k) for k in kinds)
 
 
-def group_scan(fn, values, carry, first, tpr: int, lane):
+def group_scan(
+    fn, values, carry, first, tpr: int, lane, smem=None, base: int = 0, split=None
+):
     """Inclusive scan of one value per thread over each group of ``tpr`` consecutive
-    lanes (at most a wave), continuing from ``carry``, the previous runs' total.
+    lanes, continuing from ``carry``, the previous runs' total. A group wider than a
+    wave goes through LDS at word ``base`` of ``smem`` (``scan_smem_words``).
 
     ``fn(earlier, later)`` is the combine on tuples. Returns the scanned values followed
     by the carry for the next run, as one flat tuple. ``first`` (a trace-time or device
     bool) discards ``carry``.
     """
-    out, nxt = _group_scan(fn, values, carry, first, tpr, lane)
+    out, nxt = _group_scan(fn, values, carry, first, tpr, lane, smem, base, split)
     return (*out, *nxt)
+
+
+def scan_smem_words(threads: int, components: int) -> int:
+    """LDS words ``group_scan`` needs: two per component per wave."""
+    return threads // WAVE * components * 2
 
 
 def group_scan_runs(
@@ -2192,6 +2233,9 @@ def group_scan_runs(
     j: int,
     ept: int,
     phase: int,
+    smem=None,
+    base: int = 0,
+    split=None,
 ):
     """``group_scan`` where each thread owns runs of ``ept`` contiguous elements.
 
@@ -2209,9 +2253,15 @@ def group_scan_runs(
         pre = [state[(key, run, 0)]]
         for k in range(1, ept):
             pre.append(tuple(_canon(v) for v in fn(pre[-1], state[(key, run, k)])))
-        inc, nxt = _group_scan(fn, pre[-1], carry, first, tpr, lane)
-        # inc is inclusive of this lane's total; the lane before holds the exclusive.
+        inc, nxt, before = _group_scan_waves(
+            fn, pre[-1], carry, first, tpr, lane, smem, base
+        )
+        # inc is inclusive of this lane's total; the lane before holds the exclusive,
+        # unless that lane is in the wave before.
         ex = tuple(_shfl(v, 1, WAVE, "up") for v in inc)
+        if before is not None:
+            wave_head = eq(_tid() % WAVE, 0)
+            ex = tuple(where(wave_head, b, e) for b, e in zip(before, ex))
         lead = eq(lane, 0)
         outs = []
         for p in pre:
@@ -2226,34 +2276,204 @@ def group_scan_runs(
                     else tuple(where(first, a, b) for a, b in zip(p, c))
                 )
             outs.append(tuple(where(lead, h, a) for h, a in zip(head, after)))
+        if split is not None:
+            at = base + scan_smem_words(tpr, len(nxt))
+            pre = _split_lookback(fn, nxt, smem, at, split)
+            later = ne(split[2], 0)
+            outs = [
+                tuple(where(later, s, o) for s, o in zip(fn(pre, out), out))
+                for out in outs
+            ]
         state[(key, run, "out")] = (outs, nxt)
     outs, nxt = state[(key, run, "out")]
     return (*outs[e], *nxt)
 
 
-def _group_scan(fn, values, carry, first, tpr: int, lane):
+def _group_scan(
+    fn, values, carry, first, tpr: int, lane, smem=None, base: int = 0, split=None
+):
+    out, nxt, _ = _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base)
+    if split is not None:
+        out = _split_offset(fn, out, nxt, smem, base, tpr, len(out), split)
+    return out, nxt
+
+
+# Words of a chunk's slot in a split scan's workspace: [flag, aggregate (2 words),
+# inclusive prefix (2 words)], padded. Flag 0: not yet published, 1: aggregate, 2: both.
+SPLIT_SLOT_WORDS = 8
+
+
+def split_ws_bytes(chunks) -> int:
+    return chunks * SPLIT_SLOT_WORDS * 4
+
+
+def _split_offset(fn, out, total, smem, base, tpr, n, split):
+    """Offset the block's scanned values ``out`` by the chunks of the row before it."""
+    pre = _split_lookback(fn, total, smem, base + scan_smem_words(tpr, n), split)
+    later = ne(split[2], 0)
+    return tuple(where(later, s, o) for s, o in zip(fn(pre, out), out))
+
+
+def split_smem_words(threads: int, components: int) -> int:
+    """LDS words a split scan needs: ``group_scan``'s, then the broadcast prefix."""
+    return scan_smem_words(threads, components) + 2 * components
+
+
+def _split_lookback(fn, total, smem, at: int, split):
+    """Decoupled look-back (Merrill & Garland): thread 0 publishes this chunk's total,
+    folds in the earlier chunks' -- an aggregate each, back to one whose inclusive
+    prefix is out -- then publishes its own inclusive prefix. Returns the exclusive
+    prefix, to every thread through LDS at word ``at``. ``split`` is (workspace raw
+    address, this chunk's slot, its index in the row); slots are zero-filled, and
+    a row's chunks are consecutive slots, dispatched in order.
+    """
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    ws, slot, chunk = split
+    r = _Flat(_val(to(ws, "i64")))
+    total = tuple(_canon(v) for v in total)
+    kinds = [kind(t) for t in total]
+    n = len(total)
+    i32 = T.i32()
+    i1 = ir.IntegerType.get_signless(1)
+    order = _llvm.AtomicOrdering
+
+    def ptr(s, w):
+        return _flat_ptr(r, ArithValue(s) * SPLIT_SLOT_WORDS + w, 4)
+
+    def c32(v):
+        return _arith.ConstantOp(i32, ir.IntegerAttr.get(i32, v)).result
+
+    def flag_store(s, f):
+        _llvm.StoreOp(
+            f, ptr(s, 0), ordering=order.release, syncscope="agent", alignment=4
+        )
+
+    def emit():
+        me = _val(idx32(slot))
+        first = _val(eq(chunk, 0))
+        words = [w for t in total for w in _to_words(t)]
+        for i, w in enumerate(words):
+            _llvm.StoreOp(w, ptr(me, 1 + i), alignment=4)
+            _llvm.StoreOp(w, ptr(me, 3 + i), alignment=4)
+        flag_store(me, _arith.SelectOp(first, c32(2), c32(1)).result)
+        acc0 = [_val(t) for t in total]
+        types = [i32, i1, *[a.type for a in acc0]]
+        prev = _arith.SubIOp(me, c32(1)).result
+        loop = _scf.WhileOp(types, [prev, first, *acc0])
+        before = loop.before.blocks.append(*types)
+        with ir.InsertionPoint(before):
+            done = before.arguments[1]
+            go = _arith.XOrIOp(done, _val(const(True, "b1"))).result
+            _scf.ConditionOp(go, list(before.arguments))
+        after = loop.after.blocks.append(*types)
+        with ir.InsertionPoint(after):
+            k, _, *acc = after.arguments
+            flag = _llvm.LoadOp(
+                i32, ptr(k, 0), ordering=order.acquire, syncscope="agent", alignment=4
+            ).result
+            ready = _val(ne(ArithValue(flag), 0))
+            inclusive = _val(eq(ArithValue(flag), 2))
+            vals, w = [], 0
+            for kd in kinds:
+                nw = 2 if kd in ("i64", "f64") else 1
+                ws_ = []
+                for i in range(nw):
+                    a = _llvm.LoadOp(i32, ptr(k, 1 + w + i), alignment=4).result
+                    b = _llvm.LoadOp(i32, ptr(k, 3 + w + i), alignment=4).result
+                    ws_.append(_arith.SelectOp(inclusive, b, a).result)
+                vals.append(_canon(_from_words(ws_, kd)))
+                w += nw
+            # The first chunk found starts the accumulation; acc holds this chunk's
+            # total until then.
+            started = _val(ne(ArithValue(k), ArithValue(prev)))
+            comb = fn(tuple(vals), tuple(ArithValue(a) for a in acc))
+            nxt = []
+            for a, v, c in zip(acc, vals, comb):
+                folded = _arith.SelectOp(started, _val(_canon(c)), _val(v)).result
+                nxt.append(_arith.SelectOp(ready, folded, a).result)
+            k2 = _arith.SelectOp(ready, _arith.SubIOp(k, c32(1)).result, k).result
+            _scf.YieldOp([k2, inclusive, *nxt])
+        pre = tuple(ArithValue(v) for v in loop.results[2:])
+        inc = tuple(_canon(v) for v in fn(pre, total))
+        # Only a later chunk publishes again; the first's inclusive prefix is out.
+        def publish():
+            for i, w in enumerate(x for t in inc for x in _to_words(t)):
+                _llvm.StoreOp(w, ptr(me, 3 + i), alignment=4)
+            flag_store(me, c32(2))
+
+        _when(_arith.XOrIOp(first, _val(const(True, "b1"))).result, publish)
+        for c, p in enumerate(pre):
+            tile_put(smem, at, 1, 2 * c, p)
+
+    _when(_val(eq(_tid(), 0)), emit)
+    barrier()
+    return tuple(tile_get(smem, at, 1, 2 * c, kinds[c]) for c in range(n))
+
+
+def _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base):
+    """``_group_scan``, plus (for a group of several waves) what precedes each wave:
+    the carry and the totals of the waves before it, for its first lane."""
     xs = tuple(_canon(v) for v in values)
+    width = min(tpr, WAVE)
+    wl = _tid() % WAVE if tpr > WAVE else lane
     off = 1
-    while off < tpr:
+    while off < width:
         ys = tuple(_shfl(x, off, WAVE, "up") for x in xs)
         comb = fn(ys, xs)
-        ok = ge(lane, off)
+        ok = ge(wl, off)
         xs = tuple(where(ok, c, x) for c, x in zip(comb, xs))
         off *= 2
-    if tpr > 1:
-        last = _tid() % WAVE - lane + (tpr - 1)
+    if width > 1:
+        last = _tid() % WAVE - wl + (width - 1)
         total = tuple(_shfl(x, last, WAVE, "idx") for x in xs)
     else:
         total = xs
+    before = None
+    if tpr > WAVE:
+        # The waves' totals through LDS (every lane of a wave writes the same words),
+        # then each wave folds in those of the waves before it.
+        nw, n = tpr // WAVE, len(xs)
+        kinds = [kind(t) for t in total]
+        wave = _tid() // WAVE
+        w = wave % nw
+        row0 = wave - w
+
+        def slot(wv, c):
+            return (wv * n + c) * 2
+
+        barrier()
+        for c, t in enumerate(total):
+            tile_put(smem, base, 1, slot(wave, c), t)
+        barrier()
+        totals = [
+            tuple(tile_get(smem, base, 1, slot(row0 + k, c), kinds[c]) for c in range(n))
+            for k in range(nw)
+        ]
+        acc, pre = totals[0], totals[0]
+        for k in range(1, nw):
+            pre = tuple(where(eq(w, k), a, p) for a, p in zip(acc, pre))
+            acc = tuple(_canon(v) for v in fn(acc, totals[k]))
+        later = ge(w, 1)
+        xs = tuple(
+            where(later, s, x) for s, x in zip(fn(pre, xs), xs)
+        )
+        before, total = pre, acc
     if first is True:
-        return xs, total
+        return xs, total, before
     full = tuple(_canon(v) for v in fn(carry, xs))
     nxt = tuple(_canon(v) for v in fn(carry, total))
+    if before is not None:
+        before_c = tuple(_canon(v) for v in fn(carry, before))
+        if first is not False:
+            before_c = tuple(where(first, b, c) for b, c in zip(before, before_c))
+        before = before_c
     if first is False:
-        return full, nxt
+        return full, nxt, before
     return (
         tuple(where(first, x, f) for x, f in zip(xs, full)),
         tuple(where(first, t, n) for t, n in zip(total, nxt)),
+        before,
     )
 
 

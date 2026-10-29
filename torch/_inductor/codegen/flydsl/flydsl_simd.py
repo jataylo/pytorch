@@ -118,6 +118,20 @@ PERSISTENT_MAX_UNROLL = 16
 DYNAMIC_RNUMEL = 1 << 16
 # Elements of a bucketize table staged in LDS (two words each): 16 KB at most.
 LDS_TABLE_MAX = 2048
+# Columns a scan along a strided dimension needs before each gets a thread of its own.
+SCAN_COLUMN_MIN = 8192
+# Waves per CU a row scan aims for before rows widen past a wave.
+SCAN_TARGET_WAVES = 16
+# The widest such row, in threads (the block grows to it): 8x100000 f32 cumsum takes
+# 68 us at 256, 44 us at 512, 42 us at 1024 (Triton 27 us).
+SCAN_MAX_THREADS = 1024
+# Chunks a row needs before Inductor's split scan takes a block per chunk.
+SPLIT_SCAN_MIN_CHUNKS = 4
+# Elements a thread of a split scan takes: a row's prefix crosses the chunks one
+# look-back at a time (~0.5 us each), so the fewer the better. 1M f32 cumsum: ept 4
+# 134 us, 8 74 us, 16 48 us, 32 44 us (Triton 46 us).
+SPLIT_SCAN_EPT = 16
+SPLIT_SLOT_WORDS = 8  # a chunk's workspace slot: fdp.SPLIT_SLOT_WORDS
 ONE_STEP_MAX_RUNS = 8  # vector runs per thread in a one-step looped row reduction
 # Preloaded f16/bf16 elements a thread converts to f32 ahead of the reduction (fdp.widen).
 WIDEN_MAX_ELEMENTS = 32
@@ -238,6 +252,17 @@ class FlyDSLSIMDPrinter(PythonPrinter):
         return f"fdp.idiv({self._print(x)}, {self._print(div)})"
 
     _print_CleanDiv = _print_FloorDiv
+
+    def _print_floor(self, expr):
+        # `(s0 + 15) // 16` written in sympy: floor(s0/16 + 15/16).
+        num, den = sympy.fraction(sympy.together(expr.args[0]))
+        if not den.is_Integer or den <= 0:
+            raise FlyDSLUnsupported(f"index expression {expr}")
+        if den == 1:
+            # pyrefly: ignore [missing-attribute]
+            return self._print(num)
+        # pyrefly: ignore [missing-attribute]
+        return f"fdp.idiv({self._print(sympy.expand(num))}, {int(den)})"
 
     def _print_ModularIndexing(self, expr):
         x, div, mod = expr.args
@@ -716,6 +741,21 @@ def _int_or_none(e) -> int | None:
         return None
 
 
+# Dynamic sizes a kernel variant may take to be multiples of 16, as Triton specializes
+# integer arguments divisible by 16; ``_main`` picks that variant when they are.
+SIZE_ALIGN = 16
+_ASSUME_ALIGNED = [False]
+
+
+@contextlib.contextmanager
+def _assume_aligned():
+    _ASSUME_ALIGNED[0] = True
+    try:
+        yield
+    finally:
+        _ASSUME_ALIGNED[0] = False
+
+
 def _multiple(e, w: int) -> bool:
     """Whether ``e`` is a multiple of ``w``: provably, for a size expression."""
     v = _int_or_none(e)
@@ -725,6 +765,14 @@ def _multiple(e, w: int) -> bool:
         sizevars = V.graph.sizevars
         # A precomputed size (``ps0``) stands for its expression: `64 * s0`, say.
         e = sympy.sympify(e).xreplace(sizevars.inv_precomputed_replacements)
+        if _ASSUME_ALIGNED[0]:
+            e = e.xreplace(
+                {
+                    s: SIZE_ALIGN * s
+                    for s in e.free_symbols
+                    if symbol_is_type(s, SymT.SIZE)
+                }
+            )
         return bool(sizevars.statically_known_multiple_of(e, w))
     except Exception:
         return False
@@ -971,6 +1019,8 @@ class FlyDSLKernel(SIMDKernel):
             False  # a scan over runs of ept > 1 elements: two traced passes
         )
         self.has_scan = False
+        self.scan_components = 0  # of the widest scan whose rows span several waves
+        self.split_chunks = 0  # blocks a row of a split scan takes (_finalize_scan)
         self.rstep = 1
         self.load_site = 0
         self.region = 0  # bumped per flushed scf.for loop: see _site_key
@@ -1135,20 +1185,57 @@ class FlyDSLKernel(SIMDKernel):
             self.stride = 1
             # Runs of ept contiguous elements: one vector load each, scanned in
             # registers, with one cross-lane scan per run.
-            self.ept = _tune(
-                "ept", _largest_pow2_dividing(self.rnumel, min(4, widest_vec))
-            )
+            self.ept = _tune("ept", self._r_pow2_dividing(min(4, widest_vec)))
             runs = -(-self.rnumel // self.ept)
-            self.tpr = _tune("row_tpr", min(WAVE, _pow2_ceil(runs)))
+            # Too few rows to fill the GPU with a wave each: rows of several waves,
+            # their totals exchanged through LDS.
+            lanes = SCAN_TARGET_WAVES * _num_cus() * WAVE
+            span = _pow2_floor(max(1, lanes // self.xnumel))
+            span = max(WAVE, min(_tune("scan_max_threads", SCAN_MAX_THREADS), span))
+            self.tpr = _tune("row_tpr", min(span, _pow2_ceil(runs)))
+            self.threads = max(self.threads, self.tpr)
             self.rpb = self.threads // self.tpr
+            split_ept = _tune("ept", SPLIT_SCAN_EPT)
+            chunks = -(-self.rnumel // (self.tpr * split_ept))
+            if self._split_scan_ok() and self.tpr > WAVE and chunks >= _tune(
+                "split_scan_min_chunks", SPLIT_SCAN_MIN_CHUNKS
+            ):
+                # A block a chunk of the row, chained by fdp's decoupled look-back.
+                self.split_chunks, self.ept = chunks, split_ept
+                self.persistent, self.unroll = True, 1
+                self.rstep = self.tpr * self.ept
+                return
         iters = -(-self.rnumel // (self.tpr * self.ept))
-        self.persistent = iters * self.ept <= PERSISTENT_MAX_UNROLL
+        # A dynamic row (DYNAMIC_RNUMEL long here) loops: masked, its carry passed on.
+        self.persistent = (
+            self.rnumel_dyn is None and iters * self.ept <= PERSISTENT_MAX_UNROLL
+        )
         if not self.persistent:
             self.unroll = _tune(
                 "row_unroll",
                 max(1, min(4, PERSISTENT_MAX_UNROLL // self.ept, iters // 2)),
             )
         self.rstep = self.tpr * self.ept * self.unroll
+
+    def _split_scan_ok(self) -> bool:
+        """Inductor split this scan (``ir.SplitScan``: one value, a long row), and the
+        kernel has nothing a chunk of the row could not compute alone."""
+        nodes = list(self.features.scheduler_nodes())
+        return (
+            self.rnumel_dyn is None
+            and self.xnumel_dyn is None
+            and any(n.is_split_scan() for n in nodes)
+            and all(n.is_split_scan() or not n.is_reduction() for n in nodes)
+        )
+
+    @property
+    def _r_base(self) -> str:
+        return "_rc0 + " if self.split_chunks else ""
+
+    @property
+    def _r_extent(self) -> int:
+        """The part of the row a block's persistent loop covers."""
+        return self.rstep if self.split_chunks else self.rnumel
 
     def _tile_counts(self) -> tuple[int, int]:
         """Tiles along (fast, slow)."""
@@ -1347,9 +1434,15 @@ class FlyDSLKernel(SIMDKernel):
             classify_access(e, x, 2) == "contig" for e in votes if r in e.free_symbols
         )
         if self.features.contains_op("scan"):
-            if self.rnumel_dyn is not None:
-                raise FlyDSLUnsupported("scan over a dynamic length")
-            self._finalize_scan(x_contig > r_contig, widest_vec)
+            # A column per thread only with columns to fill the GPU: otherwise the
+            # row's lanes share each column, its loads gathered. cumsum(0) of 8192 x 64
+            # f32 2854us -> 100us (Triton 43us), 100000 x 8 22.4ms -> 0.68ms, 8192 x
+            # 4096 3.3ms -> 2.5ms (Triton 2.7ms); 64 x 65536 stays a column's (25us
+            # against 100us).
+            column = x_contig > r_contig and self.xnumel >= _tune(
+                "scan_column_min", SCAN_COLUMN_MIN
+            )
+            self._finalize_scan(column, widest_vec)
             return
         gather = False
         if x_contig > r_contig:
@@ -1630,6 +1723,8 @@ class FlyDSLKernel(SIMDKernel):
     def _xmask(self) -> str | None:
         if self.tile2d:
             return None if self._dim_multiple("x", self._tile_edge("x")) else "xmask"
+        if self.mix_order_reduction:
+            return None if self._x_multiple(self.rsplit_size) else "xmask"
         if self.is_reduction_kernel:
             block = self.rpb * self.xunroll * self.cpair
         else:
@@ -2046,12 +2141,25 @@ class FlyDSLKernel(SIMDKernel):
         self.has_scan = True
         if self._load_mask:
             raise FlyDSLUnsupported("scan inside ops.masked")
-        if self.tpr * self.stride > self.threads or self.tpr > WAVE:
+        if self.tpr * self.stride > self.threads or (
+            self.tpr > WAVE and self.tpr % WAVE
+        ):
             raise FlyDSLUnsupported("scan layout")
         dtypes = tuple(upcast_compute_type(d) for d in dtypes)
         fn = self._lift_combine(combine_fn, len(values), dtypes)
         self.acc_counter += 1
         n = len(values)
+        waves = ""
+        if self.tpr > WAVE:
+            self.scan_components = max(self.scan_components, n)
+            waves = ", smem=_smem, base=_sb"
+        if self.split_chunks:
+            nbytes = self.xnumel * self.split_chunks * SPLIT_SLOT_WORDS * 4
+            ws, _, off = self.args.workspace(nbytes, True)
+            if off % (4 * SPLIT_SLOT_WORDS):
+                raise FlyDSLUnsupported("split scan workspace offset")
+            slot = f"_b + {off // (4 * SPLIT_SLOT_WORDS)}"
+            waves += f", split=({ws}, {slot}, _chunk)"
         carries = [f"_scan{self.acc_counter}_c{i}" for i in range(n)]
         kinds = ", ".join(repr(compute_kind(d)) for d in dtypes)
         self.body.writeline(f"{', '.join(carries)}, = fdp.scan_init({kinds})")
@@ -2066,10 +2174,10 @@ class FlyDSLKernel(SIMDKernel):
             self.scan_runs = True
             key = f"scan{self.acc_counter}"
             self.compute.writeline(
-                f"{head}({args}, _sc, {key!r}, _j, {self.ept}, {SCAN_PHASE})"
+                f"{head}({args}, _sc, {key!r}, _j, {self.ept}, {SCAN_PHASE}{waves})"
             )
         else:
-            self.compute.writeline(f"{head}({args})")
+            self.compute.writeline(f"{head}({args}{waves})")
         return tuple(results)
 
     def _lift_combine(self, combine_fn, n: int, dtypes) -> str:
@@ -2119,12 +2227,15 @@ class FlyDSLKernel(SIMDKernel):
         sizes = [boundaries[1], boundaries[2], boundaries[3]]
         if sorter:
             sizes.append(sorter[1])
-        if not all(sympy.sympify(s).is_Integer for s in sizes):
-            raise FlyDSLUnsupported("bucketize over a dynamic size")
-        size, numel, stride = (int(s) for s in sizes[:3])
         mask = self._mask_arg(self._masks())
         barg = self.args.input(boundaries[0])
         bst = storage_kind(V.graph.get_dtype(boundaries[0]))
+        if not all(sympy.sympify(s).is_Integer for s in sizes):
+            return self._bucketize_dynamic(
+                values, barg, bst, boundary_indices, sizes, right, sorter,
+                sorter_indices, indexing_dtype, mask,
+            )
+        size, numel, stride = (int(s) for s in sizes[:3])
         if (
             not sorter
             and numel == size
@@ -2165,18 +2276,54 @@ class FlyDSLKernel(SIMDKernel):
             self.compute, f"fdp.bucketize({', '.join(args)}{mask})", dtype=indexing_dtype
         )
 
+    def _bucketize_dynamic(
+        self, values, barg, bst, boundary_indices, sizes, right, sorter,
+        sorter_indices, indexing_dtype, mask,
+    ):
+        """``bucketize`` over a table sized at run time: a loop of ``bit_length(size)``
+        search steps, as Triton's ``while`` over the range."""
+        size, numel, stride = (
+            self.kexpr(self.rename_indexing(sympy.sympify(s))) for s in sizes[:3]
+        )
+        srt = ["None", "None", "None", "None"]
+        if sorter:
+            srt = [
+                f"_r_{self.args.input(sorter[0])}",
+                repr(storage_kind(V.graph.get_dtype(sorter[0]))),
+                self.kexpr(self.rename_indexing(sympy.sympify(sorter[1]))),
+                str(sorter_indices),
+            ]
+        lo, hi = self.cse.newvar(dtype=torch.int64), self.cse.newvar(dtype=torch.int64)
+        step_args = ", ".join(
+            [f"_r_{barg}", repr(bst), str(values), str(boundary_indices), size, numel,
+             stride, str(bool(right)), *srt]
+        )
+        self.compute.writeline(f"{lo}, {hi} = fdp.bsearch_init({size})")
+        self.compute.writeline(
+            f"for _bk in range(fx.Int32(0), fdp.bsearch_steps({size}), fx.Int32(1)):"
+        )
+        with self.compute.indent():
+            self.compute.writeline(
+                f"{lo}, {hi} = fdp.bsearch_step({lo}, {hi}, {step_args}{mask})"
+            )
+        return self.cse.generate(
+            self.compute,
+            f"fdp.to({lo}, {compute_kind(indexing_dtype)!r})",
+            dtype=indexing_dtype,
+        )
+
     def _finalize_mix_order(self) -> None:
         """A block runs ``rsplit_size`` rows over ``rpb`` row groups, each of its rows
         unrolled ``xunroll`` at a time with every row's loads issued first, then
         combines the groups' column partials through LDS into one workspace row."""
         split = self.rsplit_size
-        if self.xnumel_dyn is not None or self.rnumel_dyn is not None:
-            raise FlyDSLUnsupported("mix-order reduction over a dynamic extent")
+        if self.rnumel_dyn is not None:
+            raise FlyDSLUnsupported("mix-order reduction over a dynamic row")
+        # A last block's rows past xnumel are masked, their partials the identity.
         if not (
             self.persistent
             and self.stride == 1
             and not self.interleaved
-            and self.xnumel % split == 0
             and self.tpr * split >= WAVE
         ):
             raise FlyDSLUnsupported("mix-order reduction over a looped row")
@@ -2447,13 +2594,13 @@ class FlyDSLKernel(SIMDKernel):
             return
         pre = IndentedBuffer(initial_indent=self._preload_indent)
         pre.writeline(
-            f"for r0_offset in range_constexpr(0, {self.rnumel}, {self.rstep}):"
+            f"for r0_offset in range_constexpr(0, {self._r_extent}, {self.rstep}):"
         )
         with pre.indent():
             pre.writeline(f"for _j in range_constexpr({self.ept * self.unroll}):")
             with pre.indent():
                 pre.writeline(
-                    f"r0_index = r0_offset + (_j // {self.ept}) * {self.tpr * self.ept} "
+                    f"r0_index = {self._r_base}r0_offset + (_j // {self.ept}) * {self.tpr * self.ept} "
                     f"+ _rl * {self.ept} + _j % {self.ept}"
                 )
                 if self._rmask():
@@ -2512,7 +2659,7 @@ class FlyDSLKernel(SIMDKernel):
             if self.persistent:
                 self._queue_preload()
                 self.body.writeline(
-                    f"for r0_offset in range_constexpr(0, {self.rnumel}, {self.rstep}):"
+                    f"for r0_offset in range_constexpr(0, {self._r_extent}, {self.rstep}):"
                 )
             else:
                 # FlyDSL loops count in i32; a wide kernel's index values are i64.
@@ -2534,7 +2681,7 @@ class FlyDSLKernel(SIMDKernel):
                         # vector instruction covers one contiguous span across the row's
                         # threads.
                         self.body.writeline(
-                            f"r0_index = r0_offset + (_j // {self.ept}) * {self.tpr * self.ept} "
+                            f"r0_index = {self._r_base}r0_offset + (_j // {self.ept}) * {self.tpr * self.ept} "
                             f"+ _rl * {self.ept} + _j % {self.ept}"
                         )
                         if self._rmask():
@@ -2616,9 +2763,18 @@ class FlyDSLKernel(SIMDKernel):
                 continue
             if a in workspaces:
                 ws = workspaces[a]
-                n = _int_or_none(V.graph.sizevars.simplify(ws.count))
+                count = V.graph.sizevars.simplify(ws.count)
+                n = _int_or_none(count)
                 if n is None:
-                    raise FlyDSLUnsupported("dynamic workspace")
+                    nbytes = count * ws.dtype.itemsize
+                    if not expr_fits_within_32bit(nbytes):
+                        raise FlyDSLUnsupported("dynamic workspace not known to fit")
+                    V.graph.sizevars.check_leq(nbytes, _I32_LIMIT - 1)
+                    # Unsimplified: simplify turns its FloorDiv into a rational floor.
+                    extents[a] = self.kexpr(
+                        self.rename_indexing(ws.count * ws.dtype.itemsize)
+                    )
+                    continue
                 extents[a] = max(1, n) * ws.dtype.itemsize
                 continue
             buf = name_of.get(a)
@@ -2686,6 +2842,15 @@ class FlyDSLKernel(SIMDKernel):
 
     @property
     def smem_words(self) -> int:
+        n = self.scan_components
+        if self.split_chunks:
+            # Mirrors fdp.split_smem_words.
+            return self._scan_base + 2 * (self.threads // WAVE) * n + 2 * n
+        return self._scan_base + 2 * (self.threads // WAVE) * n
+
+    @property
+    def _scan_base(self) -> int:
+        # Wave totals of a scan wider than a wave: after the body and the tables.
         return self._smem_body_words + sum(
             2 * size for _, size in self.lds_tables.values()
         )
@@ -2723,38 +2888,49 @@ class FlyDSLKernel(SIMDKernel):
         if not self.is_reduction_kernel:
             return -(-self.xnumel // (self.threads * self.ept * self.unroll))
         if self.mix_order_reduction:
-            return self.xnumel // self.rsplit_size
+            return -(-self.xnumel // self.rsplit_size)
+        if self.split_chunks:
+            return self.xnumel * self.split_chunks
         pairs = 2 if self._pair_lines is not None else 1
         return -(-self.xnumel // (self.rpb * self.xunroll * pairs))
 
-    def _grid(self) -> int | str:
-        """``num_blocks``, or for a dynamic extent the expression ``_main`` computes it
-        by from its size arguments."""
+    def _blocks_expr(self) -> sympy.Expr:
+        """``num_blocks`` as an expression in the (renamed) size arguments."""
+
+        def cdiv(n, d: int) -> sympy.Expr:
+            return FloorDiv(n + d - 1, d)
+
         if self.tile2d:
             if self.xnumel_dyn is None and self.ynumel_dyn is None:
-                return self.num_blocks
-
-            def tiles(d: str) -> str:
-                dyn = self.xnumel_dyn if d == "x" else self.ynumel_dyn
-                n = (
-                    (self.xnumel if d == "x" else self.ynumel)
-                    if dyn is None
-                    else PythonPrinter().doprint(self.rename_indexing(dyn))
+                return sympy.Integer(self.num_blocks)
+            ns = {
+                d: dyn if dyn is not None else sympy.Integer(n)
+                for d, dyn, n in (
+                    ("x", self.xnumel_dyn, self.xnumel),
+                    ("y", self.ynumel_dyn, self.ynumel),
                 )
-                return f"(-(-({n}) // {self._tile_edge(d)}))"
-
-            return f"max(1, {tiles('x')} * {tiles('y')})"
+            }
+            return self.rename_indexing(
+                cdiv(ns["x"], self._tile_edge("x")) * cdiv(ns["y"], self._tile_edge("y"))
+            )
         if self.xnumel_dyn is None:
-            return self.num_blocks
+            return sympy.Integer(self.num_blocks)
         if self.mix_order_reduction:
-            raise FlyDSLUnsupported("dynamic grid")
-        if self.is_reduction_kernel:
+            span = self.rsplit_size
+        elif self.is_reduction_kernel:
             pairs = 2 if self._pair_lines is not None else 1
             span = self.rpb * self.xunroll * pairs
         else:
             span = self.threads * self.ept * self.unroll
-        xs = PythonPrinter().doprint(self.rename_indexing(self.xnumel_dyn))
-        return f"max(1, -(-({xs}) // {span}))"
+        return self.rename_indexing(cdiv(self.xnumel_dyn, span))
+
+    def _grid(self) -> int | str:
+        """``num_blocks``, or for a dynamic extent the expression ``_main`` computes it
+        by from its size arguments."""
+        blocks = self._blocks_expr()
+        if blocks.is_Integer:
+            return int(blocks)
+        return f"max(1, {PythonPrinter().doprint(blocks)})"
 
     def arg_names(self) -> list[str]:
         arg_defs, _, _, _ = self.args.python_argdefs()
@@ -2924,6 +3100,8 @@ class FlyDSLKernel(SIMDKernel):
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
         self._emit_lds_tables(code)
+        if self.scan_components:
+            code.writeline(f"_sb = {self._scan_base}")
         if self.tile2d:
             self._emit_tile2d(code)
         elif not self.is_reduction_kernel:
@@ -2966,9 +3144,14 @@ class FlyDSLKernel(SIMDKernel):
                 code.writeline("_xs = {}")
 
             def row_start() -> None:
-                code.writeline(
-                    f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
-                )
+                if self.split_chunks:
+                    code.writeline(f"_chunk = _b % {self.split_chunks}")
+                    code.writeline(f"_rc0 = fdp.idx(_chunk) * {self.rstep}")
+                    code.writeline(f"xindex = _b // {self.split_chunks}")
+                else:
+                    code.writeline(
+                        f"xindex = _b * {self.rpb * self.xunroll} + _xr * {self.rpb} + {lane_x}"
+                    )
                 if self._xmask():
                     code.writeline(f"xmask = xindex < {self._xn}")
 
@@ -3033,6 +3216,8 @@ class FlyDSLKernel(SIMDKernel):
             code.writeline(
                 f"xindex = _b * {split} + ({xc} * {xr} + _xr) * {groups} + {lane_x}"
             )
+            if self._xmask() is not None:
+                code.writeline(f"xmask = xindex < {self._xn}")
 
         def row_end() -> None:
             for i, pa in enumerate(accs):
@@ -3082,9 +3267,18 @@ class FlyDSLKernel(SIMDKernel):
         loop.close()
 
         (ws,) = self.args.workspace_args
-        partials = self.num_blocks
         rnumel = self.rnumel
+        if self.xnumel_dyn is None:
+            partials = str(self.num_blocks)
+        else:
+            split = self.rsplit_size
+            partials = self.kexpr(
+                self.rename_indexing(FloorDiv(self.xnumel_dyn + split - 1, split))
+            )
         code.writeline("_ws = {}")
+
+        def ws_base(i: int) -> str:
+            return f"{i} * {partials} * {rnumel} + " if i else ""
 
         def col_of(step: int, j: int) -> str:
             return f"{step * self.rstep + (j // ept) * self.tpr * ept + j % ept} + _rl * {ept}"
@@ -3100,7 +3294,7 @@ class FlyDSLKernel(SIMDKernel):
                         )
                         code.writeline(
                             f"fdp.vstore(_ws, 'pa{i}_{step}_{j // w}', {j % w}, {w}, "
-                            f"_r_{ws.inner_name}, {i * partials * rnumel} + _b * {rnumel} + {col}, "
+                            f"_r_{ws.inner_name}, {ws_base(i)}_b * {rnumel} + {col}, "
                             f"_pa{i}_{step * per_step + j}, 'f32'{mask})"
                         )
             return
@@ -3132,7 +3326,7 @@ class FlyDSLKernel(SIMDKernel):
                     mask = f", mask=({col}) < {rnumel}" if rnumel % span else ""
                     code.writeline(
                         f"fdp.vstore(_ws, 'f{i}_{c}_{e // w}', {e % w}, {w}, "
-                        f"_r_{ws.inner_name}, {i * partials * rnumel} + _b * {rnumel} + {col}, "
+                        f"_r_{ws.inner_name}, {ws_base(i)}_b * {rnumel} + {col}, "
                         f"_v, 'f32'{mask})"
                     )
 
@@ -3486,11 +3680,59 @@ def _merge_identical(
     return out
 
 
+def _combo_source_dynamic(kernels: list[FlyDSLKernel]) -> str:
+    """``_combo_source`` with sizes known at run time: each kernel a branch of its own
+    (no merged bodies), its block range ending where the size arguments put it."""
+    inners, blocks = [], []
+    for k in kernels:
+        with V.set_kernel_handler(k):
+            k.codegen_body()
+            buf = IndentedBuffer()
+            k.emit_inner(buf)
+            inners.append(buf.getvalue())
+            blocks.append(k._blocks_expr())
+    k0 = kernels[0]
+    arg_names = k0.arg_names()
+    extents = k0._arg_extents(arg_names)
+    code = _module_prologue(
+        arg_names,
+        extents,
+        max(k.smem_words for k in kernels),
+        [k._describe() for k in kernels],
+        {n: s for k in kernels for n, s in k.helpers.items()},
+        k0.threads,
+        k0.size_args(),
+        wide=any(k.wide for k in kernels),
+    )
+    ends = list(itertools.accumulate(blocks))
+    with code.indent():
+        code.writeline("_bid = fdp.bid()")
+        for i, inner in enumerate(inners):
+            if i == len(inners) - 1:
+                code.writeline("else:")
+            else:
+                end = k0.kexpr(ends[i])
+                code.writeline(f"{'if' if i == 0 else 'elif'} _bid < {end}:")
+            with code.indent():
+                if i:
+                    code.writeline(f"_b = _bid - ({k0.kexpr(ends[i - 1])})")
+                else:
+                    code.writeline("_b = _bid")
+                code.splice(inner)
+    grid = f"max(1, {PythonPrinter().doprint(ends[-1])})"
+    code.splice(
+        _module_epilogue(
+            arg_names, grid, k0.threads, all(k.slp for k in kernels), k0.size_args()
+        )
+    )
+    return code.getvalue()
+
+
 def _combo_source(kernels: list[FlyDSLKernel]) -> str:
     """One launch for several kernels sharing a KernelArgs: each owns a contiguous range
     of block ids and runs, with ``_b`` rebased, under a branch on the block id."""
     if any(k.is_dynamic for k in kernels):
-        raise FlyDSLUnsupported("dynamic sizes in a combo kernel")
+        return _combo_source_dynamic(kernels)
     inners = []
     for k in kernels:
         with V.set_kernel_handler(k):
@@ -3619,6 +3861,36 @@ def _autotune_source(
     return code.getvalue()
 
 
+def _dispatch_source(generic: str, aligned: str, arg_names: list[str], sizes) -> str:
+    """One module holding a dynamic kernel built for any sizes (``_c0``) and for sizes
+    all multiples of SIZE_ALIGN (``_c1``), and a ``_main`` choosing by the sizes."""
+    kname = str(Placeholder.KERNEL_NAME)
+    names = [f"{kname}_c0", f"{kname}_c1"]
+    parts = [s.replace(kname, n) for s, n in zip((generic, aligned), names)]
+    args = ", ".join(arg_names)
+    cond = " and ".join(f"{s} % {SIZE_ALIGN} == 0" for s in sizes)
+    parts.append(
+        f"""
+        def {kname}_main({args}, stream=None):
+            if {cond}:
+                {names[1]}_main({args}, stream=stream)
+            else:
+                {names[0]}_main({args}, stream=stream)
+
+
+        def {kname}_precompile(only=None, **kw):
+            if only in (None, 0):
+                {names[0]}_precompile(**kw)
+            if only in (None, 1):
+                {names[1]}_precompile(**kw)
+        """
+    )
+    code = IndentedBuffer()
+    for p in parts:
+        code.splice(p)
+    return code.getvalue()
+
+
 class _DropFallbackErrors(logging.Filter):
     """The scheduler logs every exception out of a node body as fatal before re-raising;
     a FlyDSLUnsupported is the expected signal to use Triton, not an error."""
@@ -3736,7 +4008,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                     self.codegen_node_schedule_with_kernel(
                         kernel_features.node_schedule, kernel
                     )
-                    partials = -(-kernel.xnumel // split_size)
+                    partials = (
+                        kernel_features.numel + split_size - 1
+                    ) // split_size
                     _, ws_name, _ = kernel.args.workspace(
                         len(kernel.saved_partial_accumulate) * partials * kernel.rnumel,
                         False,
@@ -3940,9 +4214,14 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                 src_code = kernel.codegen_kernel()
             if not _stage_enabled(kernel.stage):
                 raise FlyDSLUnsupported(f"stage {kernel.stage} disabled")
-            src_code = self._with_candidates(
-                kernel, src_code, kernel_features, node_schedule, tiling
-            )
+            if kernel.is_dynamic:
+                src_code = self._with_aligned_variant(
+                    kernel, src_code, kernel_features, node_schedule, tiling
+                )
+            else:
+                src_code = self._with_candidates(
+                    kernel, src_code, kernel_features, node_schedule, tiling
+                )
         except FlyDSLUnsupported:
             metrics.generated_kernel_count = count_before
             raise
@@ -4060,6 +4339,40 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             cands, kernel, src_code, kernel_features, node_schedule, tiling
         )
         return memo[src_code]
+
+    def _with_aligned_variant(
+        self, kernel, src_code, kernel_features, node_schedule, tiling
+    ) -> str:
+        """A dynamic kernel, and beside it the variant for sizes that are multiples of
+        SIZE_ALIGN when that one differs (wider runs, fewer masks): a row cumsum over a
+        dynamic 8192 99us -> 17us. Sizes that are expressions (``ps0``) keep one."""
+        sizes = kernel.args.sizevars
+        if not all(
+            isinstance(e, sympy.Symbol) and symbol_is_type(e, SymT.SIZE) for e in sizes
+        ):
+            return src_code
+        memo = self.__dict__.setdefault("_aligned_sources", {})
+        if src_code in memo:
+            return memo[src_code]
+        count = metrics.generated_kernel_count
+        result = src_code
+        try:
+            with _assume_aligned():
+                k = FlyDSLKernel(tiling, features=kernel_features)
+                self.codegen_node_schedule_with_kernel(node_schedule, k)
+                with V.set_kernel_handler(k):
+                    aligned = k.codegen_kernel()
+            if k.arg_names() == kernel.arg_names() and aligned != src_code:
+                result = _dispatch_source(
+                    src_code, aligned, kernel.arg_names(), list(sizes.values())
+                )
+        except FlyDSLUnsupported:
+            pass
+        finally:
+            # pyrefly: ignore [bad-assignment]
+            metrics.generated_kernel_count = count
+        memo[src_code] = result
+        return result
 
     def _recent_buffers(self, kernel_features) -> OrderedSet[str]:
         """The buffers the nodes just before this kernel's wrote or read, back through

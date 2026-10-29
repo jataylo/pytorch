@@ -8,6 +8,7 @@ classifier tests are pure sympy and run anywhere.
 """
 
 import contextlib
+import os
 import unittest
 from unittest.mock import patch
 
@@ -561,6 +562,10 @@ class TestFlyDSLSIMD(TestCase):
             "sum_dyn_rows": (lambda a: (a * 2).sum(-1), lambda n: (torch.randn(n, n + 3, device="cuda"),), [(0, 1)]),
             "col_sum": (lambda a: a.sum(0), lambda n: (torch.randn(n, 256, device="cuda"),), [(0,)]),
             "cross_entropy": (lambda a, t: F.cross_entropy(a, t), lambda n: (torch.randn(n, 1000, device="cuda"), torch.randint(0, 1000, (n,), device="cuda")), [(0,), (0,)]),
+            "cumsum": (lambda a: a.cumsum(-1), lambda n: (torch.randn(8, n, device="cuda"),), [(1,)]),
+            "cumprod_dim0": (lambda a: a.cumprod(0), lambda n: (torch.rand(n, 64, device="cuda") + 0.5,), [(0,)]),
+            "bucketize": (lambda x, b: torch.bucketize(x, b, right=True), lambda n: (torch.randn(4096, device="cuda"), torch.sort(torch.randn(n // 4 + 3, device="cuda")).values), [(), (0,)]),
+            "foreach": (lambda a, b, c, d: torch._foreach_add([a, b], [c, d], alpha=0.5), lambda n: tuple(torch.randn(n, 64, device="cuda") for _ in range(4)), [(0,)] * 4),
         }
         fn, make, dims = fns[case]
         cf = torch.compile(fn)
@@ -569,10 +574,52 @@ class TestFlyDSLSIMD(TestCase):
             for a, ds in zip(args, dims):
                 for d in ds:
                     torch._dynamo.mark_dynamic(a, d)
-            tol = 2e-2 if args[0].dtype == bf16 else 1e-4
+            tol = 2e-2 if args[0].dtype == bf16 else 1e-3 if "cum" in case else 1e-4
             torch.testing.assert_close(cf(*args), fn(*args), atol=tol, rtol=tol)
         self.assertEqual(counters["stats"]["unique_graphs"], 1)
         self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
+    def test_dynamic_mix_order(self):
+        # An RMSNorm backward over a dynamic batch: the weight gradient's split
+        # partials in a workspace sized at run time, the last split's rows masked.
+        def rms(x, w):
+            xf = x.float()
+            return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)).to(
+                x.dtype
+            ) * w
+
+        cf = torch.compile(rms)
+        w = torch.randn(2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for n in (1000, 1537, 4099):
+            x = torch.randn(n, 2048, device="cuda", dtype=torch.bfloat16)
+            x.requires_grad_()
+            g = torch.randn_like(x)
+            torch._dynamo.mark_dynamic(x, 0)
+            cf(x, w).backward(g)
+            got = (x.grad.double(), w.grad.double())
+            x.grad = w.grad = None
+            rms(x.double(), w.double()).backward(g.double())
+            for a, b in zip(got, (x.grad, w.grad)):
+                self.assertLess(((a - b).abs().max() / b.abs().max()).item(), 5e-3)
+            x.grad = w.grad = None
+        self.assertGreater(counters["flydsl_simd"]["mix_order"], 0)
+        self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
+    @config.patch(combo_kernels=True)
+    def test_dynamic_combo(self):
+        def f(a, b, c, d):
+            return a.sin() + 1, (b * c).cos(), d.t().contiguous() * 2, a.sum(-1)
+
+        cf = torch.compile(f)
+        for n in (1000, 1537, 64):
+            args = [
+                torch.randn(n, k, device="cuda") for k in (64, 33, 33, 80)
+            ]
+            for a in args:
+                torch._dynamo.mark_dynamic(a, 0)
+            torch.testing.assert_close(cf(*args), f(*args), atol=1e-4, rtol=1e-4)
+        self.assertEqual(counters["flydsl_simd"]["combo"], 1)
         self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
 
     def test_index64(self):
@@ -948,6 +995,36 @@ class TestFlyDSLSIMD(TestCase):
             lambda x: x.cumsum(-1), torch.randint(0, 5, (50, 777), device="cuda")
         )
 
+    def test_wide_row_scans(self):
+        # Few rows: a row spans several waves, their totals exchanged through LDS.
+        for fn, a in (
+            (lambda x: x.cumsum(-1), torch.randn(8, 100000)),
+            (lambda x: x.cumsum(0), torch.randn(8192, 64)),
+            (lambda x: torch.logcumsumexp(x, -1), torch.randn(8, 8191)),
+            (lambda x: torch.cummax(x, -1), torch.randn(4, 5000)),
+        ):
+            torch._dynamo.reset()
+            self.check(fn, a.cuda(), atol=1e-3, rtol=1e-3)
+
+    def test_split_scan(self):
+        # Inductor's split scan: a block a chunk of the row, chained by look-back.
+        for fn, a in (
+            (lambda x: x.cumsum(-1), torch.randn(1000003)),
+            (lambda x: x.cumsum(-1), torch.randn(3, 300001)),
+            (lambda x: x.cumsum(-1), torch.randint(0, 9, (1, 500000))),
+            (lambda x: x.double().cumsum(-1), torch.randn(400000)),
+            (lambda x: (x * 1e-6 + 1).cumprod(-1), torch.randn(300000)),
+            (lambda x: (x.cumsum(-1) * 2).abs(), torch.randn(400000)),
+        ):
+            torch._dynamo.reset()
+            counters.clear()
+            a = a.cuda()
+            ref = fn(a.double()).to(fn(a[:1]).dtype)
+            out = torch.compile(fn, dynamic=False)(a)
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-3)
+            self.assertGreater(counters["flydsl_simd"]["flydsl_kernels"], 0)
+            self.assertEqual(counters["flydsl_simd"]["triton_kernels"], 0)
+
     def test_tuple_scans(self):
         a = torch.randn(64, 513, device="cuda")
         self.check(lambda x: torch.cummax(x, -1), a)
@@ -1117,10 +1194,10 @@ class TestFlyDSLSIMDFallback(TestCase):
         with config.patch(
             {"flydsl.simd": True, "flydsl.simd_strict": True, "fx_graph_cache": False}
         ):
-            with self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"):
-                torch.compile(lambda x: x.cumsum(-1), dynamic=True)(
-                    torch.randn(100, 77, device="cuda")
-                )
+            with patch.dict(
+                os.environ, {"TORCHINDUCTOR_FLYDSL_SIMD_STAGES": "row"}
+            ), self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"):
+                torch.compile(lambda x: x + 1)(torch.randn(100, device="cuda"))
 
 
 if __name__ == "__main__":
