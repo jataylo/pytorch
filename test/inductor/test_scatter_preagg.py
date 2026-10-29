@@ -450,6 +450,10 @@ class TestScatterPreagg(TestCase):
             "gfx1100": (ScatterPreaggTarget("gfx1100", warp_size=32), False, 4096),
         }
         device = torch.device(GPU_TYPE, 0)
+        self.assertEqual(
+            ScatterPreaggTarget.of(device).lds_bytes,
+            torch.cuda.get_device_properties(0).shared_memory_per_block,
+        )
         for arch, (target, cdna3, ragged_tile) in targets.items():
             with (
                 self.subTest(arch),

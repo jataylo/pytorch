@@ -466,11 +466,8 @@ class ScatterPreaggTarget:
 def _scatter_preagg_target(index: int) -> ScatterPreaggTarget:
     props = torch.cuda.get_device_properties(index)
     arch = props.gcnArchName.split(":", 1)[0] if torch.version.hip else ""
-    # HIP reports the 64KB default rather than the opt-in limit (see
-    # torch.cuda._utils.set_shared_memory_config); other targets keep the 64KB
-    # the LDS-bound choices were measured with.
-    lds_bytes = {"gfx950": 160 * 1024, "gfx1250": 320 * 1024}.get(arch, 64 * 1024)
-    return ScatterPreaggTarget(arch, props.warp_size, lds_bytes)
+    # Triton refuses kernels over the per-block limit, whatever the CU holds.
+    return ScatterPreaggTarget(arch, props.warp_size, props.shared_memory_per_block)
 
 
 class BaseHeuristicSingleton(type):
