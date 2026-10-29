@@ -1479,6 +1479,12 @@ class BaseConfigHeuristic(metaclass=BaseHeuristicSingleton):
         # Narrow rows give each block's sort few elements to amortize over:
         # past 256 tokens per element it costs more than it saves (gfx942).
         block_t = max(32, min(1024, 256 * block_d, block_t))
+        # Small scatters keep at least two programs per gfx942 CU (up to 1.5x).
+        while (
+            block_t > 32
+            and ceildiv(num_tokens, block_t) * ceildiv(num_inner, block_d) < 2 * 80
+        ):
+            block_t //= 2
 
         # Fewest programs along the inner dim (one sort per token block) that
         # still keeps 1024 programs in flight. That count does not scale with

@@ -720,10 +720,10 @@ for it in tl.range(0, D_ITERS):
             HIST_BINS - 1
         )
         counts = tl.histogram(hashed.to(tl.int32), HIST_BINS, mask=live)
-        # A destination taking an eighth of the block serializes its plain
+        # A destination taking over HOT_COUNT tokens serializes its plain
         # atomics, so such blocks sort whatever they save: a hot bin counts
         # as HIST_BINS more empty ones, which takes the estimate below zero.
-        empty = (counts == 0).to(tl.float32) + (counts > BLOCK_T // 8).to(
+        empty = (counts == 0).to(tl.float32) + (counts > HOT_COUNT).to(
             tl.float32
         ) * HIST_BINS
         empty = tl.maximum(tl.sum(empty, 0), 1.0)
@@ -1478,6 +1478,11 @@ def _lower_atomic(
             # on ten hot destinations, gfx942).
             "SORT_SAVED": block_min_saved / (2 if cfg.block_d == 1 else 1),
             "RUN_MAX": 0,
+            # A destination taking a sixteenth of the block is hot enough to
+            # sort, as every block's atomics on it contend (an eighth for rows
+            # over 128, whose scans cost more). Up to 2.6x on embedding
+            # backward of Zipf ids (gfx942).
+            "HOT_COUNT": cfg.block_t // (8 if _hint(plan.num_inner) > 128 else 16),
         }
         if not plan.inner_contiguous:
             # Strided inner elements take a transaction each, so the plain
