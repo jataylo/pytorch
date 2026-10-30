@@ -369,7 +369,8 @@ class TestFlyDSLSIMD(TestCase):
         self.check(lambda x: x.sum(0), a, atol=1e-3, kinds=["reduction"])
 
     @parametrize(
-        "cols,two", [(1024, False), (768, True), (2048, False), (1536, True), (3072, False)]
+        "cols,two",
+        [(1024, False), (768, True), (2048, False), (1536, True), (3072, False)],
     )
     def test_mix_order_reduction(self, cols, two):
         # A row and a column reduction of the same input (a norm's backward) fuse into
@@ -499,7 +500,9 @@ class TestFlyDSLSIMD(TestCase):
         torch._dynamo.reset()
         b = x[1:].bfloat16()
         self.check(
-            lambda b: (b.float() * (mx / b.float().abs().amax(-1, keepdim=True))).to(dtype),
+            lambda b: (b.float() * (mx / b.float().abs().amax(-1, keepdim=True))).to(
+                dtype
+            ),
             b,
             atol=0,
             rtol=0,
@@ -551,7 +554,20 @@ class TestFlyDSLSIMD(TestCase):
 
     @parametrize(
         "case",
-        ["bias_gelu", "seq_bcast", "permute", "transpose", "transpose_both", "nchw_nhwc", "rmsnorm", "softmax", "argmax", "sum_dyn_rows", "col_sum", "cross_entropy"],
+        [
+            "bias_gelu",
+            "seq_bcast",
+            "permute",
+            "transpose",
+            "transpose_both",
+            "nchw_nhwc",
+            "rmsnorm",
+            "softmax",
+            "argmax",
+            "sum_dyn_rows",
+            "col_sum",
+            "cross_entropy",
+        ],
     )
     def test_dynamic_shapes(self, case):
         # One compiled graph over every size: the dynamic extents are kernel arguments
@@ -560,25 +576,107 @@ class TestFlyDSLSIMD(TestCase):
 
         def rms(x, w):
             xf = x.float()
-            return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * w).to(bf16)
+            return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6) * w).to(
+                bf16
+            )
 
         fns = {
-            "bias_gelu": (lambda a, b: F.gelu(a + b), lambda n: (torch.randn(n, 768, device="cuda", dtype=bf16), torch.randn(768, device="cuda", dtype=bf16)), [(0,), ()]),
-            "seq_bcast": (lambda a, b: a * b[None], lambda n: (torch.randn(4, n, 64, device="cuda"), torch.randn(n, 64, device="cuda")), [(1,), (0,)]),
-            "permute": (lambda a: a.view(2, a.shape[1], 8, 64).permute(0, 2, 1, 3).contiguous() * 2, lambda n: (torch.randn(2, n, 512, device="cuda"),), [(1,)]),
-            "transpose": (lambda a: a.transpose(1, 2).contiguous(), lambda n: (torch.randn(3, n, 200, device="cuda", dtype=bf16),), [(1,)]),
-            "transpose_both": (lambda a: a.t().contiguous() * 2, lambda n: (torch.randn(n, n // 2 + 5, device="cuda"),), [(0, 1)]),
-            "nchw_nhwc": (lambda a: a.permute(0, 2, 3, 1).contiguous() + 1, lambda n: (torch.randn(2, 32, n // 8 + 1, 40, device="cuda"),), [(2,)]),
-            "rmsnorm": (rms, lambda n: (torch.randn(n, 2048, device="cuda", dtype=bf16), torch.randn(2048, device="cuda", dtype=bf16)), [(0,), ()]),
-            "softmax": (lambda a: a.softmax(-1), lambda n: (torch.randn(n, 512, device="cuda"),), [(0,)]),
-            "argmax": (lambda a: a.argmax(-1), lambda n: (torch.randn(n, 1000, device="cuda"),), [(0,)]),
-            "sum_dyn_rows": (lambda a: (a * 2).sum(-1), lambda n: (torch.randn(n, n + 3, device="cuda"),), [(0, 1)]),
-            "col_sum": (lambda a: a.sum(0), lambda n: (torch.randn(n, 256, device="cuda"),), [(0,)]),
-            "cross_entropy": (lambda a, t: F.cross_entropy(a, t), lambda n: (torch.randn(n, 1000, device="cuda"), torch.randint(0, 1000, (n,), device="cuda")), [(0,), (0,)]),
-            "cumsum": (lambda a: a.cumsum(-1), lambda n: (torch.randn(8, n, device="cuda"),), [(1,)]),
-            "cumprod_dim0": (lambda a: a.cumprod(0), lambda n: (torch.rand(n, 64, device="cuda") + 0.5,), [(0,)]),
-            "bucketize": (lambda x, b: torch.bucketize(x, b, right=True), lambda n: (torch.randn(4096, device="cuda"), torch.sort(torch.randn(n // 4 + 3, device="cuda")).values), [(), (0,)]),
-            "foreach": (lambda a, b, c, d: torch._foreach_add([a, b], [c, d], alpha=0.5), lambda n: tuple(torch.randn(n, 64, device="cuda") for _ in range(4)), [(0,)] * 4),
+            "bias_gelu": (
+                lambda a, b: F.gelu(a + b),
+                lambda n: (
+                    torch.randn(n, 768, device="cuda", dtype=bf16),
+                    torch.randn(768, device="cuda", dtype=bf16),
+                ),
+                [(0,), ()],
+            ),
+            "seq_bcast": (
+                lambda a, b: a * b[None],
+                lambda n: (
+                    torch.randn(4, n, 64, device="cuda"),
+                    torch.randn(n, 64, device="cuda"),
+                ),
+                [(1,), (0,)],
+            ),
+            "permute": (
+                lambda a: a.view(2, a.shape[1], 8, 64).permute(0, 2, 1, 3).contiguous()
+                * 2,
+                lambda n: (torch.randn(2, n, 512, device="cuda"),),
+                [(1,)],
+            ),
+            "transpose": (
+                lambda a: a.transpose(1, 2).contiguous(),
+                lambda n: (torch.randn(3, n, 200, device="cuda", dtype=bf16),),
+                [(1,)],
+            ),
+            "transpose_both": (
+                lambda a: a.t().contiguous() * 2,
+                lambda n: (torch.randn(n, n // 2 + 5, device="cuda"),),
+                [(0, 1)],
+            ),
+            "nchw_nhwc": (
+                lambda a: a.permute(0, 2, 3, 1).contiguous() + 1,
+                lambda n: (torch.randn(2, 32, n // 8 + 1, 40, device="cuda"),),
+                [(2,)],
+            ),
+            "rmsnorm": (
+                rms,
+                lambda n: (
+                    torch.randn(n, 2048, device="cuda", dtype=bf16),
+                    torch.randn(2048, device="cuda", dtype=bf16),
+                ),
+                [(0,), ()],
+            ),
+            "softmax": (
+                lambda a: a.softmax(-1),
+                lambda n: (torch.randn(n, 512, device="cuda"),),
+                [(0,)],
+            ),
+            "argmax": (
+                lambda a: a.argmax(-1),
+                lambda n: (torch.randn(n, 1000, device="cuda"),),
+                [(0,)],
+            ),
+            "sum_dyn_rows": (
+                lambda a: (a * 2).sum(-1),
+                lambda n: (torch.randn(n, n + 3, device="cuda"),),
+                [(0, 1)],
+            ),
+            "col_sum": (
+                lambda a: a.sum(0),
+                lambda n: (torch.randn(n, 256, device="cuda"),),
+                [(0,)],
+            ),
+            "cross_entropy": (
+                lambda a, t: F.cross_entropy(a, t),
+                lambda n: (
+                    torch.randn(n, 1000, device="cuda"),
+                    torch.randint(0, 1000, (n,), device="cuda"),
+                ),
+                [(0,), (0,)],
+            ),
+            "cumsum": (
+                lambda a: a.cumsum(-1),
+                lambda n: (torch.randn(8, n, device="cuda"),),
+                [(1,)],
+            ),
+            "cumprod_dim0": (
+                lambda a: a.cumprod(0),
+                lambda n: (torch.rand(n, 64, device="cuda") + 0.5,),
+                [(0,)],
+            ),
+            "bucketize": (
+                lambda x, b: torch.bucketize(x, b, right=True),
+                lambda n: (
+                    torch.randn(4096, device="cuda"),
+                    torch.sort(torch.randn(n // 4 + 3, device="cuda")).values,
+                ),
+                [(), (0,)],
+            ),
+            "foreach": (
+                lambda a, b, c, d: torch._foreach_add([a, b], [c, d], alpha=0.5),
+                lambda n: tuple(torch.randn(n, 64, device="cuda") for _ in range(4)),
+                [(0,)] * 4,
+            ),
         }
         fn, make, dims = fns[case]
         cf = torch.compile(fn)
@@ -626,9 +724,7 @@ class TestFlyDSLSIMD(TestCase):
 
         cf = torch.compile(f)
         for n in (1000, 1537, 64):
-            args = [
-                torch.randn(n, k, device="cuda") for k in (64, 33, 33, 80)
-            ]
+            args = [torch.randn(n, k, device="cuda") for k in (64, 33, 33, 80)]
             for a in args:
                 torch._dynamo.mark_dynamic(a, 0)
             torch.testing.assert_close(cf(*args), f(*args), atol=1e-4, rtol=1e-4)
@@ -677,11 +773,16 @@ class TestFlyDSLSIMD(TestCase):
 
         def fn(x, y):
             s = inline_asm_elementwise(
-                x * 2, y, asm_str="v_add_f32 $0, $1, $2", constraints="=v,v,v",
+                x * 2,
+                y,
+                asm_str="v_add_f32 $0, $1, $2",
+                constraints="=v,v,v",
                 dtype=torch.float32,
             )
             e = inline_asm_elementwise(
-                x, asm_str="v_bfe_u32 $0, $1, 23, 8", constraints="=v,v",
+                x,
+                asm_str="v_bfe_u32 $0, $1, 23, 8",
+                constraints="=v,v",
                 dtype=torch.int32,
             )
             # Eager's result comes back float32 whatever `dtype` says; Triton's is int32.
@@ -707,7 +808,9 @@ class TestFlyDSLSIMD(TestCase):
         )
         torch._dynamo.reset()
         xi = torch.randint(-(1 << 40), 1 << 40, (100000,), device="cuda")
-        bi = torch.sort(torch.randint(-(1 << 40), 1 << 40, (100,), device="cuda")).values
+        bi = torch.sort(
+            torch.randint(-(1 << 40), 1 << 40, (100,), device="cuda")
+        ).values
         self.check(lambda x, b: torch.bucketize(x + 1, b, right=right), xi, bi)
         torch._dynamo.reset()
         rows = torch.sort(torch.randn(512, 17, device="cuda"), -1).values
@@ -723,9 +826,18 @@ class TestFlyDSLSIMD(TestCase):
         x[0, :3] = torch.tensor([float("nan"), float("inf"), -0.0])
         f8 = torch.float8_e4m3fnuz
         cases = [
-            (lambda x: (0x5F3759DF - (x.abs().view(torch.int32) >> 1)).view(torch.float32) * 1, x),
+            (
+                lambda x: (0x5F3759DF - (x.abs().view(torch.int32) >> 1)).view(
+                    torch.float32
+                )
+                * 1,
+                x,
+            ),
             (lambda b: (b * 1).view(torch.int16) >> 3, x.bfloat16()),
-            (lambda i: (i & 0x3FFF).view(torch.bfloat16) + 1, (x * 1000).to(torch.int16)),
+            (
+                lambda i: (i & 0x3FFF).view(torch.bfloat16) + 1,
+                (x * 1000).to(torch.int16),
+            ),
             (lambda q: q.float().to(f8).view(torch.uint8).int() + 1, x.to(f8)),
             (lambda u: (u & 0x7F).view(f8).float() * 3, (x * 50).to(torch.uint8)),
             (lambda d: (d * 3).view(torch.int64) >> 2, x.double()),
@@ -855,7 +967,11 @@ class TestFlyDSLSIMD(TestCase):
         # A row's sum scattered with an atomic add: every thread of the row group holds
         # the sum, and exactly one of them may add it.
         torch.manual_seed(0)
-        for dtype, d in ((torch.float32, 1024), (torch.bfloat16, 1024), (torch.float32, 96)):
+        for dtype, d in (
+            (torch.float32, 1024),
+            (torch.bfloat16, 1024),
+            (torch.float32, 96),
+        ):
             torch._dynamo.reset()
             x = torch.randn(512, d, device="cuda", dtype=dtype)
             ix = torch.randint(0, 64, (512,), device="cuda")
@@ -1073,19 +1189,25 @@ class TestFlyDSLSIMD(TestCase):
 
         for fn, args, ref in (
             # uint32 computes in i64: past 2**31 it still compares and divides right.
-            (lambda x: (x // 7 + x % 5).to(torch.int64), (big.to(torch.uint32),), big // 7 + big % 5),
+            (
+                lambda x: (x // 7 + x % 5).to(torch.int64),
+                (big.to(torch.uint32),),
+                big // 7 + big % 5,
+            ),
             (lambda x: (x + 3).to(torch.uint16), (big % 60000,), None),
             (lambda x: x.view(torch.uint8) + 1, (big % 2 == 0,), None),
             (lambda x: torch.fmax(x, x.flip(0)).amax(), (big % 200 - 100,), None),
             (
-                lambda i, v: torch.zeros(64, dtype=torch.int64, device="cuda").index_add_(0, i, v),
+                lambda i, v: torch.zeros(
+                    64, dtype=torch.int64, device="cuda"
+                ).index_add_(0, i, v),
                 (idx, idx % 7 - 3),
                 None,
             ),
             (
-                lambda i, v: torch.zeros(64, dtype=torch.int32, device="cuda").index_put_(
-                    (i,), v, accumulate=True
-                ),
+                lambda i, v: torch.zeros(
+                    64, dtype=torch.int32, device="cuda"
+                ).index_put_((i,), v, accumulate=True),
                 (idx, (idx % 5).int()),
                 None,
             ),
@@ -1104,7 +1226,9 @@ class TestFlyDSLSIMD(TestCase):
     def test_activation_softmax_welford_rewrites(self):
         # 1 + tanh(u) as 2 sigmoid(2u), x / (1 + exp(y)) by v_rcp, a softmax's
         # exp(x - max) without the denormal fix-up, chunked welford merges.
-        sp = torch.tensor([float("inf"), -float("inf"), float("nan"), 0.0, -0.0, 30.0, -30.0])
+        sp = torch.tensor(
+            [float("inf"), -float("inf"), float("nan"), 0.0, -0.0, 30.0, -30.0]
+        )
         x = torch.cat([torch.linspace(-12, 12, 4099), sp]).cuda()
         rows = torch.randn(6, 300, device="cuda") * 4
         rows[1, 7] = float("nan")
@@ -1331,9 +1455,10 @@ class TestFlyDSLSIMDFallback(TestCase):
         with config.patch(
             {"flydsl.simd": True, "flydsl.simd_strict": True, "fx_graph_cache": False}
         ):
-            with patch.dict(
-                os.environ, {"TORCHINDUCTOR_FLYDSL_SIMD_STAGES": "row"}
-            ), self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"):
+            with (
+                patch.dict(os.environ, {"TORCHINDUCTOR_FLYDSL_SIMD_STAGES": "row"}),
+                self.assertRaisesRegex(Exception, "FlyDSL SIMD kernel refused"),
+            ):
                 torch.compile(lambda x: x + 1)(torch.randn(100, device="cuda"))
 
 

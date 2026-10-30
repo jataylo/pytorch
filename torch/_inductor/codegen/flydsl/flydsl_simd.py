@@ -977,9 +977,7 @@ class FlyDSLKernel(SIMDKernel):
             # i32 offsets, as Inductor guards for Triton's 32-bit indexing; the bound
             # leaves room for a mask's block-sized overshoot.
             total = V.graph.sizevars.simplify(
-                self.numels["x"]
-                * self.numels.get("r0_", 1)
-                * self.numels.get("y", 1)
+                self.numels["x"] * self.numels.get("r0_", 1) * self.numels.get("y", 1)
             )
             if not expr_fits_within_32bit(total):
                 raise FlyDSLUnsupported("dynamic extent not known to fit int32")
@@ -1229,8 +1227,10 @@ class FlyDSLKernel(SIMDKernel):
             self.rpb = self.threads // self.tpr
             split_ept = self._split_scan_ept(gathered)
             chunks = -(-self.rnumel // (self.tpr * split_ept))
-            if self._split_scan_ok() and self.tpr > WAVE and chunks >= _tune(
-                "split_scan_min_chunks", SPLIT_SCAN_MIN_CHUNKS
+            if (
+                self._split_scan_ok()
+                and self.tpr > WAVE
+                and chunks >= _tune("split_scan_min_chunks", SPLIT_SCAN_MIN_CHUNKS)
             ):
                 # A block a chunk of the row, chained by fdp's decoupled look-back.
                 self.split_chunks, self.ept = chunks, split_ept
@@ -2070,7 +2070,14 @@ class FlyDSLKernel(SIMDKernel):
         arg = self.args.output(name)
         dtype = V.graph.get_dtype(name)
         st = storage_kind(dtype)
-        if mode == "atomic_add" and st not in ("f32", "f64", "f16", "bf16", "i32", "i64"):
+        if mode == "atomic_add" and st not in (
+            "f32",
+            "f64",
+            "f16",
+            "bf16",
+            "i32",
+            "i64",
+        ):
             raise FlyDSLUnsupported(f"atomic_add of {dtype}")
         index = self.prepare_indexing(index)
         index_str = self.kexpr(self.rename_indexing(index))
@@ -2325,8 +2332,16 @@ class FlyDSLKernel(SIMDKernel):
         bst = storage_kind(V.graph.get_dtype(boundaries[0]))
         if not all(sympy.sympify(s).is_Integer for s in sizes):
             return self._bucketize_dynamic(
-                values, barg, bst, boundary_indices, sizes, right, sorter,
-                sorter_indices, indexing_dtype, mask,
+                values,
+                barg,
+                bst,
+                boundary_indices,
+                sizes,
+                right,
+                sorter,
+                sorter_indices,
+                indexing_dtype,
+                mask,
             )
         size, numel, stride = (int(s) for s in sizes[:3])
         if (
@@ -2366,12 +2381,23 @@ class FlyDSLKernel(SIMDKernel):
             args += ["None", "None", "None", "None"]
         args.append(repr(compute_kind(indexing_dtype)))
         return self.cse.generate(
-            self.compute, f"fdp.bucketize({', '.join(args)}{mask})", dtype=indexing_dtype
+            self.compute,
+            f"fdp.bucketize({', '.join(args)}{mask})",
+            dtype=indexing_dtype,
         )
 
     def _bucketize_dynamic(
-        self, values, barg, bst, boundary_indices, sizes, right, sorter,
-        sorter_indices, indexing_dtype, mask,
+        self,
+        values,
+        barg,
+        bst,
+        boundary_indices,
+        sizes,
+        right,
+        sorter,
+        sorter_indices,
+        indexing_dtype,
+        mask,
     ):
         """``bucketize`` over a table sized at run time: a loop of ``bit_length(size)``
         search steps, as Triton's ``while`` over the range."""
@@ -2388,8 +2414,17 @@ class FlyDSLKernel(SIMDKernel):
             ]
         lo, hi = self.cse.newvar(dtype=torch.int64), self.cse.newvar(dtype=torch.int64)
         step_args = ", ".join(
-            [f"_r_{barg}", repr(bst), str(values), str(boundary_indices), size, numel,
-             stride, str(bool(right)), *srt]
+            [
+                f"_r_{barg}",
+                repr(bst),
+                str(values),
+                str(boundary_indices),
+                size,
+                numel,
+                stride,
+                str(bool(right)),
+                *srt,
+            ]
         )
         self.compute.writeline(f"{lo}, {hi} = fdp.bsearch_init({size})")
         self.compute.writeline(
@@ -2763,6 +2798,10 @@ class FlyDSLKernel(SIMDKernel):
             self.preload_lines = []
 
     def codegen_body(self):
+        """Flush the buffered loads, compute and stores into the body: inside a
+        reduction as one step of the loop over the row (unrolled when persistent),
+        each element of the step traced once a scan phase; otherwise straight-line,
+        with the loads also kept for the prefetch."""
         if not (
             self.indexing_code
             or self.loads
@@ -3035,7 +3074,8 @@ class FlyDSLKernel(SIMDKernel):
                 )
             }
             return self.rename_indexing(
-                cdiv(ns["x"], self._tile_edge("x")) * cdiv(ns["y"], self._tile_edge("y"))
+                cdiv(ns["x"], self._tile_edge("x"))
+                * cdiv(ns["y"], self._tile_edge("y"))
             )
         if self.xnumel_dyn is None:
             return sympy.Integer(self.num_blocks)
@@ -3090,9 +3130,7 @@ class FlyDSLKernel(SIMDKernel):
         with code.indent():
             code.splice(inner.getvalue())
         code.splice(
-            _module_epilogue(
-                arg_names, grid, self.threads, self.slp, self.size_args()
-            )
+            _module_epilogue(arg_names, grid, self.threads, self.slp, self.size_args())
         )
         return code.getvalue()
 
@@ -3174,7 +3212,11 @@ class FlyDSLKernel(SIMDKernel):
         assigned = OrderedSet(
             name
             for _, li in template
-            for m in [re.match(r"\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)", text_of(li))]
+            for m in [
+                re.match(
+                    r"\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*=(?!=)", text_of(li)
+                )
+            ]
             if m
             for name in re.split(r"\s*,\s*", m.group(1))
             if name not in ("r0_offset", "_j", "_pc")
@@ -3219,7 +3261,9 @@ class FlyDSLKernel(SIMDKernel):
         RoPE variant's prefetch traced index math for nothing (0.76 s to compile)."""
         n = self.ept * self.unroll
         step = math.gcd(self.prefetch_step, self.ept) if part is self.prefetch else 1
-        return f"range_constexpr(0, {n}, {step})" if step > 1 else f"range_constexpr({n})"
+        return (
+            f"range_constexpr(0, {n}, {step})" if step > 1 else f"range_constexpr({n})"
+        )
 
     def emit_inner(self, code: IndentedBuffer) -> None:
         """The thread layout and body, given ``_t``, ``_b``, the descriptors and ``_smem``."""
@@ -4132,9 +4176,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                     self.codegen_node_schedule_with_kernel(
                         kernel_features.node_schedule, kernel
                     )
-                    partials = (
-                        kernel_features.numel + split_size - 1
-                    ) // split_size
+                    partials = (kernel_features.numel + split_size - 1) // split_size
                     _, ws_name, _ = kernel.args.workspace(
                         len(kernel.saved_partial_accumulate) * partials * kernel.rnumel,
                         False,
@@ -4683,16 +4725,6 @@ def _warm_compile_workers() -> None:
         return  # the workers forked with it done
     for _ in range(threads):
         pool.submit(warm_worker, _gpu_arch())
-
-
-@functools.cache
-def flydsl_simd_available() -> bool:
-    try:
-        # pyrefly: ignore [missing-import]
-        import flydsl.compiler  # noqa: F401
-    except ImportError:
-        return False
-    return bool(torch.version.hip)
 
 
 del BackendFeature, OpsWrapper

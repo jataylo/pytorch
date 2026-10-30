@@ -799,7 +799,17 @@ def _packing(st: str, w: int):
     on either side. Returns ``(word type, word count, elements per word)``, or ``None``
     as the type for kinds that go through unchanged.
     """
-    nbytes = {"f16": 2, "bf16": 2, "i16": 2, "u16": 2, "i8": 1, "u8": 1, "b1": 1, "f8e4": 1, "f8e5": 1}.get(st)
+    nbytes = {
+        "f16": 2,
+        "bf16": 2,
+        "i16": 2,
+        "u16": 2,
+        "i8": 1,
+        "u8": 1,
+        "b1": 1,
+        "f8e4": 1,
+        "f8e5": 1,
+    }.get(st)
     if nbytes is None:
         return None, w, 1
     total = nbytes * w
@@ -1373,7 +1383,19 @@ def where(c, a, b):
 
 
 def bucketize(
-    r, st, values, base, size, numel, stride, right, sr, sst, sstride, sbase, out,
+    r,
+    st,
+    values,
+    base,
+    size,
+    numel,
+    stride,
+    right,
+    sr,
+    sst,
+    sstride,
+    sbase,
+    out,
     mask=None,
 ):
     """``triton_helpers.bucketize_binary_search``, its ``log2(size + 1)`` steps unrolled:
@@ -1411,7 +1433,20 @@ def bsearch_init(size):
 
 
 def bsearch_step(
-    lo, hi, r, st, values, base, size, numel, stride, right, sr, sst, sstride, sbase,
+    lo,
+    hi,
+    r,
+    st,
+    values,
+    base,
+    size,
+    numel,
+    stride,
+    right,
+    sr,
+    sst,
+    sstride,
+    sbase,
     mask=None,
 ):
     """One step of ``bucketize`` for a size known only at run time, in a loop of
@@ -1516,15 +1551,6 @@ def clamp(x, lo, hi):
 def relu(x):
     x = _canon(x)
     return maximum(x, const(0, kind(x)))
-
-
-def copysign(a, b):
-    k = _float_kind(a, b)
-    return (
-        ArithValue(_arith.CopySignOp(_val(to(a, k)), _val(to(b, k))).result)
-        if hasattr(_arith, "CopySignOp")
-        else ArithValue(fmath.copysign(to(a, k), to(b, k)))
-    )
 
 
 def _f32(x):
@@ -1827,9 +1853,7 @@ def _device_libs() -> list:
     only, no unsafe math, denormals kept), a correctly rounded sqrt, wave64."""
     from flydsl.runtime.device import get_rocm_arch
 
-    root = _os.path.join(
-        _os.environ.get("ROCM_PATH", "/opt/rocm"), "amdgcn", "bitcode"
-    )
+    root = _os.path.join(_os.environ.get("ROCM_PATH", "/opt/rocm"), "amdgcn", "bitcode")
     names = [
         "ocml",
         "oclc_finite_only_off",
@@ -1917,7 +1941,10 @@ def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs, pack: int 
     """
     from flydsl._mlir.dialects import llvm as _llvm
 
-    vals = [_val(_canon(x) if not isinstance(x, (bool, int, float)) else const(x, kind(x))) for x in xs]
+    vals = [
+        _val(_canon(x) if not isinstance(x, (bool, int, float)) else const(x, kind(x)))
+        for x in xs
+    ]
     et = _STORAGE_IR[out]()
     if pack == 1:
         op = _llvm.InlineAsmOp(et, vals, asm, constraints, has_side_effects=not pure)
@@ -1928,10 +1955,14 @@ def inline_asm(asm: str, constraints: str, out: str, pure: bool, *xs, pack: int 
         regs = pack // per_reg
         st = _llvm.StructType.get_literal([reg] * regs)
         operands = [v for v in vals for _ in range(pack)]
-        op = _llvm.InlineAsmOp(st, operands, asm, constraints, has_side_effects=not pure)
+        op = _llvm.InlineAsmOp(
+            st, operands, asm, constraints, has_side_effects=not pure
+        )
         res = _llvm.ExtractValueOp(reg, op.result, [0]).result
         if per_reg > 1:
-            res = _vector.ExtractOp(res, static_position=[0], dynamic_position=[]).result
+            res = _vector.ExtractOp(
+                res, static_position=[0], dynamic_position=[]
+            ).result
     return ArithValue(_cvt(res, _MEM_KIND.get(out, out), _COMPUTE_OF[out]))
 
 
@@ -1939,18 +1970,21 @@ def frexp(x):
     """(mantissa in [0.5, 1) with x's sign, exponent): ``x`` itself and 0 for zero,
     inf and NaN. A denormal is scaled into the normal range first."""
     x = to(x, "f32")
-    i32 = lambda c: const(c, "i32")
+
+    def i32(c):
+        return const(c, "i32")
+
     bits = ArithValue(_arith.BitcastOp(T.i32(), _val(x)).result)
     tiny = ArithValue(fmath.absf(x)) < fdu.const_f32(1.1754943508222875e-38)
-    scaled = ArithValue(_arith.BitcastOp(T.i32(), _val(x * fdu.const_f32(16777216.0))).result)
+    scaled = ArithValue(
+        _arith.BitcastOp(T.i32(), _val(x * fdu.const_f32(16777216.0))).result
+    )
     bits = where(tiny, scaled, bits)
     biased = bitwise_and(bitwise_right_shift(bits, i32(23)), i32(0xFF))
     e = sub(biased, where(tiny, i32(126 + 24), i32(126)))
     m = bitwise_or(bitwise_and(bits, i32(-0x7F800001)), i32(126 << 23))
     mant = ArithValue(_arith.BitcastOp(T.f32(), _val(m)).result)
-    special = logical_or(
-        eq(x, fdu.const_f32(0.0)), logical_or(isnan(x), isinf(x))
-    )
+    special = logical_or(eq(x, fdu.const_f32(0.0)), logical_or(isnan(x), isinf(x)))
     return where(special, x, mant), where(special, i32(0), e)
 
 
@@ -2088,14 +2122,20 @@ def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
     eager's under ``config.align_random_eager``."""
     denom = vec * threads_per_round
     t = _val(idx32(tid))
-    i32 = lambda c: _val(const(c, "i32"))
+
+    def i32(c):
+        return _val(const(c, "i32"))
+
     t_round = _arith.DivUIOp(t, i32(denom)).result
     t_trunc = _arith.RemUIOp(t, i32(denom)).result
     subseq = _arith.DivUIOp(t_trunc, i32(vec)).result
     which4 = _arith.DivUIOp(_arith.RemUIOp(t_trunc, i32(vec)).result, i32(4)).result
     lane = _arith.RemUIOp(t_trunc, i32(4)).result
     blocks = _arith.MulIOp(t_round, i32(vec // 4)).result
-    ext = lambda v: _arith.ExtUIOp(T.i64(), v).result
+
+    def ext(v):
+        return _arith.ExtUIOp(T.i64(), v).result
+
     off = _arith.AddIOp(
         _val(to(base_offset, "i64")), ext(_arith.AddIOp(blocks, which4).result)
     ).result
@@ -2104,9 +2144,11 @@ def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
         T.i32(), _arith.ShRUIOp(off, _val(const(32, "i64"))).result
     ).result
     u = _philox(seed, lo, hi, subseq, None)
-    pick = lambda c, a, b: _arith.SelectOp(
-        _arith.CmpIOp(_arith.CmpIPredicate.eq, lane, i32(c)).result, a, b
-    ).result
+
+    def pick(c, a, b):
+        eq_c = _arith.CmpIOp(_arith.CmpIPredicate.eq, lane, i32(c)).result
+        return _arith.SelectOp(eq_c, a, b).result
+
     word = pick(0, u[0], pick(1, u[1], pick(2, u[2], u[3])))
     f = _arith.UIToFPOp(T.f32(), word).result
     inv = 1.0 / 4294967296.0
@@ -2458,11 +2500,8 @@ def _group_scan(
 
 # Words of a chunk's slot in a split scan's workspace: [flag, aggregate (2 words),
 # inclusive prefix (2 words)], padded. Flag 0: not yet published, 1: aggregate, 2: both.
+# A single 32-bit value packs (flag << 32 | value) into the slot's first 64-bit word.
 SPLIT_SLOT_WORDS = 8
-
-
-def split_ws_bytes(chunks) -> int:
-    return chunks * SPLIT_SLOT_WORDS * 4
 
 
 def _split_offset(fn, out, total, smem, base, tpr, n, split):
@@ -2556,6 +2595,7 @@ def _split_lookback(fn, total, smem, at: int, split):
             _scf.YieldOp([k2, inclusive, *nxt])
         pre = tuple(ArithValue(v) for v in loop.results[2:])
         inc = tuple(_canon(v) for v in fn(pre, total))
+
         # Only a later chunk publishes again; the first's inclusive prefix is out.
         def publish():
             for i, w in enumerate(x for t in inc for x in _to_words(t)):
@@ -2677,7 +2717,9 @@ def _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base):
             tile_put(smem, base, 1, slot(wave, c), t)
         barrier()
         totals = [
-            tuple(tile_get(smem, base, 1, slot(row0 + k, c), kinds[c]) for c in range(n))
+            tuple(
+                tile_get(smem, base, 1, slot(row0 + k, c), kinds[c]) for c in range(n)
+            )
             for k in range(nw)
         ]
         acc, pre = totals[0], totals[0]
@@ -2685,9 +2727,7 @@ def _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base):
             pre = tuple(where(eq(w, k), a, p) for a, p in zip(acc, pre))
             acc = tuple(_canon(v) for v in fn(acc, totals[k]))
         later = ge(w, 1)
-        xs = tuple(
-            where(later, s, x) for s, x in zip(fn(pre, xs), xs)
-        )
+        xs = tuple(where(later, s, x) for s, x in zip(fn(pre, xs), xs))
         before, total = pre, acc
     if first is True:
         return xs, total, before
@@ -2802,9 +2842,7 @@ def _compare_swap(x, y, i, k: int, p: int, kind_, stable, descending):
     (a, ai, va), (b, bi, vb) = x, y
     order = _sort_after(a, b, ai, bi, kind_, stable, descending)
     # Padding past the row's end sorts after every element.
-    cond = logical_or(
-        logical_and(vb, logical_not(va)), logical_and(eq(va, vb), order)
-    )
+    cond = logical_or(logical_and(vb, logical_not(va)), logical_and(eq(va, vb), order))
     if k < p:
         # Alternate blocks of k run the other way.
         cond = ne(cond, ne(i & k, 0))
@@ -2831,7 +2869,10 @@ def _bitonic(lds, p, rows, threads, kind_, stable, descending, run: int):
 
     lanes = p // m
     if lanes <= WAVE and threads % lanes == 0:
-        over(rows * lanes, lambda g: _bitonic_wave(lds, g, p, m, kind_, stable, descending))
+        over(
+            rows * lanes,
+            lambda g: _bitonic_wave(lds, g, p, m, kind_, stable, descending),
+        )
         return
 
     k = 2
@@ -2850,25 +2891,27 @@ def _bitonic(lds, p, rows, threads, kind_, stable, descending, run: int):
             over(rows * p // 2, pair)
             j //= 2
 
-        def run(g, j=j, k=k):
-            q, r = g // (p // m), g % (p // m)
-            e0 = r * m
-            at = idx(q) * p + idx(e0)
+        def in_registers(g, j=j, k=k):
+            at = idx(g // lanes) * p + idx((g % lanes) * m)
             vals = [lds.get(at + e) for e in range(m)]
-            jj = j
-            while jj >= 1:
-                for e in range(m):
-                    if e & jj:
-                        continue
-                    vals[e], vals[e + jj] = _compare_swap(
-                        vals[e], vals[e + jj], e0 + e, k, p, kind_, stable, descending
-                    )
-                jj //= 2
+            _bitonic_run(vals, (g % lanes) * m, j, k, p, kind_, stable, descending)
             for e in range(m):
                 lds.put(at + e, vals[e])
 
-        over(rows * (p // m), run)
+        over(rows * lanes, in_registers)
         k *= 2
+
+
+def _bitonic_run(vals, e0, j: int, k: int, p: int, kind_, stable, descending):
+    """Steps ``j``, ``j / 2``, ... 1 of stage ``k`` on a run of slots from ``e0``, held
+    in registers (``vals``, updated in place)."""
+    while j >= 1:
+        for e in range(len(vals)):
+            if not e & j:
+                vals[e], vals[e + j] = _compare_swap(
+                    vals[e], vals[e + j], e0 + e, k, p, kind_, stable, descending
+                )
+        j //= 2
 
 
 def _bitonic_wave(lds, g, p: int, m: int, kind_, stable, descending):
@@ -2893,14 +2936,7 @@ def _bitonic_wave(lds, g, p: int, m: int, kind_, stable, descending):
                 x, y = _compare_swap(lo, hi, e0 + e, k, p, kind_, stable, descending)
                 vals[e] = tuple(where(up, b, a) for a, b in zip(x, y))
             j //= 2
-        while j >= 1:
-            for e in range(m):
-                if e & j:
-                    continue
-                vals[e], vals[e + j] = _compare_swap(
-                    vals[e], vals[e + j], e0 + e, k, p, kind_, stable, descending
-                )
-            j //= 2
+        _bitonic_run(vals, e0, j, k, p, kind_, stable, descending)
         k *= 2
     for e in range(m):
         lds.put(at + e, vals[e])
@@ -3003,20 +3039,6 @@ def welford_default():
     return const(0.0, "f32"), const(0.0, "f32"), const(0.0, "f32")
 
 
-def welford_update(mean, m2, weight, x, mask=None):
-    """One sample into a running (mean, m2, weight); masked lanes leave it unchanged."""
-    x = _f32(x)
-    m = _mask(mask)
-    w1 = add(weight, 1.0)
-    delta = sub(x, mean)
-    mean1 = add(mean, truediv(delta, w1))
-    m21 = add(m2, mul(delta, sub(x, mean1)))
-    if m is None:
-        return mean1, m21, w1
-    sel = lambda new, old: ArithValue(_arith.SelectOp(m, _val(new), _val(old)).result)  # noqa: E731
-    return sel(mean1, mean), sel(m21, m2), sel(w1, weight)
-
-
 def welford_merge(a, b, mask=None):
     """Chan's parallel combine of two (mean, m2, weight) triples."""
     (m1, s1, w1), (m2_, s2, w2) = a, b
@@ -3042,9 +3064,12 @@ def welford_block(acc, items, combine: bool):
     divide or two a chunk rather than an IEEE divide an element. A split BatchNorm's
     statistics were ALU-bound at 770 GB/s on it."""
     zero = const(0.0, "f32")
-    sel = lambda m, v, o: v if m is None else ArithValue(  # noqa: E731
-        _arith.SelectOp(m, _val(v), _val(o)).result
-    )
+
+    def sel(m, v, o):
+        if m is None:
+            return v
+        return ArithValue(_arith.SelectOp(m, _val(v), _val(o)).result)
+
     ms = [_mask(m) for _, m in items]
     if combine:
         trip = [
@@ -3091,19 +3116,6 @@ def _safe_exp_diff(a, m):
 
 def online_softmax_default():
     return const(float("-inf"), "f32"), const(0.0, "f32")
-
-
-def online_softmax_update(mx, s, x, mask=None):
-    x = _f32(x)
-    m_new = maximum(mx, x)
-    s_new = add(mul(s, _safe_exp_diff(mx, m_new)), _safe_exp_diff(x, m_new))
-    m = _mask(mask)
-    if m is None:
-        return m_new, s_new
-    return (
-        ArithValue(_arith.SelectOp(m, _val(m_new), _val(mx)).result),
-        ArithValue(_arith.SelectOp(m, _val(s_new), _val(s)).result),
-    )
 
 
 def online_softmax_merge(a, b):
@@ -3182,7 +3194,10 @@ def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
     (or is NaN either way). The max needn't carry a NaN, a cmp and a select an element:
     exp(NaN - max) puts it in the sum, and so in every output, as eager's."""
     xs = _masked_items(items, "f32", float("-inf"))
-    maxnum = lambda a, b: ArithValue(_arith.MaxNumFOp(_val(a), _val(b)).result)  # noqa: E731
+
+    def maxnum(a, b):
+        return ArithValue(_arith.MaxNumFOp(_val(a), _val(b)).result)
+
     gm = _derive(
         group_reduce("max", _tree(xs, maxnum), tpr, smem, threads, stride), "rowmax"
     )
@@ -3206,7 +3221,10 @@ def group_welford_twopass(
         mean = _canon(mul(s, const(1.0 / count, "f32")))
     else:
         ones = _masked_items([(const(1.0, "f32"), m) for _, m in items], "f32", 0.0)
-        add2 = lambda a, b: (_canon(add(a[0], b[0])), _canon(add(a[1], b[1])))  # noqa: E731
+
+        def add2(a, b):
+            return _canon(add(a[0], b[0])), _canon(add(a[1], b[1]))
+
         s, n = _group_reduce(
             (_tree(xs, add), _tree(ones, add)),
             add2,
@@ -3330,7 +3348,7 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
         return times
 
     times = measure(mains, before)
-    del flush
+    flush = None  # 256 MB, not needed for the warm timing below
     # Candidates within 3% of each other cold are told apart warm, where their cache
     # behaviour differs: a bf16 embedding's two launches timed within 3% cold, then
     # 10% apart in the steady state, and which one won the cold timing varied by run.
