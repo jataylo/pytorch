@@ -1187,7 +1187,23 @@ class FlyDSLKernel(SIMDKernel):
         self.unroll = self.tile_f * self.tile_s // (self.threads * self.ept)
         self.rpb = self.threads * self.ept // self.tile_f
 
-    def _finalize_scan(self, column: bool, widest_vec: int) -> None:
+    def _split_scan_ept(self, gathered: bool) -> int:
+        """Elements a thread of a split scan's chunk: fewer chunks for a look-back of
+        two-word values, which takes the general (fenced) form of fdp._split_lookback;
+        smaller chunks of a gathered row, whose strided loads are each a cache line.
+        1M-element f32 cumsum 26.6us at 16 -> 23.2us at 8 (Triton 44.7us); i64 38.2us
+        at 16 vs 45.2us at 8; cumsum(0) of 100000 x 8 51.7us at 8 -> 39.8us at 4
+        (Triton 62us)."""
+        wide = any(
+            dt.itemsize > 4
+            for n in self.features.scheduler_nodes()
+            if n.is_split_scan()
+            for dt in getattr(getattr(n.node, "data", None), "dtypes", ())
+        )
+        ept = SPLIT_SCAN_EPT if wide else SPLIT_SCAN_EPT // 2
+        return _tune("ept", ept // 2 if gathered else ept)
+
+    def _finalize_scan(self, column: bool, widest_vec: int, gathered: bool) -> None:
         """Layout of a scan: each run of the row gives a thread ``ept`` contiguous
         elements, scanned in registers and then across the row's lanes (at most a wave:
         shuffles only), and combined with the carry from the runs before it. A scan along a
@@ -1211,7 +1227,7 @@ class FlyDSLKernel(SIMDKernel):
             self.tpr = _tune("row_tpr", min(span, _pow2_ceil(runs)))
             self.threads = max(self.threads, self.tpr)
             self.rpb = self.threads // self.tpr
-            split_ept = _tune("ept", SPLIT_SCAN_EPT)
+            split_ept = self._split_scan_ept(gathered)
             chunks = -(-self.rnumel // (self.tpr * split_ept))
             if self._split_scan_ok() and self.tpr > WAVE and chunks >= _tune(
                 "split_scan_min_chunks", SPLIT_SCAN_MIN_CHUNKS
@@ -1477,7 +1493,7 @@ class FlyDSLKernel(SIMDKernel):
             column = x_contig > r_contig and self.xnumel >= _tune(
                 "scan_column_min", SCAN_COLUMN_MIN
             )
-            self._finalize_scan(column, widest_vec)
+            self._finalize_scan(column, widest_vec, x_contig > r_contig)
             return
         gather = False
         if x_contig > r_contig:
@@ -3634,16 +3650,16 @@ def _module_epilogue(
 
         def {kname}_main({", ".join(arg_names)}, stream=None):
             global {kname}_compiled
-            args = ({"".join(f"{a}, " if a in sizes else f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
             if {kname}_compiled is None:
                 {kname}_compiled = fdp.load_binary(
-                    {kname}_binary, "{kname}_kernel_0", {threads}, {len(arg_names)}
+                    {kname}_binary, "{kname}_kernel_0", {threads}, {"".join("l" if a in sizes else "O" for a in arg_names)!r}
                 )
                 if {kname}_compiled is None:
                     # flyc.compile launches once while compiling, so this call is done.
-                    {kname}_compiled = flyc.compile({kname}_flydsl(), *args)
+                    jit = flyc.compile({kname}_flydsl(), {"".join(f"{a}, " if a in sizes else f"{a}.data_ptr(), " for a in arg_names)}{grid}, 0 if stream is None else stream)
+                    {kname}_compiled = lambda _gx, _gy, _gz, _s, *a: jit(*(x if isinstance(x, int) else x.data_ptr() for x in a), _gx, _s)
                     return
-            {kname}_compiled(*args)
+            {kname}_compiled({grid}, 1, 1, 0 if stream is None else stream, {"".join(f"{a}, " for a in arg_names)})
 
 
         def {kname}_precompile(**_):

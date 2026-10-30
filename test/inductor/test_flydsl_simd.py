@@ -334,6 +334,19 @@ class TestFlyDSLSIMD(TestCase):
         torch.testing.assert_close(out, ref)
         self.assertIn("fdp.bucket(", code)
 
+    def test_foreach_combo_many_args(self):
+        # More arguments than the vectorcall launcher takes: launched the slower way.
+        ps = [torch.randn(256 + i, device="cuda") for i in range(80)]
+        gs = [torch.randn_like(p) for p in ps]
+
+        def step(ps, gs):
+            torch._foreach_add_(ps, torch._foreach_mul(gs, 0.1))
+            return ps
+
+        ref = step([p.clone() for p in ps], gs)
+        out = torch.compile(step, dynamic=False)(ps, gs)
+        torch.testing.assert_close(out, ref)
+
     def test_indirect(self):
         w = torch.randn(5000, 128, device="cuda")
         ix = torch.randint(0, 5000, (64, 33), device="cuda")
@@ -1001,6 +1014,11 @@ class TestFlyDSLSIMD(TestCase):
                 torch.randn(40, 256).bfloat16(),
             ),
             (lambda x: torch.sort(x, dim=0, stable=True), torch.randn(100, 64)),
+            # Rows a few lanes wide sharing waves, the last wave part idle.
+            (
+                lambda x: torch.sort(x, dim=-1, descending=True, stable=True),
+                torch.randint(0, 4, (37, 13)).double(),
+            ),
         ):
             torch._dynamo.reset()
             counters.clear()

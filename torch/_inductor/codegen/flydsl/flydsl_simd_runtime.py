@@ -268,8 +268,20 @@ def to(x, k: str):
     v = _val(x)
     if k in _FP8:
         # Rounded to FP8 and back: in compute an FP8 value is the f32 it stands for.
-        return ArithValue(_cvt(_cvt(v, kind_of_type(v.type), k), k, "f32"))
+        f = _cvt(v, kind_of_type(v.type), "f32")
+        r = ArithValue(_cvt(_cvt(f, "f32", k), k, "f32"))
+        return _derive(r, "fp8", (k, f))
     return ArithValue(_cvt(v, kind_of_type(v.type), k))
+
+
+def _fp8_source(v, st: str):
+    """For an FP8 store, the f32 that ``v`` rounded to ``st`` from, if it did: rounding
+    again gives the same bits, so the store converts that and the round trip goes
+    unused -- three conversions an element to one on a rowwise quantization."""
+    d = _derived(v)
+    if d is not None and d[0] == "fp8" and d[1][0] == st:
+        return d[1][1]
+    return v
 
 
 def bitcast(x, src: str, dst: str):
@@ -924,6 +936,8 @@ def forget(cache: dict, arg: str) -> None:
 
 def store(r, off, value, st: str, mask=None):
     v = _val(_canon(value))
+    if st in _FP8:
+        v = _val(_fp8_source(v, st))
     raw = _cvt(v, kind_of_type(v.type), _MEM_KIND.get(st, st))
     _bstore(raw, r, idx(off), _mask(mask))
 
@@ -956,6 +970,8 @@ def vstore(
     v = _val(_canon(value))
     # FP8 elements stay f32 until the vector goes out, to convert two to a word half.
     f8 = st in _FP8 and w % 4 == 0
+    if st in _FP8:
+        v = _val(_fp8_source(v, st))
     raw = _cvt(v, kind_of_type(v.type), "f32" if f8 else _MEM_KIND.get(st, st))
     if j % w == 0:
         # A fresh slot: the same site is traced again by every unrolled loop iteration.
@@ -2476,6 +2492,8 @@ def _split_lookback(fn, total, smem, at: int, split):
     total = tuple(_canon(v) for v in total)
     kinds = [kind(t) for t in total]
     n = len(total)
+    if n == 1 and len(_to_words(total[0])) == 1:
+        return _split_lookback_packed(fn, total[0], smem, at, r, slot, chunk)
     i32 = T.i32()
     i1 = ir.IntegerType.get_signless(1)
     order = _llvm.AtomicOrdering
@@ -2551,6 +2569,76 @@ def _split_lookback(fn, total, smem, at: int, split):
     _when(_val(eq(_tid(), 0)), emit)
     barrier()
     return tuple(tile_get(smem, at, 1, 2 * c, kinds[c]) for c in range(n))
+
+
+def _split_lookback_packed(fn, total, smem, at: int, r, slot, chunk):
+    """``_split_lookback`` of one 32-bit value: (flag << 32 | value) in a slot's first
+    64-bit word, published and polled by relaxed agent-scope atomics, as Triton's
+    look-back. The release store and acquire loads of the general form cost an L2
+    write-back and invalidate a hop on gfx942: ~3us against ~0.5us."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    k0 = kind(total)
+    i32, i64 = T.i32(), T.i64()
+    i1 = ir.IntegerType.get_signless(1)
+    mono = _llvm.AtomicOrdering.monotonic
+
+    def c(t, v):
+        return _arith.ConstantOp(t, ir.IntegerAttr.get(t, v)).result
+
+    def ptr(s):
+        return _flat_ptr(r, ArithValue(s) * SPLIT_SLOT_WORDS, 4)
+
+    def pack(flag, v):
+        w = _arith.ExtUIOp(i64, _to_words(v)[0]).result
+        f = _arith.ShLIOp(_arith.ExtUIOp(i64, flag).result, c(i64, 32)).result
+        return _arith.OrIOp(f, w).result
+
+    def publish(s, flag, v):
+        _llvm.StoreOp(
+            pack(flag, v), ptr(s), ordering=mono, syncscope="agent", alignment=8
+        )
+
+    def emit():
+        me = _val(idx32(slot))
+        first = _val(eq(chunk, 0))
+        publish(me, _arith.SelectOp(first, c(i32, 2), c(i32, 1)).result, total)
+        prev = _arith.SubIOp(me, c(i32, 1)).result
+        acc0 = _val(total)
+        types = [i32, i1, acc0.type]
+        loop = _scf.WhileOp(types, [prev, first, acc0])
+        before = loop.before.blocks.append(*types)
+        with ir.InsertionPoint(before):
+            go = _arith.XOrIOp(before.arguments[1], _val(const(True, "b1"))).result
+            _scf.ConditionOp(go, list(before.arguments))
+        after = loop.after.blocks.append(*types)
+        with ir.InsertionPoint(after):
+            k, _, acc = after.arguments
+            p = _llvm.LoadOp(
+                i64, ptr(k), ordering=mono, syncscope="agent", alignment=8
+            ).result
+            flag = _arith.TruncIOp(i32, _arith.ShRUIOp(p, c(i64, 32)).result).result
+            v = _canon(_from_words([_arith.TruncIOp(i32, p).result], k0))
+            ready = _val(ne(ArithValue(flag), 0))
+            inclusive = _val(eq(ArithValue(flag), 2))
+            started = _val(ne(ArithValue(k), ArithValue(prev)))
+            folded = _arith.SelectOp(
+                started, _val(_canon(fn((v,), (ArithValue(acc),))[0])), _val(v)
+            ).result
+            nxt = _arith.SelectOp(ready, folded, acc).result
+            k2 = _arith.SelectOp(ready, _arith.SubIOp(k, c(i32, 1)).result, k).result
+            _scf.YieldOp([k2, inclusive, nxt])
+        pre = ArithValue(loop.results[2])
+        inc = _canon(fn((pre,), (total,))[0])
+        _when(
+            _arith.XOrIOp(first, _val(const(True, "b1"))).result,
+            lambda: publish(me, c(i32, 2), inc),
+        )
+        tile_put(smem, at, 1, 0, pre)
+
+    _when(_val(eq(_tid(), 0)), emit)
+    barrier()
+    return (tile_get(smem, at, 1, 0, k0),)
 
 
 def _group_scan_waves(fn, values, carry, first, tpr, lane, smem, base):
@@ -2741,6 +2829,11 @@ def _bitonic(lds, p, rows, threads, kind_, stable, descending, run: int):
                 body(g)
         barrier()
 
+    lanes = p // m
+    if lanes <= WAVE and threads % lanes == 0:
+        over(rows * lanes, lambda g: _bitonic_wave(lds, g, p, m, kind_, stable, descending))
+        return
+
     k = 2
     while k <= p:
         j = k // 2
@@ -2776,6 +2869,41 @@ def _bitonic(lds, p, rows, threads, kind_, stable, descending, run: int):
 
         over(rows * (p // m), run)
         k *= 2
+
+
+def _bitonic_wave(lds, g, p: int, m: int, kind_, stable, descending):
+    """The whole network of a row held by one wave, ``m`` slots a lane: steps across
+    lanes swap through shuffles, so no step waits on the block."""
+    lanes = p // m
+    r = g % lanes
+    e0 = r * m
+    at = idx(g // lanes) * p + idx(e0)
+    vals = [lds.get(at + e) for e in range(m)]
+    k = 2
+    while k <= p:
+        j = k // 2
+        while j >= m:
+            d = j // m
+            up = ne(r & d, 0)
+            for e in range(m):
+                mine = vals[e]
+                other = tuple(_shfl(v, d, WAVE) for v in mine)
+                lo = tuple(where(up, o, v) for v, o in zip(mine, other))
+                hi = tuple(where(up, v, o) for v, o in zip(mine, other))
+                x, y = _compare_swap(lo, hi, e0 + e, k, p, kind_, stable, descending)
+                vals[e] = tuple(where(up, b, a) for a, b in zip(x, y))
+            j //= 2
+        while j >= 1:
+            for e in range(m):
+                if e & j:
+                    continue
+                vals[e], vals[e + j] = _compare_swap(
+                    vals[e], vals[e + j], e0 + e, k, p, kind_, stable, descending
+                )
+            j //= 2
+        k *= 2
+    for e in range(m):
+        lds.put(at + e, vals[e])
 
 
 def barrier():
@@ -3360,13 +3488,19 @@ def compile_early(kernel_name: str, source: str, binaries: list[str]) -> None:
     """At codegen, hand each of a module's variants to an idle compile worker, rather
     than when the finished graph module loads: a graph's first call otherwise waited
     on its slowest compile after all of codegen (Llama training's AdamW kernel, 1.4 s).
-    Only once the pool is up, as ``async_compile`` decides; ``compiled`` then waits for
-    the job and loads its code object here."""
+    Whenever there may be a pool, ready or not: ``use_process_pool`` only says whether
+    its workers are up yet, which on a short graph they are not until after codegen,
+    leaving all of its compiles to start at load. A job queued now starts as soon as
+    they are up.
+    ``compiled`` then waits for the job and loads its code object here."""
     from torch._inductor import async_compile
     from torch._inductor.codegen.flydsl.flydsl_kernel import MAIN_SUFFIX
     from torch._inductor.runtime.compile_tasks import _worker_compile_pycodecache_kernel
 
-    if not async_compile.AsyncCompile.use_process_pool():
+    pool_cls = async_compile.AsyncCompile
+    # Starts the workers if this is the first ask; None when there is to be no pool.
+    pool_cls.use_process_pool()
+    if pool_cls._ready_future is None:
         return
     env = async_compile._pycodecache_kernel_compile_env()
     if "FLYDSL_RUNTIME_CACHE_DIR" in _os.environ:
@@ -3416,11 +3550,13 @@ def have_binary(path: str) -> bool:
     return _os.path.exists(path)
 
 
-def load_binary(path: str, kernel: str, threads: int, nargs: int):
-    """A launcher for the code object ``save_binary`` wrote, taking the arguments of a
-    FlyDSL launch (``nargs`` addresses, the grid, the stream), or None if there is
-    none. FlyDSL's own first call in a process re-JITs the host launch code from the
-    cached module, about 18 ms a kernel: 10 s of a Qwen3 prefill's first step."""
+def load_binary(path: str, kernel: str, threads: int, tys: str):
+    """A launcher for the code object ``save_binary`` wrote, or None if there is none,
+    called as ``(grid, 1, 1, stream, *args)``: an argument of type ``O`` a tensor, ``l``
+    an int. FlyDSL's own first call in a process re-JITs the host launch code from the
+    cached module, about 18 ms a kernel: 10 s of a Qwen3 prefill's first step. The
+    vectorcall launcher Triton's kernels use reads the tensors' addresses in C++: 3 us
+    a launch under the Python path's."""
     if not _os.path.exists(path):
         return None
     import torch
@@ -3432,17 +3568,25 @@ def load_binary(path: str, kernel: str, threads: int, nargs: int):
         return None
     launcher = torch._C._StaticCudaLauncher
     module, function, _, _ = launcher._load_kernel(path, kernel, 0, device)
-    launch_kernel = launcher._launch_kernel
-    tys = "l" * nargs
+    # The launchers hold the raw function: its code object stays loaded.
+    _LOADED.append(module)
     warps = threads // warp
+    fast = getattr(torch._C, "_FastCudaLauncher", None)
+    if fast is not None:
+        # It takes at most MAX_ARGS arguments: a wide combo kernel has more.
+        with contextlib.suppress(ValueError):
+            return fast(function, warps, 0, tys, 0)
+    launch_kernel = launcher._launch_kernel
+    addr_tys = tys.replace("O", "l")
 
-    def run(*args):
-        launch_kernel(
-            function, args[nargs], 1, 1, warps, 0, tys, args[:nargs], args[nargs + 1]
-        )
+    def slow(gx, gy, gz, stream, *args):
+        args = tuple(a if t == "l" else a.data_ptr() for a, t in zip(args, tys))
+        launch_kernel(function, gx, gy, gz, warps, 0, addr_tys, args, stream)
 
-    run.module = module  # keep the code object loaded
-    return run
+    return slow
+
+
+_LOADED: list = []
 
 
 del _math

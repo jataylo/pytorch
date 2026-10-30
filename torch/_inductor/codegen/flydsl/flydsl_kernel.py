@@ -34,10 +34,9 @@ class FlyDSLKernelWrapper:
     def __init__(self, kernel_fn: Callable[..., Any], kernel_path: str | None = None):
         self.kernel_fn = kernel_fn
         self.kernel_path = kernel_path
+        # Called once a kernel launch: one Python frame fewer than a forwarding method.
+        self.run = kernel_fn
         kernel_code_log.info("FlyDSL kernel path: %s", kernel_path)
-
-    def run(self, *args, stream=None, **kwargs):
-        return self.kernel_fn(*args, stream=stream, **kwargs)
 
 
 class FlyDSLTemplateKernel(Kernel):
@@ -167,7 +166,7 @@ class FlyDSLTemplateKernel(Kernel):
             for arg_def in arg_defs:
                 if arg_def.full_name() not in self._seen_input_args:
                     params.append(arg_def.full_name())
-            params.append("stream")
+            params.append("stream=None")
             code.writeline(
                 f"def {self.kernel_name}_{MAIN_SUFFIX}({', '.join(params)}):"
             )
