@@ -1416,6 +1416,28 @@ class TestFlyDSLSIMD(TestCase):
         for binary in submitted:
             self.assertTrue(os.path.exists(binary), binary)
 
+    def test_compile_pool_forks_with_flydsl_set_up(self):
+        # As with Triton, the pool's sidecar sets FlyDSL up before forking its workers,
+        # so none of them pays for it on its first kernel.
+        from torch._inductor.compile_worker.subproc_pool import SubprocPool
+
+        torch.zeros(1, device="cuda")
+        arch = torch.cuda.get_device_properties().gcnArchName.split(":", 1)[0]
+        with patch.dict(os.environ):
+            os.environ.pop("FLYDSL_GPU_ARCH", None)
+            pool = SubprocPool(2)
+        try:
+            self.assertTrue(pool.flydsl_preloaded)
+            self.assertEqual(pool.submit(os.getenv, "FLYDSL_GPU_ARCH").result(), arch)
+        finally:
+            pool.shutdown()
+        with config.patch({"flydsl.simd": False}):
+            pool = SubprocPool(1)
+        try:
+            self.assertFalse(pool.flydsl_preloaded)
+        finally:
+            pool.shutdown()
+
     def test_autotuned_in_place(self):
         # A pointwise kernel this large times its candidates on its first call; one that
         # updates a buffer in place must be timed on a copy and applied exactly once.

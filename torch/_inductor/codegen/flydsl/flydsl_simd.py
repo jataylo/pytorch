@@ -4713,8 +4713,7 @@ def _warm_compile_workers() -> None:
     from .flydsl_simd_runtime import warm_worker
 
     pool = async_compile.AsyncCompile.process_pool()
-    preloads = getattr(pool, "preload", ())
-    if any("flydsl_simd_runtime:preload_worker" in p for p in preloads):
+    if getattr(pool, "flydsl_preloaded", False):
         return  # the workers forked with it done
     for _ in range(threads):
         pool.submit(warm_worker, _gpu_arch())

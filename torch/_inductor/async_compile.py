@@ -95,23 +95,6 @@ def _pycodecache_kernel_compile_env() -> dict[str, str | None]:
     return {v: os.environ.get(v) for v in env_vars}
 
 
-def _worker_preloads() -> list[str]:
-    """Setup the SubprocPool's sidecar runs before forking its workers (see
-    ``SubprocPool(preload=...)``), for kernel kinds whose first compile in a worker
-    would otherwise pay for it."""
-    from torch._inductor.codegen.flydsl import flydsl_utils
-
-    preloads = []
-    if flydsl_utils.simd_enabled():
-        arch = None
-        if torch.cuda.is_initialized():
-            name = torch.cuda.get_device_properties(torch.cuda.current_device())
-            arch = name.gcnArchName.split(":", 1)[0]
-        spec = "torch._inductor.codegen.flydsl.flydsl_simd_runtime:preload_worker"
-        preloads.append(f"{spec}={arch}" if arch else spec)
-    return preloads
-
-
 def pre_fork_setup():
     """
     Setup that must be done prior to forking with a process pool.
@@ -346,9 +329,7 @@ class AsyncCompile:
         if config.worker_start_method == "subprocess":
             # Wrapper around ProcessPoolExecutor forks in a new process we control
             pool = SubprocPool(
-                get_compile_threads(),
-                quiesce=config.quiesce_async_compile_pool,
-                preload=_worker_preloads(),
+                get_compile_threads(), quiesce=config.quiesce_async_compile_pool
             )
         else:
             if config.worker_start_method == "spawn":

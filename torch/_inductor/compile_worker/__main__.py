@@ -48,16 +48,16 @@ def _lookup_and_create_type(base: type[_T], qname: str) -> _T:
     return ty()
 
 
-def _run_preload(spec: str) -> None:
-    """Run ``module:function[=arg]`` before the workers fork, so each inherits its
-    result. Only a head start: a failure is logged and the workers set up alone."""
-    target, _, arg = spec.partition("=")
-    pkg, _, name = target.partition(":")
+def _preload_flydsl(arch: str | None) -> None:
+    """Import and set up FlyDSL before the workers fork, as Triton is imported above,
+    so each inherits it rather than paying ~2 s on its first kernel. Only a head
+    start: on failure the workers set up alone."""
     try:
-        fn = getattr(importlib.import_module(pkg), name)
-        fn(arg) if arg else fn()
+        from torch._inductor.codegen.flydsl.flydsl_simd_runtime import preload_worker
+
+        preload_worker(arch)
     except Exception:
-        log.exception("compile_worker preload %s failed", spec)
+        log.exception("compile_worker FlyDSL preload failed")
 
 
 def main():
@@ -72,7 +72,7 @@ def main():
         parser.add_argument("--read-fd", type=int)
         parser.add_argument("--write-fd", type=int)
         parser.add_argument("--torch-key", type=str)
-        parser.add_argument("--preload", action="append", default=[])
+        parser.add_argument("--flydsl-preload", type=str, default=None)
         args = parser.parse_args()
         if os.getppid() != args.parent:
             sys.exit(0)
@@ -85,8 +85,8 @@ def main():
 
         _async_compile_initializer(args.parent)
 
-        for spec in args.preload:
-            _run_preload(spec)
+        if args.flydsl_preload is not None:
+            _preload_flydsl(args.flydsl_preload or None)
 
         SubprocMain(args.pickler, args.kind, args.workers, read_fd, write_fd).main()
     except Exception:

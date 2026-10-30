@@ -13,7 +13,7 @@ import threading
 import time
 import traceback
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from enum import Enum, IntEnum
@@ -24,7 +24,7 @@ from typing_extensions import Never, ParamSpec
 # _thread_safe_fork is needed because the subprocesses in the pool can read
 # justknobs, e.g., in the Triton compiler. For internal, the import installs
 # functionality to destroy singletons before forking and re-enable them after.
-import torch._thread_safe_fork  # noqa: F401
+import torch._thread_safe_fork
 from torch._inductor import config
 from torch._inductor.codecache import torch_key
 from torch._inductor.compile_worker import watchdog
@@ -152,6 +152,22 @@ class SubprocKind(Enum):
     SPAWN = "spawn"
 
 
+def _flydsl_preload_arch() -> str | None:
+    """The gfx target the sidecar sets FlyDSL up for before forking ("" to detect it),
+    or None when Inductor is not generating FlyDSL kernels. Decided here because the
+    sidecar cannot see the parent's config."""
+    if not config.flydsl.simd:
+        return None
+    from torch._inductor.codegen.flydsl import flydsl_utils
+
+    if not flydsl_utils.simd_enabled():
+        return None
+    if not torch.cuda.is_initialized():
+        return ""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.gcnArchName.split(":", 1)[0]
+
+
 class SubprocPool:
     """
     Mimic a concurrent.futures.ProcessPoolExecutor, but wrap it in
@@ -164,12 +180,8 @@ class SubprocPool:
         pickler: SubprocPickler | None = None,
         kind: SubprocKind = SubprocKind.FORK,
         quiesce: bool = False,
-        preload: Sequence[str] = (),
     ) -> None:
-        """``preload``: ``"module:function"`` or ``"module:function=arg"`` setup the
-        sidecar runs before forking its workers, so each worker inherits it."""
         entry = os.path.join(os.path.dirname(__file__), "__main__.py")
-        self.preload = tuple(preload)
         self.pickler = pickler or SubprocPickler()
         self.kind = kind
 
@@ -195,7 +207,10 @@ class SubprocPool:
             f"--write-fd={str(subproc_write_fd)}",
             f"--torch-key={torch_key_str}",
         ]
-        args.extend(f"--preload={p}" for p in preload)
+        flydsl_arch = _flydsl_preload_arch()
+        self.flydsl_preloaded = flydsl_arch is not None
+        if flydsl_arch is not None:
+            args.append(f"--flydsl-preload={flydsl_arch}")
         cmd.extend(args)
         log_path = None
         self.log_file = None
