@@ -657,20 +657,9 @@ _install_overrides()
 def _runtime_fingerprint() -> str:
     import os
 
-    from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
-
-    from . import flydsl_mod_runtime
-
-    h = hashlib.sha256()
-    here = os.path.dirname(__file__)
-    for path in (
-        os.path.join(here, "flydsl_simd_runtime.py"),
-        flydsl_mod_runtime.__file__,
-        buffer_ops.__file__,
-    ):
-        with open(path, "rb") as f:
-            h.update(f.read())
-    return h.hexdigest()[:16]
+    path = os.path.join(os.path.dirname(__file__), "flydsl_simd_runtime.py")
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
 
 
 _STRING = re.compile(r"'[^']*'|\"[^\"]*\"")
@@ -919,7 +908,7 @@ def _linear_in(expr: sympy.Expr, var: sympy.Symbol) -> bool:
 
 class FlyDSLKernel(SIMDKernel):
     """A fused pointwise or reduction kernel emitted as a FlyDSL module: one flat ``x``
-    tile, or ``x`` by ``r0_``, over a fixed 256-thread block. See SIMD_BACKEND.md."""
+    tile, or ``x`` by ``r0_``, over a fixed 256-thread block."""
 
     overrides = FlyDSLKernelOverrides  # type: ignore[assignment]
     kexpr = staticmethod(_printer.doprint)  # type: ignore[assignment]

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 from unittest.mock import patch
 
-from torch._inductor.utils import Placeholder
+from torch._inductor.utils import OrderedSet, Placeholder
 from torch._inductor.virtualized import V
 from torch._logging import getArtifactLogger
 
@@ -47,8 +47,6 @@ class FlyDSLTemplate(KernelTemplate):
     def maybe_append_choice(
         self, choices: list[Any], **kwargs: Any
     ) -> NotImplementedError | None:
-        # These kernels are JIT-compiled through the FlyDSL runtime at first call, so
-        # there is nothing for an ahead-of-time wrapper to emit.
         if getattr(V.graph, "cpp_wrapper", False) or getattr(
             V.graph, "aot_mode", False
         ):
@@ -62,7 +60,7 @@ class FlyDSLTemplate(KernelTemplate):
             log.debug("FlyDSL template choice generation failed: %s", e)
             return e
         except Exception as e:
-            log.warning("FlyDSL template choice generation error: %s", e, exc_info=True)
+            log.debug("FlyDSL template choice generation error: %s", e, exc_info=True)
             return NotImplementedError(f"FlyDSL template failed: {e}")
 
     def generate(self, **kwargs: Any) -> ChoiceCaller:
@@ -70,7 +68,8 @@ class FlyDSLTemplate(KernelTemplate):
         layout = kwargs.pop("layout")
         mutated_inputs = kwargs.pop("mutated_inputs", None)
         template_kwargs = dict(kwargs)
-        kernel_name = f"flydsl_{self.name}_{next(self.index_counter)}"
+        benchmark_kernel_name = f"flydsl_{self.name}"
+        choice_name = f"{benchmark_kernel_name}_{next(self.index_counter)}"
 
         if self.template is None:
             raise RuntimeError("Template compilation failed (Jinja2 required)")
@@ -80,49 +79,25 @@ class FlyDSLTemplate(KernelTemplate):
             V.graph, "get_dtype", KernelTemplate._fake_get_dtype(output_node)
         ):
             kernel = self.kernel_type(
-                kernel_name=kernel_name,
+                kernel_name=benchmark_kernel_name,
                 input_nodes=input_nodes,
                 output_node=output_node,
             )
             code = kernel.render(self.template, **kwargs)
-            output_code_log.debug("Generated FlyDSL Code:\n%s", code)
 
             input_call_args = tuple(kernel.args.input_buffers.keys())
-            declared_input_args = tuple(x.get_name() for x in input_nodes)
-            missing = [n for n in declared_input_args if n not in input_call_args]
-            if missing:
+            # KernelArgs deduplicates input buffers by string value, so mirror
+            # that contract even when equal names are distinct Python objects.
+            expected_input_args = tuple(
+                OrderedSet(node.get_name() for node in input_nodes)
+            )
+            if input_call_args[: len(expected_input_args)] != expected_input_args:
                 raise RuntimeError(
-                    f"FlyDSL template never registered its declared inputs {missing}; "
-                    f"registered {input_call_args}."
+                    "FlyDSL template input registration order changed. "
+                    f"Got {input_call_args}, expected prefix {expected_input_args}."
                 )
 
-            # Note [registration order is not signature order]
-            #
-            # Presence is all this can check. It is tempting to also require the declared
-            # inputs to be the prefix of `input_call_args`, and for a template with no
-            # captures that holds, but a flex mod registers the tensors it captures when
-            # its subgraph is lowered, which can be before the template calls def_kernel:
-            # the backward renders with its captures registered first. The positional ABI
-            # is checked below against `python_argdefs`, which is the order that actually
-            # reaches the kernel.
-
-            # Whatever else got registered was discovered while rendering -- a tensor
-            # captured by a flex mod, say. The kernel signature already picks those up
-            # through the def_kernel hook, but they also have to join `input_nodes`, which
-            # is what tells the benchmark harness and the scheduler that this kernel reads
-            # them. They go last, matching where the hook puts them in the signature,
-            # which is not necessarily where they were registered: a template is free to
-            # call def_kernel below the code that registers them.
-            extra_input_nodes = {
-                name: kernel.resolve_extra_input(name)
-                for name in input_call_args
-                if name not in declared_input_args
-            }
-            input_nodes = list(input_nodes) + list(extra_input_nodes.values())
-            kernel.set_extra_input_nodes(extra_input_nodes)
-
-            with kernel._patch_get_dtype_for_args():
-                arg_defs, call_args, _, _ = kernel.args.python_argdefs()
+            arg_defs, call_args, _, _ = kernel.args.python_argdefs()
             expected_args = list(input_call_args)
             expected_args.append(output_node.get_name())
             if list(call_args)[: len(expected_args)] != expected_args:
@@ -135,12 +110,13 @@ class FlyDSLTemplate(KernelTemplate):
             )
 
             bmreq = FlyDSLBenchmarkRequest(
-                kernel_name=kernel_name,
+                kernel_name=benchmark_kernel_name,
                 input_tensor_meta=TensorMeta.from_irnodes(input_nodes),
                 output_tensor_meta=TensorMeta.from_irnodes(output_node),
                 extra_args=extra_args,
                 source_code=code,
             )
+            output_code_log.debug("Generated FlyDSL Code:\n%s", bmreq.source_code)
 
             def make_kernel_render(out_node, hint_override: int | None = None):
                 render_kernel = self.kernel_type(
@@ -148,7 +124,6 @@ class FlyDSLTemplate(KernelTemplate):
                     input_nodes=input_nodes,
                     output_node=out_node,
                 )
-                render_kernel.set_extra_input_nodes(extra_input_nodes)
 
                 def render():
                     return render_kernel.render(self.template, **kwargs)
@@ -157,7 +132,7 @@ class FlyDSLTemplate(KernelTemplate):
 
             caller_type = self.caller_type or FlyDSLTemplateCaller
             return caller_type(
-                name=kernel_name,
+                name=choice_name,
                 input_nodes=input_nodes,
                 layout=layout,
                 make_kernel_render=make_kernel_render,
@@ -204,17 +179,6 @@ class FlyDSLTemplateCaller(ChoiceCaller):
     def __str__(self) -> str:
         return f"FlyDSLTemplateCaller({self.name})"
 
-    def precompile(self) -> None:
-        """Compile ahead of the benchmark loop, in a worker process.
-
-        Defining this at all is what routes FlyDSL choices off the serial path, since the
-        autotune driver dispatches on `hasattr(choice, "precompile")`. It calls this from
-        a thread pool, which on its own buys nothing here -- FlyDSL's compiler does not
-        overlap across threads -- so the request hands the work to a process pool and
-        blocks on it. See `FlyDSLBenchmarkRequest.precompile`.
-        """
-        self.bmreq.precompile()
-
     def benchmark(self, *args, out) -> float:
         return self.bmreq.benchmark(*args, out=out)
 
@@ -226,6 +190,8 @@ class FlyDSLTemplateCaller(ChoiceCaller):
             template=self.template,
             mutated_inputs=self.mutated_inputs,
         )
+        if "ktc" in self.annotations:
+            buffer.annotations["ktc"] = self.annotations["ktc"]
         return TensorBox.create(buffer)
 
     def call_name(self) -> str:

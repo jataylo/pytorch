@@ -1,11 +1,8 @@
 # mypy: ignore-errors
 """Device-side helpers for FlyDSL kernels generated from Inductor pointwise/reduction IR.
 
-Generated SIMD kernels import this module as ``fdp``. It is the SIMD counterpart of
-``flydsl_mod_runtime`` (the flex score_mod shim, imported as ``fdu``), and leans on it for
-the transcendental expansions that have no AMDGPU libcall. Where the flex shim only ever
-sees an f32 score and i32 coordinates, a general Inductor kernel carries every dtype, so
-values here live in one of five *compute kinds*:
+Generated SIMD kernels import this module as ``fdp``. A general Inductor kernel carries
+every dtype, so values here live in one of five *compute kinds*:
 
     b1   bool                      (i1)
     i32  int8/int16/uint8/int32    (sign- or zero-extended at load, truncated at store)
@@ -48,19 +45,18 @@ from flydsl.expr.utils.arith import ArithValue
 from torch.utils._ordered_set import OrderedSet
 
 
-try:
-    from flydsl.expr import buffer_ops
-except ImportError:
-    # FlyDSL 0.3 moved it kernel-side. The shim's package imports torch._inductor's
-    # kernel templates, flex attention, and the lowerings: 0.45 s of a compile
-    # worker's warm-up, so only when the library has none.
-    from torch._inductor.kernel.vendored_templates.flydsl.flex_kernels import buffer_ops
-
-from . import flydsl_mod_runtime as fdu
-
-
 WAVE = 64
 _LOG2E = 1.4426950408889634
+_LN2 = 1.0 / _LOG2E
+_LN10 = _math.log(10.0)
+
+# Abramowitz & Stegun 7.1.26, max abs error 1.5e-7 on x >= 0.
+_ERF_P = 0.3275911
+_ERF_COEFFS = (1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592)
+
+
+def _cf32(v):
+    return fx.Float32(float(v))
 
 
 # ---------------------------------------------------------------------------------------
@@ -493,6 +489,51 @@ class _Flat:
         self.addr = addr  # i64
 
 
+# Word 3 of a CDNA buffer descriptor: data format 7 and num format 4, both of which
+# must be nonzero and neither of which the raw buffer instructions read.
+_RSRC_FLAGS = (7 << 12) | (4 << 15)
+_MASKED_OFFSET = 0x7FFFFFFF
+
+
+def _int_const(t, v):
+    return _arith.ConstantOp(t, ir.IntegerAttr.get(t, v)).result
+
+
+def _i32_offset(off):
+    if isinstance(off, int):
+        return _int_const(T.i32(), off)
+    v = _val(off)
+    if not (isinstance(v.type, ir.IntegerType) and v.type.width == 32):
+        v = _arith.IndexCastOp(T.i32(), v).result
+    return v
+
+
+def _byte_offset(off, unit: int, mask):
+    """Element offset ``off`` in bytes; a masked lane's is past every descriptor's end,
+    so the hardware drops it (a load returns 0)."""
+    o = _arith.MulIOp(_i32_offset(off), _int_const(T.i32(), unit)).result
+    if mask is not None:
+        o = _arith.SelectOp(_val(mask), o, _int_const(T.i32(), _MASKED_OFFSET)).result
+    return o
+
+
+def _rsrc_from_addr(addr, num_records):
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    base = _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr"), addr).result
+    if isinstance(num_records, int):
+        n = _int_const(T.i64(), num_records)
+    else:
+        n = _arith.ExtUIOp(T.i64(), _val(num_records)).result
+    return _rocdl.MakeBufferRsrcOp(
+        ir.Type.parse("!llvm.ptr<8>"),
+        base,
+        _int_const(T.i16(), 0),
+        n,
+        _int_const(T.i32(), _RSRC_FLAGS),
+    ).result
+
+
 def rsrc(addr, nbytes: int):
     """Buffer resource over ``nbytes`` from a raw device address (or a ``_Flat`` for
     one too large for it).
@@ -502,14 +543,10 @@ def rsrc(addr, nbytes: int):
     """
     if not isinstance(nbytes, int):
         # Computed from the size arguments; guarded below 2**31 at compile time.
-        return buffer_ops.create_buffer_resource_from_addr(
-            _val(addr), num_records_bytes=_val(idx32(nbytes))
-        )
+        return _rsrc_from_addr(_val(addr), idx32(nbytes))
     if nbytes >= 2**31 - 1:
         return _Flat(_val(addr))
-    return buffer_ops.create_buffer_resource_from_addr(
-        _val(addr), num_records_bytes=int(nbytes)
-    )
+    return _rsrc_from_addr(_val(addr), int(nbytes))
 
 
 def size_arg(v):
@@ -543,18 +580,30 @@ def _flat_ptr(r: _Flat, off, unit: int, mask=None):
 
 
 def _bload(r, off, vec_width: int, dtype, mask=None, is_scalar: bool = False):
-    """``buffer_ops.buffer_load``, or its 64-bit global form for a ``_Flat``."""
-    if not isinstance(r, _Flat):
-        off = _narrow(off)
-        if is_scalar:
-            return buffer_ops.buffer_load(r, off, vec_width=1, is_scalar=True)
-        return buffer_ops.buffer_load(
-            r, off, vec_width=vec_width, dtype=dtype, mask=mask
-        )
+    """A buffer load of ``vec_width`` ``dtype`` elements at element offset ``off``, or
+    its 64-bit global form for a ``_Flat``. ``is_scalar`` loads one wave-uniform i32
+    through the scalar cache into an SGPR."""
     from flydsl._mlir.dialects import llvm as _llvm
 
     t = dtype if vec_width == 1 else ir.VectorType.get([vec_width], dtype)
     unit = _type_bytes(dtype)
+    if not isinstance(r, _Flat):
+        o = _byte_offset(_narrow(off), unit, mask)
+        if is_scalar:
+            rsrc_v4 = _llvm.bitcast(
+                ir.VectorType.get([4], T.i32()),
+                _llvm.ptrtoint(ir.IntegerType.get_signless(128), r),
+            )
+            return _llvm.call_intrinsic(
+                T.i32(),
+                "llvm.amdgcn.s.buffer.load.i32",
+                [rsrc_v4, o, _int_const(T.i32(), 0)],
+                [],
+                [],
+            )
+        return _rocdl.RawPtrBufferLoadOp(
+            t, r, o, _int_const(T.i32(), 0), aux=None
+        ).result
     v = _llvm.LoadOp(t, _flat_ptr(r, off, unit, mask), alignment=unit).result
     if mask is None:
         return v
@@ -585,14 +634,17 @@ def _zero_attr(t):
 
 
 def _bstore(value, r, off, mask=None):
-    """``buffer_ops.buffer_store``, or its 64-bit global form for a ``_Flat``."""
-    if not isinstance(r, _Flat):
-        buffer_ops.buffer_store(value, r, _narrow(off), mask=mask)
-        return
+    """A buffer store of ``value`` at element offset ``off``, or its 64-bit global
+    form for a ``_Flat``."""
     from flydsl._mlir.dialects import llvm as _llvm
 
+    value = _val(value)
     t = value.type
     unit = _type_bytes(t.element_type if isinstance(t, ir.VectorType) else t)
+    if not isinstance(r, _Flat):
+        o = _byte_offset(_narrow(off), unit, mask)
+        _rocdl.RawPtrBufferStoreOp(value, r, o, _int_const(T.i32(), 0), aux=None)
+        return
     ptr = _flat_ptr(r, off, unit)
     _when(mask, lambda: _llvm.StoreOp(value, ptr, alignment=unit))
 
@@ -1151,18 +1203,20 @@ def _buffer_add(r, off, unit: int, v, mask):
         _global_fadd(r, off, unit, v, mask)
         return
     byte_off = _val(mul(ArithValue(_val(_narrow(ArithValue(off)))), unit))
+
+    def fadd():
+        _rocdl.RawPtrBufferAtomicFaddOp(v.type, v, r, byte_off, _int_const(T.i32(), 0))
+
     m = _mask(mask)
     if m is None:
-        zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
-        _rocdl.RawPtrBufferAtomicFaddOp(v, r, byte_off, zero, zero)
+        fadd()
         return
     # Unlike loads and stores, a buffer atomic steered out of range (offset 0x7FFFFFFF)
     # faults on gfx942 rather than being dropped, so a masked lane needs a real branch.
     # Built by hand: helpers are not AST-rewritten, so a Python `if` would not trace.
     if_op = _scf.IfOp(m)
     with ir.InsertionPoint(if_op.then_block):
-        zero = _arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), 0)).result
-        _rocdl.RawPtrBufferAtomicFaddOp(v, r, byte_off, zero, zero)
+        fadd()
         _scf.YieldOp([])
 
 
@@ -1622,7 +1676,7 @@ def libdevice_exp(x):
 
 def sched_fence():
     """``llvm.amdgcn.sched.barrier(0)``: the machine scheduler moves nothing across it."""
-    _rocdl.sched_barrier(0)
+    _rocdl.sched_barrier(ir.Attribute.parse("#rocdl<sched_group_mask none>"))
 
 
 def _rcp(x):
@@ -1643,9 +1697,9 @@ def _copysign(mag, x):
 
 def _horner(z, coeffs):
     """``coeffs[0] + coeffs[1] z + ...``, as fused multiply-adds."""
-    acc = fdu.const_f32(coeffs[-1])
+    acc = _cf32(coeffs[-1])
     for c in reversed(coeffs[:-1]):
-        acc = ArithValue(fmath.fma(acc, z, fdu.const_f32(c)))
+        acc = ArithValue(fmath.fma(acc, z, _cf32(c)))
     return acc
 
 
@@ -1666,7 +1720,7 @@ _SMALL = 0.25
 
 
 def _erf_rcp(x):
-    # Below 1, erf(x) / x as a polynomial in x^2 (relative error ~1e-7). Above, fdu.erf's
+    # Below 1, erf(x) / x as a polynomial in x^2 (relative error ~1e-7). Above,
     # A&S 7.1.26 (abs error 1.5e-7) with 1 / (1 + p|x|), which lies in (0, 1], taken by
     # v_rcp_f32. Pointwise kernels around erf are ALU-bound on MI300 (~35 instructions
     # an element at HBM speed), so every instruction here shows: an erf GELU went
@@ -1675,15 +1729,15 @@ def _erf_rcp(x):
     # the GELU of a freshly initialized ViT MLP).
     x = _f32(x)
     ax = ArithValue(fmath.absf(x))
-    if_op = _scf.IfOp(_val(ax < fdu.const_f32(1.0)), [T.f32()], has_else=True)
+    if_op = _scf.IfOp(_val(ax < _cf32(1.0)), [T.f32()], has_else=True)
     with ir.InsertionPoint(if_op.then_block):
         small = ArithValue(ax * _horner(ArithValue(ax * ax), _ERF_UNIT))
         _scf.YieldOp([_val(small)])
     with ir.InsertionPoint(if_op.else_block):
-        t = _rcp(fmath.fma(fdu.const_f32(fdu._ERF_P), ax, fdu.const_f32(1.0)))
-        poly = ArithValue(t * _horner(t, tuple(reversed(fdu._ERF_COEFFS))))
-        e = _exp2_raw(ArithValue(ArithValue(ax * ax) * fdu.const_f32(-_LOG2E)))
-        big = ArithValue(fmath.fma(ArithValue(-poly), e, fdu.const_f32(1.0)))
+        t = _rcp(fmath.fma(_cf32(_ERF_P), ax, _cf32(1.0)))
+        poly = ArithValue(t * _horner(t, tuple(reversed(_ERF_COEFFS))))
+        e = _exp2_raw(ArithValue(ArithValue(ax * ax) * _cf32(-_LOG2E)))
+        big = ArithValue(fmath.fma(ArithValue(-poly), e, _cf32(1.0)))
         _scf.YieldOp([_val(big)])
     return _copysign(ArithValue(if_op.results[0]), x)
 
@@ -1692,12 +1746,10 @@ def _tanh_rcp(x):
     # 1 - 2 / (exp(2|x|) + 1), the denominator >= 2 (rcp(inf) = 0); the series below.
     x = _f32(x)
     ax = ArithValue(fmath.absf(x))
-    e = _exp2_raw(ArithValue(ax * fdu.const_f32(2.0 * _LOG2E)))
-    big = ArithValue(
-        fmath.fma(fdu.const_f32(-2.0), _rcp(e + fdu.const_f32(1.0)), fdu.const_f32(1.0))
-    )
+    e = _exp2_raw(ArithValue(ax * _cf32(2.0 * _LOG2E)))
+    big = ArithValue(fmath.fma(_cf32(-2.0), _rcp(e + _cf32(1.0)), _cf32(1.0)))
     small = ArithValue(ax * _horner(ArithValue(ax * ax), _TANH_SMALL))
-    r = ArithValue(ArithValue(ax < fdu.const_f32(_SMALL)).select(small, big))
+    r = ArithValue(ArithValue(ax < _cf32(_SMALL)).select(small, big))
     return _copysign(r, x)
 
 
@@ -1733,14 +1785,14 @@ def _one_plus_of(v):
     if d is None:
         return None
     op, u = d
-    one = fdu.const_f32(1.0)
+    one = _cf32(1.0)
     if op == "tanh":
         # 2 sigmoid(2u): one exp and one rcp, no cancellation as tanh nears -1.
-        e = _exp2_raw(ArithValue(u * fdu.const_f32(-2.0 * _LOG2E)))
-        return ArithValue(_rcp(e + one) * fdu.const_f32(2.0))
+        e = _exp2_raw(ArithValue(u * _cf32(-2.0 * _LOG2E)))
+        return ArithValue(_rcp(e + one) * _cf32(2.0))
     if op == "exp":
         # >= 1, so a division by it can take v_rcp; a denormal exp is as good as 0.
-        e = _exp2_raw(ArithValue(u * fdu.const_f32(_LOG2E)))
+        e = _exp2_raw(ArithValue(u * _cf32(_LOG2E)))
         return _derive(ArithValue(e + one), "ge1")
     return None
 
@@ -1756,14 +1808,35 @@ def _exp_registered(x):
         # A softmax's exp(x - max) <= 1: a result in the denormal range, a probability
         # below 1e-38, may as well be 0. LLVM's range fix-up is 5 of the ~27
         # instructions an element of GPT-2's causal softmax.
-        return _derive(_exp2_raw(ArithValue(x * fdu.const_f32(_LOG2E))), "exp", x)
-    return _derive(ArithValue(fdu.exp(x)), "exp", x)
+        return _derive(_exp2_raw(ArithValue(x * _cf32(_LOG2E))), "exp", x)
+    return _derive(_exp_f32(x), "exp", x)
+
+
+def _exp2_f32(x):
+    return ArithValue(ArithValue(_f32(x)).exp2())
+
+
+def _exp_f32(x):
+    # exp2 is the native instruction; exp would go through a libcall.
+    return _exp2_f32(ArithValue(_f32(x) * _cf32(_LOG2E)))
+
+
+def _log2_f32(x):
+    return ArithValue(fmath.log2(_f32(x)))
+
+
+def _log_f32(x):
+    return ArithValue(_log2_f32(x) * _cf32(_LN2))
+
+
+def _log10_f32(x):
+    return ArithValue(_log2_f32(x) * _cf32(_LN2 / _LN10))
 
 
 def _sigmoid_rcp(x):
     # 1 / (1 + exp(-x)): the denominator is >= 1, and rcp(inf) = 0 for very negative x.
-    e = _exp2_raw(ArithValue(_f32(x) * fdu.const_f32(-_LOG2E)))
-    return _rcp(e + fdu.const_f32(1.0))
+    e = _exp2_raw(ArithValue(_f32(x) * _cf32(-_LOG2E)))
+    return _rcp(e + _cf32(1.0))
 
 
 # pi/2 as three floats summing to it to ~2^-80, for the Cody-Waite reduction; minimax
@@ -1787,10 +1860,10 @@ def _trig_reduce(x):
     hit = _trig_memo["map"].get(key)
     if hit is not None:
         return hit
-    q = ArithValue(fmath.roundeven(ArithValue(x * fdu.const_f32(_TWO_OVER_PI))))
+    q = ArithValue(fmath.roundeven(ArithValue(x * _cf32(_TWO_OVER_PI))))
     r = x
     for c in _PIO2:
-        r = ArithValue(fmath.fma(ArithValue(-q), fdu.const_f32(c), r))
+        r = ArithValue(fmath.fma(ArithValue(-q), _cf32(c), r))
     qi = ArithValue(_arith.FPToSIOp(T.i32(), _val(q)).result)
     _trig_memo["map"][key] = (r, qi)
     return r, qi
@@ -1807,7 +1880,7 @@ def _trig(x, cosine: bool):
         fmath.fma(
             ArithValue(z * z),
             _horner(z, _COS_POLY),
-            fmath.fma(z, fdu.const_f32(-0.5), fdu.const_f32(1.0)),
+            fmath.fma(z, _cf32(-0.5), _cf32(1.0)),
         )
     )
     if cosine:
@@ -1816,10 +1889,10 @@ def _trig(x, cosine: bool):
     neg_ = ArithValue((q & fx.Int32(2)) != fx.Int32(0))
     v = ArithValue(odd.select(c, s))
     v = ArithValue(neg_.select(ArithValue(-v), v))
-    big = ArithValue(ArithValue(fmath.absf(x)) > fdu.const_f32(_TRIG_BIG))
+    big = ArithValue(ArithValue(fmath.absf(x)) > _cf32(_TRIG_BIG))
     if_op = _scf.IfOp(_val(big), [T.f32()], has_else=True)
     with ir.InsertionPoint(if_op.then_block):
-        _scf.YieldOp([_val((fdu.cos if cosine else fdu.sin)(x))])
+        _scf.YieldOp([_val((fmath.cos if cosine else fmath.sin)(_f32(x)))])
     with ir.InsertionPoint(if_op.else_block):
         _scf.YieldOp([_val(v)])
     return ArithValue(if_op.results[0])
@@ -1834,10 +1907,10 @@ def cos(x):
 
 
 exp = _exp_registered
-exp2 = _unary_f32("exp2", fdu.exp2)
-log = _unary_f32("log", fdu.log)
-log2 = _unary_f32("log2", fdu.log2)
-log10 = _unary_f32("log10", fdu.log10)
+exp2 = _unary_f32("exp2", _exp2_f32)
+log = _unary_f32("log", _log_f32)
+log2 = _unary_f32("log2", _log2_f32)
+log10 = _unary_f32("log10", _log10_f32)
 tanh = _tanh_registered
 sigmoid = _unary_f32("sigmoid", _sigmoid_rcp)
 erf = _unary_f32("erf", _erf_rcp)
@@ -1975,16 +2048,14 @@ def frexp(x):
         return const(c, "i32")
 
     bits = ArithValue(_arith.BitcastOp(T.i32(), _val(x)).result)
-    tiny = ArithValue(fmath.absf(x)) < fdu.const_f32(1.1754943508222875e-38)
-    scaled = ArithValue(
-        _arith.BitcastOp(T.i32(), _val(x * fdu.const_f32(16777216.0))).result
-    )
+    tiny = ArithValue(fmath.absf(x)) < _cf32(1.1754943508222875e-38)
+    scaled = ArithValue(_arith.BitcastOp(T.i32(), _val(x * _cf32(16777216.0))).result)
     bits = where(tiny, scaled, bits)
     biased = bitwise_and(bitwise_right_shift(bits, i32(23)), i32(0xFF))
     e = sub(biased, where(tiny, i32(126 + 24), i32(126)))
     m = bitwise_or(bitwise_and(bits, i32(-0x7F800001)), i32(126 << 23))
     mant = ArithValue(_arith.BitcastOp(T.f32(), _val(m)).result)
-    special = logical_or(eq(x, fdu.const_f32(0.0)), logical_or(isnan(x), isinf(x)))
+    special = logical_or(eq(x, _cf32(0.0)), logical_or(isnan(x), isinf(x)))
     return where(special, x, mant), where(special, i32(0), e)
 
 
@@ -2152,7 +2223,7 @@ def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
     word = pick(0, u[0], pick(1, u[1], pick(2, u[2], u[3])))
     f = _arith.UIToFPOp(T.f32(), word).result
     inv = 1.0 / 4294967296.0
-    r = ArithValue(fmath.fma(f, fdu.const_f32(inv), fdu.const_f32(inv * 0.5)))
+    r = ArithValue(fmath.fma(f, _cf32(inv), _cf32(inv * 0.5)))
     return sub(const(1.0, "f32"), r)
 
 

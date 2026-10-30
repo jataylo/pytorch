@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import atexit
 import functools
-import importlib.util
 import json
 import logging
 import multiprocessing
@@ -100,12 +99,10 @@ def _worker_preloads() -> list[str]:
     """Setup the SubprocPool's sidecar runs before forking its workers (see
     ``SubprocPool(preload=...)``), for kernel kinds whose first compile in a worker
     would otherwise pay for it."""
+    from torch._inductor.codegen.flydsl import flydsl_utils
+
     preloads = []
-    if (
-        config.flydsl.simd
-        and torch.version.hip
-        and importlib.util.find_spec("flydsl") is not None
-    ):
+    if flydsl_utils.simd_enabled():
         arch = None
         if torch.cuda.is_initialized():
             name = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -694,21 +691,9 @@ class AsyncCompile:
 
     def _load_kernel_wrapper(self, kernel_name, main_suffix, wrapper_cls, key, path):
         """Reload a kernel module from PyCodeCache and wrap the entry point."""
-        return wrapper_cls(
-            self._load_kernel_fn(kernel_name, main_suffix, key, path),
-            kernel_path=path,
-        )
-
-    def _load_kernel_fn(self, kernel_name, main_suffix, key, path):
-        """Reload a kernel module from PyCodeCache and return its entry point."""
         mod = torch._inductor.codecache.PyCodeCache.load_by_key_path(key, path)
         main_func_name = f"{kernel_name}_{main_suffix}"
-        if not hasattr(mod, main_func_name):
-            available = [name for name in dir(mod) if callable(getattr(mod, name))]
-            raise RuntimeError(
-                f"Could not find kernel function '{main_func_name}'. Available callables: {available}"
-            )
-        return getattr(mod, main_func_name)
+        return wrapper_cls(getattr(mod, main_func_name), kernel_path=path)
 
     def cutedsl(self, kernel_name: str, source_code: str, precompile_metadata=None):
         """
@@ -782,10 +767,14 @@ class AsyncCompile:
         `{kernel_name}_main` entry point is exposed through the standard
         kernel ``.run()`` interface.
         """
+        from torch._inductor.codegen.flydsl import flydsl_utils
         from torch._inductor.codegen.flydsl.flydsl_kernel import (
             FlyDSLKernelWrapper,
             MAIN_SUFFIX,
         )
+
+        if not flydsl_utils.runtime_available():
+            raise RuntimeError("FlyDSL runtime is unavailable")
 
         kernel_code_log.info("FlyDSL Kernel:\n%s", source_code)
         _compile_start()
@@ -794,10 +783,9 @@ class AsyncCompile:
 
         if is_parallel:
             extra_env = _pycodecache_kernel_compile_env()
-            if "FLYDSL_RUNTIME_CACHE_DIR" in os.environ:
-                extra_env["FLYDSL_RUNTIME_CACHE_DIR"] = os.environ[
-                    "FLYDSL_RUNTIME_CACHE_DIR"
-                ]
+            extra_env["FLYDSL_RUNTIME_CACHE_DIR"] = os.environ.get(
+                "FLYDSL_RUNTIME_CACHE_DIR"
+            )
 
             subprocess_task = self.process_pool().submit(
                 _worker_compile_pycodecache_kernel,
@@ -819,14 +807,22 @@ class AsyncCompile:
                     elapsed_us,
                 )
                 return self._load_kernel_wrapper(
-                    kernel_name, MAIN_SUFFIX, FlyDSLKernelWrapper, key, path
+                    kernel_name,
+                    MAIN_SUFFIX,
+                    FlyDSLKernelWrapper,
+                    key,
+                    path,
                 )
 
             return LambdaFuture(get_result, future=subprocess_task)
         else:
             key, path = torch._inductor.codecache.PyCodeCache.write(source_code)
             return self._load_kernel_wrapper(
-                kernel_name, MAIN_SUFFIX, FlyDSLKernelWrapper, key, path
+                kernel_name,
+                MAIN_SUFFIX,
+                FlyDSLKernelWrapper,
+                key,
+                path,
             )
 
     def pallas(self, kernel_name: str, source_code: str):

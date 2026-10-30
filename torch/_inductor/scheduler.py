@@ -193,6 +193,14 @@ class ComboKernelMemoryContext:
     baseline_live_before: list[int] = dataclasses.field(default_factory=list)
 
 
+def _flydsl_simd_enabled() -> bool:
+    if not config.flydsl.simd:
+        return False
+    from .codegen.flydsl.flydsl_utils import simd_enabled
+
+    return simd_enabled()
+
+
 def _is_gpu_triton_backend(
     node1: BaseSchedulerNode,
     node2: BaseSchedulerNode,
@@ -201,7 +209,7 @@ def _is_gpu_triton_backend(
     if not node1.is_gpu() or not node2.is_gpu():
         return False
     device_type = node1.get_device().type  # type: ignore[union-attr]
-    if device_type == "cuda" and config.flydsl.simd and torch.version.hip:
+    if device_type == "cuda" and _flydsl_simd_enabled():
         # Nested reductions have only Triton kernels, which would bypass FlyDSL;
         # generated apart, its two reductions ran BERT training 29.83 -> 29.47 ms a
         # step. Mix-order reductions FlyDSL generates (FlyDSLSIMDScheduling).

@@ -1,9 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
-import contextlib
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 from torch._inductor.codegen.common import IndentedBuffer, Kernel
 from torch._inductor.ir import (
@@ -57,43 +55,7 @@ class FlyDSLTemplateKernel(Kernel):
         self.prologue_fused_inputs_preserve_zero: OrderedSet[str] = OrderedSet()
         self._template_input_args: list[tuple[str, Buffer]] = []
         self._seen_input_args: OrderedSet[str] = OrderedSet()
-        self._extra_input_nodes: dict[str, Buffer] = {}
         self._template_signature_defined = False
-
-    # ── inputs discovered while rendering ────────────────────────────────────
-    #
-    # ``def_kernel`` names the inputs the template asks for, but its signature is a
-    # deferred hook, so a template may also register inputs part way through a render --
-    # the flex mods do this for the tensors a score_mod or mask_mod captures. Those
-    # arrive too late to be named, and may not be plain graph buffers, so the two places
-    # that need to resolve a name to a node go through the helpers below.
-
-    def set_extra_input_nodes(self, nodes_by_name: dict[str, Buffer]) -> None:
-        """Record the IR nodes behind inputs registered during a render."""
-        self._extra_input_nodes = dict(nodes_by_name)
-
-    def resolve_extra_input(self, name: str) -> Buffer:
-        """IR node for an input the template registered while rendering.
-
-        Subclasses whose late inputs are not plain graph buffers override this.
-        """
-        return V.graph.get_buffer(name)
-
-    @contextlib.contextmanager
-    def _patch_get_dtype_for_args(self):
-        original_get_dtype = V.graph.get_dtype
-
-        def get_dtype(name: str):
-            for arg_name, input_node in self._template_input_args:
-                if name == arg_name:
-                    return input_node.get_dtype()
-            extra = self._extra_input_nodes.get(name)
-            if extra is not None:
-                return extra.get_dtype()
-            return original_get_dtype(name)
-
-        with patch.object(V.graph, "get_dtype", get_dtype):
-            yield
 
     @staticmethod
     def _get_reinterpret_view(node) -> ReinterpretView | None:
@@ -161,8 +123,7 @@ class FlyDSLTemplateKernel(Kernel):
         def hook():
             code = IndentedBuffer()
             params = [arg_name for arg_name, _ in self._template_input_args]
-            with self._patch_get_dtype_for_args():
-                arg_defs, _, _, _ = self.args.python_argdefs()
+            arg_defs, _, _, _ = self.args.python_argdefs()
             for arg_def in arg_defs:
                 if arg_def.full_name() not in self._seen_input_args:
                     params.append(arg_def.full_name())
@@ -201,20 +162,13 @@ class FlyDSLTemplateKernel(Kernel):
             )
             arg_types.append(V.graph.get_dtype(input_node.get_name()))
 
-        with self._patch_get_dtype_for_args():
-            orig_arg_defs, orig_call_args, _, orig_arg_types = (
-                self.args.python_argdefs()
-            )
+        orig_arg_defs, orig_call_args, _, orig_arg_types = self.args.python_argdefs()
         for arg_def, call_arg, arg_type in zip(
             orig_arg_defs, orig_call_args, orig_arg_types
         ):
             if arg_def.full_name() in self._seen_input_args:
                 continue
-            # A late input can be a view, whose name alone does not identify the tensor
-            # to pass; `codegen_reference` emits the reinterpret for it and the plain
-            # name for everything else.
-            extra = self._extra_input_nodes.get(call_arg)
-            call_args.append(call_arg if extra is None else extra.codegen_reference())
+            call_args.append(call_arg)
             arg_types.append(arg_type)
 
         # TODO: The `triton` argument identifies the common `.run()` calling

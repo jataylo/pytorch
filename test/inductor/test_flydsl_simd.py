@@ -33,13 +33,11 @@ def _skip_reason():
         return "no GPU"
     if not torch.version.hip:
         return "FlyDSL is ROCm only"
-    try:
-        from torch._inductor.kernel.flex.flydsl_flash_attention import (
-            flydsl_unavailable_reason,
-        )
-    except ImportError as e:
-        return f"could not import FlyDSL: {e}"
-    return flydsl_unavailable_reason()
+    from torch._inductor.codegen.flydsl.flydsl_utils import (
+        _flydsl_runtime_unavailable_reason,
+    )
+
+    return _flydsl_runtime_unavailable_reason()
 
 
 SKIP_REASON = _skip_reason()
