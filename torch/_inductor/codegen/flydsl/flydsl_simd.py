@@ -1871,10 +1871,6 @@ class FlyDSLKernel(SIMDKernel):
 
     # -- memory -------------------------------------------------------------------------
 
-    def _rsrc(self, name: str, *, output: bool) -> str:
-        arg = self.args.output(name) if output else self.args.input(name)
-        return arg
-
     def load(self, name: str, index: sympy.Expr):
         """Emit a load of ``name`` at ``index``, choosing scalar, wave-uniform,
         vectorized or gathered access from how the index varies with the lane."""

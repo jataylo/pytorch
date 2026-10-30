@@ -210,9 +210,8 @@ def _is_gpu_triton_backend(
         return False
     device_type = node1.get_device().type  # type: ignore[union-attr]
     if device_type == "cuda" and _flydsl_simd_enabled():
-        # Nested reductions have only Triton kernels, which would bypass FlyDSL;
-        # generated apart, its two reductions ran BERT training 29.83 -> 29.47 ms a
-        # step. Mix-order reductions FlyDSL generates (FlyDSLSIMDScheduling).
+        # FlyDSLSIMDScheduling generates mix-order reductions itself. Nested
+        # reductions only Triton can generate, so keep their reductions apart.
         return flydsl_mix_order
     return (
         device_type in ("cuda", "xpu") and get_current_backend(device_type) == "triton"
