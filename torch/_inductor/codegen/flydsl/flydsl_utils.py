@@ -67,8 +67,27 @@ def runtime_available() -> bool:
     return _check_runtime_available()
 
 
+# The SIMD kernels assume 64-lane waves, GFX9's DPP row broadcasts and CDNA's buffer
+# descriptor format: CDNA3 and CDNA4.
+_SIMD_ARCHS = ("gfx942", "gfx950")
+
+
+@functools.cache
+def _simd_arch_supported(device: int) -> bool:
+    import torch
+
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+    return arch in _SIMD_ARCHS
+
+
 def simd_enabled() -> bool:
     """Whether Inductor generates its pointwise and reduction kernels with FlyDSL."""
+    import torch
     from torch._inductor import config
 
-    return config.flydsl.simd and runtime_available()
+    if not (config.flydsl.simd and runtime_available()):
+        return False
+    # Before CUDA is up (the compile pool's preload) the device is not known yet.
+    return not torch.cuda.is_initialized() or _simd_arch_supported(
+        torch.cuda.current_device()
+    )

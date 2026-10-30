@@ -201,9 +201,13 @@ class FlyDSLUnsupported(RuntimeError):
 
 def storage_kind(dtype: torch.dtype) -> str:
     try:
-        return _STORAGE[dtype]
+        k = _STORAGE[dtype]
     except KeyError:
         raise FlyDSLUnsupported(f"dtype {dtype}") from None
+    if k in ("f8e4", "f8e5") and not (_gpu_arch() or "").startswith("gfx94"):
+        # The v_cvt FP8 instructions convert FNUZ only on gfx94x; gfx950's are OCP.
+        raise FlyDSLUnsupported(f"dtype {dtype} on {_gpu_arch()}")
+    return k
 
 
 def compute_kind(dtype: torch.dtype) -> str:
