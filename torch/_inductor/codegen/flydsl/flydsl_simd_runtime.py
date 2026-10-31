@@ -480,8 +480,8 @@ def _tid():
 class _Flat:
     """A buffer of 2 GiB or more, beyond a descriptor: there a masked lane's offset
     (0x7FFFFFFF) would land inside it. Addressed through 64-bit global pointers
-    instead, masked by selects and branches -- the logits a Qwen3 cross-entropy
-    reads (8192 x 151936 bf16) are 2.5 GB."""
+    instead, masked by selects and branches, as a large-vocabulary cross-entropy's
+    logits need."""
 
     __slots__ = ("addr",)
 
@@ -922,8 +922,7 @@ def widen(cache: dict, keys) -> None:
     Called after a row's first pass of a persistent reduction, for the loads of later
     passes issued ahead of it (a LayerNorm's weight and bias): the conversions then run
     while the wave waits on the first pass's loads, rather than after its reduction,
-    where every resident wave reaches the same normalization tail at once. GPT's
-    embedding + LayerNorm 14.0us -> 12.7us (Triton 12.9us)."""
+    where every resident wave reaches the same normalization tail at once."""
     done = False
     for k, vec in list(cache.items()):
         if not (isinstance(k, tuple) and len(k) == 2 and isinstance(k[0], tuple)):
@@ -1082,7 +1081,7 @@ def vstore(
             lc.setdefault(_FRESH, OrderedSet()).add((lkey, j // w))
             # Held back to the loop's forget: LLVM keeps a buffer load after a store it
             # cannot prove apart, so storing as it went left each of a gather's loads
-            # (GPT's embedding + LayerNorm) a full memory round trip behind the last.
+            # (an embedding + LayerNorm) a full memory round trip behind the last.
             lc.setdefault(_PENDING, []).append((lkey[0], *args))
 
 
@@ -1634,8 +1633,8 @@ def sqrt(x):
 
 def rsqrt(x):
     """``v_rsq_f32`` (1 ulp), as Triton's ``tl.rsqrt``: ``math.rsqrt`` lowers to a
-    correctly rounded sqrt and an IEEE divide, ~40 dependent instructions on a norm's
-    critical path -- GPT's embedding + LayerNorm 15.5us against Triton's 12.8us."""
+    correctly rounded sqrt and an IEEE divide, dozens of dependent instructions on a
+    norm's critical path."""
     return ArithValue(_rocdl.rsq(T.f32(), _val(_require_f32("rsqrt", x))))
 
 
@@ -1722,11 +1721,9 @@ _SMALL = 0.25
 def _erf_rcp(x):
     # Below 1, erf(x) / x as a polynomial in x^2 (relative error ~1e-7). Above,
     # A&S 7.1.26 (abs error 1.5e-7) with 1 / (1 + p|x|), which lies in (0, 1], taken by
-    # v_rcp_f32. Pointwise kernels around erf are ALU-bound on MI300 (~35 instructions
-    # an element at HBM speed), so every instruction here shows: an erf GELU went
-    # 121us -> 96us without the fdiv. The two sides are a real branch, as in OCML's
-    # erf: a wave whose lanes are all below 1 skips the exp path (126us vs 143us on
-    # the GELU of a freshly initialized ViT MLP).
+    # v_rcp_f32 rather than an fdiv. Pointwise kernels around erf are ALU-bound on
+    # MI300, so every instruction here shows. The two sides are a real branch, as in
+    # OCML's erf: a wave whose lanes are all below 1 skips the exp path.
     x = _f32(x)
     ax = ArithValue(fmath.absf(x))
     if_op = _scf.IfOp(_val(ax < _cf32(1.0)), [T.f32()], has_else=True)
@@ -1779,8 +1776,8 @@ def _derive(r, op: str, arg=None):
 
 def _one_plus_of(v):
     """``1 + v`` rewritten, for a ``v`` that ``tanh`` or ``exp`` registered, else
-    None. (Not erf: a branch-free rational erf ran the GELU 8% faster at 3x eager's
-    error, an f32 evaluation floor of ~3e-7.)"""
+    None. (Not erf: a branch-free rational erf is faster, but at several times
+    eager's error.)"""
     d = _derived(v)
     if d is None:
         return None
@@ -1806,8 +1803,8 @@ def _exp_registered(x):
     x = _f32(_require_f32("exp", x))
     if (_derived(x) or (None,))[0] == "le0":
         # A softmax's exp(x - max) <= 1: a result in the denormal range, a probability
-        # below 1e-38, may as well be 0. LLVM's range fix-up is 5 of the ~27
-        # instructions an element of GPT-2's causal softmax.
+        # below 1e-38, may as well be 0, which drops LLVM's range fix-up from a
+        # softmax's few instructions an element.
         return _derive(_exp2_raw(ArithValue(x * _cf32(_LOG2E))), "exp", x)
     return _derive(_exp_f32(x), "exp", x)
 
@@ -2329,8 +2326,8 @@ def _dpp_reduce(vals, comb, tpr: int, ident=None):
     lanes a step has no source for read it and every lane combines, so LLVM folds each
     move into its combine (``v_add_f32_dpp``); without one they keep their value
     through a select. The scan order keeps ``comb(earlier, later)``. Instruction count
-    is what counts: a 768-wide LayerNorm is vector-ALU-bound, and went 141us -> 110us
-    with the identity, where DPP alone measured even with ``ds_bpermute``."""
+    is what counts: norms are vector-ALU-bound, and the identity is what makes DPP
+    beat ``ds_bpermute``."""
     lane = imod(_tid(), WAVE)
 
     def step(ctrl, row_mask, ok):
@@ -2686,7 +2683,7 @@ def _split_lookback_packed(fn, total, smem, at: int, r, slot, chunk):
     """``_split_lookback`` of one 32-bit value: (flag << 32 | value) in a slot's first
     64-bit word, published and polled by relaxed agent-scope atomics, as Triton's
     look-back. The release store and acquire loads of the general form cost an L2
-    write-back and invalidate a hop on gfx942: ~3us against ~0.5us."""
+    write-back and invalidate a hop on gfx942."""
     from flydsl._mlir.dialects import llvm as _llvm
 
     k0 = kind(total)
@@ -3132,8 +3129,8 @@ def welford_block(acc, items, combine: bool):
     """``acc`` merged with a chunk of samples ``(x, mask)``, or of ``((mean, m2,
     weight), mask)`` triples for a combine: the chunk's weighted mean, then its
     squared deviations from it (Chan's formula over the chunk), then one merge -- a
-    divide or two a chunk rather than an IEEE divide an element. A split BatchNorm's
-    statistics were ALU-bound at 770 GB/s on it."""
+    divide or two a chunk rather than an IEEE divide an element, which left a split
+    BatchNorm's statistics ALU-bound."""
     zero = const(0.0, "f32")
 
     def sel(m, v, o):
@@ -3259,7 +3256,7 @@ def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
     exp-sum pass, as Triton does for a persistent reduction. ``exp(x - max)`` exactly as
     the kernel's normalizing pass writes it -- no -inf guard; an all -inf row is NaN
     either way, as in eager and Triton -- so LLVM shares each exp between the two
-    passes: 268us vs 317us on a causal softmax over 512.
+    passes.
 
     The sum holds exp(max - max) = 1, so the normalizing divide takes the row's v_rcp
     (or is NaN either way). The max needn't carry a NaN, a cmp and a select an element:
@@ -3347,19 +3344,16 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
         fn(*scratch, stream=stream)  # compiles (and runs once)
     # Back-to-back calls averaged, the candidates interleaved round by round and the
     # best round kept: the fastest single call (the benchmarker's "min") favours a
-    # candidate with a high variance, a 16x64 transpose tile 10% slower on average.
+    # candidate with a high variance.
     # Each round is queued behind a GPU sleep: a launch from Python takes longer than
-    # a 20us kernel, and unqueued the GPU would idle between them, timing the launches.
+    # a short kernel, and unqueued the GPU would idle between them, timing the launches.
     # Every call starts from the cache state the kernel meets in the model, as far as
     # the scheduler can tell: the 256 MB last-level cache flushed, then the inputs that
     # the kernels just before it wrote or read (`warm`) rewritten in place, leaving
     # them there dirty, as their producer would. Timed back to back instead, every
-    # input is cached: BERT's softmax-dropout backward, whose matmul-written gradient
-    # alone is, picked a variant 115us in the model against 100us. Flushed with nothing
-    # rewritten, ResNet's BatchNorm backward, whose saved activations the convolution
-    # backward had just read, picked variants 0.1 ms a step slower; rewarmed by reading
-    # (clean lines), its in-place conv bias add 95us against 84us. Without `warm` (an
-    # older module), only L2 is flushed.
+    # input is cached; flushed with nothing rewritten, none is; rewarmed by reading,
+    # the lines are clean. Each of those picked slower variants for the model. Without
+    # `warm` (an older module), only L2 is flushed.
     device = next(a.device for a in args if isinstance(a, torch.Tensor))
     flush = torch.empty(
         (256 if warm is not None else 16) << 20, dtype=torch.int8, device=device
@@ -3409,8 +3403,7 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
             events[-1][-1][1].synchronize()
             if queued_us > sleep_us and tries < 8:
                 # The GPU outran the launches (a host busy compiling other kernels),
-                # so this round timed them too: a [32, 512, 768] heads permute picked
-                # a variant 2.5x slower next to a pytest run.
+                # so this round timed them too.
                 sleep_us *= 2
                 continue
             rounds += 1
@@ -3421,8 +3414,7 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
     times = measure(mains, before)
     flush = None  # 256 MB, not needed for the warm timing below
     # Candidates within 3% of each other cold are told apart warm, where their cache
-    # behaviour differs: a bf16 embedding's two launches timed within 3% cold, then
-    # 10% apart in the steady state, and which one won the cold timing varied by run.
+    # behaviour differs: which of them wins cold varies by run.
     close = [m for m, t in zip(mains, times) if t <= min(times) * 1.03]
     if len(close) > 1:
         warm_times = measure(close, None)
@@ -3445,7 +3437,7 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
 def _pick_path(mains):
     """Where ``pick_fastest`` keeps its choice among ``mains`` for later processes, as
     Triton keeps its autotuning results: a warm start otherwise re-timed every
-    autotuned kernel (0.17 s of a GPT-2 prefill's). None with caches disabled. The
+    autotuned kernel. None with caches disabled. The
     names carry a hash of the kernel source, which fixes the shapes."""
     import hashlib
 
@@ -3491,15 +3483,15 @@ def save_binary(launch, path: str, kernel: str) -> None:
 
 
 def _set_arch(arch: str | None) -> None:
-    # Otherwise FlyDSL runs rocm_agent_enumerator in every compile worker: 0.2 s
-    # alone, over a second with the pool's workers all querying the driver at once.
+    # Otherwise FlyDSL runs rocm_agent_enumerator in every compile worker, all of them
+    # querying the driver at once.
     if arch:
         _os.environ.setdefault("FLYDSL_GPU_ARCH", arch)
 
 
 def compile_only(launch, *args, arch: str | None = None) -> None:
     """Compile ``launch`` for ``args`` into its caches without building the host
-    launcher (~18 ms) or launching."""
+    launcher or launching."""
     import io
 
     from flydsl.utils import env
@@ -3521,9 +3513,9 @@ def compile_only(launch, *args, arch: str | None = None) -> None:
 
 @contextlib.contextmanager
 def _no_source_locations():
-    """FlyDSL tags every op with its Python call stack (``inspect`` per op), a third
-    of tracing a generated kernel and ~15% of its compile; these kernels' line
-    numbers point into generated code nobody steps through."""
+    """FlyDSL tags every op with its Python call stack (``inspect`` per op), a large
+    share of tracing a generated kernel; these kernels' line numbers point into
+    generated code nobody steps through."""
     from flydsl.compiler import ast_rewriter
     from flydsl.expr import meta
 
@@ -3539,9 +3531,9 @@ def _no_source_locations():
 
 
 def warm_worker(arch: str | None = None) -> None:
-    """A compile worker's first FlyDSL kernel paid ~1.4 s of imports and ~0.5 s of
-    one-time compiler setup; run ahead of the kernels, while Inductor is still
-    generating them."""
+    """A compile worker's first FlyDSL kernel pays for the imports and one-time
+    compiler setup; run ahead of the kernels, while Inductor is still generating
+    them."""
     import flydsl.compiler as flyc
 
     _set_arch(arch)
@@ -3563,7 +3555,7 @@ def preload_worker(arch: str | None = None) -> None:
     FlyDSL's imports and the gfx target rather than paying for them itself."""
     _set_arch(arch)
     if "FLYDSL_GPU_ARCH" not in _os.environ:
-        # Queries the driver, 0.3 s of the pool's startup, so only without ``arch``.
+        # Queries the driver, slowing the pool's startup, so only without ``arch``.
         from flydsl.runtime.device import get_rocm_arch
 
         _os.environ["FLYDSL_GPU_ARCH"] = get_rocm_arch()
@@ -3576,7 +3568,7 @@ _EARLY: dict = {}
 def compile_early(kernel_name: str, source: str, binaries: list[str]) -> None:
     """At codegen, hand each of a module's variants to an idle compile worker, rather
     than when the finished graph module loads: a graph's first call otherwise waited
-    on its slowest compile after all of codegen (Llama training's AdamW kernel, 1.4 s).
+    on its slowest compile after all of codegen.
     Whenever there may be a pool, ready or not: ``use_process_pool`` only says whether
     its workers are up yet, which on a short graph they are not until after codegen,
     leaving all of its compiles to start at load. A job queued now starts as soon as
@@ -3611,8 +3603,8 @@ def compile_early(kernel_name: str, source: str, binaries: list[str]) -> None:
 
 def compiled(async_compile, kernel_name: str, source: str, binary: str, **kw):
     """``async_compile.flydsl``, except that a kernel whose code object ``binary`` is
-    already on disk (a warm start) loads in this process: through the pool it waited
-    on a worker to find nothing to do, 0.35 s of GPT training's warm start. So does
+    already on disk (a warm start) loads in this process: through the pool it would
+    wait on a worker to find nothing to do. So does
     one that ``compile_early`` compiled, once its job is done; if it failed, the
     regular compile reports the error."""
     early = _EARLY.pop(binary, None)
@@ -3643,9 +3635,8 @@ def load_binary(path: str, kernel: str, threads: int, tys: str):
     """A launcher for the code object ``save_binary`` wrote, or None if there is none,
     called as ``(grid, 1, 1, stream, *args)``: an argument of type ``O`` a tensor, ``l``
     an int. FlyDSL's own first call in a process re-JITs the host launch code from the
-    cached module, about 18 ms a kernel: 10 s of a Qwen3 prefill's first step. The
-    vectorcall launcher Triton's kernels use reads the tensors' addresses in C++: 3 us
-    a launch under the Python path's."""
+    cached module, for every kernel. The vectorcall launcher Triton's kernels use reads
+    the tensors' addresses in C++, faster than the Python path."""
     if not _os.path.exists(path):
         return None
     import torch

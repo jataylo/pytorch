@@ -89,27 +89,23 @@ log = logging.getLogger(__name__)
 
 THREADS = 256
 # Pointwise kernels this large time a few launch configurations on their first call.
-# At 2M elements the candidates tied on every Llama and GPT kernel, doubling their
-# compile time for nothing.
+# Below it the candidates tie, and timing them only doubles the compile time.
 AUTOTUNE_MIN_NUMEL = 1 << 22
-# Transposing tiles, rarer, from here: GPT-2's 3M-element V-head select 11.1us ->
-# 9.9us at its candidate (Triton 9.8us).
+# Transposing tiles, which are rarer, from this many.
 AUTOTUNE_MIN_TILE_NUMEL = 1 << 20
-# A transposing tile's block: 50us vs 55us at 256 threads on a 4096^2 transpose.
+# A transposing tile's block: faster than 256 threads.
 TILE_THREADS = 128
-# A column reduction launching fewer blocks than CUs: Qwen3's per-head weight
-# gradient's second stage (128 columns x 319 partial sums) took 37.6us end to end at
-# 256 threads, 33.8us at this many (Triton 32.5us); 34.8us at 512.
+# A column reduction launching fewer blocks than CUs: more threads a block put more
+# of its loads in flight.
 SMALL_COLUMN_THREADS = 1024
 # Buffers written or read within this many bytes of traffic before a kernel count as
 # still in the 256 MB last-level cache when its autotune candidates are timed.
 WARM_BYTES = 128 << 20
 WAVE = 64
 # Rows a wave interleaves when they are read through a transpose (see
-# finalize_indexing): 101us at 8 (8 lanes a row), 107us at 16, 124us at 4.
+# finalize_indexing): 8 lanes a row measured best.
 ROW_INTERLEAVE = 8
-# Only rows this short: 8 lanes on a ResNet BatchNorm backward's 200704-long rows took
-# 2.1 ms rather than 0.1 ms.
+# Only rows this short: 8 lanes on a very long row leave too few to reduce it.
 ROW_INTERLEAVE_MAX = 4096
 # A trace-time-unrolled ("persistent") reduction body is at most this many copies of the
 # loop body per loop; beyond it the code size and register pressure outgrow the reuse.
@@ -122,14 +118,12 @@ LDS_TABLE_MAX = 2048
 SCAN_COLUMN_MIN = 8192
 # Waves per CU a row scan aims for before rows widen past a wave.
 SCAN_TARGET_WAVES = 16
-# The widest such row, in threads (the block grows to it): 8x100000 f32 cumsum takes
-# 68 us at 256, 44 us at 512, 42 us at 1024 (Triton 27 us).
+# The widest such row, in threads (the block grows to it).
 SCAN_MAX_THREADS = 1024
 # Chunks a row needs before Inductor's split scan takes a block per chunk.
 SPLIT_SCAN_MIN_CHUNKS = 4
 # Elements a thread of a split scan takes: a row's prefix crosses the chunks one
-# look-back at a time (~0.5 us each), so the fewer the better. 1M f32 cumsum: ept 4
-# 134 us, 8 74 us, 16 48 us, 32 44 us (Triton 46 us).
+# look-back at a time, so the fewer chunks the better.
 SPLIT_SCAN_EPT = 16
 SPLIT_SLOT_WORDS = 8  # a chunk's workspace slot: fdp.SPLIT_SLOT_WORDS
 # A sort's row across at most this many threads (the rest in runs of each thread).
@@ -151,8 +145,7 @@ MIX_FINALIZE_SLICES = 16
 MIX_FINALIZE_UNROLL = 16
 SCAN_PHASE = "__scan_phase__"  # replaced per traced pass of a multi-element scan
 # Edge of the square tile a block covers in a {y, x} (transposing) pointwise kernel. A
-# 64-wide f32 tile's 16.6 KiB of LDS leaves room for three blocks a CU: 54us vs 47us
-# on an NCHW -> NHWC copy (Triton 47us), 54us vs 50us on a 4096^2 transpose.
+# 64-wide f32 tile's 16.6 KiB of LDS leaves room for only three blocks a CU.
 TILE = 32
 # LDS words a staged tile row takes: one word of padding spreads the transposed reads
 # over the banks.
@@ -542,7 +535,7 @@ class FlyDSLKernelOverrides(OpOverrides):
             # Computed in f32, as Triton does: Inductor asks for a rounding explicitly
             # (use_compute_types=False, then an upcast) where eager's must be kept --
             # under emulate_precision_casts, or for a saved tensor. Rounding every cast
-            # cost a third more bf16 conversions on Llama's RMSNorm: 25us vs 20us.
+            # would add bf16 conversions for nothing.
             if not use_compute_types:
                 return f"fdp.to(fdp.to({x}, {k!r}), 'f32')"
             return f"fdp.to({x}, 'f32')"
@@ -1161,9 +1154,8 @@ class FlyDSLKernel(SIMDKernel):
         self.ept = _tune("ept", ept)
         # A tile narrow along the stores and long along the loads when the stores' rows
         # are close together, as when the fast dimension is a few channels, so the
-        # neighbouring tiles fill each other's cache lines: an NCHW -> NHWC f32 copy
-        # 52us -> 48us (Triton 46us), where a 4096^2 transpose (rows 16 KiB apart) goes
-        # 52.6us -> 57.5us.
+        # neighbouring tiles fill each other's cache lines. Not when the rows are far
+        # apart, as in a large square transpose, which this shape slows.
         s = self._tree_sym("x" if self.fast == "y" else "y")
         pitch = [
             e.subs({f: 0, s: 1}) - e.subs({f: 0, s: 0})
@@ -1183,10 +1175,7 @@ class FlyDSLKernel(SIMDKernel):
     def _split_scan_ept(self, gathered: bool) -> int:
         """Elements a thread of a split scan's chunk: fewer chunks for a look-back of
         two-word values, which takes the general (fenced) form of fdp._split_lookback;
-        smaller chunks of a gathered row, whose strided loads are each a cache line.
-        1M-element f32 cumsum 26.6us at 16 -> 23.2us at 8 (Triton 44.7us); i64 38.2us
-        at 16 vs 45.2us at 8; cumsum(0) of 100000 x 8 51.7us at 8 -> 39.8us at 4
-        (Triton 62us)."""
+        smaller chunks of a gathered row, whose strided loads are each a cache line."""
         wide = any(
             dt.itemsize > 4
             for n in self.features.scheduler_nodes()
@@ -1431,29 +1420,22 @@ class FlyDSLKernel(SIMDKernel):
         atomic_elems = self._has_atomic(per_element=True)
         if atomic_elems:
             # Atomics are issued an element at a time, and a wave's spread over more
-            # than two elements a lane goes slower: an embedding-gradient scatter
-            # takes 58us at 4 a lane, 32us at 2 in f32 (Triton 36us); 34us at 4,
-            # 23us at 2 in bf16 (Triton 21us). Not one atomic a row, after its
+            # than two elements a lane goes slower. Not one atomic a row, after its
             # reduction, which leaves the row's loads and stores at full width.
             widest_vec = min(widest_vec, 2)
         if not self.is_reduction_kernel:
             if not atomic and not self.in_combo:
-                # One-wave blocks: a [32, 512, 768] bf16 heads permute 18.6us -> 14.3us
-                # (Triton 18.1us), a 16M f32 add 45.8 -> 41.2us, an NCHW bias add
-                # 38.7 -> 36.0us; none slower.
+                # One-wave blocks: faster on every pointwise kernel measured.
                 self.threads = self.rpb = _tune("threads", WAVE)
             streams = self._stream_itemsizes()
             if streams:
                 # Runs as wide as the widest stream's 16-byte vector: wider ones split
                 # its loads into strided halves, each instruction a wave's 64 lanes over
-                # twice the lines -- 136us vs 105us on ResNet's f32 threshold backward,
-                # whose bool mask alone would allow eight a lane (Triton 100us).
+                # twice the lines.
                 widest_vec = min(widest_vec, max(1, 16 // max(streams)))
                 # Unless that leaves every store short of a 16-byte vector: twice as
                 # wide, an f32 -> bf16 cast stores 16 bytes a lane for two strided
-                # loads, 44.7us -> 41.3us on 24M elements (Triton 41.9us). Not past the
-                # atomics' two: the f32 scatter of a standalone embedding gradient went
-                # back to 100us at four (Triton 51us, 48us at two).
+                # loads, which wins. Not past the atomics' two.
                 stores = self._stream_itemsizes(loads=False)
                 if stores and not atomic_elems and 16 // max(stores) > widest_vec:
                     widest_vec = min(2 * widest_vec, 16 // max(stores))
@@ -1468,7 +1450,7 @@ class FlyDSLKernel(SIMDKernel):
         x, r = self._x_sym(), self._r_sym()
         # One vote per load: `indices` holds each distinct index once, so three inputs
         # read at one x-contiguous index tied a small r-contiguous one and kept the
-        # row layout -- 184us vs Triton's 28us on Llama's RMSNorm weight gradient.
+        # row layout, far slower than the column one.
         votes = self._memory_roots(stores=False) or roots
         r_contig = sum(
             classify_access(e, r, 2) == "contig" for e in votes if r in e.free_symbols
@@ -1481,10 +1463,7 @@ class FlyDSLKernel(SIMDKernel):
             return
         if self.features.contains_op("scan"):
             # A column per thread only with columns to fill the GPU: otherwise the
-            # row's lanes share each column, its loads gathered. cumsum(0) of 8192 x 64
-            # f32 2854us -> 100us (Triton 43us), 100000 x 8 22.4ms -> 0.68ms, 8192 x
-            # 4096 3.3ms -> 2.5ms (Triton 2.7ms); 64 x 65536 stays a column's (25us
-            # against 100us).
+            # row's lanes share each column, its loads gathered.
             column = x_contig > r_contig and self.xnumel >= _tune(
                 "scan_column_min", SCAN_COLUMN_MIN
             )
@@ -1495,9 +1474,9 @@ class FlyDSLKernel(SIMDKernel):
             # Column reduction: x is the contiguous dimension. Lanes run along x (`stride`
             # of them, so a wave's loads coalesce) and the block's remaining threads split
             # the row range, combining through LDS at the end.
-            # One wave per row slice measured best by far on an 8192^2 column sum: 85us
-            # against 140us for 32 or 16 lanes, though those launch 2-4x the blocks.
-            # Coalescing beats occupancy here, and Inductor's split reduction already
+            # One wave per row slice measured best by far, though fewer lanes launch
+            # more blocks. Coalescing beats occupancy here, and Inductor's split
+            # reduction already
             # handles the few-columns, very-long-rows case at the graph level.
             self.ept = 1
             self.stride = _tune("col_stride", WAVE)
@@ -1511,9 +1490,8 @@ class FlyDSLKernel(SIMDKernel):
                 self.threads = SMALL_COLUMN_THREADS
             self.tpr = self.threads // self.stride
             if not _tune("threads", 0):
-                # No more lanes a column than it has rows: ResNet's BatchNorm stats
-                # finalize (64 channels x 3 partial sums) ran 1024 threads, 192 of them
-                # loading, and combined through LDS across all of them.
+                # No more lanes a column than it has rows: the rest would only idle,
+                # and widen the LDS combine.
                 while self.tpr > 1 and V.graph.sizevars.statically_known_geq(
                     self.tpr // 2, self.rnumel
                 ):
@@ -1525,10 +1503,8 @@ class FlyDSLKernel(SIMDKernel):
             # Narrower vectors when they tile a one-wave row exactly where the widest
             # leave a partly masked last run: 768 = 64 lanes x 3 runs of 4. Not with
             # many row-sized inputs, where the wider loads' fewer instructions win
-            # (these kernels are vector-ALU-bound): 49us vs 63us on a 4-input add +
-            # LayerNorm over 768, against 20us vs 19.6us with 2 inputs. Nor with a
-            # gathered row, whose loads wait on the index load: GPT's embedding +
-            # LayerNorm 15.3us -> 14.3us at 8 a lane (Triton 12.9us).
+            # (these kernels are vector-ALU-bound). Nor with a gathered row, whose
+            # loads wait on the index load.
             ept = self.ept
             while (
                 ept > 1
@@ -1550,16 +1526,14 @@ class FlyDSLKernel(SIMDKernel):
                 # Nothing vectorizes (an unaligned split-reduction offset, say), so a
                 # thread's elements are scalar loads anyway: one per thread keeps a
                 # wave's loads adjacent, and deeper unrolling keeps them in flight.
-                # 70us vs 127us on a BatchNorm backward reduction over NCHW.
                 self.ept = 1
                 gather = True
             self.ept = _tune("ept", self.ept)
             runs = -(-self.rnumel // self.ept)
             if runs >= 8 and (self._pure_reduction() or 32 <= runs <= WAVE):
                 # Give each thread two runs of a short row (and, for a bare reduction,
-                # two rows below), trading threads for loads in flight: 47us vs 55us
-                # on a 512-wide bf16 softmax backward. A normalization over a 64-wide
-                # row (16 runs) instead lost 89us -> 105us at 8 threads a row.
+                # two rows below), trading threads for loads in flight. Not a
+                # normalization over a row of fewer than 32 runs, which loses.
                 runs //= 2
             tpr = min(self.threads, _pow2_ceil(runs))
             if (
@@ -1569,11 +1543,8 @@ class FlyDSLKernel(SIMDKernel):
                 and self.xnumel < _num_cus()
             ):
                 # Fewer rows than CUs: each row's block as wide as its runs allow, for
-                # more of its loads in flight at once. BERT's loss tail (one row of
-                # 8192 gathered logits) 36.3us -> 25.3us at 1024 threads (Triton 26.4us);
-                # Llama's (4096) 15.0us at one wave, 14.1us at 512 threads and 12.2us
-                # at 1024 of 4 elements (Triton 12.1us). Narrower runs only pay for
-                # gathers: a contiguous 4096-wide sum went 1.8us -> 2.3us.
+                # more of its loads in flight at once. Narrower runs only pay for
+                # gathers; a contiguous row loses with them.
                 gathers = self._has_gather()
                 while (
                     gathers
@@ -1591,8 +1562,7 @@ class FlyDSLKernel(SIMDKernel):
                 <= PERSISTENT_MAX_UNROLL
             ):
                 # One wave still holds the row in registers: shuffles only, no LDS
-                # round trip and barriers per reduction. 31us vs 39us on a 768-wide
-                # add+layernorm, where 128 threads also left a quarter of them idle.
+                # round trip and barriers per reduction.
                 tpr = WAVE
             elif (
                 tpr > WAVE
@@ -1611,9 +1581,7 @@ class FlyDSLKernel(SIMDKernel):
             ):
                 # A mix-order row as wide as whole waves that tile it exactly go: its
                 # column partials take a register a lane per element, so more lanes,
-                # not fewer, beat more elements a lane. A 16384 x 1536 RMSNorm backward
-                # 76us -> 60us at 192 lanes of 8, 3072 wide 174us -> 153us at 192 of
-                # 16; 2048 wide 172us at 256 lanes of 8 against 192us at 128 of 16.
+                # not fewer, beat more elements a lane.
                 tpr = fit
             elif (
                 tpr > WAVE
@@ -1625,10 +1593,7 @@ class FlyDSLKernel(SIMDKernel):
             ):
                 # Rows that waves (or half waves) hold in registers, a full unroll a
                 # lane: a normalization reads its row more than once, which the
-                # one-step loop goes back to L2 for. A 4096-wide bf16 RMSNorm 107us ->
-                # 93us (Triton 147us) and its backward 95us -> 57us; 2048-wide 53us ->
-                # 47us and 74us -> 65us; 3072-wide (three waves) 77us -> 80us but its
-                # backward 124us -> 93us; 1536-wide (96 lanes) backward 55us -> 47us.
+                # one-step loop goes back to L2 for.
                 tpr = fit
             elif (
                 tpr > WAVE
@@ -1639,11 +1604,8 @@ class FlyDSLKernel(SIMDKernel):
             ):
                 # One wave per row, all of it in a single loop step: the second pass
                 # re-reads the row from L2 rather than holding it, and the reduction
-                # needs no LDS or barrier. 154us vs 165us on a 4096-wide bf16 RMSNorm,
-                # 99us vs 112us on an amax. A welford instead pays for its looped
-                # (online) form: 254us vs 147us on a LayerNorm of the same shape. Nor
-                # a mix-order reduction, which needs its row held: a 32768 x 2048 RMSNorm
-                # backward went to Triton's otherwise, 235us vs 184us.
+                # needs no LDS or barrier. Not a welford, which pays for its looped
+                # (online) form, nor a mix-order reduction, which needs its row held.
                 tpr = WAVE
                 self.one_step = True
             # pyrefly: ignore [bad-argument-type]
@@ -1659,10 +1621,9 @@ class FlyDSLKernel(SIMDKernel):
                 and not (short and self._pure_reduction())
             ):
                 # Rows that stay within a wave share nothing across it, and one-wave
-                # blocks schedule and retire independently: 40us vs 45us on a 512-wide
-                # bf16 softmax backward, as Triton's num_warps=1 there. Not a bare
-                # reduction of short rows, each thread group several of them: a sum of
-                # 32-wide rows 38.5us -> 35.7us in 256-thread blocks (Triton 35.5us).
+                # blocks schedule and retire independently, as Triton's num_warps=1
+                # there. Not a bare reduction of short rows, each thread group several
+                # of them, which does better in full-size blocks.
                 self.threads = WAVE
             elif self.threads % self.tpr:
                 # Whole rows a block: the spare waves would take a part of the next.
@@ -1677,9 +1638,8 @@ class FlyDSLKernel(SIMDKernel):
                 # Rows read through a transpose (an NCHW conv output as tokens): the
                 # rows of a wave interleave, `interleave` lanes apart, so its loads of
                 # one element of adjacent rows are adjacent. One row a wave reads 64
-                # lines for a strided load. ViT's patch embedding + LayerNorm (rows of
-                # 768 f16, 196 apart) 255us -> 101us (Triton 141us), the widest vectors
-                # along the row-contiguous inputs counting: 144us at 4 a lane.
+                # lines for a strided load. The row-contiguous inputs still take the
+                # widest vectors.
                 self.threads, self.stride = WAVE, interleave
                 self.tpr = WAVE // interleave
                 self.interleaved = True
@@ -1701,9 +1661,8 @@ class FlyDSLKernel(SIMDKernel):
             # Short rows: the whole row is unrolled already, so let each thread group take
             # several rows instead, while the grid stays large.
             # Normalization kernels (several passes, a full-size store) measured best
-            # with one row per group: 89us vs 97us at two rows on a 64-wide softmax. A
-            # bare reduction wants about 64 elements a thread, every row's loads issued
-            # up front (see emit_inner): 40us vs 43us at two rows on a 32-wide sum.
+            # with one row per group. A bare reduction wants about 64 elements a
+            # thread, every row's loads issued up front (see emit_inner).
             self.xunroll = (
                 max(2, min(8, 64 // (iters * self.ept)))
                 if self._pure_reduction()
@@ -1727,8 +1686,7 @@ class FlyDSLKernel(SIMDKernel):
             )
             if any(t.startswith("welford") for t in self._reduction_types()):
                 # A welford merges each chunk into its running triple with a divide or
-                # two (fdp.welford_block): 32 elements a chunk. A split BatchNorm's
-                # statistics over NCHW 51us -> 39us (Triton 100us).
+                # two (fdp.welford_block): 32 elements a chunk.
                 self.unroll = max(1, min(WELFORD_CHUNK // self.ept, iters // 2))
             if self.one_step and self.tpr == WAVE:
                 self.unroll = iters
@@ -1747,9 +1705,8 @@ class FlyDSLKernel(SIMDKernel):
             r_roots = [e for e in votes if r in e.free_symbols]
             if r_roots and all(classify_access(e, x, 2) == "contig" for e in r_roots):
                 # Two adjacent columns a lane, one load for both: a bf16 column
-                # reads a dword a lane, not a short. ViT's MLP bias gradient (first
-                # stage) 33.8us -> 23.1us (Triton 26.8us). Settled in emit_inner,
-                # which falls back to one column if the body has other control flow.
+                # reads a dword a lane, not a short. Settled in emit_inner, which
+                # falls back to one column if the body has other control flow.
                 self.cpair = 2
         self.rstep = self.tpr * self.ept * self.unroll
         if self.mix_order_reduction:
@@ -1889,8 +1846,8 @@ class FlyDSLKernel(SIMDKernel):
         if load_mask is not None and not indirect:
             # Under ops.masked the value is always passed through where(mask, ., other),
             # and a buffer load never faults (out of range reads 0), so a load with a
-            # static index can ignore the mask -- and vectorize: 95us -> 27us on RoPE,
-            # where torch.cat's halves are masked loads.
+            # static index can ignore the mask -- and vectorize, as RoPE's torch.cat
+            # halves need.
             var = self._vector_var()
             if var is not None and classify_access(
                 root, var, min(self.ept, max(1, 16 // dtype.itemsize)), uniform
@@ -1965,8 +1922,7 @@ class FlyDSLKernel(SIMDKernel):
             line = f"fdp.uload({self._cache()}, {key}, _j // {self.ept}, _r_{arg}, lambda: {index_str}, {st!r}{mask})"
         elif self.cpair > 1 and not hoist and r is not None and r in root.free_symbols:
             x = self._x_sym()
-            # Only 2-byte loads: f32 pairs (dwordx2) took an 8192^2 column sum 85us ->
-            # 119us.
+            # Only 2-byte loads: f32 pairs (dwordx2) are slower than single dwords.
             if (
                 not indirect
                 and dtype.itemsize == 2
@@ -2715,9 +2671,8 @@ class FlyDSLKernel(SIMDKernel):
 
         Every pass reads through the ``_lc`` memo, so loading early only moves the load:
         the pass finds it cached. A later pass's loads (a LayerNorm's weight and bias,
-        say) then need not wait out the reduction before them: 135us vs 151us on a
-        4096-wide bf16 LayerNorm. Skipped for
-        buffers already stored to, and for a pass whose indexing uses names the body
+        say) then need not wait out the reduction before them. Skipped for buffers
+        already stored to, and for a pass whose indexing uses names the body
         only defines after the first pass.
         """
         if self._preload_at is None:
@@ -2762,8 +2717,7 @@ class FlyDSLKernel(SIMDKernel):
         """After the first pass, convert the preloaded f16/bf16 loads the same for every
         row (a norm's weight and bias) to f32 (see fdp.widen), as long as the f32
         copies stay few: they are live across the reduction. Not a row's own inputs:
-        the converted copies of those only add pressure (Qwen's q/k RMSNorm + RoPE
-        67us -> 79us)."""
+        the converted copies of those only add register pressure."""
         if not self.preload_lines or self._widen_at is None:
             return
         text = "\n".join(str(li) for li in self.preload_lines)
@@ -2971,8 +2925,7 @@ class FlyDSLKernel(SIMDKernel):
     def merged_rows(self) -> bool:
         """Whether a row group's ``xunroll`` results are stored together (fdp.xstore),
         every lane writing one, instead of one store a row from lane 0: short rows
-        otherwise take as many partial store instructions as loads -- 42us vs 37us on
-        a 32-wide sum (Triton 35us), 52us vs 38us at 8 lanes a row."""
+        otherwise take as many partial store instructions as loads."""
         return bool(
             self.is_reduction_kernel
             and self.persistent
@@ -2987,10 +2940,8 @@ class FlyDSLKernel(SIMDKernel):
     @property
     def slp(self) -> bool:
         """Whether LLVM's SLP vectorizer runs. It pairs a reduction's f32 math into
-        ``v_pk_*`` ops whose operands need a ``v_mov`` each to line up -- 44us vs 49us
-        on a 512-wide bf16 softmax backward, and 5-10% on LayerNorm backward and
-        RMSNorm -- while pointwise kernels gain from it overall (gelu: 0.79x vs 0.94x
-        of Triton)."""
+        ``v_pk_*`` ops whose operands need a ``v_mov`` each to line up, which slows
+        reductions, while pointwise kernels gain from it overall."""
         return bool(_tune("slp", int(not self.is_reduction_kernel or self.tile2d)))
 
     @property
@@ -3249,8 +3200,8 @@ class FlyDSLKernel(SIMDKernel):
 
     def _pass_range(self, part: IndentedBuffer) -> str:
         """The elements a pointwise or tile pass traces: all of a thread's for the body,
-        only those that can issue a load for the prefetch -- the rest of a 64-element
-        RoPE variant's prefetch traced index math for nothing (0.76 s to compile)."""
+        only those that can issue a load for the prefetch: the rest would trace index
+        math for nothing, at a compile-time cost."""
         n = self.ept * self.unroll
         step = math.gcd(self.prefetch_step, self.ept) if part is self.prefetch else 1
         return (
@@ -3271,7 +3222,7 @@ class FlyDSLKernel(SIMDKernel):
             # With several runs a thread, issue every run's loads (into the trace-time
             # vector cache) before the first store: the backend cannot prove a store
             # leaves a later run's input alone, so it would otherwise wait out each
-            # store before the next load -- 141us vs 95us on an in-place bias add.
+            # store before the next load.
             passes = (
                 [self.prefetch, self.body]
                 if self.unroll > 1 and self.prefetch
@@ -3647,8 +3598,7 @@ def _module_epilogue(
     sizes: OrderedSet[str] = OrderedSet(),
 ) -> str:
     kname = str(Placeholder.KERNEL_NAME)
-    # Contracting a multiply and add into an FMA, as Triton's default enable_fp_fusion:
-    # LayerNorm over 16384 x 4096 bf16 118us -> 112us.
+    # Contracting a multiply and add into an FMA, as Triton's default enable_fp_fusion.
     hint: dict[str, Any] = {}
     if _tune("fma", 1):
         hint["fastmath"] = "contract"
@@ -3671,8 +3621,8 @@ def _module_epilogue(
 
 
         def {kname}_flydsl():
-            # Decorating rewrites the kernel's AST, ~15 ms a kernel: only the compile
-            # worker, or a process without the saved code object, needs it.
+            # Decorating rewrites the kernel's AST: only the compile worker, or a
+            # process without the saved code object, needs it.
             global {kname}_kernel, {kname}_launch
             if {kname}_launch is None:
                 {kname}_kernel = {decorator}({kname}_kernel)
@@ -3715,8 +3665,8 @@ def _mix_order_finalize_source(
     """A mix-order reduction's second stage: each of ``outs`` (reduction type,
     storage) reduces its ``nsplit`` x ``rnumel`` f32 slice of the workspace over its
     rows. A one-wave block takes four columns a lane over its column lanes, the
-    ``slices`` lanes of each splitting the rows, then combined by shuffles. ATen's
-    ``sum(dim=0)`` and cast took 19.7us on 512 x 1024 partials."""
+    ``slices`` lanes of each splitting the rows, then combined by shuffles, in place
+    of ATen's slower ``sum(dim=0)`` and cast."""
     slices = _tune("mix_fin_slices", MIX_FINALIZE_SLICES)
     lanes = WAVE // slices
     cols = 4 * lanes
@@ -3801,13 +3751,12 @@ def _merge_identical(
     kernels, inners, flat: OrderedSet[str] = OrderedSet()
 ) -> list[tuple[list[int], str, list[tuple[str, ...]]]]:
     """Group a combo's sub-kernels whose bodies differ only in their buffers, as a
-    foreach's per-parameter kernels do (6 distinct of GPT's 22 AdamW sub-kernels).
+    foreach's per-parameter kernels do.
     Each group is ``(each member's blocks, body, members)``: the body names its j-th
     buffer ``_g{j}`` (descriptor ``_r__g{j}``), a member lists its buffers in that
-    order. One traced body a group: GPT's largest AdamW kernel compiles in 2.4 s
-    rather than 4.7 s, and runs faster for its smaller code. Members of different
-    sizes share a body too when it does not depend on the size (Llama's 1024^2 and
-    256 x 1024 weights)."""
+    order. One traced body a group compiles faster, and runs faster for its smaller
+    code. Members of different sizes share a body too when it does not depend on the
+    size."""
     groups: dict[tuple, tuple[list[int], str, list[tuple[str, ...]]]] = {}
     for k, inner in zip(kernels, inners):
         names: list[str] = []
@@ -4091,8 +4040,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
 
     def __init__(self, scheduler) -> None:
         super().__init__(scheduler)
-        # Before fusion rather than at the first kernel: ViT inference's first step
-        # waited 3.8 s on workers still importing FlyDSL.
+        # Before fusion rather than at the first kernel, so the first kernels do not
+        # wait on workers still importing FlyDSL.
         _warm_compile_workers()
 
     def codegen_node_schedule(self, kernel_features: SIMDKernelFeatures):
@@ -4324,8 +4273,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             return flat
         # Triton's tiling analysis adds a y (or z) dimension exactly when some access
         # is transposed relative to the others. A flat kernel then coalesces the
-        # stores and strides the loads (or the reverse), which measured 8x slower on
-        # a 4096^2 transpose; a pointwise kernel takes the {y, x} tiling instead and
+        # stores and strides the loads (or the reverse), which is far slower; a
+        # pointwise kernel takes the {y, x} tiling instead and
         # stages the transposed loads through LDS.
         preferred, _ = self.get_tiling_and_scores(
             kernel_features.node_schedule,
@@ -4417,11 +4366,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
     def _candidates(kernel: FlyDSLKernel) -> list[dict[str, int]]:
         """Launch parameters to time against the heuristic's for a large pointwise,
         column or short-row kernel. Which is fastest depends on what the kernel's
-        inputs were last touched by, so it is measured, as Triton autotunes these: in
-        ResNet's training step an in-place conv bias add takes 106us at 2048 elements a
-        block, 84us at 256 (Triton 95us), while its BatchNorm backward takes 96us at
-        2048 and 84us at 8192 (Triton 76us) -- and 1024-element blocks of either take
-        150us. Each candidate costs a compile, so there are two a kernel."""
+        inputs were last touched by, so it is measured, as Triton autotunes these: the
+        same block size can be best for one kernel and worst for the next. Each
+        candidate costs a compile, so there are two a kernel."""
         stage = kernel.stage
         numel = kernel.xnumel * kernel.ynumel * kernel.rnumel
         tuned = _tune_table()
@@ -4438,8 +4385,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             if "ept" in tuned or "unroll" in tuned:
                 return []
             w = kernel.ept
-            # 4096-element blocks won a few ResNet kernels by 3-9% over these, never
-            # by more.
+            # Larger blocks won rarely, and never by much.
             cands = [
                 {"ept": max(1, w // 2), "unroll": 1, "threads": 128},
                 {"ept": w, "unroll": 8, "threads": THREADS},
@@ -4449,16 +4395,13 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         if stage == "tile":
             if tuned.keys() & OrderedSet(["tile_f", "tile_s"]) or kernel.tile_f != TILE:
                 return []
-            # Twice the fast edge, at twice the threads: GPT-2's QKV gradient (three
-            # bf16 heads layouts to rows) 39.2us -> 33.4us in the model (Triton 34.3us),
-            # where a 4096^2 f32 transpose or an NCHW -> NHWC copy lose 1-10%.
+            # Twice the fast edge, at twice the threads: wins on some head-layout
+            # transposes, loses a little on large square ones.
             return [{"tile_f": 2 * TILE, "threads": 2 * kernel.threads}]
-        # Not tuned, as no candidate won across ten models' autotuned kernels: a row's
-        # rows per lane group.
+        # Not tuned, as no candidate won: a row's rows per lane group.
         if stage == "column":
-            # Twice the lanes on each column: Qwen3's per-head norm weight gradient
-            # (bf16 rows 128 wide) 37us -> 33us (Triton 32us), but an 8192^2 f32
-            # column sum 82us -> 103us.
+            # Twice the lanes on each column: wins on narrow columns, loses on wide
+            # ones.
             return [{"threads": 2 * kernel.threads}] if kernel.threads < 512 else []
         if (
             stage in ("row", "norm")
@@ -4467,9 +4410,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             and "row_tpr" not in tuned
             and "xunroll" not in tuned
         ):
-            # Fewer lanes a row: Qwen3's q-norm + RoPE (128 wide) 134us -> 85us at 8.
-            # Not when that loops over the row instead: it lost all 55 such kernels
-            # across ten models, by 13-76%.
+            # Fewer lanes a row. Not when that loops over the row instead, which
+            # always lost.
             half = kernel.tpr // 2
             cands = (
                 [{"row_tpr": half}]
@@ -4479,11 +4421,10 @@ class FlyDSLSIMDScheduling(TritonScheduling):
                 else []
             )
             if kernel.tpr < WAVE:
-                # Or more, up to a wave: GPT-2's masked softmax backward (512 bf16)
-                # 62.5us -> 58.4us in the model (Triton 61us).
+                # Or more, up to a wave.
                 cands.append({"row_tpr": 2 * kernel.tpr})
-            # Or more: an ALU-bound row (Qwen3's k-norm + RoPE, angles computed in the
-            # kernel) 70us -> 61us at 4 elements a lane rather than 8 (Triton 101us).
+            # Or fewer elements a lane, for an ALU-bound row (a norm + RoPE computing
+            # its angles in the kernel).
             if kernel.ept > 2 and "ept" not in tuned:
                 cands.append({"ept": kernel.ept // 2})
             return cands
@@ -4509,8 +4450,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         self, kernel, src_code, kernel_features, node_schedule, tiling
     ) -> str:
         """A dynamic kernel, and beside it the variant for sizes that are multiples of
-        SIZE_ALIGN when that one differs (wider runs, fewer masks): a row cumsum over a
-        dynamic 8192 99us -> 17us. Sizes that are expressions (``ps0``) keep one."""
+        SIZE_ALIGN when that one differs (wider runs, fewer masks). Sizes that are
+        expressions (``ps0``) keep one."""
         sizes = kernel.args.sizevars
         if not all(
             isinstance(e, sympy.Symbol) and symbol_is_type(e, SymT.SIZE) for e in sizes
@@ -4636,8 +4577,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         wrapper.src_to_kernel[src_code] = kernel_name
         src_code = src_code.replace(str(Placeholder.KERNEL_NAME), kernel_name)
         _, _, kernel_path = get_path(code_hash(src_code), "py")
-        # An autotuned module's variants compile as separate jobs, one per worker: in
-        # one job they compiled one after another, 2-3 s a kernel.
+        # An autotuned module's variants compile as separate jobs, one per worker,
+        # rather than one after another in a single job.
         variants = 1
         while f"{kernel_name}_c{variants}_kernel" in src_code:
             variants += 1
@@ -4686,10 +4627,9 @@ class FlyDSLSIMDScheduling(TritonScheduling):
         if not getattr(wrapper, "flydsl_waits_for_pool", False):
             # async_compile hands kernels to the compile workers only once the pool is
             # up, and those defined before are compiled lazily on their first call, one
-            # at a time: 39 flyc.compile calls, 11 s of Llama inference's 17 s first
-            # step. The pool has been starting since compilation began; the module runs
-            # this line on load, after all of codegen. Not when the first kernel's code
-            # object is already on disk (a warm start compiles nothing): 7.6 s vs 4 s.
+            # at a time. The pool has been starting since compilation began; the module
+            # runs this line on load, after all of codegen. Not when the first kernel's
+            # code object is already on disk (a warm start compiles nothing).
             # pyrefly: ignore [missing-attribute]
             wrapper.flydsl_waits_for_pool = True
             if binaries is not None:
@@ -4709,7 +4649,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
 @functools.cache
 def _warm_compile_workers() -> None:
     """Once a process: start every compile worker importing and setting up FlyDSL
-    (~2 s each) while the kernels are still being generated."""
+    while the kernels are still being generated."""
     from torch._inductor import async_compile
 
     threads = async_compile.get_compile_threads()
