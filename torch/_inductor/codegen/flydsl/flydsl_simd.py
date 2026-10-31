@@ -79,7 +79,7 @@ from ..triton import TritonScheduling
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from ...ops_handler import ReductionType, StoreMode
     from ..simd_kernel_features import SIMDKernelFeatures
@@ -579,6 +579,7 @@ class FlyDSLKernelOverrides(OpOverrides):
         return f"fdp.inline_asm({asm!r}, {constraints!r}, {out!r}, {bool(is_pure)}, {args}{packed})"
 
     @staticmethod
+    # pyrefly: ignore [bad-override]
     def frexp(x):
         key = f"frexp({x})"
         if cached := V.kernel.cse.try_get(key):
@@ -680,7 +681,7 @@ def _only_names(expr: str, allowed: OrderedSet[str]) -> bool:
 @functools.cache
 def _tune_table() -> dict[str, int]:
     """Developer overrides for the launch heuristics, for tuning experiments:
-    ``TORCHINDUCTOR_FLYDSL_SIMD_TUNE="col_unroll=8,col_stride=32,force_flat=1"``."""
+    ``TORCHINDUCTOR_FLYDSL_SIMD_TUNE="threads=256,ept=4,force_flat=1"``."""
     import os
 
     out = {}
@@ -927,6 +928,7 @@ class FlyDSLKernel(SIMDKernel):
         # A dynamic x extent (batch, sequence): the kernel takes it as an argument, its
         # bounds mask always on, and the static choices use its size hint.
         self.xnumel_dyn: sympy.Expr | None = None
+        self.mix_node_schedule: list[Any] = []
         xs = V.graph.sizevars.simplify(self.numels["x"])
         if _int_or_none(xs) is None:
             self.xnumel_dyn = xs
@@ -1644,6 +1646,7 @@ class FlyDSLKernel(SIMDKernel):
                 # backward went to Triton's otherwise, 235us vs 184us.
                 tpr = WAVE
                 self.one_step = True
+            # pyrefly: ignore [bad-argument-type]
             self.tpr = _tune("row_tpr", tpr)
             short = (
                 -(-self.rnumel // (self.tpr * self.ept)) * self.ept
@@ -2905,7 +2908,7 @@ class FlyDSLKernel(SIMDKernel):
         for outer, inner in self.args.inplace_buffers.items():
             if hasattr(inner, "inner_name"):
                 name_of[inner.inner_name] = outer
-        extents = {}
+        extents: dict[str, int | str] = {}
         workspaces = {ws.inner_name: ws for ws in self.args.workspace_args}
         sizes = OrderedSet(self.args.sizevars.values())
         for a in arg_defs:
@@ -3581,7 +3584,7 @@ class FlyDSLKernel(SIMDKernel):
 
 def _module_prologue(
     arg_names: list[str],
-    extents: dict[str, int],
+    extents: Mapping[str, int | str],
     smem_words: int,
     notes: list[str],
     helpers: dict[str, str],
@@ -3827,7 +3830,7 @@ def _merge_identical(
     for blocks, body, members in groups.values():
         if len(members) == 1:
             # Unchanged, under its own buffer names.
-            names = members[0]
+            names = list(members[0])
             body = re.sub(
                 r"(?<![A-Za-z0-9])(_r_)?_g(\d+)\b",
                 lambda m: f"{m.group(1) or ''}{names[int(m.group(2))]}",
@@ -3912,7 +3915,11 @@ def _combo_source(kernels: list[FlyDSLKernel]) -> str:
         wide=any(k.wide for k in kernels),
     )
     groups = _merge_identical(
-        kernels, inners, OrderedSet(a for a, n in extents.items() if n >= _I32_LIMIT)
+        kernels,
+        inners,
+        OrderedSet(
+            a for a, n in extents.items() if isinstance(n, int) and n >= _I32_LIMIT
+        ),
     )
     start = 0
     with code.indent():
@@ -4194,9 +4201,12 @@ class FlyDSLSIMDScheduling(TritonScheduling):
 
     def _codegen_mix_order_finalize(self, kernel, ws_name, nsplit, rnumel):
         n, r = _int_or_none(nsplit), _int_or_none(rnumel)
-        bufs = [
-            V.graph.get_buffer(pa.buffer_name) for pa in kernel.saved_partial_accumulate
-        ]
+        bufs: list[ir.Buffer] = []
+        for pa in kernel.saved_partial_accumulate:
+            buf = V.graph.get_buffer(pa.buffer_name)
+            if not isinstance(buf, ir.Buffer):
+                raise AssertionError(type(buf))
+            bufs.append(buf)
         if not (
             isinstance(kernel, FlyDSLKernel)
             and n
@@ -4532,6 +4542,8 @@ class FlyDSLSIMDScheduling(TritonScheduling):
     def _recent_buffers(self, kernel_features) -> OrderedSet[str]:
         """The buffers the nodes just before this kernel's wrote or read, back through
         WARM_BYTES of them: what is likely still in the last-level cache when it runs."""
+        if self.scheduler is None:
+            raise AssertionError("expected self.scheduler to be set")
         nodes = self.scheduler.nodes
         cache = self.__dict__.get("_node_pos")
         if cache is None or cache[0] is not nodes or len(cache[1]) < len(nodes):
@@ -4678,6 +4690,7 @@ class FlyDSLSIMDScheduling(TritonScheduling):
             # step. The pool has been starting since compilation began; the module runs
             # this line on load, after all of codegen. Not when the first kernel's code
             # object is already on disk (a warm start compiles nothing): 7.6 s vs 4 s.
+            # pyrefly: ignore [missing-attribute]
             wrapper.flydsl_waits_for_pool = True
             if binaries is not None:
                 metadata = (
