@@ -312,6 +312,12 @@ def flex_attention(
             subgraph_buffer=subgraph_buffer,
             mask_graph_buffer=mask_graph_buffer,
             write_max_scores=kernel_options.get("OUTPUT_MAX", True),
+            head_slow_order=kernel_options.get("FLYDSL_HEAD_SLOW_ORDER", True),
+            split_kv=kernel_options.get("FLYDSL_SPLIT_KV", False),
+            single_pass=kernel_options.get(
+                "fwd_FLYDSL_WIDE_SINGLE_PASS",
+                kernel_options.get("FLYDSL_WIDE_SINGLE_PASS", True),
+            ),
         )
 
     can_use_decode = _use_flex_decoding(
@@ -953,8 +959,8 @@ def flex_attention_backward(*args, **kwargs):
     else:
         kernel_options.setdefault("IS_DIVISIBLE", False)
 
-    if backend == "FLYDSL":
-        flydsl_result = create_flydsl_flex_attention_backward_kernel(
+    def _create_flydsl_backward(**mod_kwargs):
+        return create_flydsl_flex_attention_backward_kernel(
             query,
             key,
             value,
@@ -980,9 +986,25 @@ def flex_attention_backward(*args, **kwargs):
                     kernel_options.get("FLYDSL_DQ_ACCUM_FP32", True),
                 ),
             ),
+            single_pass=cast(
+                bool,
+                kernel_options.get(
+                    "bwd_FLYDSL_WIDE_SINGLE_PASS",
+                    kernel_options.get("FLYDSL_WIDE_SINGLE_PASS", False),
+                ),
+            ),
+            **mod_kwargs,
         )
-        if flydsl_result is not None:
-            return flydsl_result
+
+    flydsl_score_is_trivial = is_trivial_score_graph(fw_graph.graph_module)
+    if backend == "FLYDSL":
+        if flydsl_score_is_trivial:
+            flydsl_result = _create_flydsl_backward()
+            if flydsl_result is not None:
+                return flydsl_result
+        else:
+            # The FlyDSL template matches captures to subgraph loads by buffer name.
+            score_mod_other_buffers = maybe_realize(list(score_mod_other_buffers))
 
     fwd_placeholder_inps = [
         create_placeholder(name, dtype, device)
@@ -1020,6 +1042,13 @@ def flex_attention_backward(*args, **kwargs):
     joint_outputs = process_joint_outputs(
         all_joint_outputs, len(joint_placeholder_inps)
     )
+
+    if backend == "FLYDSL" and not flydsl_score_is_trivial:
+        flydsl_result = _create_flydsl_backward(
+            fw_subgraph_buffer=fw_subgraph_buffer, joint_outputs=joint_outputs
+        )
+        if flydsl_result is not None:
+            return flydsl_result
 
     mask_graph_placeholder_inps = [
         create_placeholder(name, dtype, query.get_device())

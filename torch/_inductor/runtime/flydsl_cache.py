@@ -211,6 +211,28 @@ def run_flydsl_template(
     )
 
 
+def fill_flydsl_capture_table(
+    launchers: Sequence[LazyFlyDSLLauncher],
+    slots: int,
+    table: Any,
+    captures: Sequence[Any],
+    stream: Any,
+    *,
+    compiler: Callable[..., Any],
+    tensor_converter: Callable[[Any], Any],
+) -> None:
+    """Write capture base addresses to ``table``; launcher ``i`` takes
+    ``(table, *captures[i * slots:][:slots], stream)`` padded with ``table``."""
+    for first, launcher in zip(range(0, len(captures), slots), launchers):
+        chunk = tuple(captures[first : first + slots])
+        run_flydsl_template(
+            launcher.get(table.device),
+            (table, *chunk, *(table,) * (slots - len(chunk)), stream),
+            compiler=compiler,
+            tensor_converter=tensor_converter,
+        )
+
+
 def precompile_flydsl_template(
     kernel: Callable[..., Any],
     tensor_names: Sequence[str],
@@ -252,6 +274,15 @@ def flydsl_tensor_arg(tensor: Any) -> Any:
     import flydsl.compiler as flyc
 
     return flyc.from_torch_tensor(tensor).mark_layout_dynamic()
+
+
+def flydsl_runtime_layout_arg(tensor: Any) -> Any:
+    """Pass ``tensor`` with a runtime layout, so that one compiled kernel takes
+    every size; a tensor without a unit stride keeps its static layout."""
+    import flydsl.compiler as flyc
+
+    arg = flyc.from_torch_tensor(tensor)
+    return arg.mark_layout_dynamic() if 1 in tensor.stride() else arg
 
 
 def precompile_flydsl(
