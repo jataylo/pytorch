@@ -283,6 +283,11 @@ class FlexKernelOptions(TypedDict, total=False):
     non-atomic accumulation and return gradients in the input dtype. This option
     does not affect forward."""
 
+    FLYDSL_DUALWAVE_CAUSAL: NotRequired[bool]
+    """Allow the FlyDSL dual-wave forward candidate (``flydsl_enable_autotuning``)
+    for causal BlockMasks. It ignores the BlockMask contents beyond its shape.
+    Default: False."""
+
     FLYDSL_HEAD_SLOW_ORDER: NotRequired[bool]
     """Let FlyDSL forwards without a BlockMask run long, many-headed grids in
     head-slow workgroup order to keep each head's K/V in L2. Default: True.
@@ -293,6 +298,11 @@ class FlexKernelOptions(TypedDict, total=False):
     then merge their partial outputs and LSEs in a second kernel. True picks the
     split count from the grid size and Sk; an int sets it. Needs static sizes.
     Default: False."""
+
+    FLYDSL_DUALWAVE_WIDE: NotRequired[bool]
+    """Also offer the FlyDSL dual-wave forward candidate (``flydsl_enable_autotuning``)
+    at QK or V head dims of 160 to 256, which its default 8-wave CTA cannot take,
+    as a 4-wave CTA with one wave per SIMD. Default: False."""
 
     FLYDSL_WIDE_SINGLE_PASS: NotRequired[bool]
     """At FlyDSL QK or V head dims above 256, compute the scores once per tile

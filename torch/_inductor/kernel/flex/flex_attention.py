@@ -312,8 +312,10 @@ def flex_attention(
             subgraph_buffer=subgraph_buffer,
             mask_graph_buffer=mask_graph_buffer,
             write_max_scores=kernel_options.get("OUTPUT_MAX", True),
+            dualwave_causal=kernel_options.get("FLYDSL_DUALWAVE_CAUSAL", False),
             head_slow_order=kernel_options.get("FLYDSL_HEAD_SLOW_ORDER", True),
             split_kv=kernel_options.get("FLYDSL_SPLIT_KV", False),
+            dualwave_wide=kernel_options.get("FLYDSL_DUALWAVE_WIDE", False),
             single_pass=kernel_options.get(
                 "fwd_FLYDSL_WIDE_SINGLE_PASS",
                 kernel_options.get("FLYDSL_WIDE_SINGLE_PASS", True),
