@@ -995,6 +995,9 @@ def flex_attention_backward(*args, **kwargs):
                     kernel_options.get("FLYDSL_WIDE_SINGLE_PASS", False),
                 ),
             ),
+            split_backward=cast(
+                bool | None, kernel_options.get("FLYDSL_SPLIT_BACKWARD")
+            ),
             **mod_kwargs,
         )
 

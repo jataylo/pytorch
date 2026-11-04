@@ -288,6 +288,15 @@ class FlexKernelOptions(TypedDict, total=False):
     for causal BlockMasks. It ignores the BlockMask contents beyond its shape.
     Default: False."""
 
+    FLYDSL_SPLIT_BACKWARD: NotRequired[bool]
+    """Use separate gfx950 dQ and dK/dV kernels ported from AOTriton for
+    identity score_mod, BF16/FP16 and head dims up to 512. By default, use them
+    only without a BlockMask. True also allows recognized top-left causal or
+    causal sliding-window masks, trusting their block lists to be unchanged
+    from create_block_mask; their contents are not read by the split kernels.
+    False always uses the fused backward. Short queries stay fused where faster.
+    """
+
     FLYDSL_HEAD_SLOW_ORDER: NotRequired[bool]
     """Let FlyDSL forwards without a BlockMask run long, many-headed grids in
     head-slow workgroup order to keep each head's K/V in L2. Default: True.
