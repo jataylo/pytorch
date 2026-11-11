@@ -7973,6 +7973,10 @@ class Scheduler:
             # right now
             return False
 
+        if not allow_mix_order_reduction and MixOrderReduction.can_fuse(node1, node2):
+            WhyNoFuse(node1, node2)("recursive mix-order reduction disabled")
+            return False
+
         why = WhyNoFuse(node1, node2)
 
         if node1.is_template() and self.get_backend(
@@ -10453,11 +10457,11 @@ class BaseScheduling:  # noqa: docstring_linter
             node1, node2
         ) and NestedReduction.can_fuse(node1, node2):
             return FusedNestedReductions(node1, node2)
+        elif isinstance(node1, FusedMixOrderReductions):
+            return node1.fuse_with(node2)
         elif MixOrderReduction.are_mix_order_reductions(node1, node2):
             return FusedMixOrderReductions(node1, node2)
         elif isinstance(node1, FusedNestedReductions):
-            return node1.fuse_with(node2)
-        elif isinstance(node1, FusedMixOrderReductions):
             return node1.fuse_with(node2)
         elif isinstance(node1, ExternKernelSchedulerNode) and isinstance(
             node2, SchedulerNode

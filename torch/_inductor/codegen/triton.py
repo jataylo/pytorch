@@ -53,6 +53,7 @@ from ..ops_handler import DefaultHandler
 from ..runtime import triton_heuristics
 from ..runtime.benchmarking import benchmarker
 from ..runtime.hints import (
+    AMDConfigLimits,
     AutotuneHint,
     DeviceProperties,
     get_warp_size,
@@ -94,6 +95,7 @@ from ..utils import (
 )
 from ..virtualized import _ops as ops, ReductionType, StoreMode, V
 from ..wrapper_benchmark import get_kernel_category_by_source_code
+from .amd_kernel_optimizations import supports_amd_kernel_optimizations
 from .block_analysis import BlockPatternMatcher
 from .common import (
     ArgName,
@@ -3736,6 +3738,27 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
             return True
         features = self.features.with_tiling_scores(self.tiling_scores)
+        if (
+            config.triton.amd_kernel_optimizations
+            and config.triton.amd_extended_kernel_optimizations
+            and config.triton.persistent_reductions
+            and not (
+                config.deterministic
+                or config.batch_invariant
+                or torch.are_deterministic_algorithms_enabled()
+            )
+            and not self.cooperative_reduction
+            and features.get_reduction_hint() == ReductionHint.INNER
+            and isinstance(features.reduction_numel, (sympy.Integer, int))
+            and 1024 < int(features.reduction_numel) <= 32768
+        ):
+            device = DeviceProperties.create(V.graph.get_current_device_or_throw())
+            if supports_amd_kernel_optimizations(device):
+                if (
+                    int(features.reduction_numel)
+                    <= AMDConfigLimits.from_device(device).max_tile
+                ):
+                    return True
         return V.choices.should_use_persistent_reduction(
             features, self.cooperative_reduction
         )
@@ -7071,6 +7094,54 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 return True
         return False
 
+    def _amd_warm_arg_names(self) -> tuple[str, ...]:
+        nodes = V.graph.scheduler.nodes
+        mine = OrderedSet([node.get_name() for node in self.features.scheduler_nodes()])
+        position = next(
+            (
+                i
+                for i, node in enumerate(nodes)
+                if any(sub.get_name() in mine for sub in node.get_nodes())
+            ),
+            0,
+        )
+        recent = OrderedSet()
+        total = 0
+        for node in reversed(nodes[:position]):
+            names = [buf.get_name() for buf in node.get_outputs()]
+            names += [dep.name for dep in node.read_writes.reads]
+            for name in names:
+                if name in recent:
+                    continue
+                try:
+                    buf = V.graph.get_buffer(name)
+                    total += int(buf.get_numel()) * buf.get_dtype().itemsize
+                except (AttributeError, KeyError, NotImplementedError, TypeError):
+                    continue
+                recent.add(name)
+            if total >= 128 << 20:
+                break
+        inputs = dict(self.args.input_buffers)
+        inputs.update(
+            {
+                name: buf.inner_name
+                for name, buf in self.args.inplace_buffers.items()
+                if isinstance(buf, InplacedBuffer)
+            }
+        )
+        real = V.graph.scheduler.mutation_real_name
+        return tuple(
+            sorted(
+                OrderedSet(
+                    [
+                        inner
+                        for name, inner in inputs.items()
+                        if name in recent or real.get(name, name) in recent
+                    ]
+                )
+            )
+        )
+
     def codegen_kernel(self, name=None) -> str:
         """
         Convert the TritonKernel from Inductor SIMD IR to triton code, including inductor triton heuristics, imports,
@@ -7220,6 +7291,47 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
         }
+        amd_optimizations = (
+            config.triton.amd_kernel_optimizations
+            and supports_amd_kernel_optimizations(triton_meta["device"])
+            and not (
+                config.deterministic
+                or config.batch_invariant
+                or torch.are_deterministic_algorithms_enabled()
+            )
+        )
+        if amd_optimizations:
+            inductor_meta["amd_warp_size"] = triton_meta["device"].warp_size
+            inductor_meta["amd_max_threads_per_block"] = triton_meta[
+                "device"
+            ].max_threads_per_block
+            inductor_meta["amd_reduction_tuning"] = True
+            inductor_meta["amd_kernel_autotune"] = (
+                self._get_heuristic()
+                in ("pointwise", "reduction", "persistent_reduction")
+                and not self.cooperative_reduction
+                and OrderedSet(size_hints).issubset(OrderedSet(["x", "r0_"]))
+            )
+            inductor_meta["amd_kernel_tuning_version"] = (
+                5
+                if config.triton.amd_further_kernel_optimizations
+                else 4
+                if config.triton.amd_extended_kernel_optimizations
+                else 2
+            )
+            inductor_meta["amd_autotune_diagnostics_path"] = (
+                config.triton.amd_autotune_diagnostics_path
+            )
+            inductor_meta["amd_warm_arg_names"] = self._amd_warm_arg_names()
+            if config.triton.amd_further_kernel_optimizations:
+                reductions = inductor_meta.get("num_reduction", 0)
+                inductor_meta["amd_confirm_tuning"] = (
+                    bool(inductor_meta.get("atomic_add_found"))
+                    or reductions in (1, 2)
+                    or reductions >= 4
+                )
+                inductor_meta["amd_graph_tuning"] = inductor_meta["amd_confirm_tuning"]
+                inductor_meta["amd_allow_atomic_tuning"] = bool(mutated_args)
 
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault
@@ -7326,7 +7438,36 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
             )
 
-        return code.getvalue()
+        source = code.getvalue()
+        if amd_optimizations:
+            from .amd_kernel_optimizations import (
+                optimize_flat_pointwise_source,
+                optimize_gelu_source,
+                optimize_pointwise_source,
+                optimize_row_source,
+                simplify_masked_modulo,
+            )
+
+            placeholder = str(Placeholder.KERNEL_NAME)
+            source = source.replace(placeholder, "AMD_KERNEL_NAME")
+            source = simplify_masked_modulo(source)
+            source = optimize_pointwise_source(
+                source, extended=config.triton.amd_extended_kernel_optimizations
+            )
+            source = optimize_row_source(
+                source,
+                approximate=config.triton.amd_approximate_math,
+                extended=config.triton.amd_extended_kernel_optimizations,
+                further=config.triton.amd_further_kernel_optimizations,
+            )
+            if config.triton.amd_approximate_math:
+                source = optimize_gelu_source(
+                    source, extended=config.triton.amd_extended_kernel_optimizations
+                )
+            if config.triton.amd_extended_kernel_optimizations:
+                source = optimize_flat_pointwise_source(source)
+            source = source.replace("AMD_KERNEL_NAME", placeholder)
+        return source
 
     @staticmethod
     def _get_persistent_RBLOCK(rnumel):

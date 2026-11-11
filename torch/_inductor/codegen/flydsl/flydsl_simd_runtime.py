@@ -1934,7 +1934,19 @@ def _device_libs() -> list:
         f"oclc_isa_version_{get_rocm_arch()[3:]}",
         "oclc_abi_version_500",
     ]
-    return [_os.path.join(root, f"{n}.bc") for n in names]
+    # Recent OCML uses LLVM FP environment/intrinsics instead of these control
+    # files. ROCDL's target still supplies the precise DAZ/sqrt settings.
+    optional = OrderedSet(["oclc_daz_opt_off", "oclc_correctly_rounded_sqrt_on"])
+    libraries = []
+    for name in names:
+        path = _os.path.join(root, f"{name}.bc")
+        if _os.path.isfile(path):
+            libraries.append(path)
+        elif name not in optional:
+            raise FileNotFoundError(
+                f"ROCm device library not found: {path}; set ROCM_PATH to a complete SDK"
+            )
+    return libraries
 
 
 def _ocml(name: str, ret: str, *args):
@@ -2155,19 +2167,36 @@ def randn(seed, offset):
     return mul(sqrt(mul(const(-2.0, "f32"), log(u1))), cos(th))
 
 
+def _random_counter_lane(offset):
+    offset = _val(idx32(offset))
+    counter = ArithValue(_arith.ShRUIOp(offset, _val(const(2, "i32"))).result)
+    lane = ArithValue(_arith.AndIOp(offset, _val(const(3, "i32"))).result)
+    return counter, lane
+
+
 def _philox_group(cache, key, j: int, seed, offset):
     """The four Philox words of offset group ``offset // 4``, computed once per group of
     four consecutive elements (``j`` counts a thread's elements; groups are aligned)."""
 
     def words():
         base = sub(idx(offset), j % 4) if j % 4 else idx(offset)
-        return _philox(seed, idiv(base, 4))
+        counter, _ = _random_counter_lane(base)
+        return _philox(seed, counter)
 
     return memo(cache, (key, j // 4), words)
 
 
 def rand4(cache, key, j: int, seed, offset):
     return _uniform(_philox_group(cache, key, j, seed, offset)[j % 4])
+
+
+def rand4_at(seed, offset):
+    counter, lane = _random_counter_lane(offset)
+    words = _philox(seed, counter)
+    even = eq(bitwise_and(lane, const(1, "i32")), const(0, "i32"))
+    low = where(even, ArithValue(words[0]), ArithValue(words[1]))
+    high = where(even, ArithValue(words[2]), ArithValue(words[3]))
+    return _uniform(_val(where(lt(lane, const(2, "i32")), low, high)))
 
 
 def randn4(cache, key, j: int, seed, offset):
@@ -2182,6 +2211,19 @@ def randn4(cache, key, j: int, seed, offset):
         return out
 
     return memo(cache, (key, "n", j // 4), normals)[j % 4]
+
+
+def randn4_at(seed, offset):
+    counter, lane = _random_counter_lane(offset)
+    words = _philox(seed, counter)
+    first = lt(lane, const(2, "i32"))
+    a = where(first, ArithValue(words[0]), ArithValue(words[2]))
+    b = where(first, ArithValue(words[1]), ArithValue(words[3]))
+    u1 = maximum(_uniform(_val(a)), const(1.0e-7, "f32"))
+    th = mul(_uniform(_val(b)), const(6.283185307179586, "f32"))
+    radius = sqrt(mul(const(-2.0, "f32"), log(u1)))
+    even = eq(bitwise_and(lane, const(1, "i32")), const(0, "i32"))
+    return mul(radius, where(even, cos(th), sin(th)))
 
 
 def rand_eager(seed, base_offset, threads_per_round: int, tid, vec: int):
@@ -3193,10 +3235,22 @@ def online_softmax_merge(a, b):
     return _canon(m), _canon(s)
 
 
-def group_online_softmax(mx, s, tpr: int, smem, threads: int, stride: int = 1):
-    # The sum holds exp(max - max) = 1, as group_softmax_twopass's.
-    m, s = _group_reduce((mx, s), online_softmax_merge, tpr, smem, threads, stride)
-    return _derive(m, "rowmax"), _derive(s, "ge1")
+def online_softmax_pair_merge(a, b):
+    (m1, s1), (m2, s2) = a, b
+    m = maximum(m1, m2)
+    empty = eq(m, const(float("-inf"), "f32"))
+    scale1 = where(empty, const(1.0, "f32"), exp(sub(m1, m)))
+    scale2 = where(empty, const(1.0, "f32"), exp(sub(m2, m)))
+    return _canon(m), _canon(add(mul(s1, scale1), mul(s2, scale2)))
+
+
+def group_online_softmax(
+    mx, s, tpr: int, smem, threads: int, stride: int = 1, partial: bool = False
+):
+    # Raw logits contribute one at the row max; partial states may be entirely masked.
+    combine = online_softmax_pair_merge if partial else online_softmax_merge
+    m, s = _group_reduce((mx, s), combine, tpr, smem, threads, stride)
+    return _derive(m, "rowmax"), s if partial else _derive(s, "ge1")
 
 
 # -- chunked forms -----------------------------------------------------------------------
@@ -3249,6 +3303,34 @@ def online_softmax_block(mx, s, items):
     base = _softmax_base(m_new)
     chunk = _tree([exp(sub(x, base)) for x in xs], add)
     return m_new, _canon(add(mul(s, exp(sub(mx, base))), chunk))
+
+
+def online_softmax_pair_block(mx, s, items):
+    maxima = _masked_items(
+        [(value[0], mask) for value, mask in items], "f32", float("-inf")
+    )
+    sums = _masked_items([(value[1], mask) for value, mask in items], "f32", 0.0)
+    m = _canon(maximum(mx, _tree(maxima, maximum)))
+    empty = eq(m, const(float("-inf"), "f32"))
+    scales = [where(empty, const(1.0, "f32"), exp(sub(value, m))) for value in maxima]
+    chunk = _tree([mul(weight, scale) for weight, scale in zip(sums, scales)], add)
+    scale = where(empty, const(1.0, "f32"), exp(sub(mx, m)))
+    return m, _canon(add(mul(s, scale), chunk))
+
+
+def group_softmax_pair_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
+    maxima = _masked_items(
+        [(value[0], mask) for value, mask in items], "f32", float("-inf")
+    )
+    sums = _masked_items([(value[1], mask) for value, mask in items], "f32", 0.0)
+    m = _derive(
+        group_reduce("max", _tree(maxima, maximum), tpr, smem, threads, stride),
+        "rowmax",
+    )
+    empty = eq(m, const(float("-inf"), "f32"))
+    scales = [where(empty, const(1.0, "f32"), exp(sub(value, m))) for value in maxima]
+    total = _tree([mul(weight, scale) for weight, scale in zip(sums, scales)], add)
+    return m, group_reduce("sum", total, tpr, smem, threads, stride)
 
 
 def group_softmax_twopass(items, tpr: int, smem, threads: int, stride: int = 1):
@@ -3318,13 +3400,67 @@ def group_welford_twopass(
 # ---------------------------------------------------------------------------------------
 
 
-def pick_fastest(mains, args, mutated, stream=None, warm=None):
-    """An autotuned kernel's first call: time every candidate's ``_main`` on copies of
-    the buffers it updates in place, run the fastest on the real arguments, and return
-    it. Under graph capture nothing can be timed: the first (heuristic) one runs, and
-    None leaves the choice to a later call.
-    """
+class BackendSelector:
+    """Select a supported kernel's backend once, then call its launcher directly."""
+
+    def __init__(
+        self, mains, mutated, warm, kernel_name, stage, triton_source_hash=None
+    ):
+        for backend, fn in zip(["flydsl", "triton"], mains):
+            fn.__name__ = f"{kernel_name}_{triton_source_hash or ''}_{backend}"
+        self.mains = mains
+        self.mutated = mutated
+        self.warm = warm
+        self.metadata = {
+            "category": "backend_selection",
+            "kernel_name": kernel_name,
+            "stage": stage,
+            "backends": ["flydsl", "triton"],
+        }
+        self.run = self._select
+
+    def _select(self, *args, stream=None):
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            self.mains[0](*args, stream=stream)
+            return
+        best = pick_fastest(
+            self.mains, args, self.mutated, stream, self.warm, self.metadata
+        )
+        if best is not None:
+            from torch._dynamo.utils import counters
+
+            index = self.mains.index(best)
+            counters["flydsl_simd"][f"selected_{self.metadata['backends'][index]}"] += 1
+            self.run = best
+
+
+def pick_fastest(mains, args, mutated, stream=None, warm=None, metadata=None):
+    """Measure candidates in modeled cache context; keep the heuristic on close ties."""
+    import math
+    import statistics
+
     import torch
+
+    from .flydsl_diagnostics import record_kernel_decision
+
+    def report(best, times=None, **extra):
+        index = mains.index(best)
+        entry = {
+            **(metadata or {}),
+            "category": (metadata or {}).get("category", "autotune_selection"),
+            "kernel_name": (metadata or {}).get("kernel_name", mains[0].__name__),
+            "candidates": [m.__name__ for m in mains],
+            "candidate_times_ms": [t if math.isfinite(t) else None for t in times]
+            if times
+            else None,
+            "selected_candidate": index,
+            **extra,
+        }
+        if metadata and "backends" in metadata:
+            entry["selected_backend"] = metadata["backends"][index]
+        record_kernel_decision(entry)
 
     if torch.cuda.is_current_stream_capturing():
         mains[0](*args, stream=stream)
@@ -3332,29 +3468,84 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
     path = _pick_path(mains)
     try:
         with open(path) as f:
-            best = next(m for m in mains if m.__name__ == f.read().strip())
+            winner = f.read().strip()
+        best = next(m for m in mains if m.__name__ == winner)
         best(*args, stream=stream)
+        report(best, cache_hit=True)
         return best
     except (OSError, TypeError, StopIteration):
         pass
-    scratch = list(args)
-    for i in mutated:
-        scratch[i] = args[i].clone()
-    for fn in mains:
-        fn(*scratch, stream=stream)  # compiles (and runs once)
-    # Back-to-back calls averaged, the candidates interleaved round by round and the
-    # best round kept: the fastest single call (the benchmarker's "min") favours a
-    # candidate with a high variance.
-    # Each round is queued behind a GPU sleep: a launch from Python takes longer than
-    # a short kernel, and unqueued the GPU would idle between them, timing the launches.
-    # Every call starts from the cache state the kernel meets in the model, as far as
-    # the scheduler can tell: the 256 MB last-level cache flushed, then the inputs that
-    # the kernels just before it wrote or read (`warm`) rewritten in place, leaving
-    # them there dirty, as their producer would. Timed back to back instead, every
-    # input is cached; flushed with nothing rewritten, none is; rewarmed by reading,
-    # the lines are clean. Each of those picked slower variants for the model. Without
-    # `warm` (an older module), only L2 is flushed.
     device = next(a.device for a in args if isinstance(a, torch.Tensor))
+    mutated_storages = OrderedSet([args[i].untyped_storage()._cdata for i in mutated])
+    originals = {
+        a.untyped_storage()._cdata: a
+        for a in args
+        if isinstance(a, torch.Tensor)
+        and a.untyped_storage()._cdata in mutated_storages
+    }
+    needed = sum(a.untyped_storage().nbytes() for a in originals.values())
+    free, _ = torch.cuda.mem_get_info(device)
+    if 3 * needed + (256 << 20) > free // 2:
+        mains[0](*args, stream=stream)
+        report(mains[0], reason="insufficient scratch memory", cache_hit=False)
+        return mains[0]
+    copies = {}
+    for key, arg in originals.items():
+        original = torch.empty(0, dtype=torch.uint8, device=device).set_(
+            arg.untyped_storage()
+        )
+        copies[key] = (original, original.clone())
+    scratch = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor) and arg.untyped_storage()._cdata in copies:
+            storage = copies[arg.untyped_storage()._cdata][1].untyped_storage()
+            arg = torch.empty(0, dtype=arg.dtype, device=device).set_(
+                storage, arg.storage_offset(), arg.size(), arg.stride()
+            )
+        scratch.append(arg)
+
+    def restore():
+        for original, copied in copies.values():
+            copied.copy_(original)
+
+    for fn in mains:
+        restore()
+        fn(*scratch, stream=stream)
+    reference_index = (
+        1 if metadata and metadata.get("category") == "backend_selection" else 0
+    )
+    restore()
+    mains[reference_index](*scratch, stream=stream)
+    expected = {i: scratch[i].detach().clone() for i in mutated}
+    valid = []
+    for index, fn in enumerate(mains):
+        restore()
+        fn(*scratch, stream=stream)
+        try:
+            for i, value in expected.items():
+                low_precision = value.dtype in (torch.float16, torch.bfloat16)
+                atol, rtol = (0.02, 0.02) if low_precision else (1e-4, 1e-4)
+                if not value.is_floating_point():
+                    atol = rtol = 0
+                torch.testing.assert_close(
+                    scratch[i], value, atol=atol, rtol=rtol, equal_nan=True
+                )
+        except AssertionError as exc:
+            record_kernel_decision(
+                {
+                    **(metadata or {}),
+                    "category": "candidate_rejected",
+                    "candidate": fn.__name__,
+                    "reason": "output differs from reference candidate",
+                    "validation_error": str(exc),
+                    "reference": mains[reference_index].__name__,
+                }
+            )
+        else:
+            valid.append(index)
+    expected.clear()
+    if not valid:
+        raise RuntimeError("No numerically valid FlyDSL autotuning candidate")
     flush = torch.empty(
         (256 if warm is not None else 16) << 20, dtype=torch.int8, device=device
     )
@@ -3368,59 +3559,77 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
 
     def before():
         flush.zero_()
+        restore()
         for t in warm_bufs:
             t.add_(0)
 
     ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+    restore()
     ev[0].record()
-    mains[0](*scratch, stream=stream)
+    mains[valid[0]](*scratch, stream=stream)
     ev[1].record()
     ev[1].synchronize()
     reps = max(1, min(10, int(0.3 / max(ev[0].elapsed_time(ev[1]), 1e-3))))
 
-    def measure(fns, before):
-        times = [float("inf")] * len(fns)
-        # ~60us a launch (four with the flush and events); over-sleeping is cheap.
+    def measure(fns):
+        samples = [[] for _ in fns]
         sleep_us = len(fns) * reps * 4 * 60
-        rounds = tries = 0
-        while rounds < 3:
-            tries += 1
-            start = _time.perf_counter()
-            torch.cuda._sleep(int(sleep_us * 2.1e3))  # cycles: gfx942 at 2.1 GHz
+        rounds = 0
+        for _ in range(12):
+            begin = _time.perf_counter()
+            # Conservative cycle budget for supported CDNA devices.
+            torch.cuda._sleep(int(sleep_us * 4000))
             events = []
-            for fn in fns:
+            for j in range(len(fns)):
+                index = (rounds + j) % len(fns)
                 pairs = []
                 for _ in range(reps):
-                    if before is not None:
-                        before()
+                    before()
                     pair = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
                     pair[0].record()
-                    fn(*scratch, stream=stream)
+                    fns[index](*scratch, stream=stream)
                     pair[1].record()
                     pairs.append(pair)
-                events.append(pairs)
-            queued_us = (_time.perf_counter() - start) * 1e6
-            events[-1][-1][1].synchronize()
-            if queued_us > sleep_us and tries < 8:
-                # The GPU outran the launches (a host busy compiling other kernels),
-                # so this round timed them too.
+                events.append((index, pairs))
+            queued_us = (_time.perf_counter() - begin) * 1e6
+            events[-1][1][-1][1].synchronize()
+            if queued_us > sleep_us:
                 sleep_us *= 2
                 continue
+            for index, pairs in events:
+                samples[index].append(sum(a.elapsed_time(b) for a, b in pairs) / reps)
             rounds += 1
-            for k, pairs in enumerate(events):
-                times[k] = min(times[k], sum(s.elapsed_time(e) for s, e in pairs))
-        return times
+            if rounds == 5:
+                return samples
+        return None
 
-    times = measure(mains, before)
-    flush = None  # 256 MB, not needed for the warm timing below
-    # Candidates within 3% of each other cold are told apart warm, where their cache
-    # behaviour differs: which of them wins cold varies by run.
-    close = [m for m, t in zip(mains, times) if t <= min(times) * 1.03]
-    if len(close) > 1:
-        warm_times = measure(close, None)
-        best = close[warm_times.index(min(warm_times))]
-    else:
-        best = mains[times.index(min(times))]
+    measured = measure([mains[i] for i in valid])
+    samples = [[] for _ in mains]
+    if measured is not None:
+        for index, values in zip(valid, measured):
+            samples[index] = values
+    if measured is None:
+        mains[valid[0]](*args, stream=stream)
+        report(
+            mains[valid[0]],
+            reason="host could not queue stable measurements",
+            cache_hit=False,
+        )
+        return mains[valid[0]]
+    times = [
+        statistics.median(values) if values else float("inf") for values in samples
+    ]
+    close = sorted(valid, key=times.__getitem__)[:3]
+    if len(close) > 1 and times[close[1]] <= times[close[0]] * 1.03:
+        close = list(dict.fromkeys(([0] if 0 in valid else []) + close))
+        extra = measure([mains[i] for i in close])
+        if extra is not None:
+            for index, values in zip(close, extra):
+                times[index] = statistics.median([*samples[index], *values])
+    index = min(range(len(mains)), key=times.__getitem__)
+    if times[index] >= times[0] * 0.98:
+        index = 0
+    best = mains[index]
     if path is not None:
         tmp = f"{path}.{_os.getpid()}"
         try:
@@ -3431,6 +3640,7 @@ def pick_fastest(mains, args, mutated, stream=None, warm=None):
         except OSError:
             pass
     best(*args, stream=stream)
+    report(best, times, cache_hit=False, repeats_per_round=reps, rounds=5)
     return best
 
 
@@ -3448,7 +3658,11 @@ def _pick_path(mains):
     if config.force_disable_caches:
         return None
     key = "\n".join(
-        [torch.cuda.get_device_properties().gcnArchName, *(m.__name__ for m in mains)]
+        [
+            str(torch.cuda.get_device_properties()),
+            torch.version.hip or "",
+            *(m.__name__ for m in mains),
+        ]
     )
     h = hashlib.sha256(key.encode()).hexdigest()[:32]
     return _os.path.join(cache_dir(), "flydsl_picks", h)

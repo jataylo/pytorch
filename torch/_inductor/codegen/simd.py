@@ -841,12 +841,18 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         remaining = [sv.simplify(g) for g in groups]
         var_count = itertools.count()
 
+        def exact_quotient(
+            numerator: sympy.Expr, denominator: sympy.Expr
+        ) -> sympy.Expr:
+            quotient = numerator / denominator
+            return quotient if quotient.is_integer else FloorDiv(numerator, denominator)
+
         def add_range(i: int, expr: sympy.Expr) -> int:
             expr = sv.simplify(expr)
             if not sv.statically_known_multiple_of(remaining[i], expr):
                 raise CantSplit(remaining[i], expr)
             # guard on the last item out
-            remaining[i] = FloorDiv(remaining[i], expr)
+            remaining[i] = exact_quotient(remaining[i], expr)
             new_ranges[i].append(expr)
             return next(var_count)
 
@@ -905,7 +911,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
 
                     size1 = remaining[current_group]
                     size2 = remaining[current_group + 1]
-                    size3 = FloorDiv(size, size1 * size2)
+                    size3 = exact_quotient(size, size1 * size2)
                     return_getters.append(
                         # pyrefly: ignore [bad-argument-type]
                         make_combined(
@@ -943,7 +949,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
                         raise CantSplit(size, remaining[current_group])
 
                     size1 = remaining[current_group]
-                    size2 = FloorDiv(size, remaining[current_group])
+                    size2 = exact_quotient(size, remaining[current_group])
                     return_getters.append(
                         # pyrefly: ignore [bad-argument-type]
                         make_combined(

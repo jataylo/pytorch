@@ -1907,6 +1907,13 @@ class triton:
     # import in template_heuristics/tlx.py fails cleanly otherwise).
     tlx_mode: Literal["allow", "force"] | None = tlx_mode_from_env()
 
+    # Opt-in wave64 layout and reduction tuning experiments on gfx950.
+    amd_kernel_optimizations = False
+    amd_extended_kernel_optimizations = False
+    amd_further_kernel_optimizations = False
+    amd_autotune_diagnostics_path: str | None = None
+    amd_approximate_math = False
+
     # Use cudagraphs on output code
     cudagraphs = os.environ.get("TORCHINDUCTOR_CUDAGRAPHS") == "1"
 
@@ -2802,6 +2809,18 @@ class flydsl:
 
     # With simd on, raise instead of falling back to Triton. For tests and coverage work.
     simd_strict: bool = os.environ.get("TORCHINDUCTOR_FLYDSL_SIMD_STRICT") == "1"
+
+    # Compare supported SIMD kernels against Triton; otherwise prefer FlyDSL.
+    simd_autotune_backend: bool = (
+        os.environ.get("TORCHINDUCTOR_FLYDSL_SIMD_AUTOTUNE_BACKEND") == "1"
+    )
+    simd_autotune_min_numel: int = 65536
+    simd_autotune_max_configs: int = 12
+
+    # Optional JSONL kernel decisions, also emitted through structured tracing.
+    simd_diagnostics_path: str | None = os.environ.get(
+        "TORCHINDUCTOR_FLYDSL_SIMD_DIAGNOSTICS"
+    )
 
 
 class halide:

@@ -234,6 +234,22 @@ def get_warp_size(device) -> int:
     return DeviceProperties.create(device).warp_size_or_default
 
 
+class AMDConfigLimits(typing.NamedTuple):
+    warp_size: int
+    max_warps: int
+    max_tile: int
+
+    @classmethod
+    def from_device(cls, device: DeviceProperties) -> AMDConfigLimits:
+        warp_size = device.warp_size_or_default
+        # Bound the supported compiler search as well as the hardware block size.
+        max_warps = min(16, (device.max_threads_per_block or 1024) // warp_size)
+        # Leave room for temporaries alongside the values in a reduction tile.
+        registers = device.regs_per_multiprocessor
+        max_tile = min(32768, registers // 4) if registers else 32768
+        return cls(warp_size, max_warps, max_tile)
+
+
 class TritonMeta(typing.TypedDict, total=False):
     """Metadata bag threaded from Triton codegen into the runtime launcher.
 
@@ -278,6 +294,25 @@ class InductorMeta(typing.TypedDict, total=False):
     still build this bag as a plain dict[str, Any], so the write side is not yet
     checked against this TypedDict; typing the producers is left as a follow-up.
     """
+
+    amd_row_count: int
+    amd_reduction_extent: int
+    amd_kernel_tuning_version: int
+    amd_warp_size: int
+    amd_max_threads_per_block: int
+    amd_cache_policy: str
+    amd_confirm_tuning: bool
+    amd_graph_tuning: bool
+    amd_allow_atomic_tuning: bool
+    amd_outer_row: bool
+    amd_kernel_autotune: bool
+    amd_autotune_diagnostics_path: str | None
+    amd_warm_arg_names: tuple[str, ...]
+    amd_reduction_tuning: bool
+    amd_pointwise_family: str
+    amd_approximate_math: bool
+    amd_gluon_family: str
+    use_gluon: bool
 
     # Global inductor config snapshot (inductor_meta_common / inductor_meta_from_config)
     backend_hash: str | None

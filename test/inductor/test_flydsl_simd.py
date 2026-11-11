@@ -1344,11 +1344,7 @@ class TestFlyDSLSIMD(TestCase):
         return outs
 
     def test_rand_matches_triton_philox(self):
-        # The same Philox-4x32-10 stream as Triton: one call per four consecutive
-        # offsets as rand4x, and one per element as tl.rand where an odd size leaves
-        # FlyDSL scalar elements.
-        from torch._inductor.codegen.triton import TritonOverrides
-
+        # Flat pointwise kernels keep the packed stream even when odd tails need scalar elements.
         x = torch.empty(1000, 1000, device="cuda")
         t, f = self._vs_triton(lambda a: torch.rand_like(a), x)
         self.assertTrue(torch.equal(t, f))
@@ -1358,11 +1354,6 @@ class TestFlyDSLSIMD(TestCase):
                 torch.randint(0, 1 << 40, a.shape, device="cuda"),
             ),
             torch.empty(999, 1001, device="cuda"),
-            [
-                patch.object(
-                    TritonOverrides, "_can_use_4x_random", staticmethod(lambda: False)
-                )
-            ],
         )
         for a, b in zip(t, f):
             self.assertTrue(torch.equal(a, b))
