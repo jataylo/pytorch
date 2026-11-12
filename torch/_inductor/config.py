@@ -1907,6 +1907,11 @@ class triton:
     # import in template_heuristics/tlx.py fails cleanly otherwise).
     tlx_mode: Literal["allow", "force"] | None = tlx_mode_from_env()
 
+    # Opt-in native Triton specializations and resource-aware tuning on AMD.
+    amd_native_kernel_optimizations = False
+    amd_persistent_reduction_autotune = True
+    amd_autotune_diagnostics_path: str | None = None
+
     # Use cudagraphs on output code
     cudagraphs = os.environ.get("TORCHINDUCTOR_CUDAGRAPHS") == "1"
 
