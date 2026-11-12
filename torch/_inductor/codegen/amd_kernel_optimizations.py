@@ -2,10 +2,51 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
+from typing import TYPE_CHECKING
 
 from torch.utils._ordered_set import OrderedSet
 
 from ..runtime.hints import AMDConfigLimits, DeviceProperties
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    import torch
+
+
+@dataclasses.dataclass
+class AMDCodegenSource:
+    r"""Share one parsed source across guarded Inductor codegen passes."""
+
+    source: str
+    tree: ast.Module = dataclasses.field(init=False)
+    changed: bool = False
+
+    def __post_init__(self) -> None:
+        self.tree = ast.parse(self.source)
+
+    def emit(self) -> str:
+        r"""emit() -> str
+
+        Keep unmatched source byte-for-byte unchanged.
+        """
+        if not self.changed:
+            return self.source
+        ast.fix_missing_locations(self.tree)
+        return ast.unparse(self.tree) + "\n"
+
+
+def _finish_source(
+    tree: ast.Module, source: str, context: AMDCodegenSource | None
+) -> str:
+    if context is not None:
+        context.tree = tree
+        context.changed = True
+        return source
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree) + "\n"
 
 
 def _call(node: ast.AST, name: str) -> bool:
@@ -55,9 +96,273 @@ def _source_limits(meta: ast.Dict) -> AMDConfigLimits | None:
     )
 
 
-def optimize_pointwise_source(source: str, *, extended: bool = False) -> str:
+def _native_metadata(meta: ast.Dict, family: str, **values) -> None:
+    values = {"amd_native_family": family, "use_gluon": False, **values}
+    for key, value in values.items():
+        index = next(
+            (i for i, name in enumerate(meta.keys) if ast.literal_eval(name) == key),
+            None,
+        )
+        if index is None:
+            meta.keys.append(ast.Constant(key))
+            meta.values.append(ast.Constant(value))
+        else:
+            meta.values[index] = ast.Constant(value)
+
+
+def _row_tail_safe(fn: ast.FunctionDef, assignments: dict[str, ast.AST]) -> bool:
+    def protected(node, seen=()):
+        if (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Lt)
+        ):
+            return (
+                ast.unparse(node.left) == "xindex"
+                and ast.unparse(node.comparators[0]) == "xnumel"
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+            return protected(node.left, seen) or protected(node.right, seen)
+        if (
+            isinstance(node, ast.Name)
+            and node.id in assignments
+            and node.id not in seen
+        ):
+            return protected(assignments[node.id], (*seen, node.id))
+        return False
+
+    assigned = OrderedSet()
+    for statement in fn.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign, ast.Expr)):
+            return False
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+            if isinstance(statement, ast.AnnAssign)
+            else []
+        )
+        for target in targets:
+            for node in ast.walk(target):
+                if isinstance(node, ast.Name):
+                    if node.id in assigned:
+                        return False
+                    assigned.add(node.id)
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if (
+                    node.func.id not in ("float", "int", "bool")
+                    or not all(isinstance(arg, ast.Constant) for arg in node.args)
+                    or node.keywords
+                ):
+                    return False
+            if isinstance(node, ast.Attribute):
+                root = node.value
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                module = isinstance(root, ast.Name) and root.id in (
+                    "tl",
+                    "tl_math",
+                    "libdevice",
+                    "triton_helpers",
+                )
+                if not module and node.attr not in ("to", "dtype"):
+                    return False
+            if isinstance(node, ast.Subscript):
+                slices = (
+                    node.slice.elts
+                    if isinstance(node.slice, ast.Tuple)
+                    else [node.slice]
+                )
+                if any(
+                    not (
+                        isinstance(item, ast.Slice)
+                        and item.lower is None
+                        and item.upper is None
+                        and item.step is None
+                    )
+                    and not (isinstance(item, ast.Constant) and item.value is None)
+                    for item in slices
+                ):
+                    return False
+
+    # A row tile must advance monotonically from a nonnegative program index.
+    xindex = assignments.get("xindex")
+    if xindex is None:
+        return False
+    expression = ast.unparse(xindex)
+    offset = assignments.get("xoffset")
+    if offset is not None:
+        expression = expression.replace("xoffset", ast.unparse(offset))
+    if expression != "tl.program_id(0) * XBLOCK + tl.arange(0, XBLOCK)[:, None]":
+        return False
+    memory = [
+        node
+        for node in ast.walk(fn)
+        if _call(node, "tl.load") or _call(node, "tl.store")
+    ]
+    if not memory:
+        return False
+    definitions = dict(assignments)
+    definitions.update(
+        {
+            node.target.id: node.value
+            for node in fn.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        }
+    )
+    arguments = OrderedSet([arg.arg for arg in fn.args.args])
+
+    def row_dependent(node, seen=()):
+        if isinstance(node, ast.Name):
+            if node.id in ("xindex", "xoffset", "XBLOCK") or node.id in seen:
+                return True
+            if node.id in definitions:
+                return row_dependent(definitions[node.id], (*seen, node.id))
+            return node.id not in arguments and node.id not in (
+                "tl",
+                "tl_math",
+                "libdevice",
+                "triton_helpers",
+            )
+        if _call(node, "tl.program_id"):
+            return True
+        return any(row_dependent(child, seen) for child in ast.iter_child_nodes(node))
+
+    for call in memory:
+        if _call(call, "tl.load") and not row_dependent(call.args[0]):
+            continue
+        position = 1 if _call(call, "tl.load") else 2
+        mask = (
+            call.args[position]
+            if len(call.args) > position
+            else next((kw.value for kw in call.keywords if kw.arg == "mask"), None)
+        )
+        if mask is None or not protected(mask):
+            return False
+    # Shape-changing operations need their own proof that padded rows stay isolated.
+    elementwise = OrderedSet(
+        [
+            "tl.load",
+            "tl.store",
+            "tl.arange",
+            "tl.program_id",
+            "tl.full",
+            "tl.broadcast_to",
+            "tl.where",
+            "tl.abs",
+            "tl.exp",
+            "tl.exp2",
+            "tl.log",
+            "tl.log2",
+            "tl.sqrt",
+            "tl.rsqrt",
+            "tl.maximum",
+            "tl.minimum",
+            "tl.div_rn",
+            "tl.sum",
+            "tl.max",
+            "tl.min",
+            "tl.reduce",
+            "tl.associative_scan",
+        ]
+    )
+    for statement in fn.body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Call):
+                name = ast.unparse(node.func)
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "tl"
+                    and name not in elementwise
+                ):
+                    return False
+    # A reduction across rows could allow masked rows to influence valid outputs.
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in (
+            "tl.sum",
+            "tl.max",
+            "tl.min",
+            "tl.reduce",
+            "tl.associative_scan",
+            "triton_helpers.fmax2",
+            "triton_helpers.max2",
+            "triton_helpers.any",
+        ):
+            axis = (
+                node.args[1]
+                if len(node.args) > 1
+                else next((kw.value for kw in node.keywords if kw.arg == "axis"), None)
+            )
+            if not isinstance(axis, ast.Constant) or axis.value != 1:
+                return False
+    return True
+
+
+def amd_reduction_value_bytes(
+    input_dtypes: Iterable[torch.dtype], reduction_dtypes: Iterable[torch.dtype]
+) -> int:
+    r"""Estimate reduction value width without charging integer labels as full tiles."""
+    inputs = list(input_dtypes)
+    widths = [
+        dtype.itemsize
+        for dtype in inputs
+        if dtype.is_floating_point or dtype.is_complex
+    ]
+    if not widths:
+        widths = [dtype.itemsize for dtype in inputs]
+    return max([4, *widths, *(dtype.itemsize for dtype in reduction_dtypes)])
+
+
+def amd_persistent_reduction_eligible(
+    device: DeviceProperties,
+    rows: int,
+    width: int,
+    *,
+    input_count: int,
+    reduction_count: int,
+    dtype_bytes: int = 4,
+    compare: bool = False,
+) -> bool:
+    """Bound persistent live values and desired residency using device resources."""
+    if not supports_amd_kernel_optimizations(device) or rows < 1 or width < 1:
+        return False
+    limits = AMDConfigLimits.from_device(device)
+    padded = 1 << (width - 1).bit_length()
+    if padded > limits.max_tile:
+        return False
+    registers = device.regs_per_multiprocessor or limits.max_tile * 4
+    live_values = 2 + min(4, max(1, input_count)) + min(4, max(1, reduction_count))
+    live_registers = padded * live_values * max(1, (dtype_bytes + 3) // 4)
+    # The estimate ignores value reuse; comparison mode allows slack before measuring residency.
+    resident_blocks = (
+        1
+        if compare
+        else min(
+            4,
+            max(
+                1,
+                (rows + device.multi_processor_count - 1)
+                // max(1, device.multi_processor_count),
+            ),
+        )
+    )
+    budget = registers * 2 if compare else registers // resident_blocks
+    return live_registers <= budget
+
+
+def optimize_pointwise_source(
+    source: str,
+    *,
+    extended: bool = False,
+    use_gluon: bool = True,
+    _context: AMDCodegenSource | None = None,
+) -> str:
     """Use explicit layouts for static copy and arithmetic kernels on AMD GPUs."""
-    tree = ast.parse(source)
+    tree = _context.tree if _context is not None else ast.parse(source)
     functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
     if len(functions) != 1:
         return source
@@ -96,6 +401,8 @@ def optimize_pointwise_source(source: str, *, extended: bool = False) -> str:
             and len(statement.targets) == 1
             and isinstance(statement.targets[0], ast.Name)
         ):
+            if statement.targets[0].id in assignments:
+                return source
             assignments[statement.targets[0].id] = statement.value
         elif isinstance(statement, ast.Expr) and _call(statement.value, "tl.store"):
             stores.append(statement.value)
@@ -122,11 +429,18 @@ def optimize_pointwise_source(source: str, *, extended: bool = False) -> str:
                 )
             ):
                 return source
-    if len(stores) != 1 or not isinstance(assignments.get("xnumel"), ast.Constant):
+    if len(stores) != 1:
         return source
-    n = assignments["xnumel"].value
-    if not isinstance(n, int) or n <= 0 or n >= 2**31:
+    numel_node = assignments.get("xnumel")
+    dynamic = (
+        numel_node is None
+        and not use_gluon
+        and any(arg.arg == "xnumel" for arg in fn.args.args)
+    )
+    n = numel_node.value if isinstance(numel_node, ast.Constant) else None
+    if not dynamic and (not isinstance(n, int) or n <= 0 or n >= 2**31):
         return source
+    extent = "xnumel" if dynamic else str(n)
     store = stores[0]
     address = store.args[0]
     if (
@@ -204,6 +518,8 @@ def optimize_pointwise_source(source: str, *, extended: bool = False) -> str:
         offsets = [ast.unparse(load.args[0]) for load in loads]
         broadcast = ast.dump(
             ast.parse(f"(load0 * {1.0 / n!r}) * (load1 * 2.0)", mode="eval").body
+            if n is not None
+            else ast.Constant(None)
         )
         add = ast.dump(ast.parse("load0 + load1", mode="eval").body)
         if offsets == ["in_ptr0 + 0", "in_ptr1 + x0"] and expression == broadcast:
@@ -212,20 +528,21 @@ def optimize_pointwise_source(source: str, *, extended: bool = False) -> str:
 scale = gl.load(in_ptr0) * {1.0 / n!r}
 for u in gl.static_range(AMD_UNROLL):
     i = gl.program_id(0) * XBLOCK + u * (XBLOCK // AMD_UNROLL) + lane
-    value = gl.load(in_ptr1 + i, i < {n}, other=0).to(gl.float32)
-    gl.store(out_ptr0 + i, scale * (value * 2.0), i < {n})
+    value = gl.load(in_ptr1 + i, i < {extent}, other=0).to(gl.float32)
+    gl.store(out_ptr0 + i, scale * (value * 2.0), i < {extent})
 """
         elif offsets == ["in_ptr0 + x0", "in_ptr1 + x0"] and expression == add:
             family = "add"
             body = f"""
 for u in gl.static_range(AMD_UNROLL):
     i = gl.program_id(0) * XBLOCK + u * (XBLOCK // AMD_UNROLL) + lane
-    a = gl.load(in_ptr0 + i, i < {n}, other=0).to(gl.float32)
-    b = gl.load(in_ptr1 + i, i < {n}, other=0).to(gl.float32)
-    gl.store(out_ptr0 + i, a + b, i < {n})
+    a = gl.load(in_ptr0 + i, i < {extent}, other=0).to(gl.float32)
+    b = gl.load(in_ptr1 + i, i < {extent}, other=0).to(gl.float32)
+    gl.store(out_ptr0 + i, a + b, i < {extent})
 """
     elif (
-        len(loads) == 1
+        n is not None
+        and len(loads) == 1
         and pointers == ["in_ptr0", "out_ptr0"]
         and signature[pointers[0]] == signature[pointers[1]]
         and expression == ast.dump(ast.Name(id="load0", ctx=ast.Load()))
@@ -263,11 +580,12 @@ for u in gl.static_range(AMD_UNROLL):
                     body = f"""
 i = gl.program_id(0) * XBLOCK + lane
 output = (i // {s * c}) * {s * c} + ((i // {d}) % {s}) * {c} + ((i // {s * d}) % {c // d}) * {d} + (i % {d})
-value = gl.load(in_ptr0 + i, i < {n}, other=0)
-gl.store(out_ptr0 + output, value, i < {n})
+value = gl.load(in_ptr0 + i, i < {extent}, other=0)
+gl.store(out_ptr0 + output, value, i < {extent})
 """
     if (
         family is None
+        and n is not None
         and len(loads) == 1
         and pointers == ["in_ptr0", "out_ptr0"]
         and signature[pointers[0]] == signature[pointers[1]]
@@ -311,8 +629,8 @@ gl.store(out_ptr0 + output, value, i < {n})
                 body = f"""
 i = gl.program_id(0) * XBLOCK + lane
 output = (i // {s * c}) * {s * c} + ((i // {d}) % {s}) * {c} + ((i // {s * d}) % {h}) * {d} + (i % {d})
-value = gl.load(in_ptr0 + i, i < {n}, other=0)
-gl.store(out_ptr0 + output, value, i < {n})
+value = gl.load(in_ptr0 + i, i < {extent}, other=0)
+gl.store(out_ptr0 + output, value, i < {extent})
 """
     if family is None:
         return source
@@ -327,12 +645,33 @@ if AMD_READ_ORDER == 0:
     x0 = i % {c}
     x1 = i // {c}
     offset = {d} * (x1 % {s}) + {s * d} * (x0 // {d}) + {s * c} * (x1 // {s}) + x0 % {d}
-    value = gl.load(in_ptr0 + offset, i < {n}, other=0)
-    gl.store(out_ptr0 + i, value, i < {n})
+    value = gl.load(in_ptr0 + offset, i < {extent}, other=0)
+    gl.store(out_ptr0 + i, value, i < {extent})
 else:
 {input_linear}
 """
         extra_args.append("AMD_READ_ORDER")
+    if not use_gluon:
+        extra_args = ["AMD_UNROLL"] + (
+            ["AMD_READ_ORDER"] if family == "transpose" else []
+        )
+        for name in extra_args:
+            values["signature"].keys.append(ast.Constant(name))
+            values["signature"].values.append(ast.Constant("constexpr"))
+            fn.args.args.append(
+                ast.arg(
+                    arg=name, annotation=ast.parse("tl.constexpr", mode="eval").body
+                )
+            )
+        _native_metadata(
+            keywords["inductor_meta"],
+            family,
+            amd_cache_policy="balanced" if extended else "producer",
+        )
+        fn.body = ast.parse(
+            "lane = tl.arange(0, XBLOCK // AMD_UNROLL)\n" + body.replace("gl.", "tl.")
+        ).body
+        return _finish_source(tree, source, _context)
     for name in extra_args:
         values["signature"].keys.append(ast.Constant(name))
         values["signature"].values.append(ast.Constant("constexpr"))
@@ -364,13 +703,14 @@ else:
             module="triton.experimental", names=[ast.alias(name="gluon")], level=0
         ),
     )
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    return _finish_source(tree, source, _context)
 
 
-def simplify_masked_modulo(source: str) -> str:
+def simplify_masked_modulo(
+    source: str, *, _context: AMDCodegenSource | None = None
+) -> str:
     """Remove a row-reduction modulo when the load mask proves its range."""
-    tree = ast.parse(source)
+    tree = _context.tree if _context is not None else ast.parse(source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     if len(functions) != 1:
         return source
@@ -485,8 +825,7 @@ def simplify_masked_modulo(source: str) -> str:
                 break
     if not changed:
         return source
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    return _finish_source(tree, source, _context)
 
 
 def optimize_row_source(
@@ -495,9 +834,11 @@ def optimize_row_source(
     approximate: bool = False,
     extended: bool = False,
     further: bool = False,
+    use_gluon: bool = True,
+    _context: AMDCodegenSource | None = None,
 ) -> str:
     """Keep short row reductions and their statistics in one wave layout."""
-    tree = ast.parse(source)
+    tree = _context.tree if _context is not None else ast.parse(source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     fn = next(
         (
@@ -638,26 +979,50 @@ def optimize_row_source(
         and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name)
     }
+    names = [
+        node.targets[0].id
+        for node in fn.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    ]
+    if len(names) != len(OrderedSet(names)):
+        return source
     xnumel = assignments.get("xnumel")
-    if (
+    dynamic_rows = (
+        xnumel is None
+        and not use_gluon
+        and any(arg.arg == "xnumel" for arg in fn.args.args)
+    )
+    if not dynamic_rows and (
         not isinstance(xnumel, ast.Constant)
         or not isinstance(xnumel.value, int)
         or xnumel.value <= 0
     ):
         return source
+    row_tail_safe = _row_tail_safe(fn, assignments) if not use_gluon else False
+    if dynamic_rows and not row_tail_safe:
+        return source
     softmax = "triton_helpers.fmax2" in calls and "libdevice.exp" in calls
-    from triton.experimental.gluon import language as gl
-    from triton.experimental.gluon.language.extra import libdevice as gdev
+    if use_gluon:
+        from triton.experimental.gluon import language as target_language
+        from triton.experimental.gluon.language.extra import (
+            libdevice as target_libdevice,
+        )
+    else:
+        import triton.language as target_language
+        from triton.language.extra import libdevice as target_libdevice
 
     if any(
         name.startswith("tl.")
         and name[3:] != "broadcast_to"
-        and not hasattr(gl, name[3:])
+        and not hasattr(target_language, name[3:])
         for name in calls
     ):
         return source
     if any(
-        name.startswith("libdevice.") and not hasattr(gdev, name.split(".")[1])
+        name.startswith("libdevice.")
+        and not hasattr(target_libdevice, name.split(".")[1])
         for name in calls
     ):
         return source
@@ -677,6 +1042,52 @@ def optimize_row_source(
             "R0_BLOCK",
         ):
             return source
+
+    if not use_gluon:
+        if approximate and softmax:
+
+            class Approximate(ast.NodeTransformer):
+                def visit_Call(self, node):
+                    self.generic_visit(node)
+                    if _call(node, "libdevice.exp"):
+                        node.func = ast.parse("tl.exp", mode="eval").body
+                    return node
+
+                def visit_BinOp(self, node):
+                    self.generic_visit(node)
+                    if isinstance(node.op, ast.Div):
+                        node.op = ast.Mult()
+                        node.right = ast.Call(
+                            func=ast.Name(id="_amd_reciprocal", ctx=ast.Load()),
+                            args=[node.right],
+                            keywords=[],
+                        )
+                    return node
+
+            fn.body = [Approximate().visit(statement) for statement in fn.body]
+            tree.body.insert(
+                tree.body.index(fn),
+                ast.parse(
+                    '@triton.jit\ndef _amd_reciprocal(value):\n    return tl.inline_asm_elementwise("v_rcp_f32 $0, $1", constraints="=v,v", args=[value], dtype=tl.float32, is_pure=True, pack=1)'
+                ).body[0],
+            )
+        _native_metadata(
+            keywords["inductor_meta"],
+            "row_reduction",
+            amd_reduction_extent=hints["r0_"],
+            amd_row_count=None if dynamic_rows else xnumel.value,
+            amd_row_tail_safe=row_tail_safe,
+            amd_approximate_math=approximate and softmax,
+            amd_cache_policy="balanced" if extended else "producer",
+        )
+        if scan:
+            _native_metadata(
+                keywords["inductor_meta"],
+                "row_reduction",
+                amd_graph_tuning=True,
+                amd_confirm_tuning=True,
+            )
+        return _finish_source(tree, source, _context)
 
     class Convert(ast.NodeTransformer):
         def visit_Name(self, node):
@@ -851,13 +1262,14 @@ def _amd_reciprocal(value):
         if isinstance(node, ast.FunctionDef)
     )
     tree.body[index:index] = ast.parse(helpers).body
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    return _finish_source(tree, source, _context)
 
 
-def optimize_gelu_source(source: str, *, extended: bool = False) -> str:
+def optimize_gelu_source(
+    source: str, *, extended: bool = False, _context: AMDCodegenSource | None = None
+) -> str:
     """Share the Gaussian exponential in opt-in approximate GELU backward."""
-    tree = ast.parse(source)
+    tree = _context.tree if _context is not None else ast.parse(source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     if len(functions) != 1:
         return source
@@ -891,6 +1303,8 @@ def optimize_gelu_source(source: str, *, extended: bool = False) -> str:
             and len(statement.targets) == 1
             and isinstance(statement.targets[0], ast.Name)
         ):
+            if statement.targets[0].id in assignments:
+                return source
             assignments[statement.targets[0].id] = statement.value
         elif isinstance(statement, ast.Expr) and _call(statement.value, "tl.store"):
             stores.append(statement.value)
@@ -1034,13 +1448,14 @@ for u in tl.static_range(AMD_UNROLL):
     value=a*(cdf+b*(0.3989422804014327*ex))
     tl.store({output}+i,value,i<{n.value})
 """).body
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    return _finish_source(tree, source, _context)
 
 
-def optimize_flat_pointwise_source(source: str) -> str:
+def optimize_flat_pointwise_source(
+    source: str, *, use_gluon: bool = True, _context: AMDCodegenSource | None = None
+) -> str:
     """Tune layouts of static flat elementwise fusions without rewriting math."""
-    tree = ast.parse(source)
+    tree = _context.tree if _context is not None else ast.parse(source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     if len(functions) != 1:
         return source
@@ -1095,7 +1510,12 @@ def optimize_flat_pointwise_source(source: str) -> str:
             "tl.div_rn",
         ]
     )
-    from triton.experimental.gluon.language.extra import libdevice as gdev
+    if use_gluon:
+        from triton.experimental.gluon.language.extra import (
+            libdevice as target_libdevice,
+        )
+    else:
+        from triton.language.extra import libdevice as target_libdevice
 
     for statement in fn.body:
         if (
@@ -1103,6 +1523,8 @@ def optimize_flat_pointwise_source(source: str) -> str:
             and len(statement.targets) == 1
             and isinstance(statement.targets[0], ast.Name)
         ):
+            if statement.targets[0].id in assignments:
+                return source
             assignments[statement.targets[0].id] = statement.value
         elif isinstance(statement, ast.Expr) and _call(statement.value, "tl.store"):
             stores.append(statement.value)
@@ -1130,7 +1552,7 @@ def optimize_flat_pointwise_source(source: str) -> str:
             if name == "libdevice.erf":
                 return source
             device_math = name.startswith("libdevice.") and hasattr(
-                gdev, name.split(".")[1]
+                target_libdevice, name.split(".")[1]
             )
             if name not in elementwise and not cast and not device_math:
                 return source
@@ -1146,14 +1568,23 @@ def optimize_flat_pointwise_source(source: str) -> str:
             if _call(node, "tl.program_id") and ast.unparse(node) != "tl.program_id(0)":
                 return source
     n = assignments.get("xnumel")
+    dynamic = (
+        n is None and not use_gluon and any(arg.arg == "xnumel" for arg in fn.args.args)
+    )
     if (
-        not isinstance(n, ast.Constant)
-        or not isinstance(n.value, int)
-        or not 0 < n.value < 2**31
+        (
+            not dynamic
+            and (
+                not isinstance(n, ast.Constant)
+                or not isinstance(n.value, int)
+                or not 0 < n.value < 2**31
+            )
+        )
         or not stores
         or not loads
     ):
         return source
+    extent = "xnumel" if dynamic else str(n.value)
     expected = {
         "xoffset": "tl.program_id(0) * XBLOCK",
         "xindex": "xoffset + tl.arange(0, XBLOCK)[:]",
@@ -1204,6 +1635,44 @@ def optimize_flat_pointwise_source(source: str) -> str:
                 for keyword in call.keywords:
                     if keyword.arg == "mask":
                         keyword.value = ast.Name(id="xmask", ctx=ast.Load())
+
+    if not use_gluon:
+        body = []
+        for statement in fn.body:
+            name = (
+                statement.targets[0].id if isinstance(statement, ast.Assign) else None
+            )
+            if name in ("xnumel", "xoffset"):
+                continue
+            if name == "xindex":
+                statement = ast.parse(
+                    "xindex = tl.program_id(0) * XBLOCK + _amd_u * (XBLOCK // AMD_UNROLL) + tl.arange(0, XBLOCK // AMD_UNROLL)"
+                ).body[0]
+            elif name == "xmask":
+                statement = ast.parse(f"xmask = xindex < {extent}").body[0]
+            for node in ast.walk(statement):
+                if isinstance(node, ast.List):
+                    node.elts = [
+                        ast.parse("XBLOCK // AMD_UNROLL", mode="eval").body
+                        if isinstance(item, ast.Name) and item.id == "XBLOCK"
+                        else item
+                        for item in node.elts
+                    ]
+            body.append(statement)
+        loop = ast.parse("for _amd_u in tl.static_range(AMD_UNROLL):\n    pass").body[0]
+        loop.body = body
+        fn.body = ([] if dynamic else ast.parse(f"xnumel = {n.value}").body) + [loop]
+        signature_node.keys.append(ast.Constant("AMD_UNROLL"))
+        signature_node.values.append(ast.Constant("constexpr"))
+        fn.args.args.append(
+            ast.arg(
+                arg="AMD_UNROLL", annotation=ast.parse("tl.constexpr", mode="eval").body
+            )
+        )
+        _native_metadata(
+            keywords["inductor_meta"], "flat_pointwise", amd_cache_policy="balanced"
+        )
+        return _finish_source(tree, source, _context)
 
     class Convert(ast.NodeTransformer):
         def visit_Name(self, node):
@@ -1318,5 +1787,501 @@ def optimize_flat_pointwise_source(source: str) -> str:
         "from triton.experimental.gluon import language as gl\n"
         "from triton.experimental.gluon.language.extra import libdevice"
     ).body
+    return _finish_source(tree, source, _context)
+
+
+def use_triton_language(source: str) -> str:
+    """Let Triton infer layouts for a recognized AMD specialization."""
+    tree = ast.parse(source)
+    if not any(
+        isinstance(node, ast.ImportFrom) and node.module and "gluon" in node.module
+        for node in tree.body
+    ):
+        return source
+
+    class Convert(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            if node.module == "triton.experimental.gluon.language.extra":
+                node.module = "triton.language.extra"
+                return node
+            if node.module == "triton.experimental":
+                node.names = [alias for alias in node.names if alias.name != "gluon"]
+                return node if node.names else None
+            if node.module == "triton.experimental.gluon":
+                return None
+            return node
+
+        def visit_AnnAssign(self, node):
+            if isinstance(node.target, ast.Name) and node.target.id == "_amd_layout":
+                return None
+            return self.generic_visit(node)
+
+        def visit_Name(self, node):
+            if node.id in ("gl", "gluon"):
+                node.id = "tl" if node.id == "gl" else "triton"
+            return node
+
+        def visit_Call(self, node):
+            node.keywords = [
+                keyword for keyword in node.keywords if keyword.arg != "layout"
+            ]
+            return self.generic_visit(node)
+
+    tree = Convert().visit(tree)
+    for fn in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        used = OrderedSet(
+            [
+                node.id
+                for statement in fn.body
+                for node in ast.walk(statement)
+                if isinstance(node, ast.Name)
+            ]
+        )
+        removed = OrderedSet(
+            [
+                arg.arg
+                for arg in fn.args.args
+                if arg.arg.startswith("AMD_") and arg.arg not in used
+            ]
+        )
+        fn.args.args = [arg for arg in fn.args.args if arg.arg not in removed]
+        for decorator in fn.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            keywords = {kw.arg: kw.value for kw in decorator.keywords}
+            meta = keywords.get("triton_meta")
+            if isinstance(meta, ast.Dict):
+                for key, value in zip(meta.keys, meta.values):
+                    if ast.literal_eval(key) == "signature":
+                        pairs = [
+                            (key, val)
+                            for key, val in zip(value.keys, value.values)
+                            if ast.literal_eval(key) not in removed
+                        ]
+                        value.keys = [key for key, _ in pairs]
+                        value.values = [val for _, val in pairs]
+            meta = keywords.get("inductor_meta")
+            if isinstance(meta, ast.Dict):
+                for index, key in enumerate(meta.keys):
+                    if ast.literal_eval(key) == "use_gluon":
+                        meta.values[index] = ast.Constant(False)
+                    elif ast.literal_eval(key) == "amd_gluon_family":
+                        meta.keys[index] = ast.Constant("amd_native_family")
     ast.fix_missing_locations(tree)
     return ast.unparse(tree) + "\n"
+
+
+def optimize_tiled_transpose_source(
+    source: str, *, extended: bool = False, _context: AMDCodegenSource | None = None
+) -> str:
+    """Add native tiled alternatives to proven static transpose copies.
+
+    Zero tile dimensions retain the flat copy with normalized tail masks. Positive
+    tile dimensions traverse a batched input matrix while preserving trailing
+    contiguous elements in the output permutation and the existing flat grid.
+    """
+    tree = _context.tree if _context is not None else ast.parse(source)
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    if len(functions) != 1:
+        return source
+    fn = functions[0]
+    decorators = [
+        node for node in fn.decorator_list if _call(node, "triton_heuristics.pointwise")
+    ]
+    if len(decorators) != 1 or ast.unparse(fn.decorator_list[-1]) != "triton.jit":
+        return source
+    keywords = {keyword.arg: keyword.value for keyword in decorators[0].keywords}
+    meta = keywords.get("triton_meta")
+    if not isinstance(meta, ast.Dict):
+        return source
+    limits = _source_limits(meta)
+    if limits is None:
+        return source
+    values = {
+        ast.literal_eval(key): value for key, value in zip(meta.keys, meta.values)
+    }
+    signature_node = values.get("signature")
+    if not isinstance(signature_node, ast.Dict):
+        return source
+    signature = ast.literal_eval(signature_node)
+    two_dimensional = list(signature) == [
+        "in_ptr0",
+        "out_ptr0",
+        "ynumel",
+        "xnumel",
+        "YBLOCK",
+        "XBLOCK",
+    ]
+    if not two_dimensional and list(signature) != [
+        "in_ptr0",
+        "out_ptr0",
+        "xnumel",
+        "XBLOCK",
+    ]:
+        return source
+    if (
+        signature["in_ptr0"] not in ("*bf16", "*fp16", "*fp32")
+        or signature["out_ptr0"] != signature["in_ptr0"]
+    ):
+        return source
+    inductor_meta = keywords.get("inductor_meta")
+    if not isinstance(inductor_meta, ast.Dict):
+        return source
+    metadata = {
+        ast.literal_eval(key): value
+        for key, value in zip(inductor_meta.keys, inductor_meta.values)
+    }
+    if ast.literal_eval(
+        metadata.get("mutated_arg_names", ast.List(elts=[], ctx=ast.Load()))
+    ):
+        return source
+
+    assignments = {}
+    stores = []
+    loads = []
+    for statement in fn.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            name = statement.targets[0].id
+            if name in assignments or name in (
+                "in_ptr0",
+                "out_ptr0",
+                "XBLOCK",
+                "YBLOCK",
+            ):
+                return source
+            assignments[name] = statement.value
+        elif isinstance(statement, ast.Expr) and _call(statement.value, "tl.store"):
+            stores.append(statement.value)
+        else:
+            return source
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            cast = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to"
+                and len(node.args) == 1
+                and not node.keywords
+                and ast.unparse(node.args[0]) == "tl.float32"
+            )
+            if (
+                ast.unparse(node.func)
+                not in ("tl.load", "tl.store", "tl.arange", "tl.program_id", "tl.full")
+                and not cast
+            ):
+                return source
+            if _call(node, "tl.load"):
+                loads.append(node)
+            if _call(node, "tl.store") and not (
+                isinstance(statement, ast.Expr) and statement.value is node
+            ):
+                return source
+    if len(loads) != 1 or len(stores) != 1:
+        return source
+    load, store = loads[0], stores[0]
+    n = assignments.get("xnumel")
+    y = assignments.get("ynumel") if two_dimensional else ast.Constant(1)
+    if (
+        not isinstance(n, ast.Constant)
+        or type(n.value) is not int
+        or not isinstance(y, ast.Constant)
+        or type(y.value) is not int
+        or n.value <= 0
+        or y.value <= 0
+        or n.value * y.value >= 2**31 - limits.max_tile
+    ):
+        return source
+
+    def matches(node, expression):
+        return ast.dump(node) == ast.dump(ast.parse(expression, mode="eval").body)
+
+    required = {
+        "xoffset": "tl.program_id(0) * XBLOCK",
+        "xindex": "xoffset + tl.arange(0, XBLOCK)[:]",
+    }
+    if two_dimensional:
+        required = {
+            "xoffset": "tl.program_id(0) * XBLOCK",
+            "xindex": "xoffset + tl.arange(0, XBLOCK)[None, :]",
+            "yoffset": "tl.program_id(1) * YBLOCK",
+            "yindex": "yoffset + tl.arange(0, YBLOCK)[:, None]",
+            "xmask": "xindex < xnumel",
+            "ymask": "yindex < ynumel",
+            "x1": "xindex",
+            "y0": "yindex",
+        }
+    if any(
+        not matches(assignments.get(name, ast.Constant(None)), expression)
+        for name, expression in required.items()
+    ):
+        return source
+    if ast.unparse(assignments.get("xmask", ast.Constant(None))) not in (
+        "xindex < xnumel",
+        "tl.full([XBLOCK], True, tl.int1)[:]",
+    ):
+        return source
+    if (
+        len(store.args) < 2
+        or not isinstance(store.args[0], ast.BinOp)
+        or not isinstance(store.args[0].op, ast.Add)
+    ):
+        return source
+    address = store.args[0]
+    if not load.args:
+        return source
+    if two_dimensional:
+        if not matches(load.args[0], f"in_ptr0 + (y0 + {y.value} * x1)") or not matches(
+            address, f"out_ptr0 + (x1 + {n.value} * y0)"
+        ):
+            return source
+    else:
+        if ast.unparse(address.left) != "out_ptr0" or not isinstance(
+            address.right, ast.Name
+        ):
+            return source
+        if address.right.id != "xindex" and not matches(
+            assignments.get(address.right.id, ast.Constant(None)), "xindex"
+        ):
+            return source
+    masks = (
+        ("xmask & ymask", "ymask & xmask", "None")
+        if two_dimensional
+        else ("xmask", "None")
+    )
+    for call, position in ((load, 1), (store, 2)):
+        if len(call.args) > position and ast.unparse(call.args[position]) not in masks:
+            return source
+        if any(
+            keyword.arg == "mask" and ast.unparse(keyword.value) not in masks
+            for keyword in call.keywords
+        ):
+            return source
+
+    def constant_mod(name):
+        node = assignments.get(name)
+        if (
+            not isinstance(node, ast.BinOp)
+            or not isinstance(node.op, ast.Mod)
+            or not isinstance(node.right, ast.Constant)
+        ):
+            return None
+        return (
+            node.right.value
+            if type(node.right.value) is int and node.right.value > 0
+            else None
+        )
+
+    shape = (1, n.value, y.value, 1) if two_dimensional else None
+    c = None if two_dimensional else constant_mod("x0")
+    if c is not None and matches(assignments["x0"].left, "xindex"):
+        if matches(assignments.get("x1", ast.Constant(None)), f"xindex // {c}"):
+            columns = n.value // c
+            if n.value % c == 0 and matches(
+                load.args[0], f"in_ptr0 + (x1 + {columns} * x0)"
+            ):
+                shape = (1, c, columns, 1)
+            mods = {
+                node.left.id: node.right.value
+                for node in ast.walk(load.args[0])
+                if isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Mod)
+                and isinstance(node.left, ast.Name)
+                and isinstance(node.right, ast.Constant)
+            }
+            if OrderedSet(mods) == OrderedSet(["x0", "x1"]):
+                d, columns = mods["x0"], mods["x1"]
+                if (
+                    all(type(value) is int and value > 0 for value in (d, columns))
+                    and c % d == 0
+                    and n.value % (c * columns) == 0
+                ):
+                    offset = f"{d} * (x1 % {columns}) + {columns * d} * (x0 // {d}) + {columns * c} * (x1 // {columns}) + x0 % {d}"
+                    if matches(load.args[0], f"in_ptr0 + ({offset})"):
+                        shape = (n.value // (c * columns), c // d, columns, d)
+        columns = constant_mod("x1")
+        if columns is not None and n.value % (c * columns) == 0:
+            indices = {
+                "x1": f"(xindex // {c}) % {columns}",
+                "x2": f"xindex // {c * columns}",
+            }
+            offset = f"x1 + {columns} * x0 + {c * columns} * x2"
+            if all(
+                matches(assignments.get(name, ast.Constant(None)), value)
+                for name, value in indices.items()
+            ) and matches(load.args[0], f"in_ptr0 + ({offset})"):
+                shape = (n.value // (c * columns), c, columns, 1)
+    d, rows, columns = (
+        (None, None, None)
+        if two_dimensional
+        else (constant_mod(name) for name in ("x0", "x1", "x2"))
+    )
+    if all(value is not None for value in (d, rows, columns)):
+        c = d * rows
+        indices = {
+            "x0": f"xindex % {d}",
+            "x1": f"(xindex // {d}) % {rows}",
+            "x2": f"(xindex // {c}) % {columns}",
+            "x3": f"xindex // {c * columns}",
+        }
+        offset = f"x0 + {d} * x2 + {columns * d} * x1 + {columns * c} * x3"
+        if (
+            n.value % (c * columns) == 0
+            and all(
+                matches(assignments.get(name, ast.Constant(None)), value)
+                for name, value in indices.items()
+            )
+            and matches(load.args[0], f"in_ptr0 + ({offset})")
+        ):
+            shape = (n.value // (c * columns), rows, columns, d)
+    if shape is None:
+        return source
+
+    def copy_value(node, active):
+        if node is load:
+            return ast.Name(id="_amd_value", ctx=ast.Load())
+        if (
+            isinstance(node, ast.Name)
+            and node.id in assignments
+            and node.id not in active
+        ):
+            return copy_value(assignments[node.id], active | OrderedSet([node.id]))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to"
+        ):
+            value = copy_value(node.func.value, active)
+            if value is not None:
+                result = copy.deepcopy(node)
+                result.func.value = value
+                return result
+        return None
+
+    value = copy_value(store.args[1], OrderedSet())
+    if value is None:
+        return source
+
+    def normalize_mask(call, position, mask):
+        if len(call.args) > position:
+            call.args[position] = ast.parse(mask, mode="eval").body
+        else:
+            keyword = next(
+                (keyword for keyword in call.keywords if keyword.arg == "mask"), None
+            )
+            if keyword is None:
+                call.keywords.append(
+                    ast.keyword(arg="mask", value=ast.parse(mask, mode="eval").body)
+                )
+            else:
+                keyword.value = ast.parse(mask, mode="eval").body
+
+    flat_body = copy.deepcopy(fn.body)
+    for node in ast.walk(ast.Module(body=flat_body, type_ignores=[])):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "xmask"
+        ):
+            node.value = ast.parse(f"xindex < {n.value}", mode="eval").body
+        elif (
+            two_dimensional
+            and isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "ymask"
+        ):
+            node.value = ast.parse(f"yindex < {y.value}", mode="eval").body
+        elif _call(node, "tl.load"):
+            normalize_mask(node, 1, "xmask & ymask" if two_dimensional else "xmask")
+        elif _call(node, "tl.store"):
+            normalize_mask(node, 2, "xmask & ymask" if two_dimensional else "xmask")
+    batch, rows, columns, inner = shape
+    first = (
+        "tl.program_id(0) + tl.num_programs(0) * tl.program_id(1)"
+        if two_dimensional
+        else "tl.program_id(0)"
+    )
+    step = (
+        "tl.num_programs(0) * tl.num_programs(1)"
+        if two_dimensional
+        else "tl.num_programs(0)"
+    )
+    tiled = ast.parse(f"""
+_amd_tiles_m: tl.constexpr = triton.cdiv({rows}, AMD_TILE_M)
+_amd_tiles_n: tl.constexpr = triton.cdiv({columns * inner}, AMD_TILE_N)
+for _amd_tile in tl.range({first}, {batch} * _amd_tiles_m * _amd_tiles_n, {step}):
+    _amd_batch = _amd_tile // (_amd_tiles_m * _amd_tiles_n)
+    _amd_row = (_amd_tile // _amd_tiles_n % _amd_tiles_m) * AMD_TILE_M + tl.arange(0, AMD_TILE_M)[:, None]
+    _amd_col = (_amd_tile % _amd_tiles_n) * AMD_TILE_N + tl.arange(0, AMD_TILE_N)[None, :]
+    _amd_mask = (_amd_row < {rows}) & (_amd_col < {columns * inner})
+    pass
+""").body
+    tiled_load = copy.deepcopy(load)
+    tiled_load.args[0] = ast.parse(
+        f"in_ptr0 + _amd_batch * {rows * columns * inner} + _amd_row * {columns * inner} + _amd_col",
+        mode="eval",
+    ).body
+    normalize_mask(tiled_load, 1, "_amd_mask")
+    tiled_store = copy.deepcopy(store)
+    tiled_store.args[0] = ast.parse(
+        f"out_ptr0 + _amd_batch * {rows * columns * inner} + (_amd_col // {inner}) * {rows * inner} + _amd_row * {inner} + _amd_col % {inner}",
+        mode="eval",
+    ).body
+    tiled_store.args[1] = value
+    normalize_mask(tiled_store, 2, "_amd_mask")
+    tiled[-1].body[-1:] = [
+        ast.Assign(
+            targets=[ast.Name(id="_amd_value", ctx=ast.Store())], value=tiled_load
+        ),
+        ast.Expr(value=tiled_store),
+    ]
+    block = "XBLOCK * YBLOCK" if two_dimensional else "XBLOCK"
+    input_linear = ast.parse(f"""
+_amd_linear = ({first}) * ({block}) + tl.arange(0, {block})
+_amd_linear_mask = _amd_linear < {batch * rows * columns * inner}
+_amd_output = (_amd_linear // {rows * columns * inner}) * {rows * columns * inner} + ((_amd_linear // {inner}) % {columns}) * {rows * inner} + ((_amd_linear // {columns * inner}) % {rows}) * {inner} + _amd_linear % {inner}
+""").body
+    linear_load = copy.deepcopy(load)
+    linear_load.args[0] = ast.parse("in_ptr0 + _amd_linear", mode="eval").body
+    normalize_mask(linear_load, 1, "_amd_linear_mask")
+    linear_store = copy.deepcopy(store)
+    linear_store.args[0] = ast.parse("out_ptr0 + _amd_output", mode="eval").body
+    linear_store.args[1] = copy.deepcopy(value)
+    normalize_mask(linear_store, 2, "_amd_linear_mask")
+    input_linear.extend(
+        [
+            ast.Assign(
+                targets=[ast.Name(id="_amd_value", ctx=ast.Store())], value=linear_load
+            ),
+            ast.Expr(value=linear_store),
+        ]
+    )
+    fn.body = [
+        ast.If(
+            test=ast.parse("AMD_TILE_M == 0", mode="eval").body,
+            body=[
+                ast.If(
+                    test=ast.parse("AMD_READ_ORDER == 0", mode="eval").body,
+                    body=flat_body,
+                    orelse=input_linear,
+                )
+            ],
+            orelse=tiled,
+        )
+    ]
+    for name in ("AMD_TILE_M", "AMD_TILE_N", "AMD_READ_ORDER"):
+        signature_node.keys.append(ast.Constant(name))
+        signature_node.values.append(ast.Constant("constexpr"))
+        fn.args.args.append(
+            ast.arg(arg=name, annotation=ast.parse("tl.constexpr", mode="eval").body)
+        )
+    native_values = {"amd_transpose_shape": shape}
+    if two_dimensional:
+        native_values["amd_kernel_autotune"] = True
+    if extended:
+        native_values["amd_cache_policy"] = "balanced"
+    _native_metadata(inductor_meta, "tiled_transpose", **native_values)
+    return _finish_source(tree, source, _context)

@@ -1,0 +1,38 @@
+{
+  "provisional": true,
+  "old_v2_to_v3": [
+    {
+      "old_reason": "transposed access needs a 2D tile",
+      "resolved_paths": [
+        "x/y/r0 reduction",
+        "x/y/z pointwise",
+        "unit dummy reduction axes on pointwise"
+      ],
+      "remaining_constraints": [
+        "transposed reduction has no supported interleaved row layout",
+        "reduction tiling needs three output axes",
+        "pointwise tiling has non-unit reduction axes"
+      ]
+    },
+    {
+      "old_reason": "mix-order reduction over a looped row",
+      "resolved_path": "persistent non-interleaved row selected instead of incompatible interleave heuristic",
+      "remaining_constraints": [
+        "mix-order reduction over a dynamic row",
+        "mix-order reduction requires a persistent row",
+        "mix-order reduction requires non-interleaved row groups",
+        "mix-order reduction split spans less than a wave",
+        "mix-order reduction row groups under a wave"
+      ]
+    },
+    {
+      "old_reason": "online_softmax_reduce of a tuple",
+      "resolved_path": "weighted max/sum tuple combines in persistent and looped reductions"
+    }
+  ],
+  "separate_nonfallback_categories": {
+    "candidate_rejected": "Keep emitted: candidate validation failure is an autotuning rejection, not a missing lowering. RNG geometry fix pending; rounding-sensitive ReLU threshold rejects remain valid.",
+    "compile_or_execution_failure": "Classify originating exception: setup/input/access/memory versus shared scheduler or genuine FlyDSL codegen.",
+    "native_ATEN": "GEMM/convolution external calls intentional under experiment policy; not missing FlyDSL lowerings."
+  }
+}

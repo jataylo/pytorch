@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import math
 import statistics
+import time
 
 import torch
 from torch.utils._ordered_set import OrderedSet
@@ -163,12 +165,19 @@ def benchmark_configs(
             graphs[context] = []
             for index, launcher in enumerate(launchers):
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    for start, end in events[index]:
-                        before(context == "inputs_warm")
-                        start.record()
-                        call(launcher)
-                        end.record()
+                # Collecting discarded launcher cycles can unload Triton modules.
+                gc_enabled = gc.isenabled()
+                gc.disable()
+                try:
+                    with torch.cuda.graph(graph):
+                        for start, end in events[index]:
+                            before(context == "inputs_warm")
+                            start.record()
+                            call(launcher)
+                            end.record()
+                finally:
+                    if gc_enabled:
+                        gc.enable()
                 graphs[context].append(graph)
     for iteration in range(rounds):
         torch.cuda._sleep(40_000_000)
@@ -213,7 +222,7 @@ def _key(cfg):
     return (*sorted(cfg.kwargs.items()), cfg.num_warps, cfg.num_stages)
 
 
-def _neighbors(tuner, config, args, kwargs):
+def _neighbors(tuner, config, args, kwargs, *, n_regs=None, n_spills=None):
     from .hints import AMDConfigLimits
     from .triton_compat import Config
 
@@ -221,12 +230,23 @@ def _neighbors(tuner, config, args, kwargs):
     values = dict(zip(tuner.fn.arg_names, args)) | kwargs
     xnumel = values.get("xnumel")
     rnumel = values.get("r0_numel")
-    family = tuner.inductor_meta.get("amd_gluon_family")
-    gluon = tuner.inductor_meta.get("use_gluon", False)
+    family = tuner.inductor_meta.get("amd_gluon_family") or tuner.inductor_meta.get(
+        "amd_native_family"
+    )
+    tail_safe = family in (
+        "add",
+        "broadcast",
+        "transpose",
+        "flat_pointwise",
+        "tiled_transpose",
+    ) or (
+        family == "row_reduction"
+        and tuner.inductor_meta.get("amd_row_tail_safe", False)
+    )
     options = {
         "XBLOCK": [max(1, config.kwargs["XBLOCK"] // 2), config.kwargs["XBLOCK"] * 2]
     }
-    for field in ("R0_BLOCK", "AMD_VEC", "AMD_UNROLL", "AMD_LANES"):
+    for field in ("YBLOCK", "R0_BLOCK", "AMD_VEC", "AMD_UNROLL", "AMD_LANES"):
         if field in config.kwargs:
             options[field] = [
                 max(1, config.kwargs[field] // 2),
@@ -235,6 +255,12 @@ def _neighbors(tuner, config, args, kwargs):
     options["waves_per_eu"] = [0, 1, 2]
     for field in ("AMD_ROW_ORDER", "AMD_READ_ORDER", "AMD_SPLIT_WARPS"):
         if field in config.kwargs:
+            if (
+                field == "AMD_READ_ORDER"
+                and family == "tiled_transpose"
+                and config.kwargs["AMD_TILE_M"]
+            ):
+                continue
             options[field] = [0, 1]
     candidates = []
     for field, choices in options.items():
@@ -242,6 +268,28 @@ def _neighbors(tuner, config, args, kwargs):
             kw = dict(config.kwargs)
             kw[field] = value
             if kw != config.kwargs:
+                candidates.append(
+                    Config(kw, num_warps=config.num_warps, num_stages=config.num_stages)
+                )
+    if family == "tiled_transpose":
+        m, n = config.kwargs["AMD_TILE_M"], config.kwargs["AMD_TILE_N"]
+        if m and n:
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.kwargs["XBLOCK"] == config.kwargs["XBLOCK"]
+            ]
+            tiles = [(m // 2, n), (m * 2, n), (m, n // 2), (m, n * 2)]
+        else:
+            tiles = [(16, 16), (32, 32)]
+        for m, n in tiles:
+            if 8 <= m <= 128 and 8 <= n <= 128:
+                kw = dict(config.kwargs, XBLOCK=m * n, AMD_TILE_M=m, AMD_TILE_N=n)
+                if "YBLOCK" in kw:
+                    kw["XBLOCK"] = m
+                    kw["YBLOCK"] = n
+                if "AMD_READ_ORDER" in kw:
+                    kw["AMD_READ_ORDER"] = 0
                 candidates.append(
                     Config(kw, num_warps=config.num_warps, num_stages=config.num_stages)
                 )
@@ -259,10 +307,27 @@ def _neighbors(tuner, config, args, kwargs):
         if "AMD_WARPS" in kw:
             kw["AMD_WARPS"] = warps
         candidates.append(Config(kw, num_warps=warps, num_stages=config.num_stages))
+    registers = tuner.device_props.regs_per_multiprocessor
+    register_pressure = (
+        n_regs is not None
+        and registers is not None
+        and n_regs * config.num_warps * limits.warp_size > registers // 2
+    )
+    if n_spills or register_pressure:
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.kwargs["XBLOCK"] >= config.kwargs["XBLOCK"],
+                candidate.num_warps <= config.num_warps,
+            )
+        )
     for candidate in candidates:
         kw = candidate.kwargs
         xblock = kw["XBLOCK"]
         rblock = kw.get("R0_BLOCK", rnumel if isinstance(rnumel, int) else 1)
+        tile = xblock * rblock
+        if family == "tiled_transpose":
+            m, n = kw["AMD_TILE_M"], kw["AMD_TILE_N"]
+            tile = m * n if m else xblock * kw.get("YBLOCK", 1)
         lanes = kw.get("AMD_LANES", limits.warp_size)
         if (
             candidate.num_warps > limits.max_warps
@@ -274,18 +339,21 @@ def _neighbors(tuner, config, args, kwargs):
         if (
             xblock > min(16384, limits.max_tile)
             or kw.get("R0_BLOCK", 1) > 8192
-            or xblock * rblock > limits.max_tile
+            or tile > limits.max_tile
         ):
             continue
         if family == "transpose" and kw.get("AMD_UNROLL", 1) != 1:
             continue
         if xblock % kw.get("AMD_UNROLL", 1):
             continue
-        if (
-            isinstance(xnumel, int)
-            and (not gluon or family == "row_reduction")
-            and xnumel % xblock
-        ):
+        if family == "tiled_transpose":
+            m, n = kw["AMD_TILE_M"], kw["AMD_TILE_N"]
+            tile_xblock = m if "YBLOCK" in kw else m * n
+            if bool(m) != bool(n) or m and xblock != tile_xblock:
+                continue
+            if m and "YBLOCK" in kw and kw["YBLOCK"] != n:
+                continue
+        if isinstance(xnumel, int) and not tail_safe and xnumel % xblock:
             continue
         yield candidate
 
@@ -296,6 +364,11 @@ def tune(tuner, args, kwargs):
     Measure launchers and bounded neighbors with restored mutations and cache contexts.
     Return confirmed finalist timings when requested, or ``None`` if scratch memory is insufficient.
     """
+    started = time.perf_counter_ns()
+    neighbor_compile_ns = 0
+    initial_count = len(tuner.launchers)
+    compile_attempts = 0
+    compile_failures = 0
     values = dict(zip(tuner.fn.arg_names, args)) | kwargs
     tensors = {
         value.untyped_storage()._cdata: value
@@ -314,15 +387,29 @@ def tune(tuner, args, kwargs):
     for _ in range(3):
         best = min(timings, key=timings.get)
         neighbors = []
-        for config in _neighbors(tuner, best.config, args, kwargs):
+        for config in _neighbors(
+            tuner,
+            best.config,
+            args,
+            kwargs,
+            n_regs=getattr(best, "n_regs", None),
+            n_spills=getattr(best, "n_spills", None),
+        ):
             key = _key(config)
             if key in seen:
                 continue
-            seen.add(key)
             if len(neighbors) >= 10:
                 break
+            seen.add(key)
+            compile_attempts += 1
+            compile_started = time.perf_counter_ns()
             try:
-                with tuner.lock:
+                from torch._dynamo.device_interface import DeviceGuard
+
+                with (
+                    DeviceGuard(tuner.get_device_interface(), tuner.device_props.index),
+                    tuner.lock,
+                ):
                     result = tuner._precompile_config(config)
                     launcher = result.make_launcher()
                 tuner.compile_results.append(result)
@@ -333,6 +420,9 @@ def tune(tuner, args, kwargs):
 
                 if not isinstance(error, OutOfResources):
                     raise
+                compile_failures += 1
+            finally:
+                neighbor_compile_ns += time.perf_counter_ns() - compile_started
         if not neighbors:
             break
         measured, raw = benchmark_configs(
@@ -364,7 +454,8 @@ def tune(tuner, args, kwargs):
     report = {
         "kernel_name": meta.get("kernel_name"),
         "family": meta.get(
-            "amd_gluon_family", meta.get("amd_pointwise_family", "native")
+            "amd_gluon_family",
+            meta.get("amd_native_family", meta.get("amd_pointwise_family", "native")),
         ),
         "approximate_math": meta.get("amd_approximate_math", False),
         "cache_policy": meta.get("amd_cache_policy", "producer"),
@@ -373,6 +464,16 @@ def tune(tuner, args, kwargs):
         else "inline_gpu_events",
         "score_statistic": "median_round_geomean_ms",
         "confirmed_candidates": len(confirmed),
+        "initial_candidates": initial_count,
+        "measured_candidates": len(timings),
+        "neighbor_compile_attempts": compile_attempts,
+        "neighbor_compile_failures": compile_failures,
+        "reported_precompile_time_ns": getattr(tuner, "precompile_time_taken_ns", 0),
+        "neighbor_compile_time_ns": neighbor_compile_ns,
+        "accounted_compile_time_ns": getattr(tuner, "precompile_time_taken_ns", 0)
+        + neighbor_compile_ns,
+        "compile_time_accounting": "precompile counter may exclude async initial compilation",
+        "tuning_time_ns": time.perf_counter_ns() - started - neighbor_compile_ns,
         "inputs": [
             {
                 "name": name,
@@ -392,12 +493,17 @@ def tune(tuner, args, kwargs):
         "candidates": [
             {
                 "config": dict(
-                    launcher.config.kwargs, num_warps=launcher.config.num_warps
+                    launcher.config.kwargs,
+                    num_warps=launcher.config.num_warps,
+                    num_stages=launcher.config.num_stages,
                 ),
                 "median_ms": value if math.isfinite(value) else None,
                 "confirmed": launcher in confirmed,
                 "samples_ms": samples[launcher],
                 "cache_samples_ms": cache_samples.get(launcher, {}),
+                "n_regs": getattr(launcher, "n_regs", None),
+                "n_spills": getattr(launcher, "n_spills", None),
+                "shared": getattr(launcher, "shared", None),
             }
             for launcher, value in timings.items()
         ],

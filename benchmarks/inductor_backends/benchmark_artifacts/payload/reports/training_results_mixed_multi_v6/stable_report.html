@@ -1,0 +1,151 @@
+<!doctype html><meta charset="utf-8"><title>Steady training comparison</title><style>body{font:15px system-ui;margin:28px}td,th{padding:7px;text-align:left;border-bottom:1px solid #ddd}pre{white-space:pre-wrap}input{padding:10px;width:450px}</style><h1>Full-model training: final comparison</h1><p>Ratio = Triton time / mixed-backend time; above one favors the mixed backend. Model architectures, batch sizes, GPU groups and ATen GEMM/conv policy match within each pair. Repeat spread above 20%, a downward trend above 10%, or timing recompilation marks a result variable. Variable samples and numerical warnings are excluded from validated comparisons. Training-only results are reported separately. All attempts are preserved. This multi-GPU OOM follow-up compares Triton-only with per-kernel FlyDSL/Triton performance selection, using the finalized source in both modes. All four variants use the same longer per-model warmup, validation-input recoveries and explicit GPU placements. The fixed mixed-order scheduler remains enabled for DINOv2. Inspect per-row overrides and raw provenance.</p><p><a href="comparison_stable.csv">Final comparison CSV</a> | <a href="final_timing_sources.csv">Timing provenance and samples</a> | <a href="autotune_effect_stable.csv">Autotuning effects</a> | <a href="all_unsupported_flydsl_kernels.csv">All unsupported lowering events</a> | <a href="all_compile_execution_failures.csv">Later failures, classified separately</a> | <a href="all_kernel_decisions.jsonl">All kernel decisions</a> | <a href="final_audit.json">Source/native-call audit</a> | <a href="BENCHMARK_NOTES.txt">Methodology notes</a> | <a href="report.html">Original matrix</a></p><p><a href="kernel_inventory/REPORT.md">Static kernel definitions, launch sites and coverage audit</a></p><p><a href="all_autotune_selections.csv">All autotuning selections and capacity guards</a>. Counts include all attempts, ranks and phases; tuning guards are separate from unsupported lowering events.</p><pre>{
+  &quot;models&quot;: 23,
+  &quot;configurations&quot;: 92,
+  &quot;accepted_steady_rechecks&quot;: [],
+  &quot;terminal_recoveries_without_four_timings&quot;: [],
+  &quot;rejected_steady_rechecks&quot;: [],
+  &quot;statuses&quot;: {
+    &quot;validation_unavailable&quot;: 27,
+    &quot;capacity_skip&quot;: 48,
+    &quot;error&quot;: 16,
+    &quot;process_failed&quot;: 1
+  },
+  &quot;shared_fusion_recoveries&quot;: [],
+  &quot;validation_cache_recoveries&quot;: [],
+  &quot;multimodal_input_recoveries&quot;: [
+    &quot;Qwen/Qwen3.6-27B&quot;,
+    &quot;Qwen/Qwen3.6-35B-A3B&quot;,
+    &quot;Qwen/Qwen3.8-27B&quot;
+  ],
+  &quot;diffusion_constant_recoveries&quot;: [
+    &quot;Qwen/Qwen-Image&quot;
+  ],
+  &quot;verified_fsdp_capacity_checks&quot;: [
+    &quot;Qwen/Qwen3.8-Flash-Next&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Flash&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Flash-0731&quot;
+  ],
+  &quot;fsdp_state_initialization_recoveries&quot;: [
+    &quot;Qwen/Qwen-Image&quot;,
+    &quot;Wan-AI/Wan2.1-I2V-14B-720P-Diffusers&quot;,
+    &quot;Wan-AI/Wan2.2-I2V-A14B-Diffusers&quot;,
+    &quot;hunyuanvideo-community/HunyuanVideo&quot;
+  ],
+  &quot;memory_retry_models&quot;: [
+    &quot;MiniMaxAI/MiniMax-M3&quot;,
+    &quot;Qwen/Qwen-Image&quot;,
+    &quot;Qwen/Qwen3-235B-A22B&quot;,
+    &quot;Qwen/Qwen3-Coder-Next&quot;,
+    &quot;Qwen/Qwen3.6-27B&quot;,
+    &quot;Qwen/Qwen3.6-35B-A3B&quot;,
+    &quot;Qwen/Qwen3.8-2.4T-A95B&quot;,
+    &quot;Qwen/Qwen3.8-27B&quot;,
+    &quot;Qwen/Qwen3.8-Flash-Next&quot;,
+    &quot;Wan-AI/Wan2.1-I2V-14B-720P-Diffusers&quot;,
+    &quot;Wan-AI/Wan2.2-I2V-A14B-Diffusers&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Flash&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Flash-0731&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Pro&quot;,
+    &quot;deepseek-ai/DeepSeek-V4-Pro-0813&quot;,
+    &quot;hunyuanvideo-community/HunyuanVideo&quot;,
+    &quot;moonshotai/Kimi-K2.5&quot;,
+    &quot;moonshotai/Kimi-K3&quot;,
+    &quot;moonshotai/Kimi-Linear-48B-A3B-Instruct&quot;,
+    &quot;openai/gpt-oss-120b&quot;,
+    &quot;zai-org/GLM-5.2&quot;,
+    &quot;zai-org/GLM-5.3-BF16&quot;,
+    &quot;zai-org/GLM-5.3-Flash-BF16&quot;
+  ],
+  &quot;variable_pairs&quot;: 0,
+  &quot;comparisons&quot;: {
+    &quot;all/autotune0/stable_measured&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;all/autotune0/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;all/autotune0/training_only_fsdp&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;all/autotune1/stable_measured&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    },
+    &quot;all/autotune1/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;all/autotune1/training_only_fsdp&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    },
+    &quot;priority/autotune0/stable_measured&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;priority/autotune0/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;priority/autotune0/training_only_fsdp&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;priority/autotune1/stable_measured&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    },
+    &quot;priority/autotune1/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;priority/autotune1/training_only_fsdp&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    }
+  },
+  &quot;autotune_selection_events&quot;: 3672,
+  &quot;autotune_selection_reasons&quot;: {
+    &quot;candidate timings recorded&quot;: 3569,
+    &quot;insufficient scratch memory&quot;: 103
+  }
+}</pre><input id="filter" placeholder="Filter model, status, source or timing quality"><table><thead><tr><th>suite</th><th>model</th><th>component</th><th>autotune</th><th>world_size</th><th>local_batch_size</th><th>effective_global_batch_size</th><th>batch_distribution</th><th>triton_status</th><th>flydsl_status</th><th>triton_ms</th><th>flydsl_ms</th><th>triton_over_flydsl</th><th>winner</th><th>timing_source</th><th>timing_quality</th><th>eager_validated</th><th>common_config_overrides</th></tr></thead><tbody><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>openai/gpt-oss-120b</td><td>full_model</td><td>0</td><td>4</td><td>2</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>process_failed</td><td>5507.330078125</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>openai/gpt-oss-120b</td><td>full_model</td><td>1</td><td>4</td><td>2</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5472.1396484375</td><td>5202.1494140625</td><td>1.0518997462174309</td><td>flydsl</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.2</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.2</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3-235B-A22B</td><td>full_model</td><td>0</td><td>8</td><td>1</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5914.3115234375</td><td>6008.4462890625</td><td>0.9843329271668187</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3-235B-A22B</td><td>full_model</td><td>1</td><td>8</td><td>1</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5929.24560546875</td><td>5747.2177734375</td><td>1.031672339418309</td><td>flydsl</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>MiniMaxAI/MiniMax-M3</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>MiniMaxAI/MiniMax-M3</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen-Image</td><td>diffusion_denoiser</td><td>0</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_RESTORE_DIFFUSION_META_CONSTANTS&#x27;: &#x27;1&#x27;, &#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen-Image</td><td>diffusion_denoiser</td><td>1</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_RESTORE_DIFFUSION_META_CONSTANTS&#x27;: &#x27;1&#x27;, &#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.2-I2V-A14B-Diffusers</td><td>diffusion_denoiser</td><td>0</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.2-I2V-A14B-Diffusers</td><td>diffusion_denoiser</td><td>1</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</td><td>diffusion_denoiser</td><td>0</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</td><td>diffusion_denoiser</td><td>1</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>diffusion_denoiser</td><td>0</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>diffusion_denoiser</td><td>1</td><td>8</td><td>1</td><td>8</td><td>replicated</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_FSDP_STATE_INIT_ONLY&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K3</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_EXTRA_MODEL_DEPS&#x27;: &#x27;1&#x27;, &#x27;HF_HUB_OFFLINE&#x27;: &#x27;1&#x27;, &#x27;BENCHMARK_OFFICIAL_MODEL_REVISION&#x27;: &#x27;f831ab66814297da540d832a5235f8e904f29d06&#x27;}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K3</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_EXTRA_MODEL_DEPS&#x27;: &#x27;1&#x27;, &#x27;HF_HUB_OFFLINE&#x27;: &#x27;1&#x27;, &#x27;BENCHMARK_OFFICIAL_MODEL_REVISION&#x27;: &#x27;f831ab66814297da540d832a5235f8e904f29d06&#x27;}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K2.5</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K2.5</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>full_model</td><td>0</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>4124.41845703125</td><td>4140.3916015625</td><td>0.9961421174448277</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>full_model</td><td>1</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>4140.57275390625</td><td>4073.829833984375</td><td>1.016383335250063</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-BF16</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-BF16</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-Flash-BF16</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-Flash-BF16</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-27B</td><td>full_model</td><td>0</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2365.45263671875</td><td>2348.447509765625</td><td>1.0072410078924106</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-27B</td><td>full_model</td><td>1</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2412.941650390625</td><td>2350.1455078125</td><td>1.0267201083377069</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-Flash-Next</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-Flash-Next</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-2.4T-A95B</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-2.4T-A95B</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-35B-A3B</td><td>full_model</td><td>0</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3345.9736328125</td><td>3342.694091796875</td><td>1.000981107132619</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-35B-A3B</td><td>full_model</td><td>1</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3324.891357421875</td><td>3328.5732421875</td><td>0.9988938549649563</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-27B</td><td>full_model</td><td>0</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2367.18603515625</td><td>2343.135986328125</td><td>1.010264043132133</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-27B</td><td>full_model</td><td>1</td><td>2</td><td>4</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2352.67822265625</td><td>2373.289794921875</td><td>0.991315189443056</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_ADD_MM_TOKEN_TYPES&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>Qwen/Qwen3-Coder-Next</td><td>full_model</td><td>0</td><td>4</td><td>2</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3984.88134765625</td><td>3983.48779296875</td><td>1.000349832799779</td><td>within_3_percent</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>Qwen/Qwen3-Coder-Next</td><td>full_model</td><td>1</td><td>4</td><td>2</td><td>8</td><td>data_parallel</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3999.179931640625</td><td>4285.18505859375</td><td>0.9332572285578299</td><td>triton</td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash-0731</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash-0731</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{&#x27;BENCHMARK_VERIFY_FSDP_MEMORY_BOUND&#x27;: &#x27;1&#x27;}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro-0813</td><td>full_model</td><td>0</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro-0813</td><td>full_model</td><td>1</td><td>8</td><td>8</td><td>8</td><td>single_gpu</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td></td><td>primary</td><td>stable</td><td>False</td><td>{}</td></tr></tbody></table><script>document.getElementById("filter").oninput=function(){for(const row of document.querySelectorAll("tbody tr"))row.hidden=!row.textContent.toLowerCase().includes(this.value.toLowerCase())}</script>

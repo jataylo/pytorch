@@ -1,0 +1,74 @@
+<!doctype html><meta charset="utf-8"><title>Triton-only / mixed backend training</title><style>body{font:15px system-ui;margin:28px}td,th{padding:7px;text-align:left;border-bottom:1px solid #ddd}input{padding:10px;width:400px}pre{white-space:pre-wrap}</style><h1>Triton-only / mixed backend full-model training</h1><p>Real forward, backward, zero_grad and SGD updates; AMP BF16 with FP32 master weights. Random initialization, no checkpoints. Full model architectures at listed batch sizes; diffusion entries are denoisers. GEMM and convolution forced to ATen in every mode. Global max_autotune disabled; SIMD tuning toggled independently. FlyDSL-versus-Triton performance selection enabled in mixed rows (backend=flydsl); baseline rows are Triton-only. Native unsupported SIMD fallback remains enabled. Compile/warmup excluded; synchronized wall time, 5 repeats of 10 training steps. Compile/setup and timing serialize through a global lock, including other suite workers. OOM follow-up uses FSDP with identical GPU groups for all four variants, includes communication, and reports maximum rank latency. Single-GPU data remains separate. Full-step timing includes graph breaks/eager regions and optimizer. Eager-validated means sampled loss/gradients passed; training-only and numerical-warning results remain separate. Ratio = Triton ms / FlyDSL ms; greater than one favors FlyDSL. Wins use a 3% band, not a statistical significance test. Kernel census counts generated scheduled kernels, not runtime launches; native ATen calls are a separate inventory. Inspect active_configuration to separate previous single-GPU/FSDP attempts. Source fingerprints in each raw record identify modified sources on top of branch SHA 937d7fd.</p><p><a href="comparison.csv">Comparisons CSV</a> | <a href="runs.csv">All outcomes</a> | <a href="unsupported_flydsl_kernels.csv">Unsupported kernels</a> | <a href="unsupported_reasons.csv">Fallback reasons</a> | <a href="intentional_native_calls.csv">ATen calls</a> | <a href="kernel_decisions.jsonl">Full kernel decisions</a></p><pre>{
+  &quot;expected_runs&quot;: 92,
+  &quot;observed_runs&quot;: 92,
+  &quot;statuses&quot;: {
+    &quot;capacity_skip&quot;: 48,
+    &quot;error&quot;: 16,
+    &quot;validation_unavailable&quot;: 27,
+    &quot;process_failed&quot;: 1
+  },
+  &quot;kernel_event_categories&quot;: {
+    &quot;lowered&quot;: 22217,
+    &quot;backend_candidates&quot;: 15545,
+    &quot;backend_selection&quot;: 14160,
+    &quot;candidate_rejected&quot;: 28,
+    &quot;compile_or_execution_failure&quot;: 202,
+    &quot;autotune_selection&quot;: 3672,
+    &quot;selection_skipped&quot;: 6600
+  },
+  &quot;unsupported_scheduled_events&quot;: 0,
+  &quot;unsupported_unique_scheduled_ids&quot;: 0,
+  &quot;malformed_diagnostics&quot;: [],
+  &quot;timing_overlaps&quot;: [],
+  &quot;aten_policy_errors&quot;: [],
+  &quot;comparisons&quot;: {
+    &quot;all/autotune0/all_measured&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;all/autotune0/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;all/autotune1/all_measured&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    },
+    &quot;all/autotune1/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;priority/autotune0/all_measured&quot;: {
+      &quot;pairs&quot;: 6,
+      &quot;geomean&quot;: 0.9998501110783763,
+      &quot;median&quot;: 1.000665469966199,
+      &quot;wins&quot;: {
+        &quot;within_3_percent&quot;: 6
+      }
+    },
+    &quot;priority/autotune0/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    },
+    &quot;priority/autotune1/all_measured&quot;: {
+      &quot;pairs&quot;: 7,
+      &quot;geomean&quot;: 1.0065204444789908,
+      &quot;median&quot;: 1.016383335250063,
+      &quot;wins&quot;: {
+        &quot;flydsl&quot;: 2,
+        &quot;within_3_percent&quot;: 4,
+        &quot;triton&quot;: 1
+      }
+    },
+    &quot;priority/autotune1/eager_validated&quot;: {
+      &quot;pairs&quot;: 0
+    }
+  }
+}</pre><input id="filter" placeholder="Filter model or status"><table><thead><tr><th>Suite</th><th>Model</th><th>Tune</th><th>GPUs</th><th>Triton status</th><th>FlyDSL status</th><th>Triton ms</th><th>FlyDSL ms</th><th>Speedup</th><th>Validated</th></tr></thead><tbody><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>openai/gpt-oss-120b</td><td>0</td><td>4</td><td>validation_unavailable</td><td>process_failed</td><td>5507.330078125</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>openai/gpt-oss-120b</td><td>1</td><td>4</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5472.1396484375</td><td>5202.1494140625</td><td>1.0518997462174309</td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.2</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.2</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3-235B-A22B</td><td>0</td><td>8</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5914.3115234375</td><td>6008.4462890625</td><td>0.9843329271668187</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3-235B-A22B</td><td>1</td><td>8</td><td>validation_unavailable</td><td>validation_unavailable</td><td>5929.24560546875</td><td>5747.2177734375</td><td>1.031672339418309</td><td>False</td></tr><tr><td>priority</td><td>MiniMaxAI/MiniMax-M3</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>MiniMaxAI/MiniMax-M3</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen-Image</td><td>0</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen-Image</td><td>1</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.2-I2V-A14B-Diffusers</td><td>0</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.2-I2V-A14B-Diffusers</td><td>1</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</td><td>0</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</td><td>1</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>0</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>1</td><td>8</td><td>error</td><td>error</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K3</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K3</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K2.5</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-K2.5</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>0</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>4124.41845703125</td><td>4140.3916015625</td><td>0.9961421174448277</td><td>False</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>1</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>4140.57275390625</td><td>4073.829833984375</td><td>1.016383335250063</td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-BF16</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-BF16</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-Flash-BF16</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>zai-org/GLM-5.3-Flash-BF16</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-27B</td><td>0</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2365.45263671875</td><td>2348.447509765625</td><td>1.0072410078924106</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-27B</td><td>1</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2412.941650390625</td><td>2350.1455078125</td><td>1.0267201083377069</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-Flash-Next</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-Flash-Next</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-2.4T-A95B</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.8-2.4T-A95B</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-35B-A3B</td><td>0</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3345.9736328125</td><td>3342.694091796875</td><td>1.000981107132619</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-35B-A3B</td><td>1</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3324.891357421875</td><td>3328.5732421875</td><td>0.9988938549649563</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-27B</td><td>0</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2367.18603515625</td><td>2343.135986328125</td><td>1.010264043132133</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3.6-27B</td><td>1</td><td>2</td><td>validation_unavailable</td><td>validation_unavailable</td><td>2352.67822265625</td><td>2373.289794921875</td><td>0.991315189443056</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3-Coder-Next</td><td>0</td><td>4</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3984.88134765625</td><td>3983.48779296875</td><td>1.000349832799779</td><td>False</td></tr><tr><td>priority</td><td>Qwen/Qwen3-Coder-Next</td><td>1</td><td>4</td><td>validation_unavailable</td><td>validation_unavailable</td><td>3999.179931640625</td><td>4285.18505859375</td><td>0.9332572285578299</td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash-0731</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Flash-0731</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro-0813</td><td>0</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr><tr><td>priority</td><td>deepseek-ai/DeepSeek-V4-Pro-0813</td><td>1</td><td>8</td><td>capacity_skip</td><td>capacity_skip</td><td>None</td><td>None</td><td></td><td>False</td></tr></tbody></table><script>document.getElementById("filter").oninput=function(){for(const row of document.querySelectorAll("tbody tr"))row.hidden=!row.textContent.toLowerCase().includes(this.value.toLowerCase())}</script>

@@ -1,0 +1,662 @@
+{
+  "source_revision": "V4 exact final mixed-dtype fix",
+  "protocol": {
+    "models": [
+      {
+        "model": "DistillGPT2",
+        "suite": "huggingface-dashboard",
+        "batch_size": 32
+      },
+      {
+        "model": "mobilenetv3_large_100",
+        "suite": "timm-dashboard",
+        "batch_size": 512
+      }
+    ],
+    "variants": {
+      "stock": "candidate",
+      "new_native": "candidate"
+    },
+    "physical_gpu": "0",
+    "dtype": "amp_bf16",
+    "checkpoint": false,
+    "optimizer": "SGD(lr=0.0001, momentum=0, foreach=True)",
+    "warmup": 5,
+    "steady_warmup": 10,
+    "iterations": 20,
+    "repeats": 7,
+    "timing": "synchronized wall time of full forward/backward/SGD steps",
+    "host_overhead_included": true,
+    "compile_time_included": false,
+    "eager_reference": "loss and first/middle/last parameter gradient samples",
+    "original_protocol": "inductor_hillclimb_v16/run_models.py",
+    "offline": true,
+    "pretrained": false,
+    "concurrent_other_gpu_work": "GPU3 V4 frozen kernel comparison; GPU5 V4 focused validation",
+    "source_revision": "V4",
+    "compiler_artifacts_preseeded": true,
+    "compile_times_cold_setup_comparable": false,
+    "inductor_selection_cache_reused": false
+  },
+  "actual_runs": 4,
+  "scope": "GPU0 full training steps; separate from GPU3 kernel benchmarks",
+  "timing_includes_cpu": true,
+  "speedup_definition": "100 * (stock_ms / new_native_ms - 1)",
+  "compile_times_cold_setup_comparable": false,
+  "accuracy_limit": "Eval-mode loss and sampled-gradient checks (BatchNorm batch statistics when present), plus finite train-step checks. Original tolerances unchanged; explicit stock-error context; no convergence claim.",
+  "audit": {
+    "exactly_four_runs": true,
+    "all_status_ok": false,
+    "same_physical_gpu_uuid": true,
+    "frozen_sources_unchanged": true,
+    "old_v3_artifacts_and_results_unchanged": true,
+    "initial_states_match": true,
+    "no_timing_recompiles": false,
+    "all_parameter_gradients_present": false,
+    "source_flags_match": false,
+    "no_inductor_or_selection_cache_reuse": true
+  },
+  "errors": [
+    {
+      "model": "mobilenetv3_large_100",
+      "variant": "new_native",
+      "status": "error",
+      "error": "AcceleratorError: CUDA error: operation failed due to a previous error during capture\nSearch for `hipErrorStreamCaptureInvalidated' in https://rocm.docs.amd.com/projects/HIP/en/latest/index.html for more information.\nFor more detailed error information, run with CUDA_LOG_FILE=stderr\nDevice-side assertion tracking was not enabled by user."
+    }
+  ],
+  "source_mismatches": [],
+  "old_cache_mismatches": [],
+  "models": [
+    {
+      "model": "DistillGPT2",
+      "suite": "huggingface-dashboard",
+      "batch_size": 32,
+      "inputs": {
+        "input_ids": {
+          "shape": [
+            32,
+            128
+          ],
+          "dtype": "torch.int64"
+        },
+        "attention_mask": {
+          "shape": [
+            32,
+            128
+          ],
+          "dtype": "torch.int64"
+        },
+        "use_cache": "False"
+      },
+      "initial_state_audit": {
+        "initial_parameters": true,
+        "initial_inputs": true,
+        "inputs": true,
+        "model_config_sha256": true,
+        "model_implementation": true,
+        "model_dependencies": true
+      },
+      "variants": {
+        "stock": {
+          "status": "ok",
+          "milliseconds": 5.5399419739842415,
+          "repeat_ms": [
+            5.504165077582002,
+            5.524508701637387,
+            6.006260961294174,
+            5.538613488897681,
+            5.554744740948081,
+            5.5399419739842415,
+            5.543409939855337
+          ],
+          "gpu_uuid": "31393465-3439-6235-3736-653933623231",
+          "physical_gpu": "0",
+          "gpu": "AMD Instinct MI355X",
+          "parameters": 81912576,
+          "parameters_with_training_gradients": 81912576,
+          "all_parameter_gradients_present": true,
+          "timing_recompiles": 0,
+          "timing_includes_cpu": true,
+          "final_training_loss": 0.30603498220443726,
+          "final_training_loss_finite": true,
+          "accuracy": {
+            "mode": "eval",
+            "scope": "deterministic eager loss and up to 1024 elements of first/middle/last parameter gradients; normalization mode recorded separately; timing uses train mode",
+            "eager_reference_status": "available",
+            "eager_loss": 0.3068695068359375,
+            "compiled_loss": 0.3068706691265106,
+            "gradient_samples": {
+              "transformer.wte.weight": {
+                "rms_error": 5.124261015510001e-09,
+                "relative_rms_error": 0.002511079572993408,
+                "reference_rms": 2.0406605472089723e-06,
+                "max_abs_error": 2.9802322387695312e-08
+              },
+              "transformer.h.3.ln_1.weight": {
+                "rms_error": 1.1650090669945712e-08,
+                "relative_rms_error": 0.0007942304195360415,
+                "reference_rms": 1.4668401490780525e-05,
+                "max_abs_error": 6.446498446166515e-08
+              },
+              "transformer.ln_f.bias": {
+                "rms_error": 7.46670707485464e-08,
+                "relative_rms_error": 0.00015086511960257865,
+                "reference_rms": 0.0004949260037392378,
+                "max_abs_error": 2.835877239704132e-07
+              }
+            },
+            "warnings": [],
+            "tolerances": {
+              "loss": {
+                "rtol": 0.03,
+                "atol": 0.003
+              },
+              "sampled_gradient": {
+                "rtol": 0.05,
+                "atol": 0.005
+              }
+            },
+            "limit": "Original criteria preserved; absolute and relative RMS errors reported explicitly. Passing absolute tolerances is not tight relative-gradient or convergence validation.",
+            "timed_mode": "train; full forward + backward + SGD",
+            "training_finite_gradient_check": "first/middle/last gradient tensors, first1024 elements, after first training step"
+          },
+          "source_flags_audit": {
+            "expected_flags_match": true,
+            "flags": {
+              "autotune_local_cache": false,
+              "autotune_remote_cache": false,
+              "triton.amd_use_gluon": false,
+              "triton.amd_approximate_math": false,
+              "triton.amd_kernel_optimizations": false,
+              "triton.amd_extended_kernel_optimizations": false,
+              "triton.amd_further_kernel_optimizations": false,
+              "flydsl.simd": false,
+              "flydsl.simd_autotune_backend": false,
+              "flydsl.simd_autotune_min_numel": 65536,
+              "flydsl.simd_autotune_max_configs": 12,
+              "max_autotune": false,
+              "max_autotune_gemm": false,
+              "conv_1x1_as_mm": false,
+              "max_autotune_pointwise": true,
+              "triton.autotune_pointwise": true,
+              "max_autotune_gemm_backends": "ATEN",
+              "max_autotune_conv_backends": "ATEN",
+              "triton.cudagraphs": false
+            },
+            "loaded_module_count": 8,
+            "loaded_modules_before_after_equal": true,
+            "native_codegen_policy": {
+              "family_file_occurrences": {},
+              "violations": []
+            },
+            "codegen_audit": {
+              "graphs": 4,
+              "native_calls": 223,
+              "unexpected_triton_matrix_templates": 0,
+              "file": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/codegen/stock.world1.rank0.json"
+            },
+            "fingerprint": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/stock_source_fingerprint.json"
+          },
+          "cache_audit": {
+            "inductor_cache_started_empty": true,
+            "selection_cache_reuse": false,
+            "autotune_local_cache": false,
+            "autotune_remote_cache": false,
+            "compiler_artifact_manifest": {
+              "path": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/reuse_provenance/DistillGPT2--stock.json",
+              "sha256": "59b85db4974a019a95d40685b93eacc7df88bdaf489d4a49d7ffe023fedec2aa"
+            },
+            "compiler_groups_preseeded": 403,
+            "old_artifacts_rechecked_immutable": true,
+            "compile_times_cold_setup_comparable": false
+          },
+          "compilation_seconds_preseeded_not_cold": {
+            "eval_validation": 10.29614579025656,
+            "first_train_step": 8.302852952852845
+          },
+          "raw_result": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/stock.json",
+          "raw_log": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/stock.log"
+        },
+        "new_native": {
+          "status": "ok",
+          "milliseconds": 5.501922173425555,
+          "repeat_ms": [
+            5.476884078234434,
+            5.4969958029687405,
+            5.498598236590624,
+            5.53705170750618,
+            5.512113589793444,
+            5.505538685247302,
+            5.501922173425555
+          ],
+          "gpu_uuid": "31393465-3439-6235-3736-653933623231",
+          "physical_gpu": "0",
+          "gpu": "AMD Instinct MI355X",
+          "parameters": 81912576,
+          "parameters_with_training_gradients": 81912576,
+          "all_parameter_gradients_present": true,
+          "timing_recompiles": 0,
+          "timing_includes_cpu": true,
+          "final_training_loss": 0.3060361444950104,
+          "final_training_loss_finite": true,
+          "accuracy": {
+            "mode": "eval",
+            "scope": "deterministic eager loss and up to 1024 elements of first/middle/last parameter gradients; normalization mode recorded separately; timing uses train mode",
+            "eager_reference_status": "available",
+            "eager_loss": 0.3068695068359375,
+            "compiled_loss": 0.3068717122077942,
+            "gradient_samples": {
+              "transformer.wte.weight": {
+                "rms_error": 5.9833418220023304e-09,
+                "relative_rms_error": 0.00293206130249629,
+                "reference_rms": 2.0406605472089723e-06,
+                "max_abs_error": 2.9802322387695312e-08
+              },
+              "transformer.h.3.ln_1.weight": {
+                "rms_error": 1.2035804353160984e-08,
+                "relative_rms_error": 0.0008205259694265801,
+                "reference_rms": 1.4668401490780525e-05,
+                "max_abs_error": 7.046583050396293e-08
+              },
+              "transformer.ln_f.bias": {
+                "rms_error": 7.878857388732285e-08,
+                "relative_rms_error": 0.00015919263342815642,
+                "reference_rms": 0.0004949260037392378,
+                "max_abs_error": 2.2817403078079224e-07
+              }
+            },
+            "warnings": [],
+            "tolerances": {
+              "loss": {
+                "rtol": 0.03,
+                "atol": 0.003
+              },
+              "sampled_gradient": {
+                "rtol": 0.05,
+                "atol": 0.005
+              }
+            },
+            "limit": "Original criteria preserved; absolute and relative RMS errors reported explicitly. Passing absolute tolerances is not tight relative-gradient or convergence validation.",
+            "timed_mode": "train; full forward + backward + SGD",
+            "training_finite_gradient_check": "first/middle/last gradient tensors, first1024 elements, after first training step"
+          },
+          "source_flags_audit": {
+            "expected_flags_match": true,
+            "flags": {
+              "autotune_local_cache": false,
+              "autotune_remote_cache": false,
+              "triton.amd_use_gluon": false,
+              "triton.amd_approximate_math": false,
+              "triton.amd_kernel_optimizations": true,
+              "triton.amd_extended_kernel_optimizations": true,
+              "triton.amd_further_kernel_optimizations": true,
+              "flydsl.simd": false,
+              "flydsl.simd_autotune_backend": false,
+              "flydsl.simd_autotune_min_numel": 65536,
+              "flydsl.simd_autotune_max_configs": 12,
+              "max_autotune": false,
+              "max_autotune_gemm": false,
+              "conv_1x1_as_mm": false,
+              "max_autotune_pointwise": true,
+              "triton.autotune_pointwise": true,
+              "max_autotune_gemm_backends": "ATEN",
+              "max_autotune_conv_backends": "ATEN",
+              "triton.cudagraphs": false
+            },
+            "loaded_module_count": 8,
+            "loaded_modules_before_after_equal": true,
+            "native_codegen_policy": {
+              "family_file_occurrences": {
+                "row_reduction": 52,
+                "flat_pointwise": 44,
+                "add": 3
+              },
+              "violations": []
+            },
+            "codegen_audit": {
+              "graphs": 4,
+              "native_calls": 223,
+              "unexpected_triton_matrix_templates": 0,
+              "file": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/codegen/new_native.world1.rank0.json"
+            },
+            "fingerprint": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/new_native_source_fingerprint.json"
+          },
+          "cache_audit": {
+            "inductor_cache_started_empty": true,
+            "selection_cache_reuse": false,
+            "autotune_local_cache": false,
+            "autotune_remote_cache": false,
+            "compiler_artifact_manifest": {
+              "path": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/reuse_provenance/DistillGPT2--new_native.json",
+              "sha256": "c6db75a1ff0609016fbc87f4bc52f91d5829ff1853e27a7c11ae08d737121207"
+            },
+            "compiler_groups_preseeded": 1837,
+            "old_artifacts_rechecked_immutable": true,
+            "compile_times_cold_setup_comparable": false
+          },
+          "compilation_seconds_preseeded_not_cold": {
+            "eval_validation": 45.454341168515384,
+            "first_train_step": 34.90880046412349
+          },
+          "raw_result": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/new_native.json",
+          "raw_log": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/DistillGPT2/new_native.log"
+        }
+      },
+      "new_vs_stock_speedup_percent": 0.6910275965429591,
+      "accuracy_comparison": {
+        "scope": "each compiled variant versus its own eager reference, not a direct gradient-vector comparison",
+        "stock_eager_loss": 0.3068695068359375,
+        "new_eager_loss": 0.3068695068359375,
+        "stock_compiled_loss": 0.3068706691265106,
+        "new_compiled_loss": 0.3068717122077942,
+        "new_vs_stock_relative_compiled_loss_error": 3.3990908500261876e-06,
+        "gradient_error_metrics_side_by_side": {
+          "transformer.wte.weight": {
+            "stock": {
+              "rms_error": 5.124261015510001e-09,
+              "relative_rms_error": 0.002511079572993408,
+              "reference_rms": 2.0406605472089723e-06,
+              "max_abs_error": 2.9802322387695312e-08
+            },
+            "new_native": {
+              "rms_error": 5.9833418220023304e-09,
+              "relative_rms_error": 0.00293206130249629,
+              "reference_rms": 2.0406605472089723e-06,
+              "max_abs_error": 2.9802322387695312e-08
+            }
+          },
+          "transformer.h.3.ln_1.weight": {
+            "stock": {
+              "rms_error": 1.1650090669945712e-08,
+              "relative_rms_error": 0.0007942304195360415,
+              "reference_rms": 1.4668401490780525e-05,
+              "max_abs_error": 6.446498446166515e-08
+            },
+            "new_native": {
+              "rms_error": 1.2035804353160984e-08,
+              "relative_rms_error": 0.0008205259694265801,
+              "reference_rms": 1.4668401490780525e-05,
+              "max_abs_error": 7.046583050396293e-08
+            }
+          },
+          "transformer.ln_f.bias": {
+            "stock": {
+              "rms_error": 7.46670707485464e-08,
+              "relative_rms_error": 0.00015086511960257865,
+              "reference_rms": 0.0004949260037392378,
+              "max_abs_error": 2.835877239704132e-07
+            },
+            "new_native": {
+              "rms_error": 7.878857388732285e-08,
+              "relative_rms_error": 0.00015919263342815642,
+              "reference_rms": 0.0004949260037392378,
+              "max_abs_error": 2.2817403078079224e-07
+            }
+          }
+        },
+        "interpretation": "Original tolerances unchanged. Small absolute gradients can have large relative RMS errors; stock errors are retained alongside new errors. No tight relative-gradient or convergence claim."
+      }
+    },
+    {
+      "model": "mobilenetv3_large_100",
+      "suite": "timm-dashboard",
+      "batch_size": 512,
+      "inputs": {
+        "input": {
+          "shape": [
+            512,
+            3,
+            224,
+            224
+          ],
+          "dtype": "torch.float32"
+        }
+      },
+      "initial_state_audit": {
+        "initial_parameters": true,
+        "initial_inputs": true,
+        "inputs": true,
+        "model_config_sha256": true,
+        "model_implementation": true,
+        "model_dependencies": true
+      },
+      "variants": {
+        "stock": {
+          "status": "ok",
+          "milliseconds": 88.26069119386375,
+          "repeat_ms": [
+            88.14853164367378,
+            88.46450368873775,
+            88.25045265257359,
+            88.34663648158312,
+            88.16064996644855,
+            88.26069119386375,
+            88.30037238076329
+          ],
+          "gpu_uuid": "31393465-3439-6235-3736-653933623231",
+          "physical_gpu": "0",
+          "gpu": "AMD Instinct MI355X",
+          "parameters": 5483032,
+          "parameters_with_training_gradients": 5483032,
+          "all_parameter_gradients_present": true,
+          "timing_recompiles": 0,
+          "timing_includes_cpu": true,
+          "final_training_loss": 0.006605298724025488,
+          "final_training_loss_finite": true,
+          "accuracy": {
+            "mode": "eval with BatchNorm batch statistics",
+            "scope": "deterministic eager loss and up to 1024 elements of first/middle/last parameter gradients; normalization mode recorded separately; timing uses train mode",
+            "eager_reference_status": "available",
+            "eager_loss": 0.006553505081683397,
+            "compiled_loss": 0.006612887606024742,
+            "gradient_samples": {
+              "conv_stem.weight": {
+                "rms_error": 7.491525320801884e-05,
+                "relative_rms_error": 0.38367849194218356,
+                "reference_rms": 0.0001952552847797051,
+                "max_abs_error": 0.0002593994140625
+              },
+              "blocks.3.2.conv_dw.weight": {
+                "rms_error": 4.774280455421831e-07,
+                "relative_rms_error": 0.2138394968512979,
+                "reference_rms": 2.2326466933009215e-06,
+                "max_abs_error": 2.6226043701171875e-06
+              },
+              "classifier.bias": {
+                "rms_error": 7.692266876802023e-07,
+                "relative_rms_error": 0.0057421332330141895,
+                "reference_rms": 0.0001339618320344016,
+                "max_abs_error": 2.734363079071045e-06
+              }
+            },
+            "warnings": [],
+            "tolerances": {
+              "loss": {
+                "rtol": 0.03,
+                "atol": 0.003
+              },
+              "sampled_gradient": {
+                "rtol": 0.05,
+                "atol": 0.005
+              }
+            },
+            "limit": "Original criteria preserved; absolute and relative RMS errors reported explicitly. Passing absolute tolerances is not tight relative-gradient or convergence validation.",
+            "timed_mode": "train; full forward + backward + SGD",
+            "training_finite_gradient_check": "first/middle/last gradient tensors, first1024 elements, after first training step"
+          },
+          "source_flags_audit": {
+            "expected_flags_match": true,
+            "flags": {
+              "autotune_local_cache": false,
+              "autotune_remote_cache": false,
+              "triton.amd_use_gluon": false,
+              "triton.amd_approximate_math": false,
+              "triton.amd_kernel_optimizations": false,
+              "triton.amd_extended_kernel_optimizations": false,
+              "triton.amd_further_kernel_optimizations": false,
+              "flydsl.simd": false,
+              "flydsl.simd_autotune_backend": false,
+              "flydsl.simd_autotune_min_numel": 65536,
+              "flydsl.simd_autotune_max_configs": 12,
+              "max_autotune": false,
+              "max_autotune_gemm": false,
+              "conv_1x1_as_mm": false,
+              "max_autotune_pointwise": true,
+              "triton.autotune_pointwise": true,
+              "max_autotune_gemm_backends": "ATEN",
+              "max_autotune_conv_backends": "ATEN",
+              "triton.cudagraphs": false
+            },
+            "loaded_module_count": 8,
+            "loaded_modules_before_after_equal": true,
+            "native_codegen_policy": {
+              "family_file_occurrences": {},
+              "violations": []
+            },
+            "codegen_audit": {
+              "graphs": 4,
+              "native_calls": 258,
+              "unexpected_triton_matrix_templates": 0,
+              "file": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/mobilenetv3_large_100/codegen/stock.world1.rank0.json"
+            },
+            "fingerprint": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/stock_source_fingerprint.json"
+          },
+          "cache_audit": {
+            "inductor_cache_started_empty": true,
+            "selection_cache_reuse": false,
+            "autotune_local_cache": false,
+            "autotune_remote_cache": false,
+            "compiler_artifact_manifest": {
+              "path": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/reuse_provenance/mobilenetv3_large_100--stock.json",
+              "sha256": "3831bfcd88ca807aea89dfd9cbee2af47c9d11e08e9bbc33e51aaeab215813ef"
+            },
+            "compiler_groups_preseeded": 1768,
+            "old_artifacts_rechecked_immutable": true,
+            "compile_times_cold_setup_comparable": false
+          },
+          "compilation_seconds_preseeded_not_cold": {
+            "eval_validation": 50.58022484462708,
+            "first_train_step": 15.588658372871578
+          },
+          "raw_result": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/mobilenetv3_large_100/stock.json",
+          "raw_log": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/mobilenetv3_large_100/stock.log"
+        },
+        "new_native": {
+          "status": "error",
+          "milliseconds": null,
+          "repeat_ms": null,
+          "gpu_uuid": "31393465-3439-6235-3736-653933623231",
+          "physical_gpu": "0",
+          "gpu": "AMD Instinct MI355X",
+          "parameters": 5483032,
+          "parameters_with_training_gradients": null,
+          "all_parameter_gradients_present": false,
+          "timing_recompiles": null,
+          "timing_includes_cpu": true,
+          "final_training_loss": null,
+          "final_training_loss_finite": false,
+          "accuracy": {
+            "mode": "eval with BatchNorm batch statistics",
+            "scope": null,
+            "eager_reference_status": "available",
+            "eager_loss": 0.006553505081683397,
+            "compiled_loss": null,
+            "gradient_samples": {},
+            "warnings": [],
+            "tolerances": null,
+            "limit": null,
+            "timed_mode": "train; full forward + backward + SGD",
+            "training_finite_gradient_check": "first/middle/last gradient tensors, first1024 elements, after first training step"
+          },
+          "source_flags_audit": {
+            "expected_flags_match": true,
+            "flags": {
+              "autotune_local_cache": false,
+              "autotune_remote_cache": false,
+              "triton.amd_use_gluon": false,
+              "triton.amd_approximate_math": false,
+              "triton.amd_kernel_optimizations": true,
+              "triton.amd_extended_kernel_optimizations": true,
+              "triton.amd_further_kernel_optimizations": true,
+              "flydsl.simd": false,
+              "flydsl.simd_autotune_backend": false,
+              "flydsl.simd_autotune_min_numel": 65536,
+              "flydsl.simd_autotune_max_configs": 12,
+              "max_autotune": false,
+              "max_autotune_gemm": false,
+              "conv_1x1_as_mm": false,
+              "max_autotune_pointwise": true,
+              "triton.autotune_pointwise": true,
+              "max_autotune_gemm_backends": "ATEN",
+              "max_autotune_conv_backends": "ATEN",
+              "triton.cudagraphs": false
+            },
+            "loaded_module_count": 8,
+            "loaded_modules_before_after_equal": false,
+            "native_codegen_policy": null,
+            "codegen_audit": null,
+            "fingerprint": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/new_native_source_fingerprint.json"
+          },
+          "cache_audit": {
+            "inductor_cache_started_empty": true,
+            "selection_cache_reuse": false,
+            "autotune_local_cache": false,
+            "autotune_remote_cache": false,
+            "compiler_artifact_manifest": {
+              "path": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/reuse_provenance/mobilenetv3_large_100--new_native.json",
+              "sha256": "2dc05f17cb79ce85743fcc506dcee557f97ddf2197ab24d01420f7ce816a237a"
+            },
+            "compiler_groups_preseeded": 7542,
+            "old_artifacts_rechecked_immutable": true,
+            "compile_times_cold_setup_comparable": false
+          },
+          "compilation_seconds_preseeded_not_cold": {
+            "eval_validation": null,
+            "first_train_step": null
+          },
+          "raw_result": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/mobilenetv3_large_100/new_native.json",
+          "raw_log": "/dockerx/pytorch-flex/agent_space/simd_bench/native_triton_v2/models_v4/runs/mobilenetv3_large_100/new_native.log"
+        }
+      },
+      "new_vs_stock_speedup_percent": null,
+      "accuracy_comparison": {
+        "scope": "each compiled variant versus its own eager reference, not a direct gradient-vector comparison",
+        "stock_eager_loss": 0.006553505081683397,
+        "new_eager_loss": 0.006553505081683397,
+        "stock_compiled_loss": 0.006612887606024742,
+        "new_compiled_loss": null,
+        "new_vs_stock_relative_compiled_loss_error": null,
+        "gradient_error_metrics_side_by_side": {
+          "conv_stem.weight": {
+            "stock": {
+              "rms_error": 7.491525320801884e-05,
+              "relative_rms_error": 0.38367849194218356,
+              "reference_rms": 0.0001952552847797051,
+              "max_abs_error": 0.0002593994140625
+            },
+            "new_native": null
+          },
+          "blocks.3.2.conv_dw.weight": {
+            "stock": {
+              "rms_error": 4.774280455421831e-07,
+              "relative_rms_error": 0.2138394968512979,
+              "reference_rms": 2.2326466933009215e-06,
+              "max_abs_error": 2.6226043701171875e-06
+            },
+            "new_native": null
+          },
+          "classifier.bias": {
+            "stock": {
+              "rms_error": 7.692266876802023e-07,
+              "relative_rms_error": 0.0057421332330141895,
+              "reference_rms": 0.0001339618320344016,
+              "max_abs_error": 2.734363079071045e-06
+            },
+            "new_native": null
+          }
+        },
+        "interpretation": "Original tolerances unchanged. Small absolute gradients can have large relative RMS errors; stock errors are retained alongside new errors. No tight relative-gradient or convergence claim."
+      }
+    }
+  ]
+}

@@ -256,6 +256,14 @@ def measure(entries, inputs, rounds, repeats, cache, invocation, originals):
     return samples
 
 
+def reference_output(fn, inputs, family):
+    """Build eager gold outside compilation and timing; scans accumulate exact inputs in FP64."""
+    value = fn(*inputs)
+    if family == "cumsum":
+        value = torch.cumsum(inputs[0].to(torch.float64), dim=-1).to(value.dtype)
+    return value
+
+
 def run_case(case, output, rounds, repeats):
     folder = output / case["case"]
     folder.mkdir(exist_ok=True)
@@ -270,7 +278,7 @@ def run_case(case, output, rounds, repeats):
 
     def reference():
         restore()
-        value = fn(*inputs)
+        value = reference_output(fn, inputs, case["family"])
         return (
             tuple(item.clone() for item in value)
             if isinstance(value, (tuple, list))

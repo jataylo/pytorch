@@ -194,6 +194,7 @@ class TestAMDCompiledOptimizations(TestCase):
             with config.patch(
                 {
                     "triton.amd_kernel_optimizations": enabled,
+                    "triton.amd_use_gluon": True,
                     "max_autotune_pointwise": True,
                     "fx_graph_cache": False,
                 }

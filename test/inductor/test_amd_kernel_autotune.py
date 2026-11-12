@@ -169,6 +169,7 @@ class TestAMDExecutionTuning(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_approximate_math": True,
                 "max_autotune_pointwise": True,
                 "autotune_local_cache": False,
@@ -215,6 +216,7 @@ class TestAMDExecutionTuning(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_approximate_math": approximate,
                 "max_autotune_pointwise": True,
                 "autotune_local_cache": False,
@@ -287,6 +289,7 @@ class TestAMDExecutionTuning(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": False,
+                "triton.amd_use_gluon": True,
                 "max_autotune_pointwise": True,
                 "max_autotune_gemm_backends": "ATEN",
                 "fx_graph_cache": False,
@@ -304,6 +307,7 @@ class TestAMDExecutionTuning(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_approximate_math": approximate,
                 "max_autotune_pointwise": True,
                 "max_autotune_gemm_backends": "ATEN",

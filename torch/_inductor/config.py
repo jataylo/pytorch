@@ -1908,6 +1908,10 @@ class triton:
     tlx_mode: Literal["allow", "force"] | None = tlx_mode_from_env()
 
     # Opt-in wave64 layout and reduction tuning experiments on gfx950.
+    # Use Triton layout inference for recognized AMD specializations.
+    amd_use_gluon = False
+    amd_persistent_reduction_autotune = True
+
     amd_kernel_optimizations = False
     amd_extended_kernel_optimizations = False
     amd_further_kernel_optimizations = False

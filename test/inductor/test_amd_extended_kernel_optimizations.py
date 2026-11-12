@@ -116,6 +116,7 @@ class TestAMDExtendedLowering(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_extended_kernel_optimizations": True,
                 "fx_graph_cache": False,
             }
@@ -154,6 +155,7 @@ class TestAMDExtendedLowering(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_extended_kernel_optimizations": True,
                 "fx_graph_cache": False,
             }
@@ -196,6 +198,7 @@ class TestAMDExtendedLowering(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_extended_kernel_optimizations": True,
                 "max_autotune_gemm_backends": "ATEN",
                 "fx_graph_cache": False,
@@ -243,6 +246,7 @@ class TestAMDExtendedLowering(TestCase):
         with config.patch(
             {
                 "triton.amd_kernel_optimizations": True,
+                "triton.amd_use_gluon": True,
                 "triton.amd_extended_kernel_optimizations": True,
                 "fx_graph_cache": False,
             }

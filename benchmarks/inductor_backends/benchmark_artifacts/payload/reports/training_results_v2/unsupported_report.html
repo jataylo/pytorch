@@ -1,0 +1,386 @@
+<!doctype html><meta charset="utf-8"><title>FlyDSL lowering gaps</title><style>body{font:15px system-ui;margin:28px}td,th{padding:8px;vertical-align:top;text-align:left;border-bottom:1px solid #ddd}input{padding:10px;width:450px}</style><h1>Observed FlyDSL lowering gaps</h1><p>These schedules fell back to a named Triton kernel. Counts represent generated schedules, including backward graphs and repeated attempts, rather than dynamic launches. Selected timing counts identify the attempts used in the final comparison. A reason can depend on layout, dtype or fusion; it does not establish that every listed source operation is unsupported.</p><p><a href="all_unsupported_flydsl_kernels.csv">Complete event details, shapes and source mappings</a> | <a href="unsupported_summary.csv">Summary CSV</a> | <a href="unsupported_by_model.csv">Per-model CSV</a> | <a href="intentional_native_calls.csv">ATen/extern callsites</a> | <a href="all_compile_execution_failures.csv">Later failures</a> | <a href="stable_report.html">Performance comparison</a></p><pre>[
+  {
+    &quot;reason&quot;: &quot;transposed access needs a 2D tile&quot;,
+    &quot;all_scheduled_events&quot;: 3004,
+    &quot;selected_timing_events&quot;: 2764,
+    &quot;all_models&quot;: 27,
+    &quot;selected_models&quot;: 26,
+    &quot;source_operations&quot;: {
+      &quot;aten.view&quot;: 2736,
+      &quot;aten._to_copy&quot;: 2616,
+      &quot;aten.mul&quot;: 1488,
+      &quot;aten._unsafe_view&quot;: 1236,
+      &quot;aten.add&quot;: 1174,
+      &quot;aten.sum&quot;: 1164,
+      &quot;aten.native_layer_norm_backward&quot;: 1034,
+      &quot;aten.permute&quot;: 940,
+      &quot;aten.expand&quot;: 792,
+      &quot;aten.div&quot;: 760,
+      &quot;aten.transpose&quot;: 716,
+      &quot;aten.clone&quot;: 688,
+      &quot;aten.pow&quot;: 588,
+      &quot;aten._softmax&quot;: 320,
+      &quot;aten.bmm&quot;: 280,
+      &quot;aten.squeeze&quot;: 272,
+      &quot;aten._fused_rms_norm&quot;: 224,
+      &quot;aten._fused_rms_norm_backward&quot;: 224,
+      &quot;aten.neg&quot;: 136,
+      &quot;aten.unsqueeze&quot;: 128,
+      &quot;aten.native_layer_norm&quot;: 114,
+      &quot;aten.clamp_min&quot;: 96,
+      &quot;aten.sigmoid&quot;: 80,
+      &quot;aten.sub&quot;: 80,
+      &quot;aten.rsub&quot;: 80,
+      &quot;aten.slice&quot;: 76,
+      &quot;aten._softmax_backward_data&quot;: 56,
+      &quot;aten.col2im&quot;: 48,
+      &quot;aten.bitwise_and&quot;: 32,
+      &quot;aten.native_dropout&quot;: 32,
+      &quot;aten._safe_softmax&quot;: 32,
+      &quot;aten.scalar_tensor&quot;: 32,
+      &quot;aten.where&quot;: 32,
+      &quot;aten.cat&quot;: 16,
+      &quot;aten.slice_backward&quot;: 16,
+      &quot;aten.split&quot;: 16,
+      &quot;aten.select&quot;: 12,
+      &quot;aten.copy&quot;: 12,
+      &quot;aten.select_backward&quot;: 12,
+      &quot;aten.unfold_backward&quot;: 12,
+      &quot;aten.rsqrt&quot;: 8,
+      &quot;aten.mean&quot;: 8,
+      &quot;aten.gelu&quot;: 4,
+      &quot;aten.native_batch_norm_backward&quot;: 4
+    },
+    &quot;example_kernel&quot;: &quot;triton_per_fused__safe_softmax__to_copy_add_bitwise_and_clone_expand_native_dropout_permute_prepare_softmax_online_scalar_tensor_unsqueeze_view_where_0&quot;,
+    &quot;example_buffers&quot;: {
+      &quot;buf19&quot;: {
+        &quot;shape&quot;: [
+          &quot;192&quot;,
+          &quot;128&quot;,
+          &quot;128&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;16384&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf1&quot;: {
+        &quot;shape&quot;: [
+          &quot;1&quot;,
+          &quot;1&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;128&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bool&quot;
+      },
+      &quot;buf2&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;,
+          &quot;128&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;128&quot;,
+          &quot;128&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bool&quot;
+      },
+      &quot;buf16&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;128&quot;,
+          &quot;6&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;768&quot;,
+          &quot;6&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf20&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;768&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf21&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;768&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf22&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;768&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;,
+          &quot;24576&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bool&quot;
+      },
+      &quot;buf23&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;768&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bool&quot;
+      },
+      &quot;buf3&quot;: {
+        &quot;shape&quot;: [
+          &quot;84&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.int64&quot;
+      },
+      &quot;buf24&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;128&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;98304&quot;,
+          &quot;16384&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf25&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;128&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;98304&quot;,
+          &quot;16384&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bool&quot;
+      },
+      &quot;buf26&quot;: {
+        &quot;shape&quot;: [
+          &quot;32&quot;,
+          &quot;6&quot;,
+          &quot;128&quot;,
+          &quot;128&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;98304&quot;,
+          &quot;16384&quot;,
+          &quot;128&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      }
+    }
+  },
+  {
+    &quot;reason&quot;: &quot;mix-order reduction over a looped row&quot;,
+    &quot;all_scheduled_events&quot;: 204,
+    &quot;selected_timing_events&quot;: 204,
+    &quot;all_models&quot;: 2,
+    &quot;selected_models&quot;: 2,
+    &quot;source_operations&quot;: {
+      &quot;aten._to_copy&quot;: 204,
+      &quot;aten.view&quot;: 204,
+      &quot;aten.native_layer_norm_backward&quot;: 204,
+      &quot;aten.permute&quot;: 12
+    },
+    &quot;example_kernel&quot;: &quot;triton_per_fused__to_copy_native_layer_norm_backward_permute_view_1&quot;,
+    &quot;example_buffers&quot;: {
+      &quot;buf23&quot;: {
+        &quot;shape&quot;: [
+          &quot;6272&quot;,
+          &quot;1024&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;1024&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bfloat16&quot;
+      },
+      &quot;primals_335&quot;: {
+        &quot;shape&quot;: [
+          &quot;1024&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf29&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;7&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;49&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;,
+          &quot;6272&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;convolution_39&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;1024&quot;,
+          &quot;7&quot;,
+          &quot;7&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;50176&quot;,
+          &quot;49&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bfloat16&quot;
+      },
+      &quot;getitem_79&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;7&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;49&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;rsqrt_39&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;7&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;49&quot;,
+          &quot;7&quot;,
+          &quot;1&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      }
+    }
+  },
+  {
+    &quot;reason&quot;: &quot;online_softmax_reduce of a tuple&quot;,
+    &quot;all_scheduled_events&quot;: 16,
+    &quot;selected_timing_events&quot;: 16,
+    &quot;all_models&quot;: 1,
+    &quot;selected_models&quot;: 1,
+    &quot;source_operations&quot;: {
+      &quot;aten._to_copy&quot;: 16,
+      &quot;aten.permute&quot;: 16,
+      &quot;aten.unbind&quot;: 16,
+      &quot;aten._softmax&quot;: 16,
+      &quot;aten.view&quot;: 16
+    },
+    &quot;example_kernel&quot;: &quot;triton_red_fused__softmax__to_copy_permute_prepare_softmax_online_unbind_view_0&quot;,
+    &quot;example_buffers&quot;: {
+      &quot;buf23&quot;: {
+        &quot;shape&quot;: [
+          &quot;401536&quot;,
+          &quot;192&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;192&quot;,
+          &quot;1&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.bfloat16&quot;
+      },
+      &quot;buf24&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;8&quot;,
+          &quot;1&quot;,
+          &quot;8&quot;,
+          &quot;13&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;832&quot;,
+          &quot;8&quot;,
+          &quot;106496&quot;,
+          &quot;1&quot;,
+          &quot;64&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      },
+      &quot;buf25&quot;: {
+        &quot;shape&quot;: [
+          &quot;128&quot;,
+          &quot;8&quot;,
+          &quot;1&quot;,
+          &quot;8&quot;,
+          &quot;13&quot;
+        ],
+        &quot;stride&quot;: [
+          &quot;832&quot;,
+          &quot;8&quot;,
+          &quot;106496&quot;,
+          &quot;1&quot;,
+          &quot;64&quot;
+        ],
+        &quot;dtype&quot;: &quot;torch.float32&quot;
+      }
+    }
+  }
+]</pre><input id="filter" placeholder="Filter model, kernel or fallback reason"><table><thead><tr><th>suite</th><th>model</th><th>autotune</th><th>reason</th><th>all_scheduled_events</th><th>selected_timing_events</th><th>kernel_names</th></tr></thead><tbody><tr><td>huggingface-dashboard</td><td>MT5ForConditionalGeneration</td><td>0</td><td>transposed access needs a 2D tile</td><td>16</td><td>8</td><td>[&#x27;triton_per_fused__safe_softmax__to_copy_add_bitwise_and_clone_expand_native_dropout_permute_prepare_softmax_online_scalar_tensor_unsqueeze_view_where_0&#x27;, &#x27;triton_per_fused__safe_softmax__to_copy_add_bitwise_and_clone_expand_native_dropout_permute_prepare_softmax_online_scalar_tensor_unsqueeze_view_where_1&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>MT5ForConditionalGeneration</td><td>1</td><td>transposed access needs a 2D tile</td><td>16</td><td>8</td><td>[&#x27;triton_per_fused__safe_softmax__to_copy_add_bitwise_and_clone_expand_native_dropout_permute_prepare_softmax_online_scalar_tensor_unsqueeze_view_where_0&#x27;, &#x27;triton_per_fused__safe_softmax__to_copy_add_bitwise_and_clone_expand_native_dropout_permute_prepare_softmax_online_scalar_tensor_unsqueeze_view_where_1&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>Qwen/Qwen3-0.6B</td><td>0</td><td>transposed access needs a 2D tile</td><td>112</td><td>56</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_view_1&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>Qwen/Qwen3-0.6B</td><td>1</td><td>transposed access needs a 2D tile</td><td>112</td><td>56</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_view_1&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>XLNetLMHeadModel</td><td>0</td><td>transposed access needs a 2D tile</td><td>96</td><td>48</td><td>[&#x27;triton_poi_fused__unsafe_view_bmm_clone_permute_squeeze_view_0&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>XLNetLMHeadModel</td><td>1</td><td>transposed access needs a 2D tile</td><td>96</td><td>48</td><td>[&#x27;triton_poi_fused__unsafe_view_bmm_clone_permute_squeeze_view_0&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>YituTechConvBert</td><td>0</td><td>transposed access needs a 2D tile</td><td>24</td><td>24</td><td>[&#x27;triton_poi_fused__softmax__to_copy__unsafe_view_add_bmm_clone_col2im_slice_transpose_view_0&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>YituTechConvBert</td><td>1</td><td>transposed access needs a 2D tile</td><td>24</td><td>24</td><td>[&#x27;triton_poi_fused__softmax__to_copy__unsafe_view_add_bmm_clone_col2im_slice_transpose_view_0&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>openai/whisper-tiny</td><td>0</td><td>transposed access needs a 2D tile</td><td>12</td><td>12</td><td>[&#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_2&#x27;, &#x27;triton_red_fused_add_gelu_native_layer_norm_permute_0&#x27;, &#x27;triton_red_fused_add_gelu_native_layer_norm_permute_view_1&#x27;, &#x27;triton_red_fused_add_native_layer_norm_view_0&#x27;, &#x27;triton_red_fused_native_layer_norm_backward_0&#x27;]</td></tr><tr><td>huggingface-dashboard</td><td>openai/whisper-tiny</td><td>1</td><td>transposed access needs a 2D tile</td><td>12</td><td>12</td><td>[&#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_2&#x27;, &#x27;triton_red_fused_add_gelu_native_layer_norm_permute_0&#x27;, &#x27;triton_red_fused_add_gelu_native_layer_norm_permute_view_1&#x27;, &#x27;triton_red_fused_add_native_layer_norm_view_0&#x27;, &#x27;triton_red_fused_native_layer_norm_backward_0&#x27;]</td></tr><tr><td>priority</td><td>Lightricks/LTX-Video</td><td>0</td><td>transposed access needs a 2D tile</td><td>112</td><td>112</td><td>[&#x27;triton_red_fused__fused_rms_norm__fused_rms_norm_backward__to_copy_mul_permute_transpose_view_0&#x27;, &#x27;triton_red_fused__fused_rms_norm__fused_rms_norm_backward__to_copy_mul_permute_transpose_view_1&#x27;]</td></tr><tr><td>priority</td><td>Lightricks/LTX-Video</td><td>1</td><td>transposed access needs a 2D tile</td><td>112</td><td>112</td><td>[&#x27;triton_red_fused__fused_rms_norm__fused_rms_norm_backward__to_copy_mul_permute_transpose_view_0&#x27;, &#x27;triton_red_fused__fused_rms_norm__fused_rms_norm_backward__to_copy_mul_permute_transpose_view_1&#x27;]</td></tr><tr><td>priority</td><td>Qwen/Qwen3-8B</td><td>0</td><td>transposed access needs a 2D tile</td><td>144</td><td>144</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_transpose_view_2&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_mul_sum_transpose_view_0&#x27;]</td></tr><tr><td>priority</td><td>Qwen/Qwen3-8B</td><td>1</td><td>transposed access needs a 2D tile</td><td>144</td><td>144</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_clone_div_expand_mul_pow_sum_transpose_view_2&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_mul_sum_transpose_view_0&#x27;]</td></tr><tr><td>priority</td><td>google/gemma-4-26B-A4B-it</td><td>0</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_mul_sum_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_0&#x27;]</td></tr><tr><td>priority</td><td>google/gemma-4-26B-A4B-it</td><td>1</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_mul_sum_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_0&#x27;]</td></tr><tr><td>priority</td><td>google/gemma-4-31B</td><td>0</td><td>transposed access needs a 2D tile</td><td>120</td><td>120</td><td>[&#x27;triton_per_fused__to_copy_mul_sum_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_2&#x27;]</td></tr><tr><td>priority</td><td>google/gemma-4-31B</td><td>1</td><td>transposed access needs a 2D tile</td><td>120</td><td>120</td><td>[&#x27;triton_per_fused__to_copy_mul_sum_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_div_expand_mul_pow_sum_view_2&#x27;]</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>0</td><td>transposed access needs a 2D tile</td><td>8</td><td>0</td><td>[&#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_split_unsqueeze_view_0&#x27;]</td></tr><tr><td>priority</td><td>hunyuanvideo-community/HunyuanVideo</td><td>1</td><td>transposed access needs a 2D tile</td><td>8</td><td>0</td><td>[&#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_split_unsqueeze_view_0&#x27;]</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>0</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_add_cat_clone_copy_div_expand_mul_pow_slice_sum_transpose_view_0&#x27;, &#x27;triton_per_fused__to_copy_add_clone_copy_mean_pow_rsqrt_select_transpose_view_0&#x27;]</td></tr><tr><td>priority</td><td>moonshotai/Kimi-Linear-48B-A3B-Instruct</td><td>1</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_add_cat_clone_copy_div_expand_mul_pow_slice_sum_transpose_view_0&#x27;, &#x27;triton_per_fused__to_copy_add_clone_copy_mean_pow_rsqrt_select_transpose_view_0&#x27;]</td></tr><tr><td>priority</td><td>openai/gpt-oss-20b</td><td>0</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_per_fused__to_copy_sum_transpose_view_0&#x27;]</td></tr><tr><td>priority</td><td>openai/gpt-oss-20b</td><td>1</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_per_fused__to_copy_sum_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>cait_m36_384</td><td>0</td><td>transposed access needs a 2D tile</td><td>364</td><td>364</td><td>[&#x27;triton_red_fused__softmax__to_copy__unsafe_view_add_permute_prepare_softmax_online_1&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_transpose_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_select_backward_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_2&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_transpose_view_2&#x27;, &#x27;triton_red_fused_add_native_layer_norm_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>cait_m36_384</td><td>1</td><td>transposed access needs a 2D tile</td><td>364</td><td>364</td><td>[&#x27;triton_red_fused__softmax__to_copy__unsafe_view_add_permute_prepare_softmax_online_1&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_transpose_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_select_backward_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_2&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_transpose_view_2&#x27;, &#x27;triton_red_fused_add_native_layer_norm_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>coat_lite_mini</td><td>0</td><td>transposed access needs a 2D tile</td><td>14</td><td>14</td><td>[&#x27;triton_per_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_1&#x27;, &#x27;triton_per_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_5&#x27;, &#x27;triton_red_fused__softmax__softmax_backward_data__to_copy_transpose_view_3&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_select_backward_slice_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_2&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_4&#x27;]</td></tr><tr><td>timm-dashboard</td><td>coat_lite_mini</td><td>1</td><td>transposed access needs a 2D tile</td><td>14</td><td>14</td><td>[&#x27;triton_per_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_1&#x27;, &#x27;triton_per_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_5&#x27;, &#x27;triton_red_fused__softmax__softmax_backward_data__to_copy_transpose_view_3&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_select_backward_slice_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_2&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_slice_slice_backward_transpose_view_4&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convit_base</td><td>0</td><td>transposed access needs a 2D tile</td><td>60</td><td>60</td><td>[&#x27;triton_red_fused__softmax__softmax_backward_data__to_copy_add_bmm_div_expand_mul_neg_permute_rsub_sigmoid_squeeze_sub_sum_unsqueeze_view_0&#x27;, &#x27;triton_red_fused__softmax__to_copy_add_bmm_mul_permute_prepare_softmax_online_rsub_sigmoid_sub_view_0&#x27;, &#x27;triton_red_fused__softmax__to_copy_add_div_expand_mul_permute_squeeze_sum_unsqueeze_view_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convit_base</td><td>1</td><td>transposed access needs a 2D tile</td><td>60</td><td>60</td><td>[&#x27;triton_red_fused__softmax__softmax_backward_data__to_copy_add_div_expand_mul_neg_permute_rsub_sigmoid_squeeze_sub_sum_unsqueeze_view_0&#x27;, &#x27;triton_red_fused__softmax__to_copy_add_div_expand_mul_permute_squeeze_sum_unsqueeze_view_1&#x27;, &#x27;triton_red_fused__softmax__to_copy_add_mul_permute_prepare_softmax_online_rsub_sigmoid_sub_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convmixer_768_32</td><td>0</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_div_expand_native_batch_norm_backward_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convmixer_768_32</td><td>1</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_div_expand_native_batch_norm_backward_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convnext_base</td><td>0</td><td>transposed access needs a 2D tile</td><td>26</td><td>26</td><td>[&#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_backward_permute_sum_view_4&#x27;, &#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_backward_permute_sum_view_7&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_5&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_6&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convnext_base</td><td>1</td><td>transposed access needs a 2D tile</td><td>26</td><td>26</td><td>[&#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_backward_permute_sum_view_4&#x27;, &#x27;triton_red_fused__to_copy_add_mul_native_layer_norm_backward_permute_sum_view_7&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_5&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_6&#x27;]</td></tr><tr><td>timm-dashboard</td><td>eca_halonext26ts</td><td>0</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_0&#x27;, &#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_1&#x27;, &#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_2&#x27;]</td></tr><tr><td>timm-dashboard</td><td>eca_halonext26ts</td><td>1</td><td>transposed access needs a 2D tile</td><td>6</td><td>6</td><td>[&#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_0&#x27;, &#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_1&#x27;, &#x27;triton_poi_fused__unsafe_view_cat_clone_permute_transpose_unfold_backward_view_2&#x27;]</td></tr><tr><td>timm-dashboard</td><td>levit_128</td><td>0</td><td>transposed access needs a 2D tile</td><td>4</td><td>4</td><td>[&#x27;triton_red_fused__softmax_backward_data__to_copy_sum_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>levit_128</td><td>1</td><td>transposed access needs a 2D tile</td><td>4</td><td>4</td><td>[&#x27;triton_red_fused__softmax_backward_data__to_copy_sum_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>mobilevit_s</td><td>0</td><td>transposed access needs a 2D tile</td><td>10</td><td>10</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_native_layer_norm_backward_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_native_layer_norm_backward_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_2&#x27;]</td></tr><tr><td>timm-dashboard</td><td>mobilevit_s</td><td>1</td><td>transposed access needs a 2D tile</td><td>10</td><td>10</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_native_layer_norm_backward_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_native_layer_norm_backward_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_transpose_view_2&#x27;]</td></tr><tr><td>timm-dashboard</td><td>pit_b_224</td><td>0</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_per_fused_slice_sum_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>pit_b_224</td><td>1</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_per_fused_slice_sum_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>swin_base_patch4_window7_224</td><td>0</td><td>transposed access needs a 2D tile</td><td>4</td><td>4</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_backward_permute_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>swin_base_patch4_window7_224</td><td>1</td><td>transposed access needs a 2D tile</td><td>4</td><td>4</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_clone_native_layer_norm_backward_permute_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>tnt_s_patch16_224</td><td>0</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_sum_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>tnt_s_patch16_224</td><td>1</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_sum_transpose_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>twins_pcpvt_base</td><td>0</td><td>transposed access needs a 2D tile</td><td>72</td><td>72</td><td>[&#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_permute_view_4&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_permute_view_7&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_5&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_8&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_6&#x27;, &#x27;triton_red_fused_add_native_layer_norm_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>twins_pcpvt_base</td><td>1</td><td>transposed access needs a 2D tile</td><td>72</td><td>72</td><td>[&#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_permute_view_4&#x27;, &#x27;triton_red_fused__to_copy_add_native_layer_norm_backward_permute_view_7&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_permute_view_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_1&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_5&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_transpose_view_8&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_3&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_6&#x27;, &#x27;triton_red_fused_add_native_layer_norm_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>vit_base_patch14_dinov2.lvd142m</td><td>0</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_div_expand_mul_native_layer_norm_native_layer_norm_backward_pow_select_select_backward_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>vit_base_patch14_dinov2.lvd142m</td><td>1</td><td>transposed access needs a 2D tile</td><td>2</td><td>2</td><td>[&#x27;triton_red_fused_div_expand_mul_native_layer_norm_native_layer_norm_backward_pow_select_select_backward_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>volo_d1_224</td><td>0</td><td>transposed access needs a 2D tile</td><td>8</td><td>8</td><td>[&#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>volo_d1_224</td><td>1</td><td>transposed access needs a 2D tile</td><td>8</td><td>8</td><td>[&#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>xcit_large_24_p8_224</td><td>0</td><td>transposed access needs a 2D tile</td><td>268</td><td>268</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_mul_native_layer_norm_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_mul_sum_4&#x27;, &#x27;triton_red_fused__to_copy_clamp_min_div_expand_mul_neg_sum_view_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_permute_view_2&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_view_1&#x27;, &#x27;triton_red_fused_mul_permute_sum_view_3&#x27;, &#x27;triton_red_fused_mul_sum_view_5&#x27;]</td></tr><tr><td>timm-dashboard</td><td>xcit_large_24_p8_224</td><td>1</td><td>transposed access needs a 2D tile</td><td>268</td><td>268</td><td>[&#x27;triton_red_fused__to_copy__unsafe_view_add_mul_native_layer_norm_0&#x27;, &#x27;triton_red_fused__to_copy__unsafe_view_add_mul_sum_4&#x27;, &#x27;triton_red_fused__to_copy_clamp_min_div_expand_mul_neg_sum_view_2&#x27;, &#x27;triton_red_fused__to_copy_native_layer_norm_backward_view_0&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_permute_view_2&#x27;, &#x27;triton_red_fused_add_mul_native_layer_norm_view_1&#x27;, &#x27;triton_red_fused_mul_permute_sum_view_3&#x27;, &#x27;triton_red_fused_mul_sum_view_5&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convnext_base</td><td>0</td><td>mix-order reduction over a looped row</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_native_layer_norm_backward_permute_view_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>convnext_base</td><td>1</td><td>mix-order reduction over a looped row</td><td>6</td><td>6</td><td>[&#x27;triton_per_fused__to_copy_native_layer_norm_backward_permute_view_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>xcit_large_24_p8_224</td><td>0</td><td>mix-order reduction over a looped row</td><td>96</td><td>96</td><td>[&#x27;triton_per_fused__to_copy_native_layer_norm_backward_view_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>xcit_large_24_p8_224</td><td>1</td><td>mix-order reduction over a looped row</td><td>96</td><td>96</td><td>[&#x27;triton_per_fused__to_copy_native_layer_norm_backward_view_1&#x27;]</td></tr><tr><td>timm-dashboard</td><td>coat_lite_mini</td><td>0</td><td>online_softmax_reduce of a tuple</td><td>8</td><td>8</td><td>[&#x27;triton_per_fused__softmax__to_copy_permute_prepare_softmax_online_unbind_view_1&#x27;, &#x27;triton_red_fused__softmax__to_copy_permute_prepare_softmax_online_unbind_view_0&#x27;]</td></tr><tr><td>timm-dashboard</td><td>coat_lite_mini</td><td>1</td><td>online_softmax_reduce of a tuple</td><td>8</td><td>8</td><td>[&#x27;triton_per_fused__softmax__to_copy_permute_prepare_softmax_online_unbind_view_1&#x27;, &#x27;triton_red_fused__softmax__to_copy_permute_prepare_softmax_online_unbind_view_0&#x27;]</td></tr></tbody></table><script>document.getElementById("filter").oninput=function(){for(const row of document.querySelectorAll("tbody tr"))row.hidden=!row.textContent.toLowerCase().includes(this.value.toLowerCase())}</script>

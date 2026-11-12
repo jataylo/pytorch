@@ -295,7 +295,7 @@ class InductorMeta(typing.TypedDict, total=False):
     checked against this TypedDict; typing the producers is left as a follow-up.
     """
 
-    amd_row_count: int
+    amd_row_count: int | None
     amd_reduction_extent: int
     amd_kernel_tuning_version: int
     amd_warp_size: int
@@ -311,6 +311,11 @@ class InductorMeta(typing.TypedDict, total=False):
     amd_reduction_tuning: bool
     amd_pointwise_family: str
     amd_approximate_math: bool
+    amd_native_family: str
+    amd_row_tail_safe: bool
+    amd_resource_aware_tuning: bool
+    amd_reduction_value_bytes: int
+    amd_transpose_shape: tuple[int, int, int, int]
     amd_gluon_family: str
     use_gluon: bool
 
