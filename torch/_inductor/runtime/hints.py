@@ -400,6 +400,7 @@ class InductorMeta(typing.TypedDict, total=False):
     precomputed_grids: typing.Any
     config_args: typing.Any
     use_fast_triton_launcher: bool
+    distribution_tile: str  # "launcher" or "caller"; see hip_pointer_attrs.py
 
 
 class HalideInputSpec(typing.NamedTuple):

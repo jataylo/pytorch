@@ -63,6 +63,7 @@ from ..runtime.hints import (
     TRITON_MAX_RSPLIT,
     TritonMeta,
 )
+from ..runtime.hip_pointer_attrs import DISTRIBUTION_TILE, LAUNCHER
 from ..runtime.runtime_utils import get_max_y_grid, next_power_of_2
 from ..scheduler import (
     BaseSchedulerNode,
@@ -7822,6 +7823,13 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "disable_ftz": config.eager_numerics.disable_ftz,
         }
 
+    @staticmethod
+    def append_distribution_tile(argdefs, signature) -> None:
+        # Runtime scalar: the value tracks the allocation, so not tl.constexpr.
+        if config.rocm.pointer_slc:
+            signature.append(SizeArg(DISTRIBUTION_TILE, sympy.Integer(0)))
+            argdefs.append(ArgName(DISTRIBUTION_TILE))
+
     @classmethod
     def inductor_meta_common(cls):
         inductor_meta = {
@@ -7857,6 +7865,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
         if torch.version.hip is not None:
             inductor_meta["is_hip"] = True
+        if config.rocm.pointer_slc:
+            inductor_meta[DISTRIBUTION_TILE] = LAUNCHER
         if config.is_fbcode():
             inductor_meta["is_fbcode"] = True
         if config.profile_bandwidth:
@@ -8153,6 +8163,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             # )
             # argdefs.append(f"{tree.prefix}numel: tl.constexpr")
 
+        self.append_distribution_tile(argdefs, signature)
+
         def add_constexpr_arg(arg_name):
             # new versions (but not old versions) of Triton need constexprs included in the signature
             if triton_version_uses_attrs_dict():
@@ -8212,7 +8224,6 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             **self.inductor_meta_per_kernel(),
             **self.inductor_meta_common(),
         }
-
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault
         # during launching the Inductor-compiled Triton kernel.

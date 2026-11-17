@@ -1698,6 +1698,7 @@ class ComboKernel(Kernel):
 
         argdefs, _, signature, _ = self.args.python_argdefs()
         argdefs = self.add_numel_to_args(argdefs, signature)
+        self.triton_kernel_cls.append_distribution_tile(argdefs, signature)
         if self.per_subkernel_blocks:
             main_arg_names = OrderedSet(arg.name for arg in argdefs)
             mapped_arg_names = OrderedSet(

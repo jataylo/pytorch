@@ -3125,6 +3125,9 @@ class rocm:
     # time and runtime within the validated 4-8 range).
     origami_topk: int = int(os.environ.get("TORCHINDUCTOR_ORIGAMI_TOPK", "6"))
 
+    # Draft. See runtime/hip_pointer_attrs.py. Changes kernel signatures.
+    pointer_slc: bool = os.environ.get("TORCHINDUCTOR_POINTER_SLC", "0") == "1"
+
 
 # Backend to use for CPU codegen either "cpp" or "triton" (experimental) or "halide" (experimental) or "pallas" (experimental)
 cpu_backend: Literal["cpp", "triton", "halide", "pallas"] = "cpp"

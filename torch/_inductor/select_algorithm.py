@@ -985,7 +985,7 @@ class TritonTemplateKernel(TritonKernel):
         if self.use_jit:
             return "@triton.jit"
 
-        argdefs, _, signature, _ = self.args.python_argdefs()
+        argdefs, _, signature, _ = self.kernel_argdefs()
         triton_meta: TritonMeta = {
             "signature": signature_to_meta(
                 signature,
@@ -1077,10 +1077,17 @@ class TritonTemplateKernel(TritonKernel):
             @triton.jit
         """
 
+    def kernel_argdefs(self):
+        # use_jit templates are plain @triton.jit and never see the launcher.
+        argdefs, call_args, signature, arg_types = self.args.python_argdefs()
+        if not self.use_jit:
+            self.append_distribution_tile(argdefs, signature)
+        return argdefs, call_args, signature, arg_types
+
     def gen_argdefs(self):
         def hook():
             # python_argdefs() cannot be run until after the rest of the template lazily adds more args
-            arg_defs, *_ = self.args.python_argdefs()
+            arg_defs, *_ = self.kernel_argdefs()
             return f"{', '.join(x.full_name() for x in arg_defs)}"
 
         return self._register_hook("<ARGDEFS>", hook, allow_overwriting=True)
@@ -1155,7 +1162,7 @@ class TritonTemplateKernel(TritonKernel):
 
         def hook():
             # python_argdefs() cannot be run until after the rest of the template lazily adds more args
-            arg_defs, *_ = self.args.python_argdefs()
+            arg_defs, *_ = self.kernel_argdefs()
             code = IndentedBuffer()
             code.splice(self.gen_common_triton_imports())
             code.splice(self.jit_lines())

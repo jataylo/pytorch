@@ -58,6 +58,7 @@ from .. import async_compile, config, debug as inductor_debug, ir
 from ..codecache import get_hash, output_code_log
 from ..ir import IRNode, ReinterpretView
 from ..runtime import triton_heuristics
+from ..runtime.hip_pointer_attrs import CALLER, DISTRIBUTION_TILE, LAUNCHER
 from ..stream_constants import DEFAULT_STREAM, DEFAULT_STREAM_IDX, STREAM_NAME_TEMPLATE
 from ..stream_utils import (
     COOR_DEVICE_IDX_VAR,
@@ -97,6 +98,7 @@ from .common import (
 from .cpp_utils import cexpr
 from .custom_extern_kernel_codegen import CUSTOM_EXTERN_KERNEL_CODEGEN
 from .triton_utils import (
+    _arg_equals_1,
     config_of,
     should_unwrap_unspec_arg,
     signature_to_meta,
@@ -4533,13 +4535,8 @@ class PythonWrapperCodegen(CodeGen):
                         ),
                     )
                 else:
-                    equals_1 = isinstance(
-                        arg, (int, sympy.Integer)
-                    ) and V.graph.sizevars.statically_known_equals(
-                        arg,
-                        1,  # type: ignore[arg-type]
-                    )
-                    add_arg(idx, SizeArg(key, arg), equals_1=equals_1)
+                    size_arg = SizeArg(key, arg)
+                    add_arg(idx, size_arg, equals_1=_arg_equals_1(size_arg))
 
         triton_signature = signature_to_meta(
             signature,
@@ -4693,6 +4690,12 @@ class PythonWrapperCodegen(CodeGen):
         inductor_meta["kernel_name"] = name
         triton_info_kernel_cls = self._get_triton_info_kernel_cls()
         inductor_meta.update(triton_info_kernel_cls.inductor_meta_common())
+        if inductor_meta.get(DISTRIBUTION_TILE) == LAUNCHER:
+            # User kernels opt in by declaring a runtime distribution_tile.
+            if triton_signature.get(DISTRIBUTION_TILE) in ("i32", "i64"):
+                inductor_meta[DISTRIBUTION_TILE] = CALLER
+            else:
+                del inductor_meta[DISTRIBUTION_TILE]
 
         as_code = self.defines_triton_kernels_as_code()
         compile_wrapper = IndentedBuffer()

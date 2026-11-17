@@ -71,6 +71,11 @@ from .hints import (
     TRITON_MAX_TENSOR_NUMEL,
     TritonMeta,
 )
+from .hip_pointer_attrs import (
+    first_tile,
+    omit_launcher_distribution_tile,
+    prepare_distribution_tile_launcher,
+)
 from .runtime_utils import (
     cache_dir,
     ceildiv,
@@ -2982,6 +2987,17 @@ class CompileResult(Generic[_T]):
         self, scope, def_args, runner_args, pre_runner_lines=None
     ) -> LauncherType:
         grid = GridExpr.from_meta(self.inductor_meta, self.config)
+        signature = self.compile_meta.get("signature") or {}
+        # Templates keep BLOCK_M etc. in config_args, not in config.kwargs.
+        known = {
+            **(self.inductor_meta.get("config_args") or {}),
+            **(getattr(self.config, "kwargs", None) or {}),
+        }
+        tile = first_tile(signature, known, self.compile_meta.get("constants"))
+        def_args, tile_lines = prepare_distribution_tile_launcher(
+            scope, def_args, runner_args, self.inductor_meta, signature, tile
+        )
+        pre_lines = [*(pre_runner_lines or []), *tile_lines]
         # grid.prefix is usually empty, grid.x_grid is something like `-(xnumel//-1024)`
         lines = [
             f"def launcher({', '.join(def_args)}, stream):",
@@ -2989,7 +3005,7 @@ class CompileResult(Generic[_T]):
             f"    grid_0 = {grid.x_grid}",
             f"    grid_1 = {grid.y_grid}",
             f"    grid_2 = {grid.z_grid}",
-            *(f"    {l}" for l in (pre_runner_lines or [])),
+            *(f"    {line}" for line in pre_lines),
             f"    runner({', '.join(runner_args)})",
         ]
         launcher_code = "\n".join(lines)
@@ -3539,6 +3555,7 @@ class TritonCompileResult(CompileResult[CompiledKernel]):
                     if compile_meta["signature"].get(x, "constexpr") != "constexpr"
                     and x not in none_args
                 ]
+            def_args = omit_launcher_distribution_tile(self.inductor_meta, def_args)
             launcher.def_args = def_args
             launcher.call_args = call_args
             kernel_metadata = getattr(self.kernel, "metadata", None)

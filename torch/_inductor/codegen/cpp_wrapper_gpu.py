@@ -32,6 +32,13 @@ from ..runtime.hints import (
     TRITON_DEFAULT_RSPLIT_SIZE,
     TritonMeta,
 )
+from ..runtime.hip_pointer_attrs import (
+    CPP_DISTRIBUTION_TILE,
+    cpp_distribution_tile_decl,
+    DISTRIBUTION_TILE,
+    LAUNCHER,
+    tile_cpp_expr,
+)
 from ..stream_utils import (
     AOTI_SUPPORTED_STREAM_OP_NAMES,
     AOTI_UNSUPPORTED_STREAM_OP_REASONS,
@@ -620,10 +627,14 @@ class DeferredTritonCallWrapper:
         declared_constexpr_names = OrderedSet(
             inductor_meta.get("declared_constexpr_names", [])
         )
+        tile_from_launcher = inductor_meta.get(DISTRIBUTION_TILE) == LAUNCHER
         wrapper_arg_names = []
         kernel_arg_names = []
         for name, sig_type in signature.items():
             if internal_config_re.search(name):
+                continue
+            if tile_from_launcher and name == DISTRIBUTION_TILE:
+                kernel_arg_names.append(name)  # filled at launch, not a wrapper arg
                 continue
             if sig_type != "constexpr":
                 kernel_arg_names.append(name)
@@ -775,7 +786,13 @@ class DeferredTritonCallWrapper:
         tma_arg_names = OrderedSet(self._get_tma_args().keys())
 
         kernel_args = []
+        device_ptr_vars: list[str] = []
+        tile_sig: str | None = None
         for arg_name in kernel_arg_names:
+            if arg_name == DISTRIBUTION_TILE and DISTRIBUTION_TILE in inductor_meta:
+                tile_sig = signature.get(arg_name) or "i32"
+                kernel_args.append(f"&{CPP_DISTRIBUTION_TILE}")
+                continue
             if arg_name in tma_arg_names:
                 kernel_args.extend(
                     _unpack_tma_descriptor_args(arg_name, signature[arg_name])
@@ -791,8 +808,15 @@ class DeferredTritonCallWrapper:
                     [arg_name],
                     [arg_type_lookup[arg_name]],
                     [signature.get(arg_name)],
+                    device_ptr_vars=device_ptr_vars,
                 )
             )
+        if tile_sig is not None:
+            # After the loop so the check sees every device pointer.
+            tile = tile_cpp_expr(
+                signature, lazy_kernel=self.kernel_name, inductor_meta=inductor_meta
+            )
+            prefix.splice(cpp_distribution_tile_decl(device_ptr_vars, tile_sig, tile))
 
         call_args_str = ", ".join(kernel_args)
         call_args_str = self._generate_lazy_scratch(prefix, wrapper, call_args_str)
@@ -1086,8 +1110,25 @@ class DeferredTritonCallWrapper:
         call_args = [
             name for name in params["call_args"] if name not in triton_meta["constants"]
         ]
-        arg_types = [arg_type_lookup[name] for name in call_args]
+        # Launcher mode keeps distribution_tile in call_args but not def_args.
+        arg_types = [
+            arg_type_lookup.get(name, int)
+            if name == DISTRIBUTION_TILE
+            else arg_type_lookup[name]
+            for name in call_args
+        ]
         arg_signatures = [triton_meta["signature"][name] for name in call_args]
+        inductor_meta = params.get("inductor_meta") or {}
+        distribution_tile = (
+            tile_cpp_expr(
+                triton_meta["signature"],
+                config=params.get("config") or {},
+                constants=triton_meta.get("constants"),
+                inductor_meta=inductor_meta,
+            )
+            if DISTRIBUTION_TILE in inductor_meta
+            else None
+        )
         num_ctas = params.get("config", {}).get("num_ctas", 1)
         scratch_spaces = {
             name: params[name] * num_ctas
@@ -1100,6 +1141,7 @@ class DeferredTritonCallWrapper:
             arg_types,
             arg_signatures,
             scratch_spaces=scratch_spaces,
+            distribution_tile=distribution_tile,
         )
         prefix.writeline(f"void* kernel_args_[] = {{{call_args_str}}};")
         num_warps = str(params["num_warps"])
@@ -1845,6 +1887,8 @@ static inline void ensure_triton_kernel_compiles_started() {{
         arg_signatures,
         is_triton_kernel=True,
         scratch_spaces: dict[str, int] | None = None,
+        device_ptr_vars: list[str] | None = None,
+        distribution_tile: str | None = None,
     ):
         """
         Generates any declarations of args to pass into a kernel call, and then returns the arg names.
@@ -1861,6 +1905,9 @@ static inline void ensure_triton_kernel_compiles_started() {{
                           arg injected at the front of the arg list.
         """
         new_args: list[str] = []
+        if device_ptr_vars is None:
+            device_ptr_vars = []
+        tile_sig: str | None = None
 
         def process_tma_stable_arg(arg, arg_type, arg_signature, var_name):
             # [Note: AOTI TMA Stable handling]
@@ -1898,6 +1945,7 @@ static inline void ensure_triton_kernel_compiles_started() {{
                         f"{device_ptr_type} {var_name} = reinterpret_cast<{device_ptr_type}>({arg}.data_ptr());"
                     )
                 )
+                device_ptr_vars.append(var_name)
                 new_args.append(f"&{var_name}")
             # For symbolic call arguments, examine the arg signatures from triton meta
             # to explicitly cast to the right type
@@ -1932,7 +1980,16 @@ static inline void ensure_triton_kernel_compiles_started() {{
         for arg, arg_type, arg_signature in zip_longest(
             call_args, arg_types, arg_signatures
         ):
-            process_args(arg, arg_type, arg_signature)
+            if distribution_tile is not None and arg == DISTRIBUTION_TILE:
+                tile_sig = arg_signature or "i32"
+                new_args.append(f"&{CPP_DISTRIBUTION_TILE}")
+            else:
+                process_args(arg, arg_type, arg_signature)
+        if tile_sig is not None:
+            # After the loop so the check sees every device pointer.
+            code.splice(
+                cpp_distribution_tile_decl(device_ptr_vars, tile_sig, distribution_tile)
+            )
 
         for scratch_name, workspace_size in (scratch_spaces or {}).items():
             if (

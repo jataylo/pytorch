@@ -11,6 +11,7 @@ from torch.utils._triton import has_triton_block_ptr
 
 from .. import config
 from ..runtime.hints import AttrsDescriptorWrapper, DeviceProperties
+from ..runtime.hip_pointer_attrs import DISTRIBUTION_TILE
 from ..utils import (
     _type_of,
     device_supports_fp64,
@@ -335,9 +336,19 @@ def is_unaligned_buffer(arg: TensorArg):
     return is_unaligned_buffer_name(arg.buffer)
 
 
+def _is_distribution_tile(arg: KernelArgType) -> bool:
+    # Its value is chosen per launch, so it must never get a value hint.
+    return (
+        isinstance(arg, SizeArg)
+        and arg.name == DISTRIBUTION_TILE
+        and config.rocm.pointer_slc
+    )
+
+
 def _arg_equals_1(arg: KernelArgType) -> bool:
     return (
         isinstance(arg, SizeArg)
+        and not _is_distribution_tile(arg)
         and isinstance(arg.expr, (int, sympy.Integer))
         and V.graph.sizevars.statically_known_equals(arg.expr, 1)  # type: ignore[arg-type]
     )
@@ -408,7 +419,7 @@ def config_of(
         if isinstance(x, SizeArg):
             # TODO(voz): These are kinda redundant, if we can solve out statically_known_multiple_of with
             # _maybe_evaluate_static...
-            if x.name.startswith("load_seed_offset"):
+            if x.name.startswith("load_seed_offset") or _is_distribution_tile(x):
                 return False
             if x.expr is None:
                 return False
