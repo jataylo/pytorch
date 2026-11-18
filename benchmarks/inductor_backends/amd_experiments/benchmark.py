@@ -171,7 +171,7 @@ def run_case(case, output, rounds, repeats):
                     family=case["family"],
                 )
                 source = "\n".join(code)
-                (folder / f"{variant}.py").write_text(source)
+                (folder / f"{variant}.source.txt").write_text(source)
                 if len(records) != 1:
                     raise RuntimeError(
                         f"Expected one compiled graph, got {len(records)}"
