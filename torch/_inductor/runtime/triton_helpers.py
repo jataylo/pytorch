@@ -910,6 +910,41 @@ def select_one(x, mask, dim, keep_dims=False):
 
 
 @triton.jit
+def _sum_scan_combine(left, right):
+    return left + right
+
+
+@triton.jit
+def associative_scan_in_chunks(values, axis: tl.constexpr, tile: tl.constexpr):
+    r"""associative_scan_in_chunks(values, axis, tile) -> tuple
+
+    Shorten additive FP32 scan chains by scanning independent chunks first.
+    """
+    value = values[0]
+    rows: tl.constexpr = value.shape[0]
+    width: tl.constexpr = value.shape[1]
+    if tile == 0 or tile >= width or value.dtype != tl.float32:
+        return tl.associative_scan(values, axis, _sum_scan_combine)
+    else:
+        chunks: tl.constexpr = width // tile
+        shaped = tl.reshape(value, (rows, chunks, tile))
+        (partial,) = tl.associative_scan((shaped,), 2, _sum_scan_combine)
+        last = tl.arange(0, tile) == tile - 1
+        totals = select_one(partial, last[None, None, :], 2)
+        (offsets,) = tl.associative_scan((totals,), 1, _sum_scan_combine)
+        index = tl.arange(0, chunks)
+        previous = tl.gather(
+            offsets,
+            tl.broadcast_to(tl.maximum(index - 1, 0)[None, :], (rows, chunks)),
+            1,
+        )
+        result = tl.where(
+            index[None, :, None] == 0, partial, partial + previous[:, :, None]
+        )
+        return (tl.reshape(result, (rows, width)),)
+
+
+@triton.jit
 def x_grid_barrier(sem):
     """
     Wait for all other thread blocks in grid sharing same y/z program_id

@@ -4376,6 +4376,44 @@ def _maybe_filter_configs_for_tma_restrictions(
     return configs
 
 
+def _amd_scan_configs(configs, size_hints, triton_meta, inductor_meta):
+    r"""_amd_scan_configs(configs, size_hints, triton_meta, inductor_meta) -> list
+
+    Compare scan dependency-chain lengths without changing launch geometry.
+    """
+    if not inductor_meta.get("amd_hierarchical_scan"):
+        return configs
+    if "amd_baseline_configs" in inductor_meta:
+        inductor_meta["amd_baseline_configs"] = [
+            dict(candidate, AMD_SCAN_TILE=0)
+            for candidate in inductor_meta["amd_baseline_configs"]
+        ]
+    wave = triton_meta["device"].warp_size_or_default
+    deterministic = any(
+        inductor_meta.get(key)
+        for key in (
+            "deterministic",
+            "force_filter_reduction_configs",
+            "are_deterministic_algorithms_enabled",
+        )
+    )
+    result = []
+    for config in configs:
+        width = config.kwargs.get("R0_BLOCK", size_hints["r0_"])
+        tiles = (
+            (0, wave, 4 * wave) if width >= 64 * wave and not deterministic else (0,)
+        )
+        for tile in tiles:
+            result.append(
+                Config(
+                    dict(config.kwargs, AMD_SCAN_TILE=tile),
+                    num_warps=config.num_warps,
+                    num_stages=config.num_stages,
+                )
+            )
+    return result
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4687,6 +4725,7 @@ def reduction(
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _amd_scan_configs(configs, size_hints, triton_meta, inductor_meta)
 
     if return_configs:
         return configs
@@ -4726,6 +4765,7 @@ def cooperative_reduction(
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _amd_scan_configs(configs, size_hints, triton_meta, inductor_meta)
     return cached_autotune(
         size_hints,
         configs=configs,
@@ -4812,6 +4852,7 @@ def persistent_reduction(
         )
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _amd_scan_configs(configs, size_hints, triton_meta, inductor_meta)
 
     if return_configs:
         return configs
@@ -4855,6 +4896,7 @@ def split_scan(
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+    configs = _amd_scan_configs(configs, size_hints, triton_meta, inductor_meta)
     return cached_autotune(
         size_hints,
         configs=configs,

@@ -94,6 +94,7 @@ from ..utils import (
 )
 from ..virtualized import _ops as ops, ReductionType, StoreMode, V
 from ..wrapper_benchmark import get_kernel_category_by_source_code
+from .amd_kernel_optimizations import supports_amd_kernel_optimizations
 from .block_analysis import BlockPatternMatcher
 from .common import (
     ArgName,
@@ -7221,6 +7222,16 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             **self.inductor_meta_common(),
         }
 
+        amd_optimizations = (
+            config.triton.amd_hierarchical_scan
+            and supports_amd_kernel_optimizations(triton_meta["device"])
+            and not (
+                config.deterministic
+                or config.batch_invariant
+                or torch.are_deterministic_algorithms_enabled()
+            )
+        )
+
         # Triton compiler includes equal_to_1 args into constants even
         # when they are not constexpr. otherwise there may be a segfault
         # during launching the Inductor-compiled Triton kernel.
@@ -7326,7 +7337,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 )
             )
 
-        return code.getvalue()
+        source = code.getvalue()
+        if amd_optimizations:
+            from .amd_kernel_optimizations import AMDCodegenSource, optimize_scan_source
+
+            placeholder = str(Placeholder.KERNEL_NAME)
+            source = source.replace(placeholder, "AMD_KERNEL_NAME")
+            source_context = AMDCodegenSource(source)
+            source = optimize_scan_source(source, _context=source_context)
+            source = source_context.emit()
+            source = source.replace("AMD_KERNEL_NAME", placeholder)
+        return source
 
     @staticmethod
     def _get_persistent_RBLOCK(rnumel):
