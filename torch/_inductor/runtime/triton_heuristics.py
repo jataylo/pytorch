@@ -54,6 +54,7 @@ from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
 from .coordinate_descent_tuner import CoordescTuner
 from .hints import (
+    AMDConfigLimits,
     AutotuneHint,
     DeviceProperties,
     HeuristicType,
@@ -4376,6 +4377,120 @@ def _maybe_filter_configs_for_tma_restrictions(
     return configs
 
 
+def _amd_native_seed_configs(size_hints, triton_meta, inductor_meta):
+    """Seed native Triton geometry without inheriting explicit-layout choices."""
+    limits = AMDConfigLimits.from_device(triton_meta["device"])
+    signature = triton_meta.get("signature", {})
+    widths = {
+        "fp64": 8,
+        "i64": 8,
+        "fp32": 4,
+        "i32": 4,
+        "bf16": 2,
+        "fp16": 2,
+        "i8": 1,
+        "i1": 1,
+    }
+    itemsize = max(
+        (
+            widths.get(dtype.lstrip("*"), 4)
+            for dtype in signature.values()
+            if isinstance(dtype, str) and dtype.startswith("*")
+        ),
+        default=4,
+    )
+    warps = [value for value in (1, 2, 4, 8) if value <= limits.max_warps]
+    configs = []
+    elements = max(1, 4 // itemsize)
+    for count in warps:
+        for per_thread in (1, 2, 4, 8):
+            block = count * limits.warp_size * per_thread * elements
+            if block > limits.max_tile or block > max(
+                limits.warp_size, size_hints["x"]
+            ):
+                continue
+            configs.append(Config({"XBLOCK": block}, num_warps=count, num_stages=1))
+    if "AMD_UNROLL" in signature:
+        for block in (1024, 2048, 4096):
+            if block > min(limits.max_tile, size_hints["x"]):
+                continue
+            for unroll in (2, 4):
+                for count in (1, 2, 4):
+                    if count <= limits.max_warps:
+                        configs.append(
+                            Config(
+                                {"XBLOCK": block, "AMD_UNROLL": unroll},
+                                num_warps=count,
+                                num_stages=1,
+                            )
+                        )
+    if "AMD_READ_ORDER" in signature:
+        configs += [
+            Config(
+                dict(candidate.kwargs, AMD_READ_ORDER=1),
+                num_warps=candidate.num_warps,
+                num_stages=candidate.num_stages,
+            )
+            for candidate in configs
+        ]
+    return configs
+
+
+def _amd_native_union_configs(stock, seeds, size_hints, triton_meta, inductor_meta):
+    """Retain legal baseline candidates and supply the specialized signature defaults."""
+    inductor_meta["amd_confirm_tuning"] = True
+    inductor_meta["amd_graph_tuning"] = True
+    limits = AMDConfigLimits.from_device(triton_meta["device"])
+    signature = triton_meta.get("signature", {})
+    defaults = {
+        name: value
+        for name, value in {
+            "AMD_UNROLL": 1,
+            "AMD_READ_ORDER": 0,
+            "AMD_TILE_M": 0,
+            "AMD_TILE_N": 0,
+            "AMD_SCAN_TILE": 0,
+        }.items()
+        if name in signature
+    }
+    result = []
+    seen = OrderedSet()
+    baseline = []
+    stock_keys = OrderedSet(
+        [(*sorted(c.kwargs.items()), c.num_warps, c.num_stages) for c in stock]
+    )
+    candidates = [*stock, *seeds]
+    for candidate in candidates:
+        if candidate.num_warps > limits.max_warps:
+            continue
+        keywords = {**defaults, **candidate.kwargs}
+        key = (*sorted(keywords.items()), candidate.num_warps, candidate.num_stages)
+        if key not in seen:
+            seen.add(key)
+            original_key = (
+                *sorted(candidate.kwargs.items()),
+                candidate.num_warps,
+                candidate.num_stages,
+            )
+            if original_key in stock_keys:
+                baseline.append(
+                    dict(
+                        keywords,
+                        num_warps=candidate.num_warps,
+                        num_stages=candidate.num_stages,
+                    )
+                )
+            result.append(
+                Config(
+                    keywords,
+                    num_warps=candidate.num_warps,
+                    num_stages=candidate.num_stages,
+                )
+            )
+    inductor_meta["amd_baseline_configs"] = baseline
+    return result
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4389,6 +4504,36 @@ def pointwise(
     Construct @triton.heuristics() based on size_hints.
     """
     inductor_meta = {} if inductor_meta is None else inductor_meta
+
+    if inductor_meta.get("amd_native_family"):
+        standard_meta = {
+            key: value
+            for key, value in inductor_meta.items()
+            if key != "amd_native_family"
+        }
+        stock = pointwise(
+            size_hints,
+            triton_meta,
+            tile_hint=tile_hint,
+            filename=filename,
+            min_elem_per_thread=min_elem_per_thread,
+            inductor_meta=standard_meta,
+            return_configs=True,
+        )
+        seeds = _amd_native_seed_configs(size_hints, triton_meta, inductor_meta)
+        configs = _amd_native_union_configs(
+            stock, seeds, size_hints, triton_meta, inductor_meta
+        )
+        if return_configs:
+            return configs
+        return cached_autotune(
+            size_hints,
+            configs,
+            triton_meta=triton_meta,
+            inductor_meta=inductor_meta,
+            heuristic_type=HeuristicType.POINTWISE,
+            filename=filename,
+        )
 
     configs = _handle_combo_kernel_per_subkernel_blocks(
         size_hints,
