@@ -7846,6 +7846,13 @@ def cumsum(x, axis=None, dtype=None):
         (b,) = b_tuple
         return (ops.add(a, b),)
 
+    if config.triton.amd_two_pass_scan:
+        from .kernel.amd_scan import two_pass_scan
+
+        result = two_pass_scan(x, axis, dtype)
+        if result is not None:
+            return result
+
     kwargs = _make_scan_inner(x, axis=axis, dtype=dtype)
     (result,) = ir.Scan.create(**kwargs, combine_fn=combine_fn)
     if result is None:

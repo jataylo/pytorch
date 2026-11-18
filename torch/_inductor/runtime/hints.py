@@ -264,6 +264,39 @@ class TritonMeta(typing.TypedDict, total=False):
     backend_options: dict[str, typing.Any]
 
 
+class AMDConfigLimits(typing.NamedTuple):
+    warp_size: int
+    max_warps: int
+    max_tile: int
+
+    @classmethod
+    def from_device(cls, device: DeviceProperties) -> AMDConfigLimits:
+        warp_size = device.warp_size_or_default
+        # Bound the supported compiler search as well as the hardware block size.
+        max_warps = min(16, (device.max_threads_per_block or 1024) // warp_size)
+        # Leave room for temporaries alongside the values in a reduction tile.
+        registers = device.regs_per_multiprocessor
+        max_tile = min(32768, registers // 4) if registers else 32768
+        return cls(warp_size, max_warps, max_tile)
+
+
+def amd_scan_parameters(
+    device: DeviceProperties, rows: int, width: int
+) -> tuple[int, int] | None:
+    if device.type != "hip" or device.multi_processor_count < 4:
+        return None
+    limits = AMDConfigLimits.from_device(device)
+    processors = device.multi_processor_count
+    if not 1 <= rows < processors // 4 or width < 4 * limits.max_tile:
+        return None
+    minimum = 32 * limits.warp_size
+    per_chunk = (width + 4 * processors - 1) // (4 * processors)
+    block = max(minimum, 1 << (per_chunk - 1).bit_length())
+    if block > 128 * limits.warp_size:
+        return None
+    return block, min(8, limits.max_warps)
+
+
 class InductorMeta(typing.TypedDict, total=False):
     """The inductor kernel-config / heuristics metadata bag.
 
