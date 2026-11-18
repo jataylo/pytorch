@@ -94,6 +94,11 @@ from ..utils import (
 )
 from ..virtualized import _ops as ops, ReductionType, StoreMode, V
 from ..wrapper_benchmark import get_kernel_category_by_source_code
+from .amd_kernel_optimizations import (
+    amd_persistent_reduction_eligible,
+    amd_reduction_value_bytes,
+    supports_amd_kernel_optimizations,
+)
 from .block_analysis import BlockPatternMatcher
 from .common import (
     ArgName,
@@ -3736,6 +3741,41 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         ):
             return True
         features = self.features.with_tiling_scores(self.tiling_scores)
+        if (
+            config.triton.amd_persistent_selection
+            and config.triton.persistent_reductions
+            and (
+                not (
+                    config.deterministic
+                    or config.batch_invariant
+                    or torch.are_deterministic_algorithms_enabled()
+                )
+            )
+            and (not self.cooperative_reduction)
+            and (features.get_reduction_hint() == ReductionHint.INNER)
+            and isinstance(features.reduction_numel, (sympy.Integer, int))
+            and (1024 < int(features.reduction_numel) <= 32768)
+        ):
+            device = DeviceProperties.create(V.graph.get_current_device_or_throw())
+            if supports_amd_kernel_optimizations(device):
+                reads = features.buffer_read_counts()
+                dtype_bytes = amd_reduction_value_bytes(
+                    (V.graph.get_dtype(name) for name in reads),
+                    (node.node.get_dtype() for node in features.reduction_nodes()),
+                )
+                rows = max(
+                    1, V.graph.sizevars.optimization_hint(features.numel, fallback=1)
+                )
+                if amd_persistent_reduction_eligible(
+                    device,
+                    rows,
+                    int(features.reduction_numel),
+                    input_count=len(reads),
+                    reduction_count=len(features.reduction_nodes()),
+                    dtype_bytes=dtype_bytes,
+                    compare=config.triton.amd_persistent_reduction_autotune,
+                ):
+                    return True
         return V.choices.should_use_persistent_reduction(
             features, self.cooperative_reduction
         )
@@ -8254,8 +8294,39 @@ class TritonScheduling(SIMDScheduling):
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
     ) -> list[TritonKernel]:
+        r"""add_multi_kernel_choices(kernel, kernel_args, kernel_kwargs) -> list[TritonKernel]
+
+        Retain compatible reduction implementations for :class:`MultiKernel` selection.
+        The AMD policy measures looped alternatives to eligible persistent kernels;
+        explicit multi-kernel configuration also retains the existing alternatives.
+
+        Args:
+            kernel (TritonKernel): Initial scheduled implementation.
+            kernel_args (list): Positional arguments for constructing alternatives.
+            kernel_kwargs (dict): Keyword arguments and required feature overrides.
+        """
         kernels: list[TritonKernel] = [kernel]
-        if not config.triton.multi_kernel:
+        amd_compare = (
+            config.triton.amd_persistent_selection
+            and config.triton.amd_persistent_reduction_autotune
+            and kernel.persistent_reduction
+            and (not kernel.cooperative_reduction)
+            and (not kernel.features.contains_op("sort"))
+            and (not kernel.features.get_mutations())
+            and isinstance(kernel.features.reduction_numel, (int, sympy.Integer))
+            and (1024 < int(kernel.features.reduction_numel) <= 32768)
+            and (
+                not (
+                    config.deterministic
+                    or config.batch_invariant
+                    or torch.are_deterministic_algorithms_enabled()
+                )
+            )
+            and supports_amd_kernel_optimizations(
+                DeviceProperties.create(V.graph.get_current_device_or_throw())
+            )
+        )
+        if not config.triton.multi_kernel and not amd_compare:
             return kernels
 
         optional_persistent = kernel.persistent_reduction and not kernel_kwargs.get(
