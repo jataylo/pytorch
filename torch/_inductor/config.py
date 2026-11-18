@@ -1900,6 +1900,11 @@ class triton:
     Config specific to codegen/triton.py
     """
 
+    amd_split_wide_reductions = True
+    amd_refine_wide_reductions = True
+
+    amd_wide_reduction_splits = False
+
     # torchTLX enablement. None (the default) means TLX is never considered
     # (standard Inductor behavior); "allow" lets TLX compete via autotuning;
     # "force" uses only TLX templates plus forced epilogue fusion. Also a

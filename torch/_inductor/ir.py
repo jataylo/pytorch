@@ -109,7 +109,7 @@ from .dependencies import (
 from .loop_body import LoopBody
 from .ops_handler import OpCounterCSE, OpCountResult, ReductionType, StoreMode
 from .runtime.benchmarking import benchmarker
-from .runtime.hints import DeviceProperties, ReductionHint
+from .runtime.hints import amd_wide_reduction_split, DeviceProperties, ReductionHint
 from .utils import (
     argsort,
     argsort_sym,
@@ -1382,6 +1382,11 @@ def get_reduction_combine_fn(
 
 @ir_dataclass
 class Reduction(Loops):
+    r"""Reduction(*args, **kwargs)
+
+    Represent a loop nest with pointwise and reduction dimensions.
+    """
+
     reduction_ranges: Sequence[_IntLike]
     reduction_type: ReductionType
     # self.dtype represents the dst dtype
@@ -1449,6 +1454,125 @@ class Reduction(Loops):
             src_dtype=self.src_dtype,
             reduction_hint=ReductionHint.DEFAULT,
         )
+
+    @staticmethod
+    def _are_independent_reductions(nodes: OrderedSet[torch.fx.Node]) -> bool:
+        r"""_are_independent_reductions(nodes) -> bool
+
+        Reject sequential statistics, including dependencies hidden by views.
+        """
+        if len(nodes) < 2:
+            return True
+        order = {n: i for i, n in enumerate(next(iter(nodes)).graph.nodes)}
+        first = min(order[n] for n in nodes)
+        for source in nodes:
+            pending = list(source.all_input_nodes)
+            seen = OrderedSet()
+            while pending:
+                parent = pending.pop()
+                if parent in nodes:
+                    return False
+                if parent in seen or order[parent] < first:
+                    continue
+                if len(seen) >= 64:
+                    return False
+                seen.add(parent)
+                pending.extend(parent.all_input_nodes)
+        return True
+
+    @staticmethod
+    def _has_coupled_broadcast_epilogue(
+        node: torch.fx.Node | None, elements: int, rows: int, multi_output: bool
+    ) -> bool:
+        r"""_has_coupled_broadcast_epilogue(node, elements, rows, multi_output) -> bool
+
+        Require two row statistics feeding common full-size pointwise work.
+        """
+        if not isinstance(node, torch.fx.Node):
+            return False
+        pending = list(node.users)
+        seen = OrderedSet()
+        epilogues = []
+        while pending and len(seen) < 64:
+            user = pending.pop()
+            if user in seen or user.op != "call_function":
+                continue
+            seen.add(user)
+            pointwise = torch.Tag.pointwise in getattr(user.target, "tags", ())
+            value = user.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            count = value.numel()
+            if not isinstance(count, int) or count not in (rows, elements):
+                continue
+            if any(
+                torch.Tag.reduction in getattr(child.target, "tags", ())
+                for child in user.users
+            ):
+                continue
+            if pointwise and count == elements:
+                epilogues.append(user)
+            if (
+                pointwise
+                or user.target is operator.getitem
+                or getattr(user.target, "is_view", False)
+            ):
+                pending.extend(user.users)
+        for epilogue in reversed(epilogues):
+            pending = [epilogue]
+            seen = OrderedSet()
+            statistics = OrderedSet()
+            while pending and len(seen) < 64:
+                user = pending.pop()
+                if user in seen or user.op != "call_function":
+                    continue
+                seen.add(user)
+                tags = getattr(user.target, "tags", ())
+                value = user.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    continue
+                count = value.numel()
+                if not isinstance(count, int) or count not in (rows, elements):
+                    continue
+                producer = user
+                output = 0
+                if (
+                    user.target is operator.getitem
+                    and isinstance(user.args[0], torch.fx.Node)
+                    and isinstance(user.args[1], int)
+                    and isinstance(user.args[0].meta.get("val"), (tuple, list))
+                ):
+                    producer = user.args[0]
+                    output = user.args[1]
+                reduction = torch.Tag.reduction in getattr(producer.target, "tags", ())
+                if producer is node or reduction:
+                    if (
+                        count == rows
+                        and value.dtype
+                        in (torch.float16, torch.bfloat16, torch.float32)
+                        and (producer is user or producer is not node or multi_output)
+                    ):
+                        statistics.add((producer, output))
+                        if len(statistics) >= 2 and any(
+                            stat is node for stat, _ in statistics
+                        ):
+                            producers = OrderedSet(stat for stat, _ in statistics)
+                            if Reduction._are_independent_reductions(producers):
+                                return True
+                            break
+                    continue
+                if any(
+                    torch.Tag.reduction in getattr(child.target, "tags", ())
+                    for child in user.users
+                ):
+                    continue
+                if (
+                    torch.Tag.pointwise in tags
+                    or user.target is operator.getitem
+                    or getattr(user.target, "is_view", False)
+                ):
+                    pending.extend(user.all_input_nodes)
+        return False
 
     @staticmethod
     def num_splits(
@@ -1574,7 +1698,29 @@ class Reduction(Loops):
             reduction_hint=ReductionHint.DEFAULT,
         )
 
+        wide_native = (
+            config.triton.amd_wide_reduction_splits
+            and config.triton.amd_split_wide_reductions
+            and torch.version.hip is not None
+            and is_triton(device)
+            and should_split
+            and reduction_type in ("sum", "online_softmax_reduce")
+            and src_dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and isinstance(reduction_numel, sympy.Integer)
+            and isinstance(numel, sympy.Integer)
+            and amd_wide_reduction_split(props, reduction_numel_hint, numel_hint, 1) > 1
+            and Reduction._has_coupled_broadcast_epilogue(
+                V.graph.current_node,
+                reduction_numel_hint * numel_hint,
+                numel_hint,
+                reduction_type == "online_softmax_reduce",
+            )
+        )
+
+        has_row_parameter = False
+
         def get_read_indices(r: Reduction) -> tuple[Sequence[Expr], bool]:
+            nonlocal has_row_parameter
             device = r.get_device()
             if device is None:
                 raise AssertionError("Expected device is not None")
@@ -1618,6 +1764,7 @@ class Reduction(Loops):
                 is_broadcasted_reduction_read = not is_full_size_read and any(
                     var in free_symbols for var in reduction_vars
                 )
+                has_row_parameter |= wide_native and is_broadcasted_reduction_read
                 if is_full_size_read:
                     indices.append(md.index)
                 elif is_broadcasted_reduction_read:
@@ -1642,6 +1789,9 @@ class Reduction(Loops):
         (_, reduction_vars), ranges1 = dependencies.index_vars_squeeze(
             r.get_size(), r.get_reduction_size()
         )
+        wide_native = wide_native and (
+            reduction_type == "online_softmax_reduce" or has_row_parameter
+        )
         num_outer = 0
         num_inner = 0
         for i in indices:
@@ -1651,15 +1801,24 @@ class Reduction(Loops):
             )
             # A 0 stride does not make a reduction contiguous.
             # This can happen when the reduction ranges contains a 1.
+            if wide_native and all(s == 0 for s in strides):
+                continue
             outer = all(s == 0 or s > 1 for s in strides)
             if outer:
                 num_outer += 1
             else:
                 num_inner += 1
         if num_inner > num_outer:
-            return ReductionHint.INNER, inner_reduction_splits(
-                reduction_numel_hint, numel_hint
-            )
+            split = inner_reduction_splits(reduction_numel_hint, numel_hint)
+            if wide_native:
+                split = amd_wide_reduction_split(
+                    props,
+                    reduction_numel_hint,
+                    numel_hint,
+                    split,
+                    refine=config.triton.amd_refine_wide_reductions,
+                )
+            return ReductionHint.INNER, split
         else:
             return ReductionHint.OUTER, outer_reduction_splits(
                 reduction_numel_hint, numel_hint
