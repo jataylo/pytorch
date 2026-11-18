@@ -36,7 +36,7 @@ Every compiler source fingerprint and generated-source hash was checked against 
 
 ## Review and eventual upstream extraction
 
-The support branch contains only the benchmark harness. Each feature branch contains one lowering concept in the next commit, with experiments and receipts included as requested. For an upstream PR, retain the `torch/_inductor/` changes and focused `test/inductor/` files from that feature; remove the experimental result artifacts and decide where to place permanent benchmark coverage. Shared hardware-sizing and AST utility definitions are repeated in independent branches so none requires another optimization. Deduplicate those helpers when stacking or merging multiple concepts; do not blindly cherry-pick all sibling commits into one tree.
+The support branch contains only the benchmark harness. Each feature branch contains one lowering concept in the next commit, with experiments included as requested; a follow-up artifacts-only commit preserves generated sources and test logs that Git otherwise ignores. For an upstream PR, retain the `torch/_inductor/` changes and focused `test/inductor/` files from that feature; remove the experimental result artifacts and decide where to place permanent benchmark coverage. Shared hardware-sizing and AST utility definitions are repeated in independent branches so none requires another optimization. Deduplicate those helpers when stacking or merging multiple concepts; do not blindly cherry-pick all sibling commits into one tree.
 
 ## 1) wide-reduction-splits
 
@@ -150,17 +150,17 @@ Focused results: [RESULTS.md](results/per_concept/two-pass-scan/RESULTS.md).
 
 | Feature | Commit | GPU-suite tests |
 |---|---|---:|
-| `pointwise-subtiling` | `c5f46fe6fda8` | 2 |
-| `row-packing` | `aca7003a37d9` | 16 |
-| `transpose-tiling` | `7b72ef33ae38` | 89 |
-| `reduction-indexing` | `d76c1f96ece9` | 5 |
-| `persistent-selection` | `ef9e80393969` | 7 |
-| `wide-reduction-splits` | `aa3b9d7c1ade` | 58 |
-| `hierarchical-scan` | `ba5862b444e4` | 47 |
-| `two-pass-scan` | `16caa13b2259` | 26 |
-| `kernel-selection` | `90da7ded07aa` | 10 |
+| `pointwise-subtiling` | `3f681c158ec7` | 2 |
+| `row-packing` | `d95521e7efee` | 16 |
+| `transpose-tiling` | `149f2ea10950` | 89 |
+| `reduction-indexing` | `afca243d1c25` | 5 |
+| `persistent-selection` | `13688511f6ed` | 7 |
+| `wide-reduction-splits` | `d0419d691be2` | 58 |
+| `hierarchical-scan` | `3d1b7be9d527` | 47 |
+| `two-pass-scan` | `cdb219571b8a` | 26 |
+| `kernel-selection` | `c1edfcef828b` | 10 |
 
-The support head is `a6f1fe74111`. `branches.json` records complete hashes, worktrees and compiler file lists. All feature worktrees are committed independently.
+The support head is `a6f1fe74111`. `branches.json` records complete branch-head and lowering-commit hashes, worktrees and compiler file lists. All feature worktrees are committed independently.
 
 ## Reproduction and publication
 
