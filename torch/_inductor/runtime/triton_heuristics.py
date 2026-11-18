@@ -54,6 +54,7 @@ from .autotune_cache import AutotuneCache
 from .benchmarking import benchmarker
 from .coordinate_descent_tuner import CoordescTuner
 from .hints import (
+    AMDConfigLimits,
     AutotuneHint,
     DeviceProperties,
     HeuristicType,
@@ -1789,6 +1790,31 @@ class CachingAutotuner(KernelInterface):
         autotuning_inputs_log.debug("=" * 60)
 
     def benchmark_all_configs(self, *args, **kwargs):
+        r"""benchmark_all_configs(*args, **kwargs) -> dict
+
+        Measure eligible AMD configurations with bounded tuning, or benchmark existing launchers.
+        """
+        if (
+            self.inductor_meta.get("amd_kernel_autotune")
+            and (
+                not self.inductor_meta.get("atomic_add_found")
+                or self.inductor_meta.get("amd_allow_atomic_tuning")
+            )
+            and not any(
+                self.inductor_meta.get(name)
+                for name in (
+                    "tma_min_block_sizes",
+                    "host_tma_descriptor_args",
+                    "combo_grid_meta",
+                )
+            )
+            and all("XBLOCK" in launcher.config.kwargs for launcher in self.launchers)
+        ):
+            from .amd_autotune import tune
+
+            timings = tune(self, args, kwargs)
+            if timings is not None:
+                return timings
         with (
             dynamo_timed(
                 "CachingAutotuner.benchmark_all_configs",
@@ -2250,6 +2276,8 @@ class CachingAutotuner(KernelInterface):
     @functools.cached_property
     def _should_coordesc_tune(self) -> bool:
         """Whether this autotuner is eligible for coordinate descent tuning."""
+        if self.inductor_meta.get("amd_kernel_autotune"):
+            return False
         if self.heuristic_type in (
             HeuristicType.TEMPLATE,
             HeuristicType.USER_AUTOTUNE,
@@ -4376,6 +4404,90 @@ def _maybe_filter_configs_for_tma_restrictions(
     return configs
 
 
+def _amd_reduction_seed_feasible(tile, num_warps, device, inductor_meta, *, itemsize=4):
+    """Bound estimated live values in added configurations; stock configs bypass this."""
+    registers = device.regs_per_multiprocessor
+    if not registers:
+        return True
+    limits = AMDConfigLimits.from_device(device)
+    max_threads = device.max_threads_per_block or limits.warp_size * limits.max_warps
+    live_values = (
+        2
+        + max(1, inductor_meta.get("num_load", 1))
+        + min(4, inductor_meta.get("num_reduction", 1))
+    )
+    itemsize = inductor_meta.get("amd_reduction_value_bytes", itemsize)
+    live_values *= max(1, (itemsize + 3) // 4)
+    # Allow factor-two slack for compiler reuse in this seed-only estimate.
+    register_budget = 2 * registers // max_threads
+    return tile * live_values <= register_budget * num_warps * limits.warp_size
+
+
+def _amd_reduction_configs(configs, size_hints, inductor_meta, device, *, persistent):
+    if (
+        not inductor_meta.get("amd_reduction_tuning")
+        or OrderedSet(size_hints) != OrderedSet(["x", "r0_"])
+        or inductor_meta.get("RSPLIT_SIZE")
+        or inductor_meta.get("deterministic")
+    ):
+        return configs
+    limits = AMDConfigLimits.from_device(device)
+    inductor_meta["amd_baseline_configs"] = [
+        dict(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages) for c in configs
+    ]
+    extra = []
+    if persistent:
+        for x, warps in [(1, 1), (2, 2), (4, 1), (4, 2), (8, 2), (8, 4), (16, 1)]:
+            if x <= size_hints["x"] and x * size_hints["r0_"] <= limits.max_tile:
+                extra.append(Config({"XBLOCK": x}, num_warps=warps, num_stages=1))
+    else:
+        for x, r, warps in [
+            (1, 512, 8),
+            (1, 1024, 4),
+            (1, 2048, 4),
+            (1, 4096, 8),
+            (1, 8192, 8),
+            (32, 64, 4),
+            (32, 64, 8),
+        ]:
+            if x <= size_hints["x"] and r <= size_hints["r0_"]:
+                extra.append(
+                    Config({"XBLOCK": x, "R0_BLOCK": r}, num_warps=warps, num_stages=1)
+                )
+    if inductor_meta.get("amd_confirm_tuning") and not persistent:
+        extra += [
+            Config({"XBLOCK": x, "R0_BLOCK": r}, num_warps=warps, num_stages=1)
+            for x, r, warps in [
+                (32, 32, 4),
+                (64, 32, 4),
+                (128, 32, 4),
+                (64, 64, 8),
+                (128, 64, 8),
+                (256, 32, 8),
+            ]
+            if x <= size_hints["x"] and r <= size_hints["r0_"]
+        ]
+    seen = OrderedSet(
+        [(*sorted(c.kwargs.items()), c.num_warps, c.num_stages) for c in configs]
+    )
+    result = list(configs)
+    for cfg in extra:
+        tile = cfg.kwargs["XBLOCK"] * cfg.kwargs.get("R0_BLOCK", size_hints["r0_"])
+        if cfg.num_warps > limits.max_warps or tile > limits.max_tile:
+            continue
+        if inductor_meta.get(
+            "amd_resource_aware_tuning"
+        ) and not _amd_reduction_seed_feasible(
+            tile, cfg.num_warps, device, inductor_meta
+        ):
+            continue
+        key = (*sorted(cfg.kwargs.items()), cfg.num_warps, cfg.num_stages)
+        if key not in seen:
+            seen.add(key)
+            result.append(cfg)
+    return result
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4686,6 +4798,9 @@ def reduction(
     )
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
+    configs = _amd_reduction_configs(
+        configs, size_hints, inductor_meta, triton_meta["device"], persistent=False
+    )
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
     if return_configs:
@@ -4811,6 +4926,9 @@ def persistent_reduction(
             inductor_meta=inductor_meta,
         )
 
+    configs = _amd_reduction_configs(
+        configs, size_hints, inductor_meta, triton_meta["device"], persistent=True
+    )
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
 
     if return_configs:
