@@ -1382,11 +1382,19 @@ def get_reduction_combine_fn(
 
 @ir_dataclass
 class Reduction(Loops):
+    r"""Reduction(*args, **kwargs)
+
+    Represent a loop nest with pointwise and reduction dimensions.
+    """
+
     reduction_ranges: Sequence[_IntLike]
     reduction_type: ReductionType
     # self.dtype represents the dst dtype
     src_dtype: torch.dtype
     reduction_hint: ReductionHint
+
+    # Bound local FX proofs independently of total graph size.
+    _EPILOGUE_NODE_LIMIT: ClassVar[int] = 64
 
     def __str__(self) -> str:
         return self._to_str(("ranges", "reduction_ranges", "reduction_type"))
@@ -1451,6 +1459,138 @@ class Reduction(Loops):
         )
 
     @staticmethod
+    def _are_independent_reductions(nodes: OrderedSet[torch.fx.Node]) -> bool:
+        if len(nodes) < 2:
+            return True
+        limit = Reduction._EPILOGUE_NODE_LIMIT
+        first = min(nodes)
+        for source in nodes:
+            if len(source._input_nodes) > limit:
+                return False
+            pending = source.all_input_nodes
+            seen = OrderedSet()
+            while pending:
+                parent = pending.pop()
+                if parent in nodes:
+                    return False
+                if parent in seen or parent < first:
+                    continue
+                if len(seen) >= limit:
+                    return False
+                seen.add(parent)
+                if len(pending) + len(parent._input_nodes) > limit:
+                    return False
+                pending.extend(parent.all_input_nodes)
+        return True
+
+    @staticmethod
+    def _has_coupled_broadcast_epilogue(
+        node: torch.fx.Node | None, elements: int, rows: int, multi_output: bool
+    ) -> bool:
+        # Peer statistics may reduce different widths if their row outputs feed
+        # the same full-size pointwise epilogue.
+        limit = Reduction._EPILOGUE_NODE_LIMIT
+        if not isinstance(node, torch.fx.Node) or len(node.users) > limit:
+            return False
+        pending = list(node.users)
+        seen = OrderedSet()
+        epilogues = []
+        while pending and len(seen) < limit:
+            user = pending.pop()
+            if user in seen or user.op != "call_function":
+                continue
+            seen.add(user)
+            if len(user.users) > limit:
+                return False
+            pointwise = torch.Tag.pointwise in getattr(user.target, "tags", ())
+            value = user.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            count = value.numel()
+            if not isinstance(count, int) or count not in (rows, elements):
+                continue
+            if any(
+                torch.Tag.reduction in getattr(child.target, "tags", ())
+                for child in user.users
+            ):
+                continue
+            if pointwise and count == elements:
+                epilogues.append(user)
+            if (
+                pointwise
+                or user.target is operator.getitem
+                or getattr(user.target, "is_view", False)
+            ):
+                if len(pending) + len(user.users) > limit:
+                    return False
+                pending.extend(user.users)
+        budget = 2 * limit
+        for epilogue in reversed(epilogues):
+            pending = [epilogue]
+            seen = OrderedSet()
+            statistics = OrderedSet()
+            while pending and budget:
+                user = pending.pop()
+                if user in seen or user.op != "call_function":
+                    continue
+                seen.add(user)
+                budget -= 1
+                tags = getattr(user.target, "tags", ())
+                value = user.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    continue
+                count = value.numel()
+                if not isinstance(count, int) or count not in (rows, elements):
+                    continue
+                producer = user
+                output = 0
+                if (
+                    user.target is operator.getitem
+                    and isinstance(user.args[0], torch.fx.Node)
+                    and isinstance(user.args[1], int)
+                    and isinstance(user.args[0].meta.get("val"), (tuple, list))
+                ):
+                    producer = user.args[0]
+                    output = user.args[1]
+                reduction = torch.Tag.reduction in getattr(producer.target, "tags", ())
+                if producer is node or reduction:
+                    if producer is not node and producer.target not in (
+                        torch.ops.aten.sum.dim_IntList,
+                        torch.ops.aten.mean.dim,
+                        torch.ops.prims.sum.default,
+                    ):
+                        continue
+                    if (
+                        count == rows
+                        and value.dtype
+                        in (torch.float16, torch.bfloat16, torch.float32)
+                        and (producer is user or producer is not node or multi_output)
+                    ):
+                        statistics.add((producer, output))
+                        if len(statistics) >= 2 and any(
+                            stat is node for stat, _ in statistics
+                        ):
+                            producers = OrderedSet(stat for stat, _ in statistics)
+                            return Reduction._are_independent_reductions(producers)
+                    continue
+                if len(user.users) > limit:
+                    return False
+                if any(
+                    torch.Tag.reduction in getattr(child.target, "tags", ())
+                    for child in user.users
+                ):
+                    continue
+                if (
+                    torch.Tag.pointwise in tags
+                    or user.target is operator.getitem
+                    or getattr(user.target, "is_view", False)
+                ):
+                    if len(pending) + len(user._input_nodes) > limit:
+                        return False
+                    pending.extend(user.all_input_nodes)
+        return False
+
+    @staticmethod
     def num_splits(
         device: torch.device,
         dst_dtype: torch.dtype,
@@ -1506,6 +1646,17 @@ class Reduction(Loops):
 
         props = DeviceProperties.create(device)
         num_sm = props.multi_processor_count
+        wide_reduction = (
+            should_split
+            and reduction_type in ("sum", "online_softmax_reduce")
+            and config.triton.wide_reduction_splits
+            and src_dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and dst_dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and isinstance(numel, sympy.Integer)
+            and isinstance(reduction_numel, sympy.Integer)
+            and is_gpu(device.type)
+            and is_triton(device)
+        )
         min_elements_per_thread = 32
         if should_split:
             inner_reduction_splits: Callable[[int, int], int] = functools.partial(
@@ -1530,6 +1681,7 @@ class Reduction(Loops):
             if split == 1:
                 # No need to split.
                 return ReductionHint.INNER, split
+            input_rows: Expr | None = None
             if input_node is not None and isinstance(input_node, TensorBox):
                 with patch.object(FlexibleLayout, "allow_indexing", True):
                     (
@@ -1537,6 +1689,7 @@ class Reduction(Loops):
                         new_reduction_ranges,
                     ) = extract_input_node_reduction_ranges(input_node)
                 if new_ranges is not None and new_reduction_ranges is not None:
+                    input_rows = sympy_product(new_ranges)
                     extracted_numel_hint = (
                         V.graph.sizevars.replace_backed_symbols_with_hints(
                             sympy_product(new_ranges + new_reduction_ranges)
@@ -1556,6 +1709,23 @@ class Reduction(Loops):
                         # If the input_node or its dependent nodes are also Reduction nodes,
                         # use reduction_sizes of this node or its dependent nodes directly.
                         return ReductionHint.INNER, -1
+            if (
+                wide_reduction
+                and reduction_type == "sum"
+                and len(reduction_ranges) > 1
+                and all(isinstance(size, sympy.Integer) for size in reduction_ranges)
+            ):
+                width = int(reduction_ranges[-1])
+                if (
+                    width > 0
+                    and input_rows is not None
+                    and V.graph.sizevars.statically_known_equals(
+                        input_rows, reduction_numel_hint // width
+                    )
+                ):
+                    split = V.choices.scalar_reduction_split_factor(
+                        device, width, reduction_numel_hint // width, split
+                    )
             return ReductionHint.INNER, split
         if (
             reduction_numel_hint <= min_elements_per_thread
@@ -1643,7 +1813,7 @@ class Reduction(Loops):
             r.get_size(), r.get_reduction_size()
         )
         num_outer = 0
-        num_inner = 0
+        num_broadcast = 0
         for i in indices:
             j = V.graph.sizevars.simplify_with_ranges(i, ranges1)
             strides = V.graph.sizevars.stride_hints(
@@ -1651,19 +1821,42 @@ class Reduction(Loops):
             )
             # A 0 stride does not make a reduction contiguous.
             # This can happen when the reduction ranges contains a 1.
-            outer = all(s == 0 or s > 1 for s in strides)
-            if outer:
-                num_outer += 1
-            else:
-                num_inner += 1
+            if wide_reduction:
+                num_broadcast += all(s == 0 for s in strides)
+            num_outer += all(s == 0 or s > 1 for s in strides)
+        num_inner = len(indices) - num_outer
+        inner_split = None
+        if (
+            wide_reduction
+            and num_inner > num_outer - num_broadcast
+            and (
+                num_inner > num_outer
+                or V.choices._can_refine_outer_reduction(
+                    device, reduction_numel_hint, numel_hint
+                )
+            )
+        ):
+            inner_split = inner_reduction_splits(reduction_numel_hint, numel_hint)
+            wide_split = V.choices.coupled_reduction_split_factor(
+                device, reduction_numel_hint, numel_hint, inner_split
+            )
+            if wide_split > inner_split and Reduction._has_coupled_broadcast_epilogue(
+                V.graph.current_node,
+                reduction_numel_hint * numel_hint,
+                numel_hint,
+                reduction_type == "online_softmax_reduce",
+            ):
+                return ReductionHint.INNER, wide_split
         if num_inner > num_outer:
-            return ReductionHint.INNER, inner_reduction_splits(
-                reduction_numel_hint, numel_hint
+            split = (
+                inner_split
+                if inner_split is not None
+                else inner_reduction_splits(reduction_numel_hint, numel_hint)
             )
-        else:
-            return ReductionHint.OUTER, outer_reduction_splits(
-                reduction_numel_hint, numel_hint
-            )
+            return ReductionHint.INNER, split
+        return ReductionHint.OUTER, outer_reduction_splits(
+            reduction_numel_hint, numel_hint
+        )
 
     @staticmethod
     def _unroll_reduction_fn(

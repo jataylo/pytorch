@@ -30,7 +30,7 @@ from .metrics import get_metric_table, is_metric_table_enabled
 from .runtime.hints import DeviceProperties, ReductionHint
 from .scheduler import BaseSchedulerNode, Scheduler, WhyNoFuse
 from .select_algorithm import ExternKernelChoice
-from .utils import _use_autotune_backend
+from .utils import _use_autotune_backend, is_gpu
 from .virtualized import V
 
 
@@ -617,6 +617,100 @@ class InductorChoices:
             return (reduction_numel_hint + rvals_per_thread * split_size - 1) // (
                 rvals_per_thread * split_size
             )
+
+    def _wide_reduction_resources(
+        self, device: torch.device, width: int, rows: int
+    ) -> tuple[int, int] | None:
+        if (
+            not is_gpu(device.type)
+            or not config.triton.wide_reduction_splits
+            or config.batch_invariant
+            or config.deterministic
+            or torch.are_deterministic_algorithms_enabled()
+        ):
+            return None
+        # Existing subclass policies retain authority unless they implement the new hooks.
+        if (
+            type(self).reduction_split_factor
+            is not InductorChoices.reduction_split_factor
+        ):
+            return None
+        props = DeviceProperties.create(device)
+        processors = props.multi_processor_count
+        warp = props.warp_size
+        if (
+            not isinstance(processors, int)
+            or processors <= 0
+            or not isinstance(warp, int)
+            or warp <= 0
+            or rows < 2
+            or rows * 4 >= processors
+        ):
+            return None
+        # Keep at least eight work grains before increasing row parallelism.
+        grain = 64 * warp
+        return (processors, grain) if width >= 8 * grain else None
+
+    def _can_refine_outer_reduction(
+        self, device: torch.device, width: int, rows: int
+    ) -> bool:
+        # Only query a speculative inner split when a policy can use it.
+        return (
+            type(self).coupled_reduction_split_factor
+            is not InductorChoices.coupled_reduction_split_factor
+            or self._wide_reduction_resources(device, width, rows) is not None
+        )
+
+    def coupled_reduction_split_factor(
+        self,
+        device: torch.device,
+        reduction_numel: int,
+        numel: int,
+        original_split: int,
+    ) -> int:
+        r"""coupled_reduction_split_factor(device, reduction_numel, numel, original_split) -> int
+
+        Refine the legacy inner split for logical rows with coupled epilogues.
+        Scalar reductions can use the same policy for their trailing-axis rows.
+        """
+        if original_split < 1:
+            return original_split
+        resources = self._wide_reduction_resources(device, reduction_numel, numel)
+        if resources is None:
+            return original_split
+        processors, grain = resources
+        # Target two logical partitions per processor, rounded to a power of two.
+        target = next_power_of_2((2 * processors + numel - 1) // numel)
+        # Ceil preserves a small masked tail instead of doubling the padded Triton tile.
+        work_limit = (reduction_numel + grain - 1) // grain
+        split = min(target, work_limit)
+        # Avoid expanding a substantial legacy grid toward four logical partitions per processor.
+        if numel * original_split * 2 >= processors and numel * split > 3 * processors:
+            split = min(split, next_power_of_2((processors + numel - 1) // numel))
+        return max(original_split, split)
+
+    def scalar_reduction_split_factor(
+        self,
+        device: torch.device,
+        width: int,
+        rows: int,
+        original_split: int,
+    ) -> int:
+        r"""scalar_reduction_split_factor(device, width, rows, original_split) -> int
+
+        Tile an already-split scalar sum using its logical trailing-axis rows.
+        Matching launch geometry permits first-stage fusion with row reductions.
+        """
+        if (
+            original_split <= 1
+            or self._wide_reduction_resources(device, width, rows) is None
+        ):
+            return original_split
+        previous = self.reduction_split_factor(device, width, rows, True)
+        partition = self.coupled_reduction_split_factor(device, width, rows, previous)
+        if partition <= previous:
+            return original_split
+        return max(original_split, rows * partition)
 
     @staticmethod
     def can_fuse(

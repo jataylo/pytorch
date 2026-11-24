@@ -92,6 +92,7 @@ from torch.testing._internal.common_cuda import (
 from torch.testing._internal.common_device_type import (
     e4m3_type,
     expectedFailureXPU,
+    instantiate_device_type_tests,
     largeTensorTest,
 )
 from torch.testing._internal.common_dtype import (
@@ -383,6 +384,125 @@ class TestCase(InductorTestCase):
             elapsed = time.perf_counter() - self._start
             if elapsed >= 120:
                 raise AssertionError(f"Test took too long: {elapsed:.1f}s >= 120s")
+
+
+@instantiate_parametrized_tests
+class TestWideReductionSplits(TestCase):
+    @config.patch({"triton.wide_reduction_splits": True})
+    def test_wide_reduction_split_policy(self):
+        from torch._inductor.choices import InductorChoices
+        from torch._inductor.runtime.hints import DeviceProperties
+
+        choices = InductorChoices()
+        device = torch.device("cuda")
+        props = DeviceProperties("cuda", 0, 256, "test", warp_size=64)
+        with patch.object(DeviceProperties, "create", return_value=props):
+            choose = choices.coupled_reduction_split_factor
+            self.assertEqual(choose(device, 65537, 8, 2), 17)
+            self.assertEqual(choose(device, 65537, 63, 3), 8)
+            self.assertEqual(choose(device, 65537, 64, 3), 3)
+            self.assertEqual(
+                choices.scalar_reduction_split_factor(device, 65537, 8, 2), 136
+            )
+            with config.patch(deterministic=True):
+                self.assertEqual(choose(device, 65537, 8, 2), 2)
+            with config.patch({"triton.wide_reduction_splits": False}):
+                self.assertEqual(choose(device, 65537, 8, 2), 2)
+
+    @parametrize("independent", [True, False])
+    def test_wide_reduction_epilogue(self, independent):
+        from torch._inductor.ir import Reduction
+
+        def fn(x):
+            mean = x.mean(-1, keepdim=True)
+            values = x if independent else x - mean
+            return x - mean - values.square().mean(-1, keepdim=True)
+
+        x = torch.empty(8, 65537, device="meta")
+        graph = make_fx(fn)(x).graph
+        first = next(n for n in graph.nodes if n.target == torch.ops.aten.mean.dim)
+        self.assertEqual(
+            Reduction._has_coupled_broadcast_epilogue(
+                first, x.numel(), x.size(0), False
+            ),
+            independent,
+        )
+
+
+class TestWideReductionLowering(TestCase):
+    @requires_cuda_and_triton
+    @config.patch(
+        {
+            "triton.wide_reduction_splits": True,
+            "triton.cooperative_reductions": False,
+            "fx_graph_cache": False,
+        }
+    )
+    def test_wide_reduction_coupled_sums(self, device):
+        from torch._inductor.choices import InductorChoices
+        from torch._inductor.ir import Reduction
+
+        def fn(x):
+            return x - x.mean(-1, keepdim=True) - x.square().mean(-1, keepdim=True)
+
+        x = torch.randn(8, 65537, device=device)
+        rows, width = x.shape
+        choices = InductorChoices()
+        original = choices.reduction_split_factor(x.device, width, rows, True)
+        expected = choices.coupled_reduction_split_factor(
+            x.device, width, rows, original
+        )
+        if expected <= original:
+            self.skipTest("device already supplies enough reduction partitions")
+        with patch.object(
+            Reduction, "create_multilayer", wraps=Reduction.create_multilayer
+        ) as multilayer:
+            actual = torch.compile(fn, fullgraph=True)(x)
+        self.assertEqual(actual, fn(x), atol=2e-4, rtol=2e-4)
+        self.assertEqual(
+            [call.args[7] for call in multilayer.call_args_list], [expected, expected]
+        )
+
+    @requires_cuda_and_triton
+    @config.patch(
+        {
+            "triton.wide_reduction_splits": True,
+            "triton.cooperative_reductions": False,
+            "fx_graph_cache": False,
+        }
+    )
+    def test_wide_reduction_training(self, device):
+        from torch._inductor.choices import InductorChoices
+        from torch._inductor.ir import Reduction
+
+        def loss(x, w, grad):
+            normalized = F.rms_norm(x, (x.size(-1),), w, 1e-5)
+            return (normalized * grad).sum()
+
+        x = torch.randn(8, 65535, device=device)
+        w = torch.randn(x.size(-1), device=device)
+        grad = torch.randn_like(x)
+        fn = torch.func.grad_and_value(loss, argnums=(0, 1))
+        choices = InductorChoices()
+        legacy = choices.reduction_split_factor(x.device, x.numel(), 1, True)
+        expected = choices.scalar_reduction_split_factor(
+            x.device, x.size(1), x.size(0), legacy
+        )
+        with patch.object(
+            Reduction, "create_multilayer", wraps=Reduction.create_multilayer
+        ) as multilayer:
+            actual = torch.compile(fn, fullgraph=True)(x, w, grad)
+        self.assertEqual(actual, fn(x, w, grad), atol=2e-4, rtol=2e-4)
+        if expected > 1:
+            scalar_splits = [
+                call.args[7]
+                for call in multilayer.call_args_list
+                if not call.args[4] and tuple(call.args[5]) == tuple(x.shape)
+            ]
+            self.assertEqual(scalar_splits, [expected])
+
+
+instantiate_device_type_tests(TestWideReductionLowering, globals(), only_for="cuda")
 
 
 class ToTuple(torch.nn.Module):

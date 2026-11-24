@@ -1900,6 +1900,9 @@ class triton:
     Config specific to codegen/triton.py
     """
 
+    # Refine coupled wide reductions; other GPU builds can opt in explicitly.
+    wide_reduction_splits: bool = torch.version.hip is not None
+
     # torchTLX enablement. None (the default) means TLX is never considered
     # (standard Inductor behavior); "allow" lets TLX compete via autotuning;
     # "force" uses only TLX templates plus forced epilogue fusion. Also a
